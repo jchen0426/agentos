@@ -1,0 +1,30 @@
+"""Workflows that misbehave, for the tests of agentd's own enforcement (tests/test_cancel.py)."""
+
+import asyncio
+
+from temporalio import workflow
+
+from agentos_worker.workflows.security_audit import AuditInput, SecurityAudit, invoke
+
+
+@workflow.defn(name="security-audit")
+class IgnoresCancel(SecurityAudit):
+    """Swallows the cancel request, tries a write afterwards and never ends on its own."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        try:
+            await workflow.wait_condition(lambda: False)
+        except asyncio.CancelledError:
+            pass  # nothing makes a workflow honour a cancel request
+        status, _ = await invoke("1:github.comment_commit", "tool", "github.comment_commit",
+                                 repo=a.repo, commit=a.commit, outcome="ignored the cancel",
+                                 report_ref=None, pr_url=None)
+        await workflow.wait_condition(lambda: False)
+        return {"after_cancel": status}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+

@@ -1,0 +1,14 @@
+# models.yaml: which provider and model serve each task name (D11).
+# The anthropic and openai_compat adapters arrive in M2; M1 runs only the fake adapter
+# (config/dev/models.yaml).
+providers:
+  anthropic: {adapter: anthropic,     key: keychain:anthropic}
+  openai:    {adapter: openai_compat, base_url: "https://api.openai.com/v1", key: keychain:openai}
+  local:     {adapter: openai_compat, base_url: "http://127.0.0.1:11434/v1"}   # Ollama; vLLM uses the same adapter
+tasks:
+  audit_v1:
+    model: anthropic/claude-opus-5-5
+    effort: high
+    prompt: prompts/audit_v1/claude.md     # prompts may differ per model; the version is recorded per call
+    output_schema: schemas/audit_report.json
+    fallback: []                           # cross-provider fallback stays off unless listed here

@@ -1,0 +1,8 @@
+{
+  "name": "agentos-sandbox-macos",
+  "private": true,
+  "description": "Pins sandbox-runtime (srt), which runs the Worker under Seatbelt on macOS.",
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.79"
+  }
+}

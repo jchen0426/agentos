@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package agentos.v1;
+
+option go_package = "github.com/jchen0426/agentos/gen/go/agentos/v1;agentosv1";
+
+// Input of the single gateway activity "Invoke", registered by agentd on the
+// "gateway" task queue. Both Temporal SDKs carry it as a json/protobuf payload.
+message Call {
+  string kind = 1;      // "model" or "tool"
+  string name = 2;      // e.g. "audit_v1", "github.open_draft_pr"
+  // A JSON object. Text rather than bytes so the Temporal Web UI shows it
+  // readably; agentd canonicalizes and hashes it.
+  string args_json = 3;
+}
+
+// Output of "Invoke". Policy denials, approvals, budget pauses and refusals
+// are results, not errors: the workflow decides what to do next.
+message Result {
+  // ok, needs_approval, needs_reconcile, budget_exhausted,
+  // rejected, expired, edited, refused, denied
+  string status = 1;
+  // A JSON object. Large values are blob references, never inline content.
+  string value_json = 2;
+}

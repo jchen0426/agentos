@@ -1,0 +1,10 @@
+# M1 development policy: like config/policy.yaml, but nothing waits for approval (M4) and
+# the fake model may receive the task's data.
+repos: [acme/payments]
+tools:
+  git.show_diff:         {decision: allow, effect: none}
+  git.apply_check:       {decision: allow, effect: none}
+  github.open_draft_pr:  {decision: allow, effect: lookup}
+  github.comment_commit: {decision: allow, effect: lookup}
+models:
+  audit_v1: {allowed_providers: [fake]}

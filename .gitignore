@@ -1,0 +1,10 @@
+/bin/
+/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+/.agentos/
+/sandbox/macos/node_modules/
+/.claude/*.log
+/.claude/settings.local.json
+.DS_Store

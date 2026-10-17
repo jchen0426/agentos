@@ -1,0 +1,49 @@
+# Lima VM for the Linux side of M1: the bubblewrap sandbox prototype and Linux test runs.
+#   limactl create --name=agentos vm/lima/agentos.yaml && limactl start agentos
+# A real VM on purpose: bubblewrap often cannot run inside containers (design doc, D7).
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+cpus: 4
+memory: 6GiB
+disk: 30GiB
+
+# Only the repository is shared with the VM, not the home directory.
+mounts:
+- location: "~/GitRepos/agent-os"
+  writable: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      bubblewrap socat git ca-certificates curl sqlite3 \
+      python3 python3-venv python3-pip
+    # Ubuntu 23.10+ sets kernel.apparmor_restrict_unprivileged_userns=1: an unconfined
+    # bwrap gets a user namespace without capabilities and fails with
+    # "loopback: Failed RTM_NEWADDR: Operation not permitted". Ubuntu ships no bwrap
+    # profile, so name the binary and grant it userns, as Ubuntu's own flatpak profile does.
+    cat > /etc/apparmor.d/bwrap <<'PROFILE'
+    abi <abi/4.0>,
+    include <tunables/global>
+
+    profile bwrap /usr/bin/bwrap flags=(unconfined) {
+      userns,
+
+      include if exists <local/bwrap>
+    }
+    PROFILE
+    apparmor_parser -r /etc/apparmor.d/bwrap
+    if ! command -v temporal >/dev/null; then
+      curl -fsSL -o /tmp/temporal.tgz \
+        "https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_linux_arm64.tar.gz"
+      tar -xzf /tmp/temporal.tgz -C /usr/local/bin temporal
+      rm -f /tmp/temporal.tgz
+    fi
