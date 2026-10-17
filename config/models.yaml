@@ -1,6 +1,6 @@
 # models.yaml: which provider and model serve each task name (D11).
-# The anthropic and openai_compat adapters arrive in M2; M1 runs only the fake adapter
-# (config/dev/models.yaml).
+# The anthropic adapter arrives in M2b and openai_compat in M2c; until then only the fake
+# adapter runs (config/dev/models.yaml).
 providers:
   anthropic: {adapter: anthropic,     key: keychain:anthropic}
   openai:    {adapter: openai_compat, base_url: "https://api.openai.com/v1", key: keychain:openai}
@@ -8,6 +8,7 @@ providers:
 tasks:
   audit_v1:
     model: anthropic/claude-opus-5-5
+    max_tokens: 16000                      # bounds the budget reservation of every request
     effort: high
     prompt: prompts/audit_v1/claude.md     # prompts may differ per model; the version is recorded per call
     output_schema: schemas/audit_report.json

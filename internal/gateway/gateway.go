@@ -24,11 +24,13 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
+	"github.com/jchen0426/agentos/internal/pricing"
 	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -50,6 +52,8 @@ type Gateway struct {
 	Policy   *policy.Policy
 	Tasks    tasks.Registry // for each run's scope
 	Models   *models.Config
+	Prices   *pricing.Table
+	Budget   *budget.Budget
 	Adapters map[string]models.Adapter // by adapter name in models.yaml
 	Tools    *tools.Stubs
 	Faults   *faults.Script // nil unless agentd runs with --fault-script
@@ -141,7 +145,6 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		if fx.Status != "" {
 			return result(fx.Status, nil)
 		}
-		// M2: reserve budget here; a refused reservation returns budget_exhausted.
 		return g.callModel(ctx, info, run, route, args, fx)
 	case "tool":
 		scope, err := g.scope(run)
@@ -247,31 +250,64 @@ func (g *Gateway) modelCallOnce(ctx context.Context, info activity.Info, run db.
 		return models.Response{}, err
 	}
 
-	reqJSON, err := json.Marshal(map[string]any{
-		"task": route.Task, "provider": route.Provider, "model": route.Model, "effort": route.Effort, "args": args,
-	})
-	if err != nil {
-		return models.Response{}, err
+	req := models.Request{
+		WorkflowID: run.WorkflowID, Route: route, Args: args,
+		// One network request per attempt: a retry is a new request with its own reservation.
+		RequestID: fmt.Sprintf("%s/%s/%d", run.WorkflowID, info.ActivityID, info.Attempt),
+		Fault: models.FakeFault{Status: fx.ProviderStatus, LoseAnswer: fx.ProviderLoseAnswer,
+			Unreachable: fx.ProviderUnreachable, ServedBy: fx.ProviderServedBy},
 	}
-	reqRef, err := g.Ledger.PutBlob(ctx, reqJSON)
+	// Reserve the most the request can cost before it goes out (section 9).
+	tokens, err := adapter.CountTokens(ctx, req)
 	if err != nil {
-		return models.Response{}, err
+		return models.Response{}, fmt.Errorf("count input tokens: %w", err)
 	}
-	err = q.InsertModelCall(ctx, db.InsertModelCallParams{
-		WorkflowID: run.WorkflowID, ActivityID: info.ActivityID, Attempt: int64(info.Attempt),
-		RequestBlob: reqRef, Provider: route.Provider, Model: route.Model, PromptVersion: route.PromptVersion,
-		Effort: sql.NullString{String: route.Effort, Valid: route.Effort != ""}, StartedAt: ledger.Now(),
-	})
+	reserved, err := g.Prices.Bound(route.Candidates, tokens, route.MaxTokens)
+	if err != nil {
+		return models.Response{}, temporal.NewNonRetryableApplicationError(err.Error(), "Unpriced", err)
+	}
+	breq := budget.Request{ID: req.RequestID, WorkflowID: run.WorkflowID, ActivityID: info.ActivityID,
+		Attempt: info.Attempt, Model: route.Name()}
+	totals, err := g.Budget.Reserve(ctx, breq, reserved, g.Prices.Version)
+	if errors.Is(err, budget.ErrExhausted) {
+		// Not an error: the workflow waits in PAUSED_BUDGET for an extension, then asks again.
+		return models.Response{Status: StatusBudgetExhausted, Value: map[string]any{
+			"needed_micros": reserved, "available_micros": totals.Available(), "limit_micros": totals.Limit,
+		}}, nil
+	}
 	if err != nil {
 		return models.Response{}, err
 	}
 
+	if err := g.recordRequest(ctx, info, run, route, args); err != nil {
+		g.closeUnanswered(ctx, breq, reserved, fmt.Errorf("%w: %v", models.ErrNotSent, err))
+		return models.Response{}, err
+	}
 	fx.Stall(ctx.Done())
-	resp, err := adapter.Call(ctx, models.Request{WorkflowID: run.WorkflowID, Route: route, Args: args})
+	resp, err := adapter.Call(ctx, req)
 	if err != nil {
-		return models.Response{}, err // M2 maps provider errors to retryable and non-retryable
+		g.closeUnanswered(ctx, breq, reserved, err)
+		var rejected *models.RejectedError
+		if errors.As(err, &rejected) && !rejected.Retryable() {
+			return models.Response{}, temporal.NewNonRetryableApplicationError(err.Error(), "ProviderRejected", err)
+		}
+		return models.Response{}, err
 	}
 	fx.StallBeforeRecord(ctx.Done())
+	if resp.Model == "" {
+		resp.Model = route.Name()
+	}
+	cost, err := g.Prices.Cost(resp.Model, resp.Usage)
+	if err != nil {
+		g.Log.Error("cannot price an answer; charging its whole reservation", "request_id", req.RequestID,
+			"model", resp.Model, "error", err)
+		cost = reserved
+	}
+	if cost > reserved {
+		// The ledger records what was billed even so: the bound in section 9 failed.
+		g.Log.Error("a request cost more than its reservation", "request_id", req.RequestID,
+			"cost_micros", cost, "reserved_micros", reserved)
+	}
 	respJSON, err := json.Marshal(resp)
 	if err != nil {
 		return models.Response{}, err
@@ -284,17 +320,68 @@ func (g *Gateway) modelCallOnce(ctx context.Context, info activity.Info, run db.
 	if err != nil {
 		return models.Response{}, err
 	}
-	if err := q.FinishModelCall(ctx, db.FinishModelCallParams{
-		ResponseBlob: sql.NullString{String: respRef, Valid: true},
-		StopReason:   sql.NullString{String: resp.StopReason, Valid: resp.StopReason != ""},
-		UsageJson:    sql.NullString{String: string(usage), Valid: true},
-		FinishedAt:   sql.NullString{String: ledger.Now(), Valid: true},
-		WorkflowID:   run.WorkflowID, ActivityID: info.ActivityID, Attempt: int64(info.Attempt),
+	// The answer and its charge are recorded together. A crash or a failed write before
+	// this leaves the reservation open: it stays held, and agentd charges it in full when
+	// it starts again.
+	if err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		if err := q.FinishModelCall(ctx, db.FinishModelCallParams{
+			ResponseBlob: sql.NullString{String: respRef, Valid: true},
+			StopReason:   sql.NullString{String: resp.StopReason, Valid: resp.StopReason != ""},
+			UsageJson:    sql.NullString{String: string(usage), Valid: true},
+			FinishedAt:   sql.NullString{String: ledger.Now(), Valid: true},
+			WorkflowID:   run.WorkflowID, ActivityID: info.ActivityID, Attempt: int64(info.Attempt),
+		}); err != nil {
+			return err
+		}
+		_, err := budget.Settle(ctx, q, req.RequestID, cost, resp.Model, g.Prices.Version, budget.ReasonUsage)
+		return err
 	}); err != nil {
 		return models.Response{}, err
 	}
 	fx.StallAfterRecord(ctx.Done())
 	return resp, nil
+}
+
+// recordRequest writes the exact request of a model call before it is sent.
+func (g *Gateway) recordRequest(ctx context.Context, info activity.Info, run db.Run, route models.Route, args map[string]any) error {
+	reqJSON, err := json.Marshal(map[string]any{
+		"task": route.Task, "provider": route.Provider, "model": route.Model, "effort": route.Effort, "args": args,
+	})
+	if err != nil {
+		return err
+	}
+	reqRef, err := g.Ledger.PutBlob(ctx, reqJSON)
+	if err != nil {
+		return err
+	}
+	return g.Ledger.Q.InsertModelCall(ctx, db.InsertModelCallParams{
+		WorkflowID: run.WorkflowID, ActivityID: info.ActivityID, Attempt: int64(info.Attempt),
+		RequestBlob: reqRef, Provider: route.Provider, Model: route.Model, PromptVersion: route.PromptVersion,
+		Effort: sql.NullString{String: route.Effort, Valid: route.Effort != ""}, StartedAt: ledger.Now(),
+	})
+}
+
+// closeUnanswered closes the reservation of a request that got no answer. One that never
+// left agentd is released; one the provider turned away (429, 5xx) is settled at zero; after
+// any other failure nobody knows whether the provider billed it, so the whole reservation
+// is charged.
+func (g *Gateway) closeUnanswered(ctx context.Context, r budget.Request, reserved int64, callErr error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	var rejected *models.RejectedError
+	var err error
+	switch {
+	case errors.Is(callErr, models.ErrNotSent):
+		err = budget.Release(ctx, g.Ledger.Q, r.ID)
+	case errors.As(callErr, &rejected):
+		_, err = budget.Settle(ctx, g.Ledger.Q, r.ID, 0, r.Model, g.Prices.Version, budget.ReasonRejected)
+	default:
+		_, err = budget.Settle(ctx, g.Ledger.Q, r.ID, reserved, r.Model, g.Prices.Version, budget.ReasonOutcomeUnknown)
+	}
+	if err != nil {
+		// Left open, it stays held until agentd charges it in full at its next start.
+		g.Log.Error("could not close a reservation", "request_id", r.ID, "error", err)
+	}
 }
 
 func (g *Gateway) loadResponse(ctx context.Context, ref string) (models.Response, error) {

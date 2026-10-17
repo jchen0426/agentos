@@ -264,14 +264,16 @@ type Run struct {
 	Task          string                 `protobuf:"bytes,3,opt,name=task,proto3" json:"task,omitempty"`
 	// CREATED, RUNNING, WAITING_APPROVAL, WAITING_RECONCILE, PAUSED_BUDGET,
 	// SUCCEEDED, FAILED, CANCELLED; UNKNOWN once Temporal no longer has the execution
-	State             string            `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"`
-	Params            map[string]string `protobuf:"bytes,5,rep,name=params,proto3" json:"params,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // as resolved by agentd (commit is the full 40-char SHA)
-	BudgetLimitMicros int64             `protobuf:"varint,6,opt,name=budget_limit_micros,json=budgetLimitMicros,proto3" json:"budget_limit_micros,omitempty"`
-	CreatedAt         string            `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`    // RFC 3339, UTC
-	ResultJson        string            `protobuf:"bytes,8,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"` // the workflow result once SUCCEEDED
-	Failure           string            `protobuf:"bytes,9,opt,name=failure,proto3" json:"failure,omitempty"`                         // the failure message once FAILED
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	State                string            `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"`
+	Params               map[string]string `protobuf:"bytes,5,rep,name=params,proto3" json:"params,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // as resolved by agentd (commit is the full 40-char SHA)
+	BudgetLimitMicros    int64             `protobuf:"varint,6,opt,name=budget_limit_micros,json=budgetLimitMicros,proto3" json:"budget_limit_micros,omitempty"`                         // the current limit: the start's plus every extension
+	CreatedAt            string            `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`                                                    // RFC 3339, UTC
+	ResultJson           string            `protobuf:"bytes,8,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`                                                 // the workflow result once SUCCEEDED
+	Failure              string            `protobuf:"bytes,9,opt,name=failure,proto3" json:"failure,omitempty"`                                                                         // the failure message once FAILED
+	BudgetSpentMicros    int64             `protobuf:"varint,10,opt,name=budget_spent_micros,json=budgetSpentMicros,proto3" json:"budget_spent_micros,omitempty"`                        // settled model requests
+	BudgetReservedMicros int64             `protobuf:"varint,11,opt,name=budget_reserved_micros,json=budgetReservedMicros,proto3" json:"budget_reserved_micros,omitempty"`               // reserved by requests not yet settled
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Run) Reset() {
@@ -365,6 +367,20 @@ func (x *Run) GetFailure() string {
 		return x.Failure
 	}
 	return ""
+}
+
+func (x *Run) GetBudgetSpentMicros() int64 {
+	if x != nil {
+		return x.BudgetSpentMicros
+	}
+	return 0
+}
+
+func (x *Run) GetBudgetReservedMicros() int64 {
+	if x != nil {
+		return x.BudgetReservedMicros
+	}
+	return 0
 }
 
 type ListPendingRequest struct {
@@ -936,8 +952,8 @@ func (x *ResolveReconciliationResponse) GetStatus() string {
 type ExtendBudgetRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	RunId          string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	AmountMicros   int64                  `protobuf:"varint,2,opt,name=amount_micros,json=amountMicros,proto3" json:"amount_micros,omitempty"`
-	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	AmountMicros   int64                  `protobuf:"varint,2,opt,name=amount_micros,json=amountMicros,proto3" json:"amount_micros,omitempty"`      // added to the run's limit; must be positive
+	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // required: a retried request with the same key adds nothing
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1125,7 +1141,7 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x10ListRunsResponse\x12#\n" +
 	"\x04runs\x18\x01 \x03(\v2\x0f.agentos.v1.RunR\x04runs\")\n" +
 	"\x10CancelRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xe8\x02\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xce\x03\n" +
 	"\x03Run\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12&\n" +
 	"\x0ftemporal_run_id\x18\x02 \x01(\tR\rtemporalRunId\x12\x12\n" +
@@ -1137,7 +1153,10 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"created_at\x18\a \x01(\tR\tcreatedAt\x12\x1f\n" +
 	"\vresult_json\x18\b \x01(\tR\n" +
 	"resultJson\x12\x18\n" +
-	"\afailure\x18\t \x01(\tR\afailure\x1a9\n" +
+	"\afailure\x18\t \x01(\tR\afailure\x12.\n" +
+	"\x13budget_spent_micros\x18\n" +
+	" \x01(\x03R\x11budgetSpentMicros\x124\n" +
+	"\x16budget_reserved_micros\x18\v \x01(\x03R\x14budgetReservedMicros\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x14\n" +

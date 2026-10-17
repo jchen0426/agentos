@@ -3,8 +3,8 @@
 - After the result is in the ledger: the retry is served from the ledger and the provider
   was asked once (design doc, section 5: recorded results are reused).
 - After the provider answered but before the ledger recorded it: agentd cannot know the
-  outcome, so the retry asks again. That is the window M2's budget charges in full
-  (section 9, rule 6); here M1 must neither lose the run nor hide the second request.
+  outcome, so the retry asks again, and the first request's reservation is charged in full
+  when agentd starts (section 9). The run is not lost and the second request is not hidden.
 """
 
 from tests.harness import Stack, TERMINAL, gateway_calls, wait_for
@@ -50,3 +50,13 @@ def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded
     assert len(stack.provider_calls(run)) == 2  # asked again: agentd could not know
     rows = [(r["attempt"], r["response_blob"] is not None) for r in stack.model_calls(run)]
     assert rows == [(1, False), (2, True)], rows  # the unanswered attempt stays visible
+    # Unrecorded, so charged in full when agentd started again; the retry, what it cost.
+    entries = stack.budget_entries(run)
+    reserved = {e["request_id"]: e for e in entries if e["kind"] == "RESERVE"}
+    settled = {reserved[e["request_id"]]["attempt"]: e for e in entries if e["kind"] == "SETTLE"}
+    assert sorted(settled) == [1, 2], [dict(e) for e in entries]
+    first, second = settled[1], settled[2]
+    assert first["reason"] == "open_at_start"
+    assert first["amount_micros"] == reserved[first["request_id"]]["amount_micros"]
+    assert second["reason"] == "usage"
+    assert 0 < second["amount_micros"] < reserved[second["request_id"]]["amount_micros"]

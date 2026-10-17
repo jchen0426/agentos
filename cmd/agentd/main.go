@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/control"
 	"github.com/jchen0426/agentos/internal/faults"
@@ -35,6 +36,7 @@ import (
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
+	"github.com/jchen0426/agentos/internal/pricing"
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
 	"github.com/jchen0426/agentos/internal/safetext"
 	"github.com/jchen0426/agentos/internal/tasks"
@@ -82,6 +84,20 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	prices, err := pricing.Load(cfg.PricesFile)
+	if err != nil {
+		return err
+	}
+	for name := range mods.Tasks {
+		// Every model a task may reach must be priced before agentd will start.
+		route, err := mods.Route(name)
+		if err != nil {
+			return err
+		}
+		if _, err := prices.Bound(route.Candidates, 0, route.MaxTokens); err != nil {
+			return fmt.Errorf("model task %s: %w", name, err)
+		}
+	}
 	var script *faults.Script
 	if faultScript != "" {
 		if script, err = faults.Load(faultScript); err != nil {
@@ -94,6 +110,14 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 		return err
 	}
 	defer led.Close()
+	bud := &budget.Budget{Ledger: led}
+	// Before any request is served: a reservation still open belongs to a request agentd
+	// lost track of when it stopped, and the provider may have billed it.
+	if n, err := bud.SettleOpen(ctx); err != nil {
+		return fmt.Errorf("settle open reservations: %w", err)
+	} else if n > 0 {
+		log.Warn("charged reservations left open by the last run of agentd in full", "count", n)
+	}
 
 	tlsConfig, err := temporalTLS(cfg.Temporal.TLS)
 	if err != nil {
@@ -116,6 +140,8 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 		Policy: pol,
 		Tasks:  registry,
 		Models: mods,
+		Prices: prices,
+		Budget: bud,
 		Adapters: map[string]models.Adapter{"fake": models.Fake{
 			Blobs: led, Log: models.NewProviderLog(filepath.Join(cfg.DataDir, "fake-provider.jsonl")),
 		}},
@@ -169,6 +195,7 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	}
 	ctl := &control.Server{
 		Ledger:      led,
+		Budget:      bud,
 		Temporal:    tc,
 		Tasks:       registry,
 		TaskQueue:   cfg.TaskQueues.Workflows,

@@ -4,9 +4,11 @@ A self-hosted runtime for agent tasks that you can audit: Temporal owns executio
 (Go) holds the keys, the ledgers and every way out, and the task's workflow (Python) runs in
 a sandbox with no network and no keys. Design: the v0.1 design doc (Claude Doc).
 
-This is milestone M1, the skeleton: the gateway activity with a fake model and stub tools,
+Milestone M1, the skeleton, is done: the gateway activity with a fake model and stub tools,
 the security-audit workflow, the Runtime socket proxy, `agentctl runs`, and the sandbox
-prototypes. What M1 found and verified is in [docs/m1-notes.md](docs/m1-notes.md).
+prototypes ([docs/m1-notes.md](docs/m1-notes.md)). M2a adds the budget: a versioned price
+table, a reservation for every model request before it is sent and a settlement after, and
+`agentctl budget extend` ([docs/m2-notes.md](docs/m2-notes.md)).
 
 ## Layout
 
@@ -15,12 +17,13 @@ prototypes. What M1 found and verified is in [docs/m1-notes.md](docs/m1-notes.md
 | `proto/agentos/v1/` | `gateway.proto` (Invoke's `Call`/`Result`), `control.proto` (the Control service) |
 | `cmd/agentd`, `cmd/agentctl` | the daemon and its command line |
 | `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol |
+| `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |
 | `internal/runtimeproxy` | the Worker's only way to Temporal; an allowlist of WorkflowService methods |
 | `internal/control` | the Control service on the 0700 control socket |
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T8, T10, the replay gate, the sandbox probe, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T7 (concurrent calls against one budget), T8, T10, the replay gate, the sandbox probe, mTLS, gateway identity, agentd restart, cancel and its enforcement |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
 ## Requirements
@@ -54,6 +57,12 @@ uv run python -m agentos_worker --endpoint 127.0.0.1:7244
 bin/agentctl --socket .agentos/control/control.sock runs start security-audit --repo acme/payments --commit <sha> --base main
 ```
 
+A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
+
+```bash
+bin/agentctl --socket .agentos/control/control.sock budget extend <run-id> --usd 2.50
+```
+
 That Worker runs unsandboxed, for development only. Sandboxed, it starts through
 `sandbox/macos/run-worker.sh` (macOS) or `sandbox/linux/run-worker.sh` (Linux); see the
 headers of those scripts.
@@ -67,7 +76,7 @@ make test-linux  # in the Lima VM, Workers under bubblewrap
 ```
 
 `tests/test_temporal_mtls.py` also needs the full Temporal server: `make temporal-server`.
-`go test ./...` covers config, policy, argument canonicalization, the heartbeat interval, and the proxy's method allowlist and request rules.
+`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), argument canonicalization, the heartbeat interval, and the proxy's method allowlist and request rules.
 
 After a workflow change that is meant to be compatible, the replay gate
 (`tests/test_replay.py`) must still pass. To add samples to it, run

@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -41,7 +42,9 @@ func main() {
 
 	runs := &cobra.Command{Use: "runs", Short: "Start, inspect and cancel runs"}
 	runs.AddCommand(startCmd(g), getCmd(g), listCmd(g), cancelCmd(g), explainCmd(g))
-	root.AddCommand(runs)
+	budget := &cobra.Command{Use: "budget", Short: "Manage run budgets"}
+	budget.AddCommand(extendCmd(g))
+	root.AddCommand(runs, budget)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))
@@ -180,6 +183,64 @@ func cancelCmd(g *globals) *cobra.Command {
 	}
 }
 
+func extendCmd(g *globals) *cobra.Command {
+	var amount, key string
+	cmd := &cobra.Command{
+		Use:     "extend <run-id> --usd <amount>",
+		Short:   "Raise a run's budget; calls paused for budget ask again",
+		Example: "  agentctl budget extend 0f8b1c2e-... --usd 2.50",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			micros, err := parseUSD(amount)
+			if err != nil {
+				return fmt.Errorf("--usd: %w", err)
+			}
+			if key == "" {
+				key = uuid.NewString()
+			}
+			return withClient(g, func(ctx context.Context, c agentosv1.ControlClient) error {
+				run, err := c.ExtendBudget(ctx, &agentosv1.ExtendBudgetRequest{
+					RunId: args[0], AmountMicros: micros, IdempotencyKey: key,
+				})
+				if err != nil {
+					return err
+				}
+				return printRun(g, run)
+			})
+		},
+	}
+	cmd.Flags().StringVar(&amount, "usd", "", "amount to add, in US dollars, e.g. 2.50")
+	cmd.Flags().StringVar(&key, "idempotency-key", "", "reuse to make a repeated extension add nothing (default: a new key)")
+	_ = cmd.MarkFlagRequired("usd")
+	return cmd
+}
+
+// parseUSD reads a positive dollar amount, exactly, into micros.
+func parseUSD(s string) (int64, error) {
+	whole, frac, _ := strings.Cut(strings.TrimPrefix(s, "$"), ".")
+	if whole == "" || len(frac) > 6 || strings.Trim(whole+frac, "0123456789") != "" {
+		return 0, fmt.Errorf("%q is not an amount like 2.50 (at most 6 decimals)", s)
+	}
+	n, err := strconv.ParseInt(whole+(frac + "000000")[:6], 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%q is not a positive amount", s)
+	}
+	return n, nil
+}
+
+// usd shows micros as dollars, exactly: $5.00, $0.0045.
+func usd(micros int64) string {
+	sign := ""
+	if micros < 0 {
+		sign, micros = "-", -micros
+	}
+	frac := strings.TrimRight(fmt.Sprintf("%06d", micros%1e6), "0")
+	for len(frac) < 2 {
+		frac += "0"
+	}
+	return fmt.Sprintf("%s$%d.%s", sign, micros/1e6, frac)
+}
+
 func explainCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "explain <run-id>",
@@ -240,7 +301,8 @@ func writeRun(w io.Writer, r *agentosv1.Run) error {
 	row("task", r.GetTask())
 	row("state", r.GetState())
 	row("params", strings.Join(params, " "))
-	row("budget", fmt.Sprintf("$%.2f", float64(r.GetBudgetLimitMicros())/1e6))
+	row("budget", fmt.Sprintf("%s spent, %s reserved, limit %s",
+		usd(r.GetBudgetSpentMicros()), usd(r.GetBudgetReservedMicros()), usd(r.GetBudgetLimitMicros())))
 	row("created", r.GetCreatedAt())
 	if r.GetResultJson() != "" {
 		row("result", r.GetResultJson())

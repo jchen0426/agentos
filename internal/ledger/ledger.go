@@ -77,6 +77,20 @@ func Open(ctx context.Context, path string) (*Ledger, error) {
 
 func (l *Ledger) Close() error { return l.DB.Close() }
 
+// Tx runs fn in one write transaction and commits it unless fn fails. Transactions begin
+// IMMEDIATE (see the DSN): what fn reads cannot change before it writes.
+func (l *Ledger) Tx(ctx context.Context, fn func(q *db.Queries) error) error {
+	tx, err := l.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(l.Q.WithTx(tx)); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // Now is the ledger's timestamp format: RFC 3339 in UTC with nanoseconds.
 func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 

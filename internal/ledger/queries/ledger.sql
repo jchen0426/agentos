@@ -57,3 +57,39 @@ UPDATE runs SET cancelled_at = ? WHERE workflow_id = ? AND cancelled_at IS NULL;
 
 -- name: ListCancelledRuns :many
 SELECT * FROM runs WHERE cancelled_at IS NOT NULL AND run_id IS NOT NULL;
+
+-- name: InsertBudgetEntry :exec
+INSERT INTO budget_entries (
+  workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- name: InsertBudgetExtension :execrows
+INSERT INTO budget_entries (workflow_id, kind, amount_micros, idempotency_key, created_at)
+VALUES (?, 'EXTEND', ?, ?, ?)
+ON CONFLICT DO NOTHING;
+
+-- name: GetBudgetTotals :one
+SELECT
+  CAST(r.budget_limit_micros + COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'EXTEND'
+  ), 0) AS INTEGER) AS limit_micros,
+  CAST(COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'SETTLE'
+  ), 0) AS INTEGER) AS spent_micros,
+  CAST(COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e
+    WHERE e.workflow_id = r.workflow_id AND e.kind = 'RESERVE' AND NOT EXISTS (
+      SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'))
+  ), 0) AS INTEGER) AS held_micros
+FROM runs r WHERE r.workflow_id = ?;
+
+-- name: GetOpenReservation :one
+SELECT * FROM budget_entries e
+WHERE e.request_id = ? AND e.kind = 'RESERVE' AND NOT EXISTS (
+  SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'));
+
+-- name: ListOpenReservations :many
+SELECT * FROM budget_entries e
+WHERE e.kind = 'RESERVE' AND NOT EXISTS (
+  SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'))
+ORDER BY e.entry_id;

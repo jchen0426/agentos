@@ -135,7 +135,7 @@ class ControlServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ExtendBudget(self, request, context):
-        """M2
+        """M2a, backs `agentctl budget extend`
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

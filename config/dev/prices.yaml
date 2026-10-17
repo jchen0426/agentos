@@ -1,0 +1,6 @@
+# The fake provider's prices, in US dollars per million tokens. Not zero: a free model would
+# leave the budget untested.
+price_table_version: dev-1
+models:
+  fake/audit-fixture:  {input: 1.00, output: 5.00}
+  fake/audit-fallback: {input: 2.00, output: 10.00}

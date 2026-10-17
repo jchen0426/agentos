@@ -21,7 +21,8 @@ type Config struct {
 	TaskQueues    TaskQueues        `yaml:"task_queues"`
 	PolicyFile    string            `yaml:"policy_file"`
 	ModelsFile    string            `yaml:"models_file"`
-	Repos         map[string]string `yaml:"repos"` // logical repo id -> read-only mirror
+	PricesFile    string            `yaml:"prices_file"` // versioned price table (design doc, section 9)
+	Repos         map[string]string `yaml:"repos"`       // logical repo id -> read-only mirror
 	// How long a cancelled run may keep running before agentd terminates it: Temporal's
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
@@ -102,9 +103,9 @@ func Load(path string) (*Config, error) {
 	if c.CancelGrace <= 0 {
 		c.CancelGrace = 2 * time.Minute
 	}
-	c.PolicyFile, c.ModelsFile = abs(c.PolicyFile), abs(c.ModelsFile)
-	if c.PolicyFile == "" || c.ModelsFile == "" {
-		return nil, fmt.Errorf("config %s: policy_file and models_file are required", path)
+	c.PolicyFile, c.ModelsFile, c.PricesFile = abs(c.PolicyFile), abs(c.ModelsFile), abs(c.PricesFile)
+	if c.PolicyFile == "" || c.ModelsFile == "" || c.PricesFile == "" {
+		return nil, fmt.Errorf("config %s: policy_file, models_file and prices_file are required", path)
 	}
 	for id, mirror := range c.Repos {
 		c.Repos[id] = abs(mirror)
