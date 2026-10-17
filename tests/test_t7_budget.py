@@ -1,6 +1,6 @@
 """T7: 50 model calls in one run compete for its budget (design doc, sections 9 and 11).
 
-The run starts with room for about 20 reservations. The other calls wait in PAUSED_BUDGET
+The run starts with room for about 13 reservations. The other calls wait in PAUSED_BUDGET
 until `agentctl budget extend` rings the doorbell; then every call finishes. After the
 extension the fake provider answers 429 and 500, loses an answer it billed, never receives
 one request and answers one as the fallback model. At every entry of the ledger, settled
@@ -10,7 +10,7 @@ matches the ledger request by request.
 
 import json
 
-from tests.harness import TERMINAL, Stack, wait_for
+from tests.harness import AUDIT_SCHEMA, TERMINAL, Stack, wait_for
 from tests.t7_workflows import CALLS
 
 MODEL, FALLBACK = "fake/audit-fixture", "fake/audit-fallback"
@@ -19,7 +19,7 @@ MODELS = f"""
 providers:
   fake: {{adapter: fake}}
 tasks:
-  audit_v1: {{model: {MODEL}, max_tokens: 4096, fallback: [{FALLBACK}]}}
+  audit_v1: {{model: {MODEL}, max_tokens: 4096, fallback: [{FALLBACK}], output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
 """
 # Every request holds its reservation for half a second before it goes out, so the calls
 # really do compete: a fake answer is otherwise settled within a millisecond, and the next
@@ -34,7 +34,9 @@ FAULTS = [
     {"name": "audit_v1", "occurrence": CALLS + 12, "provider_unreachable": True},
     {"name": "audit_v1", "occurrence": CALLS + 15, "provider_served_by": FALLBACK},
 ]
-START_BUDGET = 900_000  # micros: room for about 20 reservations of about 44,000 each
+# micros: room for about 13 reservations of about 65,500 each. A reservation covers the model
+# and its fallback both billing in full, since within one request both can.
+START_BUDGET = 900_000
 EXTENSION = 5_000_000
 
 
@@ -48,7 +50,9 @@ def billed(record: dict) -> int:
 
 def test_t7_concurrent_calls_never_overspend(stack: Stack) -> None:
     prices = json.dumps({"price_table_version": "t7", "models": PRICES})
-    stack.start_agentd(models=MODELS, prices=prices, faults=FAULTS)
+    # 50 calls, 30 of them sent again after the pause: more than the default loop limits.
+    stack.start_agentd(models=MODELS, prices=prices, faults=FAULTS,
+                       extra={"loop_limits": {"model_calls": 200, "gateway_calls": 400}})
     stack.start_worker(workflows="tests.t7_workflows:FanOut")
     run = stack.start_run(budget_micros=START_BUDGET)
 
@@ -98,9 +102,9 @@ def test_t7_concurrent_calls_never_overspend(stack: Stack) -> None:
         assert close["amount_micros"] <= reserve["amount_micros"], (close, dict(reserve))
         if close["kind"] == "RELEASE":
             assert record is None and close["reason"] == "not_sent", (close, record)
-        elif record["status"] != 200:
+        elif record["status"] == 429:  # turned away: certainly not billed
             assert (close["reason"], close["amount_micros"]) == ("rejected", 0), (close, record)
-        elif close["reason"] == "outcome_unknown":  # billed, answer lost: charged the whole reservation
+        elif close["reason"] == "outcome_unknown":  # a 500, or an answer lost: charged the whole reservation
             assert billed(record) <= close["amount_micros"] == reserve["amount_micros"], (close, record)
         else:
             assert (close["reason"], close["model"], close["amount_micros"]) == ("usage", record["model"], billed(record)), \
@@ -110,7 +114,7 @@ def test_t7_concurrent_calls_never_overspend(stack: Stack) -> None:
     # Every fault fired: retries, a lost answer, an unsent request and the fallback were all accounted.
     assert sorted(r["status"] for r in records if r["status"] != 200) == [429, 500]
     reasons = [c["reason"] for c in closes.values()]
-    assert reasons.count("outcome_unknown") == 1 and reasons.count("not_sent") == 1, reasons
+    assert reasons.count("outcome_unknown") == 2 and reasons.count("not_sent") == 1, reasons  # the 500 and the lost answer
     assert [c["model"] for c in closes.values() if c["model"] == FALLBACK] == [FALLBACK]
 
     # Logical calls and network requests are counted apart: 50 answers, more requests.

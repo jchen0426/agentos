@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 
 from temporalio.api import workflowservice
 from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
@@ -47,6 +48,18 @@ def listdir(path: str) -> str:
         return f"listed {len(os.listdir(path))} entries"
     except OSError as e:
         return f"refused: {e.__class__.__name__}: {e}"
+
+
+def keychain_items(home: str) -> str:
+    """Whether the user's login keychain, where agentd's model keys live, can be listed: item
+    names only, never a secret. The system keychain is out of scope: it holds no user keys."""
+    login = os.path.join(home, "Library", "Keychains", "login.keychain-db")
+    try:
+        r = subprocess.run(["/usr/bin/security", "dump-keychain", login], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"refused: {type(e).__name__}"
+    items = r.stdout.count("class:")
+    return f"readable: {items} items" if r.returncode == 0 and items else f"refused: no items listed (exit {r.returncode})"
 
 
 async def sdk(endpoint: str, proxy: str | None) -> tuple[str, Client | None]:
@@ -108,6 +121,9 @@ async def main() -> None:
     report["home_canary"] = read(a.home_canary)
     report["ledger"] = read(a.ledger)
     report["ssh_dir"] = listdir(os.path.join(a.home, ".ssh"))
+    # agentd's model keys live in the login keychain (macOS): out of the Worker's reach.
+    report["keychains"] = listdir(os.path.join(a.home, "Library", "Keychains"))
+    report["keychain_items"] = keychain_items(a.home)
     report["env"] = sorted(os.environ)
     print(json.dumps(report))
 

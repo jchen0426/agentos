@@ -34,6 +34,11 @@ type Blob struct {
 	Bytes  []byte
 }
 
+type BlobOwner struct {
+	WorkflowID string
+	Sha256     string
+}
+
 type BudgetEntry struct {
 	EntryID           int64
 	WorkflowID        string
@@ -47,6 +52,16 @@ type BudgetEntry struct {
 	Reason            sql.NullString
 	IdempotencyKey    sql.NullString
 	CreatedAt         string
+}
+
+type Call struct {
+	WorkflowID  string
+	ActivityID  string
+	ScheduledAt string
+	Kind        string
+	Name        string
+	ArgsSha256  string
+	CreatedAt   string
 }
 
 type Effect struct {
@@ -66,6 +81,7 @@ type ModelCall struct {
 	WorkflowID    string
 	ActivityID    string
 	Attempt       int64
+	RequestSeq    int64
 	RequestBlob   string
 	ResponseBlob  sql.NullString
 	Provider      string

@@ -1,10 +1,17 @@
 package gateway
 
 import (
+	"context"
 	"maps"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"go.temporal.io/sdk/activity"
+	"golang.org/x/time/rate"
+
+	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/tasks"
 )
@@ -97,5 +104,92 @@ func TestFillScopeAddsWhatTheCallLeftOut(t *testing.T) {
 	args = map[string]any{"repo": "acme/ledger"}
 	if filled, _, _ := fillScope(args, scope); filled["repo"] != "acme/ledger" {
 		t.Errorf("a named value was overwritten: %v", filled)
+	}
+}
+
+func TestLoopGuard(t *testing.T) {
+	ctx := context.Background()
+	l, err := ledger.Open(ctx, filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := l.Q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "wf", Task: "security-audit", ParamsJson: "{}",
+		BudgetLimitMicros: 1, CreatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	g := &Gateway{Ledger: l, Limits: LoopLimits{ModelCalls: 2, GatewayCalls: 6, SameToolCalls: 2}}
+	scheduled := map[string]time.Time{} // the server's first-scheduled time, per activity ID
+	call := func(activityID, kind, name, args string) string {
+		t.Helper()
+		if _, ok := scheduled[activityID]; !ok {
+			scheduled[activityID] = time.Now()
+		}
+		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf"}, activity.Info{ActivityID: activityID, ScheduledTime: scheduled[activityID]},
+			&agentosv1.Call{Kind: kind, Name: name}, []byte(args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	steps := []struct {
+		activityID, kind, name, args string
+		refused                      bool
+	}{
+		{"1:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false},
+		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false},
+		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false}, // a retry counts once
+		{"3:git.show_diff", "tool", "git.show_diff", `{"a":1}`, true},  // a third time, same arguments
+		{"4:git.show_diff", "tool", "git.show_diff", `{"a":2}`, false}, // other arguments
+		{"5:audit_v1", "model", "audit_v1", `{"d":1}`, false},
+		{"6:audit_v1", "model", "audit_v1", `{"d":1}`, false},        // sent again after a pause: not a loop
+		{"7:audit_v1", "model", "audit_v1", `{"d":2}`, true},         // a third model call
+		{"8:git.apply_check", "tool", "git.apply_check", `{}`, true}, // the seventh call of the run
+	}
+	for _, s := range steps {
+		if reason := call(s.activityID, s.kind, s.name, s.args); (reason != "") != s.refused {
+			t.Errorf("%s %s: refused=%q, want refused=%v", s.activityID, s.args, reason, s.refused)
+		}
+	}
+
+	// A Worker that reuses an activity ID for a new call cannot hide it: Temporal schedules
+	// the new activity at a new time, and the guard counts it.
+	g.Limits = LoopLimits{GatewayCalls: 2}
+	if err := l.Q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "wf2", Task: "security-audit", ParamsJson: "{}",
+		BudgetLimitMicros: 1, CreatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	reused := func(at time.Time) string {
+		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf2"}, activity.Info{ActivityID: "1:x", ScheduledTime: at},
+			&agentosv1.Call{Kind: "tool", Name: "git.show_diff"}, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	t0 := time.Now()
+	if reused(t0) != "" || reused(t0) != "" || reused(t0.Add(time.Second)) != "" {
+		t.Fatal("the first two calls were refused")
+	}
+	if reused(t0.Add(2*time.Second)) == "" {
+		t.Error("a third call under a reused activity ID was not counted")
+	}
+}
+
+func TestWaitTurnGivesUpRatherThanWaitLong(t *testing.T) {
+	g := &Gateway{Limiters: map[string]*rate.Limiter{"slow": rate.NewLimiter(rate.Every(time.Hour), 1)}}
+	ctx := context.Background()
+	if err := g.waitTurn(ctx, "slow"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := g.waitTurn(ctx, "slow"); err == nil {
+		t.Error("a second request within the hour got a turn")
+	}
+	if time.Since(start) > time.Second {
+		t.Error("waitTurn waited instead of giving up at once")
+	}
+	if err := g.waitTurn(ctx, "unlimited"); err != nil {
+		t.Errorf("a provider without a limit: %v", err)
 	}
 }

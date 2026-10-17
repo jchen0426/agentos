@@ -50,6 +50,26 @@ func TestDevConfigLoads(t *testing.T) {
 	priced(t, m, c.PricesFile)
 }
 
+func TestDevClaudeConfigLoads(t *testing.T) {
+	c, err := Load("../../config/dev/agentd-claude.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := models.Load(c.ModelsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priced(t, m, c.PricesFile)
+	pol, err := policy.Load(c.PolicyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := m.Route("audit_v1")
+	if v := pol.EvaluateModel("audit_v1", r.Provider); v.Decision != policy.Allow {
+		t.Errorf("the dev policy refuses %s: %s", r.Provider, v.Reason)
+	}
+}
+
 func TestDesignDocModelsLoad(t *testing.T) {
 	m, err := models.Load("../../config/models.yaml")
 	if err != nil {

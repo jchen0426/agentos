@@ -1,0 +1,10 @@
+# Like agentd.yaml, but the model task goes to Claude (../models.yaml), at real prices. It needs
+# the agentos-anthropic-api-key item in the login keychain; see the README.
+data_dir: ../../.agentos
+runtime_listen: tcp://127.0.0.1:7244
+temporal: {address: 127.0.0.1:7233}
+policy_file: policy.yaml
+models_file: ../models.yaml
+prices_file: ../prices.yaml
+repos:
+  acme/payments: ../../.agentos/mirror      # any local git repository

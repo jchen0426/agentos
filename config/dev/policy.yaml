@@ -1,5 +1,5 @@
 # M1 development policy: like config/policy.yaml, but nothing waits for approval (M4) and
-# the fake model may receive the task's data.
+# the fake model, and Claude under agentd-claude.yaml, may receive the task's data.
 repos: [acme/payments]
 tools:
   git.show_diff:         {decision: allow, effect: none}
@@ -7,4 +7,4 @@ tools:
   github.open_draft_pr:  {decision: allow, effect: lookup}
   github.comment_commit: {decision: allow, effect: lookup}
 models:
-  audit_v1: {allowed_providers: [fake]}
+  audit_v1: {allowed_providers: [fake, anthropic]}   # anthropic for agentd-claude.yaml

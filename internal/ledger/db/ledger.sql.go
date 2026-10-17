@@ -10,6 +10,20 @@ import (
 	"database/sql"
 )
 
+const addBlobOwner = `-- name: AddBlobOwner :exec
+INSERT INTO blob_owners (workflow_id, sha256) VALUES (?, ?) ON CONFLICT DO NOTHING
+`
+
+type AddBlobOwnerParams struct {
+	WorkflowID string
+	Sha256     string
+}
+
+func (q *Queries) AddBlobOwner(ctx context.Context, arg AddBlobOwnerParams) error {
+	_, err := q.db.ExecContext(ctx, addBlobOwner, arg.WorkflowID, arg.Sha256)
+	return err
+}
+
 const deleteRun = `-- name: DeleteRun :exec
 DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 `
@@ -47,7 +61,7 @@ func (q *Queries) FinishEffect(ctx context.Context, arg FinishEffectParams) (int
 const finishModelCall = `-- name: FinishModelCall :exec
 UPDATE model_calls
 SET response_blob = ?, stop_reason = ?, usage_json = ?, finished_at = ?
-WHERE workflow_id = ? AND activity_id = ? AND attempt = ?
+WHERE workflow_id = ? AND activity_id = ? AND attempt = ? AND request_seq = ?
 `
 
 type FinishModelCallParams struct {
@@ -58,6 +72,7 @@ type FinishModelCallParams struct {
 	WorkflowID   string
 	ActivityID   string
 	Attempt      int64
+	RequestSeq   int64
 }
 
 func (q *Queries) FinishModelCall(ctx context.Context, arg FinishModelCallParams) error {
@@ -69,6 +84,7 @@ func (q *Queries) FinishModelCall(ctx context.Context, arg FinishModelCallParams
 		arg.WorkflowID,
 		arg.ActivityID,
 		arg.Attempt,
+		arg.RequestSeq,
 	)
 	return err
 }
@@ -113,6 +129,39 @@ func (q *Queries) GetBudgetTotals(ctx context.Context, workflowID string) (GetBu
 	return i, err
 }
 
+const getCallCounts = `-- name: GetCallCounts :one
+SELECT
+  CAST(COUNT(*) AS INTEGER) AS gateway_calls,
+  CAST(COALESCE(SUM(kind = 'model'), 0) AS INTEGER) AS model_calls,
+  CAST(COALESCE(SUM(kind = ?1 AND name = ?2 AND args_sha256 = ?3), 0) AS INTEGER) AS same_calls
+FROM calls WHERE workflow_id = ?4
+`
+
+type GetCallCountsParams struct {
+	Kind       string
+	Name       string
+	ArgsSha256 string
+	WorkflowID string
+}
+
+type GetCallCountsRow struct {
+	GatewayCalls int64
+	ModelCalls   int64
+	SameCalls    int64
+}
+
+func (q *Queries) GetCallCounts(ctx context.Context, arg GetCallCountsParams) (GetCallCountsRow, error) {
+	row := q.db.QueryRowContext(ctx, getCallCounts,
+		arg.Kind,
+		arg.Name,
+		arg.ArgsSha256,
+		arg.WorkflowID,
+	)
+	var i GetCallCountsRow
+	err := row.Scan(&i.GatewayCalls, &i.ModelCalls, &i.SameCalls)
+	return i, err
+}
+
 const getEffect = `-- name: GetEffect :one
 SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at FROM effects WHERE effect_id = ?
 `
@@ -136,9 +185,10 @@ func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error
 }
 
 const getFinishedModelCall = `-- name: GetFinishedModelCall :one
-SELECT workflow_id, activity_id, attempt, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls
+SELECT workflow_id, activity_id, attempt, request_seq, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls
 WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
-ORDER BY attempt
+  AND (stop_reason IS NULL OR stop_reason <> 'invalid_output')
+ORDER BY attempt, request_seq
 LIMIT 1
 `
 
@@ -154,6 +204,7 @@ func (q *Queries) GetFinishedModelCall(ctx context.Context, arg GetFinishedModel
 		&i.WorkflowID,
 		&i.ActivityID,
 		&i.Attempt,
+		&i.RequestSeq,
 		&i.RequestBlob,
 		&i.ResponseBlob,
 		&i.Provider,
@@ -274,6 +325,35 @@ func (q *Queries) InsertBudgetExtension(ctx context.Context, arg InsertBudgetExt
 	return result.RowsAffected()
 }
 
+const insertCall = `-- name: InsertCall :exec
+INSERT INTO calls (workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT DO NOTHING
+`
+
+type InsertCallParams struct {
+	WorkflowID  string
+	ActivityID  string
+	ScheduledAt string
+	Kind        string
+	Name        string
+	ArgsSha256  string
+	CreatedAt   string
+}
+
+func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) error {
+	_, err := q.db.ExecContext(ctx, insertCall,
+		arg.WorkflowID,
+		arg.ActivityID,
+		arg.ScheduledAt,
+		arg.Kind,
+		arg.Name,
+		arg.ArgsSha256,
+		arg.CreatedAt,
+	)
+	return err
+}
+
 const insertEffect = `-- name: InsertEffect :execrows
 INSERT INTO effects (
   effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, created_at, updated_at
@@ -313,14 +393,15 @@ func (q *Queries) InsertEffect(ctx context.Context, arg InsertEffectParams) (int
 
 const insertModelCall = `-- name: InsertModelCall :exec
 INSERT INTO model_calls (
-  workflow_id, activity_id, attempt, request_blob, provider, model, prompt_version, effort, started_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  workflow_id, activity_id, attempt, request_seq, request_blob, provider, model, prompt_version, effort, started_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertModelCallParams struct {
 	WorkflowID    string
 	ActivityID    string
 	Attempt       int64
+	RequestSeq    int64
 	RequestBlob   string
 	Provider      string
 	Model         string
@@ -334,6 +415,7 @@ func (q *Queries) InsertModelCall(ctx context.Context, arg InsertModelCallParams
 		arg.WorkflowID,
 		arg.ActivityID,
 		arg.Attempt,
+		arg.RequestSeq,
 		arg.RequestBlob,
 		arg.Provider,
 		arg.Model,
@@ -366,6 +448,22 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const isBlobOwner = `-- name: IsBlobOwner :one
+SELECT EXISTS (SELECT 1 FROM blob_owners WHERE workflow_id = ? AND sha256 = ?)
+`
+
+type IsBlobOwnerParams struct {
+	WorkflowID string
+	Sha256     string
+}
+
+func (q *Queries) IsBlobOwner(ctx context.Context, arg IsBlobOwnerParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, isBlobOwner, arg.WorkflowID, arg.Sha256)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const listCancelledRuns = `-- name: ListCancelledRuns :many

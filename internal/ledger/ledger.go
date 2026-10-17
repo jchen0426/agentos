@@ -124,6 +124,37 @@ func (l *Ledger) PutBlob(ctx context.Context, b []byte) (string, error) {
 }
 
 // GetBlob returns the bytes behind a reference returned by PutBlob.
+// ErrNotOwner means a run asked for a blob it did not produce.
+var ErrNotOwner = errors.New("the blob was not produced by this run")
+
+// PutRunBlob stores b as a blob that run produced. Only that run may have it read into a
+// model's prompt (GetRunBlob).
+func (l *Ledger) PutRunBlob(ctx context.Context, workflowID string, b []byte) (string, error) {
+	ref, err := l.PutBlob(ctx, b)
+	if err != nil {
+		return "", err
+	}
+	return ref, l.Q.AddBlobOwner(ctx, db.AddBlobOwnerParams{WorkflowID: workflowID, Sha256: strings.TrimPrefix(ref, "sha256:")})
+}
+
+// GetRunBlob returns the blob ref names when run produced it, and ErrNotOwner otherwise:
+// blobs are shared by content, and a reference learned from another run's history must not
+// carry that run's data into this one.
+func (l *Ledger) GetRunBlob(ctx context.Context, workflowID, ref string) ([]byte, error) {
+	h, ok := strings.CutPrefix(ref, "sha256:")
+	if !ok {
+		return nil, fmt.Errorf("bad blob reference %q", ref)
+	}
+	owned, err := l.Q.IsBlobOwner(ctx, db.IsBlobOwnerParams{WorkflowID: workflowID, Sha256: h})
+	if err != nil {
+		return nil, err
+	}
+	if owned == 0 {
+		return nil, ErrNotOwner
+	}
+	return l.GetBlob(ctx, ref)
+}
+
 func (l *Ledger) GetBlob(ctx context.Context, ref string) ([]byte, error) {
 	h, ok := strings.CutPrefix(ref, "sha256:")
 	if !ok {

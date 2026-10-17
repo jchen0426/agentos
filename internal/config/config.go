@@ -26,6 +26,18 @@ type Config struct {
 	// How long a cancelled run may keep running before agentd terminates it: Temporal's
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
+	LoopLimits  LoopLimits    `yaml:"loop_limits"`
+}
+
+// LoopLimits cap what one run may ask of the gateway (design doc, section 9). A call's
+// retries count once.
+type LoopLimits struct {
+	ModelCalls    int64 `yaml:"model_calls"`     // model calls per run
+	GatewayCalls  int64 `yaml:"gateway_calls"`   // calls of any kind per run
+	SameToolCalls int64 `yaml:"same_tool_calls"` // calls of one tool with the same arguments
+	// Attempts of one call. The Worker writes the activity's retry policy, so the gateway
+	// keeps its own cap.
+	Attempts int64 `yaml:"attempts"`
 }
 
 type Temporal struct {
@@ -102,6 +114,20 @@ func Load(path string) (*Config, error) {
 	}
 	if c.CancelGrace <= 0 {
 		c.CancelGrace = 2 * time.Minute
+	}
+	// An audit makes one model call and a handful of tool calls; these leave room for retries
+	// after a pause and stop a workflow that loops.
+	if c.LoopLimits.ModelCalls <= 0 {
+		c.LoopLimits.ModelCalls = 20
+	}
+	if c.LoopLimits.GatewayCalls <= 0 {
+		c.LoopLimits.GatewayCalls = 100
+	}
+	if c.LoopLimits.SameToolCalls <= 0 {
+		c.LoopLimits.SameToolCalls = 3
+	}
+	if c.LoopLimits.Attempts <= 0 {
+		c.LoopLimits.Attempts = 10
 	}
 	c.PolicyFile, c.ModelsFile, c.PricesFile = abs(c.PolicyFile), abs(c.ModelsFile), abs(c.PricesFile)
 	if c.PolicyFile == "" || c.ModelsFile == "" || c.PricesFile == "" {

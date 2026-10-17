@@ -12,22 +12,23 @@ import (
 	"github.com/jchen0426/agentos/internal/pricing"
 )
 
-// Fake answers model tasks with fixed, schema-shaped output and fixed token counts, priced
-// by the price table like any model. A fault script can make it answer 429 or 5xx, lose an
-// answer it billed, never receive a request, or answer as a fallback model. Like a real
+// Fake answers model tasks with fixed output in the shape of the audit report schema and
+// fixed token counts, priced by the price table like any model. A fault script can make it
+// answer 429 or 5xx, lose an answer it billed, never receive a request, answer as a fallback
+// model or break the schema. Like a real
 // provider it keeps its own record of every request it received, independent of agentd's
 // ledger, so that tests can hold the ledger against it.
 type Fake struct {
-	Blobs BlobStore
-	Log   *ProviderLog
+	Log *ProviderLog
 }
 
 // FakeFault is what a fault script asks of the fake provider for one request.
 type FakeFault struct {
-	Status      int    // answer with this HTTP status instead: 429 or 5xx, not billed
-	LoseAnswer  bool   // bill the request, then lose the answer, like a timeout
-	Unreachable bool   // fail before the request leaves agentd
-	ServedBy    string // answer as this "<provider>/<model>", like a fallback
+	Status        int    // answer with this HTTP status instead: 429 or 5xx, not billed
+	LoseAnswer    bool   // bill the request, then lose the answer, like a timeout
+	Unreachable   bool   // fail before the request leaves agentd
+	ServedBy      string // answer as this "<provider>/<model>", like a fallback
+	InvalidOutput bool   // answer with output that breaks the task's schema
 }
 
 // fakeOutputTokens is what every fake answer is billed for on the output side.
@@ -112,30 +113,26 @@ func (f Fake) Call(ctx context.Context, req Request) (Response, error) {
 	if req.Fault.LoseAnswer {
 		return Response{}, fmt.Errorf("fake provider: answer lost: %w", context.DeadlineExceeded)
 	}
-	findings := []map[string]any{{
-		"severity": "high",
-		"cwe":      "CWE-89",
-		"file":     "app/db.py",
-		"line":     2,
-		"title":    "SQL built with string formatting",
-	}}
-	report, err := json.Marshal(map[string]any{"diff_ref": req.Args["diff_ref"], "findings": findings})
-	if err != nil {
-		return Response{}, err
+	output := map[string]any{
+		"summary": "The commit builds a SQL query with string formatting.",
+		"findings": []any{map[string]any{
+			"severity":    "high",
+			"cwe":         "CWE-89",
+			"file":        "app/db.py",
+			"line":        2,
+			"title":       "SQL built with string formatting",
+			"explanation": "find_user formats the name into the SQL text, so a crafted name changes the query.",
+		}},
+		"patch": fakePatch,
 	}
-	reportRef, err := f.Blobs.PutBlob(ctx, report)
-	if err != nil {
-		return Response{}, err
-	}
-	patchRef, err := f.Blobs.PutBlob(ctx, []byte(fakePatch))
-	if err != nil {
-		return Response{}, err
+	if req.Fault.InvalidOutput {
+		delete(output, "summary")
 	}
 	return Response{
 		Status:     "ok",
 		Model:      model,
-		Value:      map[string]any{"report_ref": reportRef, "patch_ref": patchRef, "findings": findings},
+		Output:     output,
 		StopReason: "end_turn",
-		Usage:      usage,
+		Billed:     []Billed{{Model: model, Usage: usage}},
 	}, nil
 }

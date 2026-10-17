@@ -50,6 +50,7 @@ def test_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack) -> No
     assert report["runtime_sdk"].startswith("connected"), report
     assert report["forbidden"] and all(v.startswith("refused: PERMISSION_DENIED")
                                        for v in report["forbidden"].values()), report["forbidden"]
-    for key in ("temporal_sdk", "temporal_tcp", "internet_tcp", "control_socket", "home_canary", "ssh_dir", "ledger"):
+    for key in ("temporal_sdk", "temporal_tcp", "internet_tcp", "control_socket", "home_canary", "ssh_dir", "ledger",
+                "keychains", "keychain_items"):
         assert report[key].startswith("refused"), (key, report[key])
     assert "AGENTOS_TEST_CANARY" not in report["env"]

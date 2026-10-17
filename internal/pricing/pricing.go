@@ -112,9 +112,12 @@ func (t *Table) lookup(model string) (rates, error) {
 	return r, nil
 }
 
-// Bound is the most a request can cost: its input tokens, counted the provider's way, plus
-// 10%, at the highest input price of any model that may answer it (cache writes included),
-// and maxTokens at the highest output price. candidates are the model and its fallbacks.
+// Bound is the most a request can cost. candidates are the model and its fallbacks, and with
+// a fallback more than one of them can run, and bill, within the same request: a model may
+// produce output and then decline, and the fallback runs with its own max_tokens. So the
+// bound is the sum, over the candidates, of each one's own worst case: the input tokens,
+// counted the provider's way, plus 10%, at its highest input price (cache writes included),
+// and maxTokens at its output price.
 func (t *Table) Bound(candidates []string, inputTokens, maxTokens int64) (int64, error) {
 	if len(candidates) == 0 {
 		return 0, errors.New("no model to price")
@@ -122,17 +125,16 @@ func (t *Table) Bound(candidates []string, inputTokens, maxTokens int64) (int64,
 	if inputTokens < 0 || maxTokens <= 0 {
 		return 0, fmt.Errorf("cannot bound %d input tokens and max_tokens %d", inputTokens, maxTokens)
 	}
-	var in, out int64
+	padded := (inputTokens*11 + 9) / 10
+	var nano int64
 	for _, m := range candidates {
 		r, err := t.lookup(m)
 		if err != nil {
 			return 0, err
 		}
-		in = max(in, r.input, r.cacheWrite5m, r.cacheWrite1h, r.cacheRead)
-		out = max(out, r.output)
+		nano += padded*max(r.input, r.cacheWrite5m, r.cacheWrite1h, r.cacheRead) + maxTokens*r.output
 	}
-	padded := (inputTokens*11 + 9) / 10
-	return ceilMicros(padded*in + maxTokens*out), nil
+	return ceilMicros(nano), nil
 }
 
 // Cost is what model's provider bills for u.
