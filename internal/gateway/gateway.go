@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
+	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
 )
 
@@ -46,6 +48,7 @@ const (
 type Gateway struct {
 	Ledger   *ledger.Ledger
 	Policy   *policy.Policy
+	Tasks    tasks.Registry // for each run's scope
 	Models   *models.Config
 	Adapters map[string]models.Adapter // by adapter name in models.yaml
 	Tools    *tools.Stubs
@@ -141,7 +144,18 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		// M2: reserve budget here; a refused reservation returns budget_exhausted.
 		return g.callModel(ctx, info, run, route, args, fx)
 	case "tool":
-		v := g.Policy.EvaluateTool(c.GetName(), args)
+		scope, err := g.scope(run)
+		if err != nil {
+			return result(StatusDenied, map[string]any{"reason": err.Error()})
+		}
+		// A call that leaves part of its run's scope out gets the run's own value, never the
+		// tool's default (the default branch, the latest commit). One that names another
+		// value is denied by the policy.
+		args, canon, err = fillScope(args, scope)
+		if err != nil {
+			return nil, err
+		}
+		v := g.Policy.EvaluateTool(c.GetName(), args, scope)
 		switch v.Decision {
 		case policy.Deny:
 			return result(StatusDenied, map[string]any{"reason": v.Reason})
@@ -157,6 +171,44 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("unknown call kind %q", c.GetKind()), "BadCall", nil)
 	}
+}
+
+// scope returns the tool argument values run is confined to: its task's Scope, filled in
+// from the parameters agentd resolved when it started the run.
+func (g *Gateway) scope(run db.Run) (map[string]string, error) {
+	t, ok := g.Tasks[run.Task]
+	if !ok {
+		return nil, fmt.Errorf("task %q is not registered", run.Task)
+	}
+	var params map[string]string
+	if err := json.Unmarshal([]byte(run.ParamsJson), &params); err != nil {
+		return nil, fmt.Errorf("run parameters: %w", err)
+	}
+	scope := make(map[string]string, len(t.Scope))
+	for arg, param := range t.Scope {
+		v, ok := params[param]
+		if !ok {
+			return nil, fmt.Errorf("the run has no %s", param)
+		}
+		scope[arg] = v
+	}
+	return scope, nil
+}
+
+// fillScope adds each scoped argument the call left out, with the run's value, and encodes
+// the result again: the canonical form, and so the effect ID, covers what the tool receives.
+func fillScope(args map[string]any, scope map[string]string) (map[string]any, []byte, error) {
+	filled := maps.Clone(args)
+	for arg, v := range scope {
+		if _, ok := filled[arg]; !ok {
+			filled[arg] = v
+		}
+	}
+	canon, err := encodeCanonical(filled)
+	if err != nil {
+		return nil, nil, err
+	}
+	return filled, canon, nil
 }
 
 func (g *Gateway) callModel(ctx context.Context, info activity.Info, run db.Run, route models.Route,
@@ -281,13 +333,22 @@ func canonicalArgs(s string) (map[string]any, []byte, error) {
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		return nil, nil, errors.New("trailing data after the object")
 	}
+	canon, err := encodeCanonical(m)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, canon, nil
+}
+
+// encodeCanonical encodes args with sorted keys and no insignificant whitespace.
+func encodeCanonical(args map[string]any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(m); err != nil {
-		return nil, nil, err
+	if err := enc.Encode(args); err != nil {
+		return nil, err
 	}
-	return m, bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 func sha256Hex(parts ...[]byte) string {

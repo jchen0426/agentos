@@ -25,7 +25,7 @@ func TestLoadDesignDocPolicy(t *testing.T) {
 		{"git.show_diff", map[string]any{"commit": "3f2a"}, Deny},               // no repo at all
 	}
 	for _, c := range cases {
-		if got := p.EvaluateTool(c.tool, c.args).Decision; got != c.want {
+		if got := p.EvaluateTool(c.tool, c.args, nil).Decision; got != c.want {
 			t.Errorf("%s %v: got %v, want %v", c.tool, c.args, got, c.want)
 		}
 	}
@@ -62,7 +62,38 @@ func TestUndeclaredEffectIsUnsafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := p.EvaluateTool("x", nil).Effect; got != EffectUnsafe {
+	if got := p.EvaluateTool("x", nil, nil).Effect; got != EffectUnsafe {
 		t.Errorf("effect: got %q, want unsafe", got)
+	}
+}
+
+func TestToolCallsStayInTheRunsScope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	body := "repos: [acme/payments, acme/ledger]\ntools:\n  github.comment_commit: {decision: allow, effect: lookup}\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := "3f2a9c1d00000000000000000000000000000000"
+	scope := map[string]string{"repo": "acme/payments", "commit": sha, "base_branch": "main"}
+	cases := []struct {
+		args map[string]any
+		want Decision
+	}{
+		{map[string]any{"repo": "acme/payments", "commit": sha}, Allow},
+		{map[string]any{"repo": "acme/payments", "commit": sha, "base_branch": "main"}, Allow},
+		{map[string]any{"repo": "acme/ledger", "commit": sha}, Deny},                    // in the policy, not this run's
+		{map[string]any{"repo": "acme/payments", "commit": "0000"}, Deny},               // another commit
+		{map[string]any{"repo": "acme/payments", "base_branch": "release"}, Deny},       // another base branch
+		{map[string]any{"repo": "acme/payments", "commit": []any{sha}}, Deny},           // not a string
+		{map[string]any{"repo": "acme/payments", "report_ref": "blob:sha256:1"}, Allow}, // unscoped arguments pass
+	}
+	for _, c := range cases {
+		if got := p.EvaluateTool("github.comment_commit", c.args, scope).Decision; got != c.want {
+			t.Errorf("%v: got %v, want %v", c.args, got, c.want)
+		}
 	}
 }

@@ -61,7 +61,10 @@ async def main() -> None:
     client = await Client.connect(
         args.endpoint, namespace=args.namespace, http_connect_proxy_config=proxy_from(args.http_connect_proxy),
     )
-    worker = Worker(client, task_queue=args.task_queue, workflows=load_workflows(args.workflows))
+    # Sticky execution off: the Runtime proxy refuses sticky queues, whose names the Worker
+    # picks and Temporal does not tie to a task queue. Each workflow task replays the history.
+    worker = Worker(client, task_queue=args.task_queue, workflows=load_workflows(args.workflows),
+                    max_cached_workflows=0)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

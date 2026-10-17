@@ -5,6 +5,7 @@ package policy
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 
@@ -94,8 +95,10 @@ type Verdict struct {
 	Effect   string // the tool's effect class; empty for model calls
 }
 
-// EvaluateTool decides a tool call. args is the decoded JSON object of the call.
-func (p *Policy) EvaluateTool(name string, args map[string]any) Verdict {
+// EvaluateTool decides a tool call. args is the decoded JSON object of the call; scope holds
+// the values the run is confined to, by argument name (the task's Scope, filled in from the
+// run's resolved parameters).
+func (p *Policy) EvaluateTool(name string, args map[string]any, scope map[string]string) Verdict {
 	t, ok := p.Tools[name]
 	if !ok {
 		return Verdict{Decision: Deny, Reason: "tool not in policy"}
@@ -106,6 +109,14 @@ func (p *Policy) EvaluateTool(name string, args map[string]any) Verdict {
 		s, isString := repo.(string)
 		if !isString || !slices.Contains(p.Repos, s) {
 			return Verdict{Decision: Deny, Reason: "repo missing or not in policy"}
+		}
+	}
+	// The policy says what any run may touch; a run may touch only its own target.
+	for _, arg := range slices.Sorted(maps.Keys(scope)) {
+		if v, ok := args[arg]; ok {
+			if s, isString := v.(string); !isString || s != scope[arg] {
+				return Verdict{Decision: Deny, Reason: fmt.Sprintf("%s is not this run's", arg)}
+			}
 		}
 	}
 	switch t.Decision {

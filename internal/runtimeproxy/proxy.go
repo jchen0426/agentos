@@ -28,7 +28,7 @@ import (
 const service = "/temporal.api.workflowservice.v1.WorkflowService/"
 
 // AllowedMethods are the RPCs the Temporal Python SDK (1.34) makes as a workflow-only
-// Worker, as observed through this proxy. No activity-task method is here: the Worker runs
+// Worker with sticky execution off, as observed through this proxy. No activity-task method is here: the Worker runs
 // no activities, and allowing PollActivityTaskQueue or RespondActivityTaskCompleted(ById)
 // would let it answer gateway calls itself.
 var AllowedMethods = map[string]bool{
@@ -38,8 +38,7 @@ var AllowedMethods = map[string]bool{
 	service + "RespondWorkflowTaskCompleted": true,
 	service + "RespondWorkflowTaskFailed":    true,
 	service + "RespondQueryTaskCompleted":    true, // queries, e.g. the Web UI's stack trace
-	service + "GetWorkflowExecutionHistory":  true, // full history after a sticky-cache miss
-	service + "ResetStickyTaskQueue":         true,
+	service + "GetWorkflowExecutionHistory":  true, // the rest of a long history
 	service + "ShutdownWorker":               true,
 	service + "RecordWorkerHeartbeat":        true,
 }

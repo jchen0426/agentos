@@ -89,19 +89,31 @@
 
 设计文档第 12 节给 M1 加的三项补做都已完成，代码也跟上了修订后的文档。
 
-1. **Runtime 命令级过滤**（`internal/runtimeproxy/rules.go`）。代理在转发前先读出请求，按方法解码后检查：命名空间只能是配置的那个；拉取工作流任务只能拉 Worker 自己的任务队列（粘性队列看它的 normal name）；`RespondWorkflowTaskCompleted` 里的命令只放行这个工作流本来就会发的几种：往 gateway 队列排 Invoke 活动（不许 eager 执行）、定时器、`core_patch` 标记、取消自己的活动、结束自己，以及只改 `AgentState` 的搜索属性。给别的工作流发信号、取消别的工作流、起子工作流、continue-as-new、Nexus 操作和以后新增的命令一律拒绝，返回 PERMISSION_DENIED，请求不会到 Temporal。实测发现一处必须放行的：`workflow.patched()` 会顺带写 Temporal 自带的 `TemporalChangeVersion` 搜索属性，没放行时 T10 失败。被拒后 Worker 不会崩，只是那个工作流任务超时重试。
+1. **Runtime 命令级过滤**（`internal/runtimeproxy/rules.go`）。代理在转发前先读出请求，按方法解码后检查：命名空间只能是配置的那个；拉取工作流任务只能拉 Worker 自己的任务队列（粘性队列后来改为一律拒绝，见下节）；`RespondWorkflowTaskCompleted` 里的命令只放行这个工作流本来就会发的几种：往 gateway 队列排 Invoke 活动（不许 eager 执行）、定时器、`core_patch` 标记、取消自己的活动、结束自己，以及只改 `AgentState` 的搜索属性。给别的工作流发信号、取消别的工作流、起子工作流、continue-as-new、Nexus 操作和以后新增的命令一律拒绝，返回 PERMISSION_DENIED，请求不会到 Temporal。实测发现一处必须放行的：`workflow.patched()` 会顺带写 Temporal 自带的 `TemporalChangeVersion` 搜索属性，没放行时 T10 失败。被拒后 Worker 不会崩，只是那个工作流任务超时重试。
 2. **取消拦截**。`CancelRun` 先在账本记下取消（新迁移 `00002_cancel.sql` 加了 `runs.cancelled_at`），再请 Temporal 取消。从记下那一刻起，网关拒绝这个任务的所有调用。到 `cancel_grace`（默认 2 分钟）还没结束的，agentd 直接 Terminate；agentd 重启后会重新挂上这个期限。取消后结束的任务一律显示为 CANCELLED。
 3. **杀 agentd 的 T1**（`tests/test_t1_agentd_crash.py`）。结果落账后杀掉 agentd：Temporal 的重试由账本直接回答，假供应商自己的记录显示只被问过一次。供应商已回答、结果还没落账时杀掉：重试会再问一次供应商，账本里留着没回答的第 1 次尝试，M2 的预算要按全额计这一次。
 
 同时跟上文档的代码：门铃改成计数器；核对和预算的等待加 1 小时上限；`report_ref` 存在工作流实例上，后面一步失败也会发出已有的发现；报告没发出去时任务失败；README 的启动命令加了 `--db-filename`；`config/policy.yaml` 的 `open_draft_pr` 加了 `deny_paths`；`ResolveReconciliationRequest` 加了 `result_json`。这些改动不改变已有历史的命令，`tests/histories/` 的重放门禁照常通过。
 
+## 推送后的安全审查（2026-10-17）
+
+f22fc37 推送后，自动安全审查报了三处问题，核实都成立，已修复：
+
+1. **Runtime 代理的粘性队列**（`internal/runtimeproxy/rules.go`）。原规则对粘性队列只看 normal name，normal name 为空就放行，队列名随便填。实测 Temporal 1.32 并不把粘性队列和它的 normal name 绑在一起，代理分辨不出一个粘性队列属于谁，只收紧 normal name 不够。现在沙箱里的 Worker 关掉粘性执行（`max_cached_workflows=0`），代理拒绝一切粘性队列：粘性拉取、`RespondWorkflowTaskCompleted` 里的 `sticky_attributes`、带粘性队列名的 `ShutdownWorker`；`ResetStickyTaskQueue` 也移出了白名单。代价是每个工作流任务都要从完整历史重放，M1 的历史很短，影响不大。
+2. **工具调用不受任务自身范围约束**（`internal/policy/policy.go`）。策略只检查 repo 在不在 `repos` 列表里，所以一个对 acme/payments 启动的任务，可以对列表里的其他 repo、同一 repo 的其他 commit 或别的 base 分支发起写操作。现在任务注册时声明 `Scope`（security-audit 把工具参数 `repo`、`commit`、`base_branch` 对应到启动时解析出的 `repo`、`commit`、`base`）。网关按账本里这个任务的参数算出范围，工具调用带了这些参数、值却不同，就拒绝；没带的由网关补上任务自己的值，工具不会退回到它自己的默认值（比如默认分支）。这一条是第二轮审查指出的：只查“带了且不同”是 fail-open。
+3. **终端转义注入**（`internal/control/server.go`、`agentctl`）。任务结果和失败信息由 Worker 写入，原来原样打到终端：转义序列能改写屏幕，换行能伪造一行输出（比如一行假的 `state SUCCEEDED`）。新的 `internal/safetext` 做两件事：Control 服务把失败信息里不可打印的字符写成 `\x1b`、`\n` 这样的文本；结果 JSON 里的 DEL、C1 控制字符和格式字符（如双向覆盖）换成 `\u` 转义，解码后的值不变。agentctl 的文本输出逐字段转义，JSON 输出同样处理；agentd 的日志也经过同样的过滤，因为里面有 Worker 自己挑的活动 ID 和调用名。
+
+修复后三种环境的测试全部通过：macOS 不加沙箱 15 个通过、1 个跳过（沙箱测试要在沙箱模式下跑），macOS + srt 16 个，Linux + bwrap 16 个。真实 Worker 的调用没有一次被代理拒绝，正常任务的工具调用也没有一次被范围检查拒绝。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
 - 工作流代码里取不到的键（比如 `diff["blob"]`）会让工作流任务无限重试：任务挂住，也不发报告。这是第 7 节工作流代码的行为，T12 时要处理。
+- Runtime 代理不限制 `GetWorkflowExecutionHistory` 读哪个工作流，同一命名空间里任何工作流的历史，Worker 都能读到。M1 只有一种任务，所有 Worker 同样不可信，问题不大。以后有可信的工作流，或者按租户分 Worker 时，要么给沙箱 Worker 单独一个命名空间，要么让代理只放行分给这个 Worker 的工作流。
+- `Scope` 只约束列出来的参数名。如果工具还接受别的能指定目标的参数（比如 `head_repo`），就能绕过去。M3 接真实工具时，参数要按 schema 校验，未知参数一律拒绝。
 
 ## 后续（不在 M1 范围）
 
-- CI 配置：仓库还没有远端。CI 里跑 bwrap 同样需要上面的 AppArmor profile。
+- CI 已由 PR #1 配好（`.github/workflows/ci.yml`：Go 检查，加上无沙箱和 bwrap 两套黑盒测试）。main 还没把这些检查设为必需，测试失败也拦不住合并。
 - 按副作用类别恢复 PENDING 的记录，以及核对的两个出口（M3）；审批表、EDITED 和 outbox（M4）。
 - Worker 由谁拉起：M1 由启动脚本拉起，“沙箱起不来就拒绝启动”和 `--insecure-dev` 开关留到 M5 沙箱定稿时放进 agentd。
