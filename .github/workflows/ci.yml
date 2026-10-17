@@ -1,0 +1,130 @@
+# The Go checks, and the black-box suite (T1, T8, T10, the replay gate, mTLS, ...) with
+# Workers unsandboxed and under bubblewrap, on every push and pull request. The design doc
+# wants the fault-injection tests on every commit, and T10 relies on the replay gate
+# (tests/test_replay.py) stopping incompatible workflow changes here.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: '1.26.x'
+
+# Pinned to Ubuntu 24.04 rather than ubuntu-latest: the bubblewrap setup below (AppArmor,
+# the system Python under /usr) is what M1 verified on 24.04.
+jobs:
+  go:
+    name: Go (gofmt, vet, test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [[ -n $unformatted ]]; then
+            echo "::error::gofmt would reformat these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+
+  blackbox:
+    name: Black-box tests (AGENTOS_SANDBOX=${{ matrix.sandbox }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox: [none, bwrap]
+    env:
+      # The system Python: bubblewrap mounts /usr and the virtualenv into the sandbox, but
+      # not the home directory, where uv keeps the Pythons it downloads.
+      UV_PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The sandboxed Worker can read the checkout, so no token in .git/config.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.13.1'
+          # Both matrix jobs use the same cache key; one writer avoids a failed save.
+          save-cache: ${{ matrix.sandbox == 'none' }}
+
+      - name: Install the Temporal CLI
+        env:
+          VERSION: 1.9.1
+          SHA256: 09a0326a51db84d02735e53542b9ebd8c4758daf47482a9ab0abce15844e60d5
+        run: |
+          asset=temporal_cli_${VERSION}_linux_amd64.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/temporalio/cli/releases/download/v$VERSION/$asset"
+          echo "$SHA256  $RUNNER_TEMP/$asset" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" temporal
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/temporal" --version
+
+      - name: Install the full Temporal server, for tests/test_temporal_mtls.py
+        run: ./scripts/fetch-temporal-server.sh
+
+      - name: Install bubblewrap and grant it user namespaces
+        if: matrix.sandbox == 'bwrap'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap socat
+          # Ubuntu 23.10+ sets kernel.apparmor_restrict_unprivileged_userns=1, and an
+          # unconfined bwrap gets a user namespace without capabilities. The same profile
+          # as vm/lima/agentos.yaml.
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+
+            include if exists <local/bwrap>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          bwrap --version
+          # Fails with "loopback: Failed RTM_NEWADDR" if the profile did not take.
+          bwrap --unshare-all --ro-bind / / true
+
+      - run: make build
+      - run: uv sync --locked --group dev
+
+      - name: pytest
+        env:
+          AGENTOS_SANDBOX: ${{ matrix.sandbox }}
+        # The test data stays outside the checkout, which the bwrap sandbox mounts: the
+        # sandbox probe checks that the Worker cannot read agentd's ledger.
+        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest"
+
+      - name: Upload the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: blackbox-logs-${{ matrix.sandbox }}
+          path: ${{ runner.temp }}/pytest
+          retention-days: 7
+          if-no-files-found: ignore
