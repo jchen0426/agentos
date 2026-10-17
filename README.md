@@ -95,6 +95,17 @@ make test-linux  # in the Lima VM, Workers under bubblewrap
 ```
 
 `tests/test_temporal_mtls.py` also needs the full Temporal server: `make temporal-server`.
+
+T1 on Claude instead of the fake model (it costs money, a few cents a run; the Worker runs
+under its sandbox because agentd holds a real key), and a free check of the key:
+
+```bash
+AGENTOS_MODEL=claude AGENTOS_SANDBOX=srt uv run pytest tests/test_t1_worker_crash.py tests/test_t1_agentd_crash.py
+```
+
+```bash
+AGENTOS_LIVE=1 go test ./internal/models -run Live
+```
 `go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, and the proxy's method allowlist and request rules.
 
 After a workflow change that is meant to be compatible, the replay gate
