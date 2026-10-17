@@ -66,12 +66,15 @@ func TestPollOnlyTheWorkflowQueue(t *testing.T) {
 	}
 	allowed := []*taskqueuepb.TaskQueue{
 		{Name: "agentos-workflows", Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
-		{Name: "worker-sticky-1", Kind: enumspb.TASK_QUEUE_KIND_STICKY, NormalName: "agentos-workflows"},
+		{Name: "agentos-workflows"},
 	}
 	refused := []*taskqueuepb.TaskQueue{
 		{Name: "gateway", Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
 		{Name: "temporal-sys-batcher-taskqueue"},
-		{Name: "worker-sticky-1", Kind: enumspb.TASK_QUEUE_KIND_STICKY, NormalName: "someone-else"},
+		// Sticky queues are refused whatever they claim to belong to.
+		{Name: "worker-sticky-1", Kind: enumspb.TASK_QUEUE_KIND_STICKY, NormalName: "agentos-workflows"},
+		{Name: "worker-sticky-1", Kind: enumspb.TASK_QUEUE_KIND_STICKY},
+		{Name: "agentos-workflows", Kind: enumspb.TASK_QUEUE_KIND_STICKY},
 	}
 	for _, tq := range allowed {
 		if err := poll(tq); err != nil {
@@ -82,6 +85,25 @@ func TestPollOnlyTheWorkflowQueue(t *testing.T) {
 		if err := poll(tq); err == nil {
 			t.Errorf("%v allowed", tq)
 		}
+	}
+}
+
+func TestNoStickyExecution(t *testing.T) {
+	sticky := complete(activity("Invoke", "gateway", false))
+	sticky.StickyAttributes = &taskqueuepb.StickyExecutionAttributes{
+		WorkerTaskQueue: &taskqueuepb.TaskQueue{Name: "worker-sticky-1", Kind: enumspb.TASK_QUEUE_KIND_STICKY, NormalName: "agentos-workflows"},
+	}
+	if err := check(t, "RespondWorkflowTaskCompleted", sticky); err == nil {
+		t.Error("a workflow task completion asking for a sticky queue was allowed")
+	}
+	if err := check(t, "ShutdownWorker", &workflowservice.ShutdownWorkerRequest{Namespace: "default"}); err != nil {
+		t.Errorf("worker shutdown refused: %v", err)
+	}
+	if err := check(t, "ShutdownWorker", &workflowservice.ShutdownWorkerRequest{Namespace: "default", StickyTaskQueue: "worker-sticky-1"}); err == nil {
+		t.Error("shutting down a sticky queue was allowed")
+	}
+	if err := check(t, "ResetStickyTaskQueue", &workflowservice.ResetStickyTaskQueueRequest{Namespace: "default"}); err == nil {
+		t.Error("ResetStickyTaskQueue was allowed")
 	}
 }
 

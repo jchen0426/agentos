@@ -1,8 +1,12 @@
 package gateway
 
 import (
+	"maps"
 	"testing"
 	"time"
+
+	"github.com/jchen0426/agentos/internal/ledger/db"
+	"github.com/jchen0426/agentos/internal/tasks"
 )
 
 func TestCanonicalArgs(t *testing.T) {
@@ -44,5 +48,27 @@ func TestHeartbeatIntervalNeverPanicsTheTicker(t *testing.T) {
 	}
 	if got := heartbeatInterval(30 * time.Second); got != 10*time.Second {
 		t.Errorf("heartbeatInterval(30s) = %v, want 10s", got)
+	}
+}
+
+func TestScopeComesFromTheRunsResolvedParameters(t *testing.T) {
+	g := &Gateway{Tasks: tasks.Registry{"security-audit": tasks.SecurityAudit(nil, nil)}}
+	run := db.Run{Task: "security-audit", ParamsJson: `{"repo":"acme/payments","commit":"3f2a","base":"main"}`}
+	got, err := g.scope(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"repo": "acme/payments", "commit": "3f2a", "base_branch": "main"}
+	if !maps.Equal(got, want) {
+		t.Errorf("scope: got %v, want %v", got, want)
+	}
+	for name, r := range map[string]db.Run{
+		"unregistered task": {Task: "other", ParamsJson: run.ParamsJson},
+		"missing parameter": {Task: "security-audit", ParamsJson: `{"repo":"acme/payments","commit":"3f2a"}`},
+		"broken parameters": {Task: "security-audit", ParamsJson: `{`},
+	} {
+		if _, err := g.scope(r); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }

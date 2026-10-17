@@ -14,7 +14,7 @@ import (
 var want = map[string]bool{
 	"GetSystemInfo": true, "DescribeNamespace": true,
 	"PollWorkflowTaskQueue": true, "RespondWorkflowTaskCompleted": true, "RespondWorkflowTaskFailed": true,
-	"RespondQueryTaskCompleted": true, "GetWorkflowExecutionHistory": true, "ResetStickyTaskQueue": true,
+	"RespondQueryTaskCompleted": true, "GetWorkflowExecutionHistory": true,
 	"ShutdownWorker": true, "RecordWorkerHeartbeat": true,
 }
 

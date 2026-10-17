@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/safetext"
 )
 
 type globals struct {
@@ -42,7 +44,7 @@ func main() {
 	root.AddCommand(runs)
 
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "agentctl:", err)
+		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -150,7 +152,8 @@ func listCmd(g *globals) *cobra.Command {
 				tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 				fmt.Fprintln(tw, "RUN ID\tTASK\tSTATE\tCREATED")
 				for _, r := range resp.GetRuns() {
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.GetRunId(), r.GetTask(), r.GetState(), r.GetCreatedAt())
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", safetext.Line(r.GetRunId()), safetext.Line(r.GetTask()),
+						safetext.Line(r.GetState()), safetext.Line(r.GetCreatedAt()))
 				}
 				return tw.Flush()
 			})
@@ -216,6 +219,12 @@ func printRun(g *globals, r *agentosv1.Run) error {
 	if g.output == "json" {
 		return printJSON(r)
 	}
+	return writeRun(os.Stdout, r)
+}
+
+// writeRun prints r as text. Every value goes through safetext.Line: the result and the
+// failure come from the Worker, which agentd does not trust.
+func writeRun(w io.Writer, r *agentosv1.Run) error {
 	keys := make([]string, 0, len(r.GetParams()))
 	for k := range r.GetParams() {
 		keys = append(keys, k)
@@ -225,27 +234,37 @@ func printRun(g *globals, r *agentosv1.Run) error {
 	for _, k := range keys {
 		params = append(params, k+"="+r.GetParams()[k])
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tw, "run id\t%s\n", r.GetRunId())
-	fmt.Fprintf(tw, "task\t%s\n", r.GetTask())
-	fmt.Fprintf(tw, "state\t%s\n", r.GetState())
-	fmt.Fprintf(tw, "params\t%s\n", strings.Join(params, " "))
-	fmt.Fprintf(tw, "budget\t$%.2f\n", float64(r.GetBudgetLimitMicros())/1e6)
-	fmt.Fprintf(tw, "created\t%s\n", r.GetCreatedAt())
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	row := func(name, value string) { fmt.Fprintf(tw, "%s\t%s\n", name, safetext.Line(value)) }
+	row("run id", r.GetRunId())
+	row("task", r.GetTask())
+	row("state", r.GetState())
+	row("params", strings.Join(params, " "))
+	row("budget", fmt.Sprintf("$%.2f", float64(r.GetBudgetLimitMicros())/1e6))
+	row("created", r.GetCreatedAt())
 	if r.GetResultJson() != "" {
-		fmt.Fprintf(tw, "result\t%s\n", r.GetResultJson())
+		row("result", r.GetResultJson())
 	}
 	if r.GetFailure() != "" {
-		fmt.Fprintf(tw, "failure\t%s\n", r.GetFailure())
+		row("failure", r.GetFailure())
 	}
 	return tw.Flush()
 }
 
 func printJSON(m proto.Message) error {
-	b, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
+	b, err := encodeJSON(m)
 	if err != nil {
 		return err
 	}
 	_, err = fmt.Println(string(b))
 	return err
+}
+
+// encodeJSON is protojson with DEL, C1 controls and format characters escaped too.
+func encodeJSON(m proto.Message) ([]byte, error) {
+	b, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return safetext.JSON(b), nil
 }

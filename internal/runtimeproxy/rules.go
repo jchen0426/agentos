@@ -33,7 +33,6 @@ var requestTypes = map[string]func() proto.Message{
 	service + "RespondWorkflowTaskFailed":    func() proto.Message { return &workflowservice.RespondWorkflowTaskFailedRequest{} },
 	service + "RespondQueryTaskCompleted":    func() proto.Message { return &workflowservice.RespondQueryTaskCompletedRequest{} },
 	service + "GetWorkflowExecutionHistory":  func() proto.Message { return &workflowservice.GetWorkflowExecutionHistoryRequest{} },
-	service + "ResetStickyTaskQueue":         func() proto.Message { return &workflowservice.ResetStickyTaskQueueRequest{} },
 	service + "ShutdownWorker":               func() proto.Message { return &workflowservice.ShutdownWorkerRequest{} },
 	service + "RecordWorkerHeartbeat":        func() proto.Message { return &workflowservice.RecordWorkerHeartbeatRequest{} },
 }
@@ -67,6 +66,9 @@ func (r Rules) Check(method string, raw []byte) error {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
 		return r.checkPollQueue(m.GetTaskQueue())
 	case *workflowservice.RespondWorkflowTaskCompletedRequest:
+		if m.GetStickyAttributes() != nil {
+			return refuse("", "sticky execution is not available to workers")
+		}
 		for _, c := range m.GetCommands() {
 			if err := r.checkCommand(c); err != nil {
 				return err
@@ -75,17 +77,23 @@ func (r Rules) Check(method string, raw []byte) error {
 		if len(m.GetMessages()) > 0 {
 			return refuse("", "protocol messages (workflow updates) are not available to workers")
 		}
+	case *workflowservice.ShutdownWorkerRequest:
+		if q := m.GetStickyTaskQueue(); q != "" {
+			return refuse("", "sticky queue %q is not available to workers", q)
+		}
 	}
 	return nil
 }
 
+// checkPollQueue lets a Worker poll the workflow queue and nothing else. Sticky queues are
+// refused: the Worker picks their names and Temporal does not tie them to a task queue (its
+// normal_name is not checked), so the proxy cannot tell whose sticky queue is named. The
+// Workers run with sticky execution off.
 func (r Rules) checkPollQueue(tq *taskqueuepb.TaskQueue) error {
-	if tq.GetKind() == enumspb.TASK_QUEUE_KIND_STICKY {
-		// A sticky queue's name is the Worker's own; its normal name says whose tasks it holds.
-		if n := tq.GetNormalName(); n != "" && n != r.WorkflowQueue {
-			return refuse("", "sticky queue for %q is not available to workers", n)
-		}
-		return nil
+	switch tq.GetKind() {
+	case enumspb.TASK_QUEUE_KIND_NORMAL, enumspb.TASK_QUEUE_KIND_UNSPECIFIED:
+	default:
+		return refuse("", "%s task queues are not available to workers", tq.GetKind())
 	}
 	if tq.GetName() != r.WorkflowQueue {
 		return refuse("", "task queue %q is not available to workers", tq.GetName())

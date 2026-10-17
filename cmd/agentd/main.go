@@ -36,6 +36,7 @@ import (
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
+	"github.com/jchen0426/agentos/internal/safetext"
 	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -54,7 +55,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agentd:", err)
 		os.Exit(2)
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	// The log carries values the Worker chose (activity IDs, call names): no raw controls.
+	log := slog.New(slog.NewJSONHandler(safetext.JSONWriter(os.Stderr), &slog.HandlerOptions{Level: level}))
 	if err := run(*configPath, *faultScript, log); err != nil {
 		log.Error("agentd stopped", "error", err)
 		os.Exit(1)
@@ -108,9 +110,11 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	}
 	defer tc.Close()
 
+	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Repos)}
 	gw := &gateway.Gateway{
 		Ledger: led,
 		Policy: pol,
+		Tasks:  registry,
 		Models: mods,
 		Adapters: map[string]models.Adapter{"fake": models.Fake{
 			Blobs: led, Log: models.NewProviderLog(filepath.Join(cfg.DataDir, "fake-provider.jsonl")),
@@ -166,7 +170,7 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	ctl := &control.Server{
 		Ledger:      led,
 		Temporal:    tc,
-		Tasks:       tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Repos)},
+		Tasks:       registry,
 		TaskQueue:   cfg.TaskQueues.Workflows,
 		CancelGrace: cfg.CancelGrace,
 		Log:         log.With("component", "control"),

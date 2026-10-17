@@ -21,6 +21,9 @@ type Task struct {
 	DefaultBudget int64 // micros
 	// Resolve checks params and returns the workflow input and the params as resolved.
 	Resolve func(ctx context.Context, params map[string]string) (input any, resolved map[string]string, err error)
+	// Scope maps tool arguments to the resolved parameter they must equal: a run acts only
+	// on what it was started for, not on everything the policy allows.
+	Scope map[string]string
 }
 
 type Registry map[string]Task
@@ -45,6 +48,7 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string) Task {
 		Name:          "security-audit",
 		WorkflowType:  "security-audit",
 		DefaultBudget: 5_000_000,
+		Scope:         map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
 		Resolve: func(ctx context.Context, params map[string]string) (any, map[string]string, error) {
 			for k := range params {
 				if !slices.Contains([]string{"repo", "commit", "base"}, k) {

@@ -23,6 +23,7 @@ import (
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
+	"github.com/jchen0426/agentos/internal/safetext"
 	"github.com/jchen0426/agentos/internal/tasks"
 )
 
@@ -294,7 +295,8 @@ func (s *Server) getRun(ctx context.Context, workflowID string) (*agentosv1.Run,
 	return s.describe(ctx, r)
 }
 
-// describe combines the ledger row with the execution's state in Temporal.
+// describe combines the ledger row with the execution's state in Temporal. The result and
+// the failure message come from the Worker: neither leaves here with raw control characters.
 func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error) {
 	out := &agentosv1.Run{
 		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task,
@@ -332,14 +334,14 @@ func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error)
 		out.State = "SUCCEEDED"
 		var v any
 		if err := s.Temporal.GetWorkflow(ctx, r.WorkflowID, r.RunID.String).Get(ctx, &v); err != nil {
-			out.Failure = "result unavailable: " + err.Error()
+			out.Failure = safetext.Line("result unavailable: " + err.Error())
 			return out, nil
 		}
 		b, err := json.Marshal(v)
 		if err != nil {
 			return nil, err
 		}
-		out.ResultJson = string(b)
+		out.ResultJson = string(safetext.JSON(b))
 	case enumspb.WORKFLOW_EXECUTION_STATUS_CANCELED:
 		out.State = "CANCELLED"
 	default: // FAILED, TERMINATED, TIMED_OUT
@@ -349,7 +351,7 @@ func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error)
 			out.State = "CANCELLED"
 		}
 		if err := s.Temporal.GetWorkflow(ctx, r.WorkflowID, r.RunID.String).Get(ctx, nil); err != nil {
-			out.Failure = err.Error()
+			out.Failure = safetext.Line(err.Error())
 		}
 	}
 	return out, nil
