@@ -14,9 +14,10 @@ import (
 	"time"
 )
 
-// BlobStore keeps large values out of the activity payloads.
+// BlobStore keeps large values out of the activity payloads, owned by the run that produced
+// them.
 type BlobStore interface {
-	PutBlob(ctx context.Context, b []byte) (string, error)
+	PutRunBlob(ctx context.Context, workflowID string, b []byte) (string, error)
 }
 
 // ErrNotSent marks a tool failure where the request never reached the outside world, so
@@ -54,7 +55,7 @@ func (s *Stubs) Call(ctx context.Context, req Request) (map[string]any, error) {
 	}
 	switch req.Tool {
 	case "git.show_diff":
-		ref, err := s.Blobs.PutBlob(ctx, []byte(stubDiff))
+		ref, err := s.Blobs.PutRunBlob(ctx, req.WorkflowID, []byte(stubDiff))
 		if err != nil {
 			return nil, err
 		}

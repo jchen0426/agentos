@@ -18,7 +18,7 @@ message Call {
 // are results, not errors: the workflow decides what to do next.
 message Result {
   // ok, needs_approval, needs_reconcile, budget_exhausted,
-  // rejected, expired, edited, refused, denied
+  // rejected, expired, edited, refused, denied, invalid_output
   string status = 1;
   // A JSON object. Large values are blob references, never inline content.
   string value_json = 2;

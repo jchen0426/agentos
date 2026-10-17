@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "patch"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "Two or three sentences: what the commit changes and whether it is safe to merge."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Vulnerabilities the commit introduces or newly exposes, most severe first. Empty when there are none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "cwe", "file", "line", "title", "explanation"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+          "cwe": {"type": "string", "description": "The closest CWE id, such as CWE-89."},
+          "file": {"type": "string", "description": "The file's path as the diff names it."},
+          "line": {"type": "integer", "description": "The line in the new version of the file."},
+          "title": {"type": "string"},
+          "explanation": {"type": "string", "description": "What is wrong, how it could be exploited in this code, and the evidence in the diff."}
+        }
+      }
+    },
+    "patch": {
+      "description": "A unified diff against the new version that fixes the most severe finding and changes nothing else; null when there is no confident fix.",
+      "anyOf": [{"type": "string"}, {"type": "null"}]
+    }
+  }
+}

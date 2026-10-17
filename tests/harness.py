@@ -48,11 +48,13 @@ models:
   audit_v1: {allowed_providers: [fake]}
 """
 
-TEST_MODELS = """
+AUDIT_SCHEMA = REPO / "config/schemas/audit_report.json"
+
+TEST_MODELS = f"""
 providers:
-  fake: {adapter: fake}
+  fake: {{adapter: fake}}
 tasks:
-  audit_v1: {model: fake/audit-fixture, max_tokens: 4096}
+  audit_v1: {{model: fake/audit-fixture, max_tokens: 4096, output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
 """
 
 # Like config/dev/prices.yaml: the fake models cost money, or the budget goes untested.

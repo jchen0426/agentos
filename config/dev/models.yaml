@@ -1,4 +1,8 @@
 providers:
   fake: {adapter: fake}
 tasks:
-  audit_v1: {model: fake/audit-fixture, max_tokens: 4096}
+  audit_v1:
+    model: fake/audit-fixture
+    max_tokens: 4096
+    output_schema: ../schemas/audit_report.json
+    blobs: [patch]

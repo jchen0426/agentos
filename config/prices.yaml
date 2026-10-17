@@ -8,6 +8,12 @@ models:
     cache_write_1h: 8.00
     cache_read: 0.20
     output: 20.00
+  anthropic/claude-opus-4-8:      # the server-side fallback for refusals (models.yaml); 2026-10-17
+    input: 5.00
+    cache_write_5m: 6.25
+    cache_write_1h: 10.00
+    cache_read: 0.50
+    output: 25.00
   # openai/<model>: copy input, cache_read and output from OpenAI's pricing page before first
   #   use. Caching is automatic there; there is no cache-write price.
   # local/<model>: {input: 0, output: 0}   # self-hosted: compute is not in the budget

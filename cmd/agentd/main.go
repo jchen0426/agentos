@@ -23,6 +23,7 @@ import (
 	"go.temporal.io/sdk/client"
 	tlog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -39,6 +40,7 @@ import (
 	"github.com/jchen0426/agentos/internal/pricing"
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
 	"github.com/jchen0426/agentos/internal/safetext"
+	"github.com/jchen0426/agentos/internal/secrets"
 	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -135,16 +137,32 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	defer tc.Close()
 
 	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Repos)}
+	adapters, err := modelAdapters(mods, led, cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	for name := range mods.Tasks {
+		route, err := mods.Route(name)
+		if err != nil {
+			return err
+		}
+		if c, ok := adapters[route.Provider].(models.RouteChecker); ok {
+			if err := c.CheckRoute(route); err != nil {
+				return fmt.Errorf("model task %s: %w", name, err)
+			}
+		}
+	}
 	gw := &gateway.Gateway{
-		Ledger: led,
-		Policy: pol,
-		Tasks:  registry,
-		Models: mods,
-		Prices: prices,
-		Budget: bud,
-		Adapters: map[string]models.Adapter{"fake": models.Fake{
-			Blobs: led, Log: models.NewProviderLog(filepath.Join(cfg.DataDir, "fake-provider.jsonl")),
-		}},
+		Ledger:   led,
+		Policy:   pol,
+		Tasks:    registry,
+		Models:   mods,
+		Prices:   prices,
+		Budget:   bud,
+		Adapters: adapters,
+		Limiters: limiters(mods),
+		Limits: gateway.LoopLimits{ModelCalls: cfg.LoopLimits.ModelCalls, GatewayCalls: cfg.LoopLimits.GatewayCalls,
+			SameToolCalls: cfg.LoopLimits.SameToolCalls, Attempts: cfg.LoopLimits.Attempts},
 		Tools:  &tools.Stubs{Blobs: led, External: tools.NewExternalLog(filepath.Join(cfg.DataDir, "stub-external.jsonl"))},
 		Faults: script,
 		Log:    log.With("component", "gateway"),
@@ -290,4 +308,41 @@ func temporalTLS(c *config.TLS) (*tls.Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// modelAdapters builds one adapter for each provider a task may reach, by provider name. A
+// provider's key is read from the OS keyring now, so that a missing key stops agentd at start
+// rather than failing the first run.
+func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string) (map[string]models.Adapter, error) {
+	adapters := map[string]models.Adapter{}
+	for name, p := range mods.Providers {
+		if !mods.Uses(name) {
+			continue
+		}
+		switch p.Adapter {
+		case "fake":
+			adapters[name] = models.Fake{Log: models.NewProviderLog(filepath.Join(dataDir, "fake-provider.jsonl"))}
+		case "anthropic":
+			key, err := secrets.Resolve(p.Key)
+			if err != nil {
+				return nil, fmt.Errorf("provider %s: %w", name, err)
+			}
+			adapters[name] = models.NewAnthropic(name, key, p.BaseURL, blobs)
+		default:
+			return nil, fmt.Errorf("provider %s: adapter %q is not in this build", name, p.Adapter)
+		}
+	}
+	return adapters, nil
+}
+
+// limiters builds a token bucket for each provider with a requests_per_minute: a quarter of a
+// minute's requests may go out at once, the rest at the steady rate.
+func limiters(mods *models.Config) map[string]*rate.Limiter {
+	out := map[string]*rate.Limiter{}
+	for name, p := range mods.Providers {
+		if p.RequestsPerMinute > 0 && mods.Uses(name) {
+			out[name] = rate.NewLimiter(rate.Limit(float64(p.RequestsPerMinute)/60), max(1, p.RequestsPerMinute/4))
+		}
+	}
+	return out
 }

@@ -31,6 +31,7 @@ type Rule struct {
 	ProviderLoseAnswer  bool   `json:"provider_lose_answer"` // bill it, then lose the answer
 	ProviderUnreachable bool   `json:"provider_unreachable"` // fail before it leaves agentd
 	ProviderServedBy    string `json:"provider_served_by"`   // answer as this fallback model
+	ProviderBadOutput   bool   `json:"provider_bad_output"`  // answer with output that breaks the schema
 }
 
 // Effect is what the matching rules ask of one Invoke attempt.
@@ -45,6 +46,7 @@ type Effect struct {
 	ProviderLoseAnswer          bool
 	ProviderUnreachable         bool
 	ProviderServedBy            string
+	ProviderBadOutput           bool
 }
 
 // Script is a loaded fault script. A nil *Script injects nothing.
@@ -108,6 +110,7 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 		if r.ProviderServedBy != "" {
 			e.ProviderServedBy = r.ProviderServedBy
 		}
+		e.ProviderBadOutput = e.ProviderBadOutput || r.ProviderBadOutput
 	}
 	return e
 }

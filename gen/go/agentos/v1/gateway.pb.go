@@ -90,7 +90,7 @@ func (x *Call) GetArgsJson() string {
 type Result struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// ok, needs_approval, needs_reconcile, budget_exhausted,
-	// rejected, expired, edited, refused, denied
+	// rejected, expired, edited, refused, denied, invalid_output
 	Status string `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
 	// A JSON object. Large values are blob references, never inline content.
 	ValueJson     string `protobuf:"bytes,2,opt,name=value_json,json=valueJson,proto3" json:"value_json,omitempty"`

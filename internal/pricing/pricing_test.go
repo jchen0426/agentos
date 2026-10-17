@@ -62,19 +62,18 @@ func TestCost(t *testing.T) {
 
 func TestBoundCoversEveryOutcome(t *testing.T) {
 	tbl := load(t, table)
-	// 1000 counted tokens + 10% = 1100 at the dearest input price of either model ($2/M),
-	// plus 4096 output tokens at the dearest output price ($10/M).
+	// 1000 counted tokens + 10% = 1100. Each candidate may run to max_tokens within one
+	// request, so the bound adds up: 1100 at $1/M + 4096 at $5/M, then 1100 at $2/M + 4096 at $10/M.
 	got, err := tbl.Bound([]string{"fake/cheap", "fake/dear"}, 1000, 4096)
-	if want := int64(1100*2 + 4096*10); err != nil || got != want {
+	if want := int64(1100*1 + 4096*5 + 1100*2 + 4096*10); err != nil || got != want {
 		t.Fatalf("Bound = %d, %v; want %d", got, err, want)
 	}
-	// Whichever model answers and however the input is cached, the bill stays under it.
-	for _, m := range []string{"fake/cheap", "fake/dear"} {
-		for _, u := range []Usage{{InputTokens: 1100, OutputTokens: 4096}, {CacheReadTokens: 1100, OutputTokens: 4096}} {
-			if c, _ := tbl.Cost(m, u); c > got {
-				t.Errorf("%s %+v costs %d, over the bound %d", m, u, c, got)
-			}
-		}
+	// The worst case: the first model writes max_tokens and then declines, and the fallback
+	// does the same, with the input cached on one side and written on the other.
+	first, _ := tbl.Cost("fake/cheap", Usage{InputTokens: 1100, OutputTokens: 4096})
+	second, _ := tbl.Cost("fake/dear", Usage{CacheReadTokens: 1100, OutputTokens: 4096})
+	if first+second > got {
+		t.Errorf("both models billing in full (%d) is over the bound %d", first+second, got)
 	}
 	// Cache writes are the dearest input on Opus: the bound uses them.
 	opus, _ := tbl.Bound([]string{"anthropic/claude-opus-5-5"}, 1000, 1000)

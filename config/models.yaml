@@ -1,9 +1,8 @@
 # models.yaml: which provider and model serve each task name (D11).
-# The anthropic adapter arrives in M2b and openai_compat in M2c; until then only the fake
-# adapter runs (config/dev/models.yaml).
+# The openai_compat adapter arrives in M2c. Paths are relative to this file.
 providers:
-  anthropic: {adapter: anthropic,     key: keychain:anthropic}
-  openai:    {adapter: openai_compat, base_url: "https://api.openai.com/v1", key: keychain:openai}
+  anthropic: {adapter: anthropic,     key: "keyring:agentos-anthropic-api-key", requests_per_minute: 20}   # account: the user agentd runs as
+  openai:    {adapter: openai_compat, base_url: "https://api.openai.com/v1", key: "keyring:agentos-openai-api-key"}
   local:     {adapter: openai_compat, base_url: "http://127.0.0.1:11434/v1"}   # Ollama; vLLM uses the same adapter
 tasks:
   audit_v1:
@@ -12,4 +11,7 @@ tasks:
     effort: high
     prompt: prompts/audit_v1/claude.md     # prompts may differ per model; the version is recorded per call
     output_schema: schemas/audit_report.json
-    fallback: []                           # cross-provider fallback stays off unless listed here
+    blobs: [patch]                         # stored as blobs; the workflow gets patch_ref
+    # Server-side fallback for refusals: the reservation covers it, priced in prices.yaml.
+    # Cross-provider fallback (M2c) stays off unless listed here too.
+    fallback: [anthropic/claude-opus-4-8]
