@@ -45,17 +45,44 @@ tools:
   github.open_draft_pr:  {decision: allow, effect: lookup}
   github.comment_commit: {decision: allow, effect: lookup}
 models:
-  audit_v1: {allowed_providers: [fake]}
+  audit_v1: {allowed_providers: [fake, anthropic]}
 """
 
 AUDIT_SCHEMA = REPO / "config/schemas/audit_report.json"
 
-TEST_MODELS = f"""
+# AGENTOS_MODEL=claude sends the model task to Claude: the real prompt, schema, fallback and
+# prices, with the key from the keychain. It costs money; the tests that make sense with a
+# real model are T1's, which check that crashes never repeat or lose a model call.
+MODEL = os.environ.get("AGENTOS_MODEL", "fake")
+REAL_MODEL = MODEL != "fake"
+# How long a model call may take: a real one thinks for a while.
+MODEL_TIMEOUT = 240 if REAL_MODEL else 30
+
+if MODEL == "fake":
+    TEST_MODELS = f"""
 providers:
   fake: {{adapter: fake}}
 tasks:
   audit_v1: {{model: fake/audit-fixture, max_tokens: 4096, output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
 """
+elif MODEL == "claude":
+    # As config/models.yaml, but max_tokens 8000: a request that runs to the limit on the model
+    # and then on its fallback costs about $0.36, which keeps a T1 run under $2.
+    TEST_MODELS = f"""
+providers:
+  anthropic: {{adapter: anthropic, key: "keyring:agentos-anthropic-api-key", requests_per_minute: 20}}
+tasks:
+  audit_v1:
+    model: anthropic/claude-opus-5-5
+    max_tokens: 8000
+    effort: high
+    prompt: {REPO / "config/prompts/audit_v1/claude.md"}
+    output_schema: {AUDIT_SCHEMA}
+    blobs: [patch]
+    fallback: [anthropic/claude-opus-4-8]
+"""
+else:
+    raise ValueError(f"unknown AGENTOS_MODEL {MODEL!r}")
 
 # Like config/dev/prices.yaml: the fake models cost money, or the budget goes untested.
 TEST_PRICES = """
@@ -63,7 +90,7 @@ price_table_version: test-1
 models:
   fake/audit-fixture:  {input: 1.00, output: 5.00}
   fake/audit-fallback: {input: 2.00, output: 10.00}
-"""
+""" if not REAL_MODEL else (REPO / "config/prices.yaml").read_text()
 
 T = TypeVar("T")
 
@@ -384,6 +411,25 @@ class Stack:
         lines = path.read_text().splitlines() if path.exists() else []
         return [e for e in map(json.loads, lines)
                 if e["workflow_id"] == run["run_id"] and (tool is None or e["tool"] == tool)]
+
+    def provider_requests(self, run: dict) -> int:
+        """How many requests reached the model provider for the run: the fake provider's own
+        record, or for a real provider the ledger's reservations that were not released."""
+        if not REAL_MODEL:
+            return len(self.provider_calls(run))
+        entries = self.budget_entries(run)
+        released = {e["request_id"] for e in entries if e["kind"] == "RELEASE"}
+        return sum(1 for e in entries if e["kind"] == "RESERVE" and e["request_id"] not in released)
+
+    def model_answered(self, run: dict) -> bool:
+        """Whether the provider has answered a request of the run, recorded or not."""
+        return any(e["msg"] == "model answered" and e.get("workflow_id") == run["run_id"] for e in self.agentd_log())
+
+    def model_value(self, run: dict) -> dict:
+        """What the workflow got from the run's accepted model answer."""
+        [row] = [r for r in self.model_calls(run) if r["response_blob"] and r["stop_reason"] != "invalid_output"]
+        [blob] = self.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
+        return json.loads(blob["bytes"])["value"]
 
     def provider_calls(self, run: dict) -> list[dict]:
         """The fake model provider's own record of the requests it received for the run."""

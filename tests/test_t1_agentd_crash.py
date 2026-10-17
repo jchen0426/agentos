@@ -7,7 +7,7 @@
   when agentd starts (section 9). The run is not lost and the second request is not hidden.
 """
 
-from tests.harness import Stack, TERMINAL, gateway_calls, wait_for
+from tests.harness import MODEL_TIMEOUT, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
 
@@ -24,15 +24,16 @@ def test_t1_kill_agentd_after_the_model_result_is_recorded(stack: Stack) -> None
     stack.start_worker()
     run = stack.start_run()
     wait_for(lambda: (rows := stack.model_calls(run)) and rows[0]["response_blob"] is not None,
-             "the model result to be recorded")
+             "the model result to be recorded", timeout=MODEL_TIMEOUT)
     stack.restart_agentd(kill=True)  # the result is in the ledger; Temporal never heard of it
     hold.unlink()
 
     final = stack.wait_state(run, TERMINAL, timeout=120)
     assert final["state"] == "SUCCEEDED", final
     assert model_attempt(stack, run) == 2  # Temporal retried the activity...
-    assert [r["attempt"] for r in stack.model_calls(run)] == [1]  # ...and the ledger answered it
-    assert len(stack.provider_calls(run)) == 1  # the provider was asked once
+    rows = stack.model_calls(run)
+    assert {r["attempt"] for r in rows} == {1}, [dict(r) for r in rows]  # ...and the ledger answered it
+    assert stack.provider_requests(run) == len(rows)  # the provider was asked once (twice if it broke the schema)
 
 
 def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded(stack: Stack) -> None:
@@ -41,22 +42,24 @@ def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded
     stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_before_record_while_exists": str(hold)}])
     stack.start_worker()
     run = stack.start_run()
-    wait_for(lambda: len(stack.provider_calls(run)) == 1, "the provider to answer")
+    wait_for(lambda: stack.model_answered(run), "the provider to answer", timeout=MODEL_TIMEOUT)
     stack.restart_agentd(kill=True)  # the provider answered; the ledger has no result
     hold.unlink()
 
-    final = stack.wait_state(run, TERMINAL, timeout=120)
+    final = stack.wait_state(run, TERMINAL, timeout=MODEL_TIMEOUT + 120)
     assert final["state"] == "SUCCEEDED", final
-    assert len(stack.provider_calls(run)) == 2  # asked again: agentd could not know
-    rows = [(r["attempt"], r["response_blob"] is not None) for r in stack.model_calls(run)]
-    assert rows == [(1, False), (2, True)], rows  # the unanswered attempt stays visible
+    rows = stack.model_calls(run)
+    assert stack.provider_requests(run) == len(rows) >= 2  # asked again: agentd could not know
+    # The unanswered attempt stays visible; the retry got the one accepted answer.
+    answered = {r["attempt"] for r in rows if r["response_blob"] is not None and r["stop_reason"] != "invalid_output"}
+    assert {r["attempt"] for r in rows} == {1, 2} and answered == {2}, [dict(r) for r in rows]
     # Unrecorded, so charged in full when agentd started again; the retry, what it cost.
     entries = stack.budget_entries(run)
     reserved = {e["request_id"]: e for e in entries if e["kind"] == "RESERVE"}
-    settled = {reserved[e["request_id"]]["attempt"]: e for e in entries if e["kind"] == "SETTLE"}
-    assert sorted(settled) == [1, 2], [dict(e) for e in entries]
-    first, second = settled[1], settled[2]
-    assert first["reason"] == "open_at_start"
-    assert first["amount_micros"] == reserved[first["request_id"]]["amount_micros"]
-    assert second["reason"] == "usage"
-    assert 0 < second["amount_micros"] < reserved[second["request_id"]]["amount_micros"]
+    settled = [(reserved[e["request_id"]], e) for e in entries if e["kind"] == "SETTLE"]
+    first = [s for r, s in settled if r["attempt"] == 1]
+    second = [s for r, s in settled if r["attempt"] == 2]
+    assert first and all(s["reason"] == "open_at_start" and s["amount_micros"] == reserved[s["request_id"]]["amount_micros"]
+                         for s in first), [dict(e) for e in entries]
+    assert second and all(s["reason"] == "usage" and 0 < s["amount_micros"] < reserved[s["request_id"]]["amount_micros"]
+                          for s in second), [dict(e) for e in entries]

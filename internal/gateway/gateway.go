@@ -406,10 +406,12 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 		}
 		return models.Response{}, err
 	}
-	fx.StallBeforeRecord(ctx.Done())
 	if resp.Model == "" {
 		resp.Model = route.Name()
 	}
+	g.Log.Info("model answered", "workflow_id", run.WorkflowID, "request_id", req.RequestID,
+		"model", resp.Model, "status", resp.Status, "stop_reason", resp.StopReason)
+	fx.StallBeforeRecord(ctx.Done())
 	cost := g.charge(req.RequestID, resp, reserved)
 	stop := resp.StopReason // as recorded: invalid_output keeps the answer from being reused
 	if resp.Status == StatusOK {

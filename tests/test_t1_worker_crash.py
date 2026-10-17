@@ -1,11 +1,12 @@
-"""T1 (fake model): kill -9 the Worker at different points; the run finishes and every model
-call appears exactly once in the gateway's log (the model_calls ledger)."""
+"""T1: kill -9 the Worker at different points; the run finishes and every model call appears
+exactly once in the gateway's log (the model_calls ledger). Runs on the fake model, or on
+Claude with AGENTOS_MODEL=claude."""
 
 import json
 
 from temporalio.api.enums.v1 import EventType
 
-from tests.harness import Stack, TERMINAL, gateway_calls, wait_for
+from tests.harness import MODEL_TIMEOUT, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
 
@@ -15,15 +16,18 @@ def model_activities(stack: Stack, run: dict) -> list[dict]:
 
 
 def assert_finished_once(stack: Stack, run: dict) -> None:
-    final = stack.wait_state(run, TERMINAL, timeout=90)
+    final = stack.wait_state(run, TERMINAL, timeout=MODEL_TIMEOUT + 60)
     assert final["state"] == "SUCCEEDED", final
     assert json.loads(final["result_json"])["outcome"] == "ok"
     rows = stack.model_calls(run)
-    assert len(rows) == 1, [dict(r) for r in rows]  # one call, one attempt, one provider request
-    assert rows[0]["response_blob"] is not None
+    # One call, one attempt, one accepted answer. (A real model may take a second request
+    # within the attempt, when its first answer broke the schema.)
+    assert {r["attempt"] for r in rows} == {1}, [dict(r) for r in rows]
+    accepted = [r for r in rows if r["response_blob"] is not None and r["stop_reason"] != "invalid_output"]
+    assert len(accepted) == 1, [dict(r) for r in rows]
     assert len(model_activities(stack, run)) == 1  # and Temporal scheduled it once
-    # The rest of the run went on normally: one PR, one report.
-    assert len(stack.external(run, "github.open_draft_pr")) == 1
+    # The rest of the run went on normally: a PR when the model gave a patch, one report.
+    assert len(stack.external(run, "github.open_draft_pr")) == (1 if "patch_ref" in stack.model_value(run) else 0)
     assert len(stack.external(run, "github.comment_commit")) == 1
 
 
@@ -38,7 +42,7 @@ def test_t1_kill_worker_during_model_call(stack: Stack) -> None:
     w1.kill()  # kill -9 while agentd is in the middle of the model call
     hold.unlink()
     wait_for(lambda: stack.model_calls(run)[0]["response_blob"] is not None,
-             "the model call to finish with no Worker alive")
+             "the model call to finish with no Worker alive", timeout=MODEL_TIMEOUT)
 
     stack.start_worker()
     assert_finished_once(stack, run)
@@ -66,7 +70,7 @@ def test_t1_kill_worker_after_model_returns_before_task_completes(stack: Stack) 
                 == model_activities(stack, run)[0]["scheduled"].event_id]
         return bool(done) and any(e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_STARTED
                                   for e in events[done[0]:])
-    wait_for(task_started_after_result, "the frozen Worker to receive the workflow task", timeout=30)
+    wait_for(task_started_after_result, "the frozen Worker to receive the workflow task", timeout=MODEL_TIMEOUT + 30)
     w1.kill()
 
     stack.start_worker()
