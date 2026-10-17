@@ -52,7 +52,15 @@ TEST_MODELS = """
 providers:
   fake: {adapter: fake}
 tasks:
-  audit_v1: {model: fake/audit-fixture}
+  audit_v1: {model: fake/audit-fixture, max_tokens: 4096}
+"""
+
+# Like config/dev/prices.yaml: the fake models cost money, or the budget goes untested.
+TEST_PRICES = """
+price_table_version: test-1
+models:
+  fake/audit-fixture:  {input: 1.00, output: 5.00}
+  fake/audit-fallback: {input: 2.00, output: 10.00}
 """
 
 T = TypeVar("T")
@@ -209,11 +217,12 @@ class Stack:
         return f"tcp://127.0.0.1:{self.runtime_port}"
 
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
-                     models: str = TEST_MODELS, extra: dict | None = None) -> Proc:
+                     models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None) -> Proc:
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
         (d / "models.yaml").write_text(models)
+        (d / "prices.yaml").write_text(prices)
         config = {  # JSON is YAML
             "data_dir": str(self.data_dir),
             "control_socket": str(self.control_socket),
@@ -221,6 +230,7 @@ class Stack:
             "temporal": {"address": self.temporal_address, **({"tls": self.agentd_tls} if self.agentd_tls else {})},
             "policy_file": "policy.yaml",
             "models_file": "models.yaml",
+            "prices_file": "prices.yaml",
             "repos": {"acme/payments": str(self.tmp / "mirror")},
             **(extra or {}),
         }
@@ -296,9 +306,10 @@ class Stack:
             raise AssertionError(f"agentctl {' '.join(args)} failed: {r.stderr.strip()}")
         return json.loads(r.stdout)
 
-    def start_run(self) -> dict:
+    def start_run(self, budget_micros: int | None = None) -> dict:
+        budget = ["--budget-micros", str(budget_micros)] if budget_micros else []
         return self.agentctl("runs", "start", "security-audit", "--repo", "acme/payments",
-                             "--commit", self.commit[:7], "--base", "main")
+                             "--commit", self.commit[:7], "--base", "main", *budget)
 
     def get_run(self, run: dict) -> dict:
         return self.agentctl("runs", "get", run["run_id"])
@@ -359,6 +370,9 @@ class Stack:
     def model_calls(self, run: dict) -> list[sqlite3.Row]:
         return self.ledger("SELECT * FROM model_calls WHERE workflow_id = ? ORDER BY started_at", run["run_id"])
 
+    def budget_entries(self, run: dict) -> list[sqlite3.Row]:
+        return self.ledger("SELECT * FROM budget_entries WHERE workflow_id = ? ORDER BY entry_id", run["run_id"])
+
     def effects(self, run: dict) -> list[sqlite3.Row]:
         return self.ledger("SELECT * FROM effects WHERE workflow_id = ? ORDER BY created_at", run["run_id"])
 
@@ -370,7 +384,7 @@ class Stack:
                 if e["workflow_id"] == run["run_id"] and (tool is None or e["tool"] == tool)]
 
     def provider_calls(self, run: dict) -> list[dict]:
-        """The fake model provider's own record of the requests it answered for the run."""
+        """The fake model provider's own record of the requests it received for the run."""
         path = self.data_dir / "fake-provider.jsonl"
         lines = path.read_text().splitlines() if path.exists() else []
         return [e for e in map(json.loads, lines) if e["workflow_id"] == run["run_id"]]

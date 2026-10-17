@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x61gentos/v1/control.proto\x12\nagentos.v1\"\xa4\x01\n\x0fStartRunRequest\x12\x0c\n\x04task\x18\x01 \x01(\t\x12\x37\n\x06params\x18\x02 \x03(\x0b\x32\'.agentos.v1.StartRunRequest.ParamsEntry\x12\x1b\n\x13\x62udget_limit_micros\x18\x03 \x01(\x03\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x1f\n\rGetRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\" \n\x0fListRunsRequest\x12\r\n\x05limit\x18\x01 \x01(\x05\"1\n\x10ListRunsResponse\x12\x1d\n\x04runs\x18\x01 \x03(\x0b\x32\x0f.agentos.v1.Run\"\"\n\x10\x43\x61ncelRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\"\xfe\x01\n\x03Run\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x17\n\x0ftemporal_run_id\x18\x02 \x01(\t\x12\x0c\n\x04task\x18\x03 \x01(\t\x12\r\n\x05state\x18\x04 \x01(\t\x12+\n\x06params\x18\x05 \x03(\x0b\x32\x1b.agentos.v1.Run.ParamsEntry\x12\x1b\n\x13\x62udget_limit_micros\x18\x06 \x01(\x03\x12\x12\n\ncreated_at\x18\x07 \x01(\t\x12\x13\n\x0bresult_json\x18\x08 \x01(\t\x12\x0f\n\x07\x66\x61ilure\x18\t \x01(\t\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x14\n\x12ListPendingRequest\"=\n\x13ListPendingResponse\x12&\n\x05items\x18\x01 \x03(\x0b\x32\x17.agentos.v1.PendingItem\"K\n\x0bPendingItem\x12\x0c\n\x04kind\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06run_id\x18\x03 \x01(\t\x12\x12\n\nexpires_at\x18\x04 \x01(\t\"\xf4\x01\n\x16ResolveApprovalRequest\x12\x13\n\x0b\x61pproval_id\x18\x01 \x01(\t\x12\x16\n\x0epayload_sha256\x18\x02 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12&\n\x07\x61pprove\x18\x04 \x01(\x0b\x32\x13.agentos.v1.ApproveH\x00\x12:\n\x12\x61pprove_with_edits\x18\x05 \x01(\x0b\x32\x1c.agentos.v1.ApproveWithEditsH\x00\x12$\n\x06reject\x18\x06 \x01(\x0b\x32\x12.agentos.v1.RejectH\x00\x42\n\n\x08\x64\x65\x63ision\"\t\n\x07\x41pprove\"(\n\x10\x41pproveWithEdits\x12\x14\n\x0c\x65\x64ited_patch\x18\x01 \x01(\t\"\x18\n\x06Reject\x12\x0e\n\x06reason\x18\x01 \x01(\t\"Q\n\x17ResolveApprovalResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x12\n\ndecided_by\x18\x02 \x01(\t\x12\x12\n\ndecided_at\x18\x03 \x01(\t\"q\n\x1cResolveReconciliationRequest\x12\x11\n\teffect_id\x18\x01 \x01(\t\x12\x10\n\x08\x65xecuted\x18\x02 \x01(\x08\x12\x13\n\x0bresult_json\x18\x03 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\"/\n\x1dResolveReconciliationResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\"U\n\x13\x45xtendBudgetRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x15\n\ramount_micros\x18\x02 \x01(\x03\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\"#\n\x11\x45xplainRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\"L\n\x0b\x45xplanation\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x0c\n\x04step\x18\x02 \x01(\t\x12\r\n\x05\x63\x61use\x18\x03 \x01(\t\x12\x10\n\x08\x65vidence\x18\x04 \x03(\t2\x9e\x05\n\x07\x43ontrol\x12\x38\n\x08StartRun\x12\x1b.agentos.v1.StartRunRequest\x1a\x0f.agentos.v1.Run\x12\x34\n\x06GetRun\x12\x19.agentos.v1.GetRunRequest\x1a\x0f.agentos.v1.Run\x12\x45\n\x08ListRuns\x12\x1b.agentos.v1.ListRunsRequest\x1a\x1c.agentos.v1.ListRunsResponse\x12:\n\tCancelRun\x12\x1c.agentos.v1.CancelRunRequest\x1a\x0f.agentos.v1.Run\x12N\n\x0bListPending\x12\x1e.agentos.v1.ListPendingRequest\x1a\x1f.agentos.v1.ListPendingResponse\x12Z\n\x0fResolveApproval\x12\".agentos.v1.ResolveApprovalRequest\x1a#.agentos.v1.ResolveApprovalResponse\x12l\n\x15ResolveReconciliation\x12(.agentos.v1.ResolveReconciliationRequest\x1a).agentos.v1.ResolveReconciliationResponse\x12@\n\x0c\x45xtendBudget\x12\x1f.agentos.v1.ExtendBudgetRequest\x1a\x0f.agentos.v1.Run\x12\x44\n\nExplainRun\x12\x1d.agentos.v1.ExplainRunRequest\x1a\x17.agentos.v1.ExplanationB:Z8github.com/jchen0426/agentos/gen/go/agentos/v1;agentosv1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x61gentos/v1/control.proto\x12\nagentos.v1\"\xa4\x01\n\x0fStartRunRequest\x12\x0c\n\x04task\x18\x01 \x01(\t\x12\x37\n\x06params\x18\x02 \x03(\x0b\x32\'.agentos.v1.StartRunRequest.ParamsEntry\x12\x1b\n\x13\x62udget_limit_micros\x18\x03 \x01(\x03\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x1f\n\rGetRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\" \n\x0fListRunsRequest\x12\r\n\x05limit\x18\x01 \x01(\x05\"1\n\x10ListRunsResponse\x12\x1d\n\x04runs\x18\x01 \x03(\x0b\x32\x0f.agentos.v1.Run\"\"\n\x10\x43\x61ncelRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\"\xbb\x02\n\x03Run\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x17\n\x0ftemporal_run_id\x18\x02 \x01(\t\x12\x0c\n\x04task\x18\x03 \x01(\t\x12\r\n\x05state\x18\x04 \x01(\t\x12+\n\x06params\x18\x05 \x03(\x0b\x32\x1b.agentos.v1.Run.ParamsEntry\x12\x1b\n\x13\x62udget_limit_micros\x18\x06 \x01(\x03\x12\x12\n\ncreated_at\x18\x07 \x01(\t\x12\x13\n\x0bresult_json\x18\x08 \x01(\t\x12\x0f\n\x07\x66\x61ilure\x18\t \x01(\t\x12\x1b\n\x13\x62udget_spent_micros\x18\n \x01(\x03\x12\x1e\n\x16\x62udget_reserved_micros\x18\x0b \x01(\x03\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x14\n\x12ListPendingRequest\"=\n\x13ListPendingResponse\x12&\n\x05items\x18\x01 \x03(\x0b\x32\x17.agentos.v1.PendingItem\"K\n\x0bPendingItem\x12\x0c\n\x04kind\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\x0e\n\x06run_id\x18\x03 \x01(\t\x12\x12\n\nexpires_at\x18\x04 \x01(\t\"\xf4\x01\n\x16ResolveApprovalRequest\x12\x13\n\x0b\x61pproval_id\x18\x01 \x01(\t\x12\x16\n\x0epayload_sha256\x18\x02 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12&\n\x07\x61pprove\x18\x04 \x01(\x0b\x32\x13.agentos.v1.ApproveH\x00\x12:\n\x12\x61pprove_with_edits\x18\x05 \x01(\x0b\x32\x1c.agentos.v1.ApproveWithEditsH\x00\x12$\n\x06reject\x18\x06 \x01(\x0b\x32\x12.agentos.v1.RejectH\x00\x42\n\n\x08\x64\x65\x63ision\"\t\n\x07\x41pprove\"(\n\x10\x41pproveWithEdits\x12\x14\n\x0c\x65\x64ited_patch\x18\x01 \x01(\t\"\x18\n\x06Reject\x12\x0e\n\x06reason\x18\x01 \x01(\t\"Q\n\x17ResolveApprovalResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x12\n\ndecided_by\x18\x02 \x01(\t\x12\x12\n\ndecided_at\x18\x03 \x01(\t\"q\n\x1cResolveReconciliationRequest\x12\x11\n\teffect_id\x18\x01 \x01(\t\x12\x10\n\x08\x65xecuted\x18\x02 \x01(\x08\x12\x13\n\x0bresult_json\x18\x03 \x01(\t\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\"/\n\x1dResolveReconciliationResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\"U\n\x13\x45xtendBudgetRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x15\n\ramount_micros\x18\x02 \x01(\x03\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\"#\n\x11\x45xplainRunRequest\x12\x0e\n\x06run_id\x18\x01 \x01(\t\"L\n\x0b\x45xplanation\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x0c\n\x04step\x18\x02 \x01(\t\x12\r\n\x05\x63\x61use\x18\x03 \x01(\t\x12\x10\n\x08\x65vidence\x18\x04 \x03(\t2\x9e\x05\n\x07\x43ontrol\x12\x38\n\x08StartRun\x12\x1b.agentos.v1.StartRunRequest\x1a\x0f.agentos.v1.Run\x12\x34\n\x06GetRun\x12\x19.agentos.v1.GetRunRequest\x1a\x0f.agentos.v1.Run\x12\x45\n\x08ListRuns\x12\x1b.agentos.v1.ListRunsRequest\x1a\x1c.agentos.v1.ListRunsResponse\x12:\n\tCancelRun\x12\x1c.agentos.v1.CancelRunRequest\x1a\x0f.agentos.v1.Run\x12N\n\x0bListPending\x12\x1e.agentos.v1.ListPendingRequest\x1a\x1f.agentos.v1.ListPendingResponse\x12Z\n\x0fResolveApproval\x12\".agentos.v1.ResolveApprovalRequest\x1a#.agentos.v1.ResolveApprovalResponse\x12l\n\x15ResolveReconciliation\x12(.agentos.v1.ResolveReconciliationRequest\x1a).agentos.v1.ResolveReconciliationResponse\x12@\n\x0c\x45xtendBudget\x12\x1f.agentos.v1.ExtendBudgetRequest\x1a\x0f.agentos.v1.Run\x12\x44\n\nExplainRun\x12\x1d.agentos.v1.ExplainRunRequest\x1a\x17.agentos.v1.ExplanationB:Z8github.com/jchen0426/agentos/gen/go/agentos/v1;agentosv1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -49,35 +49,35 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CANCELRUNREQUEST']._serialized_start=325
   _globals['_CANCELRUNREQUEST']._serialized_end=359
   _globals['_RUN']._serialized_start=362
-  _globals['_RUN']._serialized_end=616
+  _globals['_RUN']._serialized_end=677
   _globals['_RUN_PARAMSENTRY']._serialized_start=160
   _globals['_RUN_PARAMSENTRY']._serialized_end=205
-  _globals['_LISTPENDINGREQUEST']._serialized_start=618
-  _globals['_LISTPENDINGREQUEST']._serialized_end=638
-  _globals['_LISTPENDINGRESPONSE']._serialized_start=640
-  _globals['_LISTPENDINGRESPONSE']._serialized_end=701
-  _globals['_PENDINGITEM']._serialized_start=703
-  _globals['_PENDINGITEM']._serialized_end=778
-  _globals['_RESOLVEAPPROVALREQUEST']._serialized_start=781
-  _globals['_RESOLVEAPPROVALREQUEST']._serialized_end=1025
-  _globals['_APPROVE']._serialized_start=1027
-  _globals['_APPROVE']._serialized_end=1036
-  _globals['_APPROVEWITHEDITS']._serialized_start=1038
-  _globals['_APPROVEWITHEDITS']._serialized_end=1078
-  _globals['_REJECT']._serialized_start=1080
-  _globals['_REJECT']._serialized_end=1104
-  _globals['_RESOLVEAPPROVALRESPONSE']._serialized_start=1106
-  _globals['_RESOLVEAPPROVALRESPONSE']._serialized_end=1187
-  _globals['_RESOLVERECONCILIATIONREQUEST']._serialized_start=1189
-  _globals['_RESOLVERECONCILIATIONREQUEST']._serialized_end=1302
-  _globals['_RESOLVERECONCILIATIONRESPONSE']._serialized_start=1304
-  _globals['_RESOLVERECONCILIATIONRESPONSE']._serialized_end=1351
-  _globals['_EXTENDBUDGETREQUEST']._serialized_start=1353
-  _globals['_EXTENDBUDGETREQUEST']._serialized_end=1438
-  _globals['_EXPLAINRUNREQUEST']._serialized_start=1440
-  _globals['_EXPLAINRUNREQUEST']._serialized_end=1475
-  _globals['_EXPLANATION']._serialized_start=1477
-  _globals['_EXPLANATION']._serialized_end=1553
-  _globals['_CONTROL']._serialized_start=1556
-  _globals['_CONTROL']._serialized_end=2226
+  _globals['_LISTPENDINGREQUEST']._serialized_start=679
+  _globals['_LISTPENDINGREQUEST']._serialized_end=699
+  _globals['_LISTPENDINGRESPONSE']._serialized_start=701
+  _globals['_LISTPENDINGRESPONSE']._serialized_end=762
+  _globals['_PENDINGITEM']._serialized_start=764
+  _globals['_PENDINGITEM']._serialized_end=839
+  _globals['_RESOLVEAPPROVALREQUEST']._serialized_start=842
+  _globals['_RESOLVEAPPROVALREQUEST']._serialized_end=1086
+  _globals['_APPROVE']._serialized_start=1088
+  _globals['_APPROVE']._serialized_end=1097
+  _globals['_APPROVEWITHEDITS']._serialized_start=1099
+  _globals['_APPROVEWITHEDITS']._serialized_end=1139
+  _globals['_REJECT']._serialized_start=1141
+  _globals['_REJECT']._serialized_end=1165
+  _globals['_RESOLVEAPPROVALRESPONSE']._serialized_start=1167
+  _globals['_RESOLVEAPPROVALRESPONSE']._serialized_end=1248
+  _globals['_RESOLVERECONCILIATIONREQUEST']._serialized_start=1250
+  _globals['_RESOLVERECONCILIATIONREQUEST']._serialized_end=1363
+  _globals['_RESOLVERECONCILIATIONRESPONSE']._serialized_start=1365
+  _globals['_RESOLVERECONCILIATIONRESPONSE']._serialized_end=1412
+  _globals['_EXTENDBUDGETREQUEST']._serialized_start=1414
+  _globals['_EXTENDBUDGETREQUEST']._serialized_end=1499
+  _globals['_EXPLAINRUNREQUEST']._serialized_start=1501
+  _globals['_EXPLAINRUNREQUEST']._serialized_end=1536
+  _globals['_EXPLANATION']._serialized_start=1538
+  _globals['_EXPLANATION']._serialized_end=1614
+  _globals['_CONTROL']._serialized_start=1617
+  _globals['_CONTROL']._serialized_end=2287
 # @@protoc_insertion_point(module_scope)

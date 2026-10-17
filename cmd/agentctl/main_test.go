@@ -62,3 +62,21 @@ func TestJSONOutputShowsWorkerTextInert(t *testing.T) {
 		t.Errorf("the JSON no longer decodes to the same run: %s", b)
 	}
 }
+
+func TestUSD(t *testing.T) {
+	for in, want := range map[string]int64{"2.50": 2_500_000, "$1": 1_000_000, "0.000001": 1, "10.123456": 10_123_456} {
+		if got, err := parseUSD(in); err != nil || got != want {
+			t.Errorf("parseUSD(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "0", "0.00", "-1", "1.2345678", "1,5", "1e3", ".5", "99999999999999999999"} {
+		if got, err := parseUSD(in); err == nil {
+			t.Errorf("parseUSD(%q) = %d, want an error", in, got)
+		}
+	}
+	for micros, want := range map[int64]string{5_000_000: "$5.00", 4500: "$0.0045", 1: "$0.000001", 0: "$0.00", 12_340_000: "$12.34"} {
+		if got := usd(micros); got != want {
+			t.Errorf("usd(%d) = %q, want %q", micros, got, want)
+		}
+	}
+}

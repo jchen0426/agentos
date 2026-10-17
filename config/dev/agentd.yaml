@@ -1,9 +1,10 @@
-# M1 development setup: Temporal's dev server on 127.0.0.1:7233, the fake model, stub tools.
+# Development setup: Temporal's dev server on 127.0.0.1:7233, the fake model, stub tools.
 # Paths are relative to this file. On Linux, use the default unix:// Runtime socket instead.
 data_dir: ../../.agentos
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml
 models_file: models.yaml
+prices_file: prices.yaml
 repos:
   acme/payments: ../../.agentos/mirror      # any local git repository

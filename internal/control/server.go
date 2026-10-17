@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/safetext"
@@ -40,6 +41,7 @@ type Server struct {
 	agentosv1.UnimplementedControlServer
 
 	Ledger      *ledger.Ledger
+	Budget      *budget.Budget
 	Temporal    client.Client
 	Tasks       tasks.Registry
 	TaskQueue   string        // where the Python Worker polls
@@ -271,8 +273,42 @@ func (s *Server) ResolveReconciliation(context.Context, *agentosv1.ResolveReconc
 	return nil, status.Error(codes.Unimplemented, "reconciliation arrives in M3")
 }
 
-func (s *Server) ExtendBudget(context.Context, *agentosv1.ExtendBudgetRequest) (*agentosv1.Run, error) {
-	return nil, status.Error(codes.Unimplemented, "budgets arrive in M2")
+// ExtendBudget raises a run's budget and rings its doorbell: calls paused in PAUSED_BUDGET
+// ask again. A lost doorbell only delays them, since a paused call rechecks within the hour.
+func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRequest) (*agentosv1.Run, error) {
+	if req.GetAmountMicros() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "amount must be positive")
+	}
+	if req.GetIdempotencyKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency_key is required")
+	}
+	r, err := s.lookup(ctx, req.GetRunId())
+	if err != nil {
+		return nil, err
+	}
+	if !r.RunID.Valid {
+		return nil, status.Error(codes.FailedPrecondition, "the run is still starting")
+	}
+	current, err := s.describe(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	if closed(current.GetState()) {
+		return nil, status.Errorf(codes.FailedPrecondition, "the run has already ended: %s", current.GetState())
+	}
+	ctx = context.WithoutCancel(ctx) // once recorded, the doorbell must ring
+	added, err := s.Budget.Extend(ctx, r.WorkflowID, req.GetAmountMicros(), req.GetIdempotencyKey())
+	if err != nil {
+		return nil, err
+	}
+	if added {
+		s.Log.Info("budget extended", "workflow_id", r.WorkflowID, "amount_micros", req.GetAmountMicros())
+	}
+	// Rung for a repeated request too: its first doorbell may have been lost.
+	if err := s.Temporal.SignalWorkflow(ctx, r.WorkflowID, r.RunID.String, "doorbell", nil); err != nil {
+		s.Log.Warn("doorbell failed; the paused calls recheck within the hour", "workflow_id", r.WorkflowID, "error", err)
+	}
+	return s.getRun(ctx, r.WorkflowID)
 }
 
 func (s *Server) ExplainRun(context.Context, *agentosv1.ExplainRunRequest) (*agentosv1.Explanation, error) {
@@ -299,12 +335,16 @@ func (s *Server) getRun(ctx context.Context, workflowID string) (*agentosv1.Run,
 // the failure message come from the Worker: neither leaves here with raw control characters.
 func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error) {
 	out := &agentosv1.Run{
-		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task,
-		BudgetLimitMicros: r.BudgetLimitMicros, CreatedAt: r.CreatedAt,
+		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task, CreatedAt: r.CreatedAt,
 	}
 	if err := json.Unmarshal([]byte(r.ParamsJson), &out.Params); err != nil {
 		return nil, err
 	}
+	b, err := s.Budget.Totals(ctx, r.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	out.BudgetLimitMicros, out.BudgetSpentMicros, out.BudgetReservedMicros = b.Limit, b.Spent, b.Held
 	if !r.RunID.Valid {
 		out.State = "CREATED"
 		return out, nil

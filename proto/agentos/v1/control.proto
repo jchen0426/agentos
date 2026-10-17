@@ -14,7 +14,7 @@ service Control {
   rpc ListPending(ListPendingRequest) returns (ListPendingResponse);  // approvals and reconciliations (M3, M4)
   rpc ResolveApproval(ResolveApprovalRequest) returns (ResolveApprovalResponse);                  // M4
   rpc ResolveReconciliation(ResolveReconciliationRequest) returns (ResolveReconciliationResponse); // M3
-  rpc ExtendBudget(ExtendBudgetRequest) returns (Run);                                            // M2
+  rpc ExtendBudget(ExtendBudgetRequest) returns (Run);                                            // M2a, backs `agentctl budget extend`
   rpc ExplainRun(ExplainRunRequest) returns (Explanation);           // M5, backs `agentctl runs explain`
 }
 
@@ -48,10 +48,12 @@ message Run {
   // SUCCEEDED, FAILED, CANCELLED; UNKNOWN once Temporal no longer has the execution
   string state = 4;
   map<string, string> params = 5;   // as resolved by agentd (commit is the full 40-char SHA)
-  int64 budget_limit_micros = 6;
+  int64 budget_limit_micros = 6;    // the current limit: the start's plus every extension
   string created_at = 7;            // RFC 3339, UTC
   string result_json = 8;           // the workflow result once SUCCEEDED
   string failure = 9;               // the failure message once FAILED
+  int64 budget_spent_micros = 10;   // settled model requests
+  int64 budget_reserved_micros = 11; // reserved by requests not yet settled
 }
 
 message ListPendingRequest {}
@@ -107,8 +109,8 @@ message ResolveReconciliationResponse {
 
 message ExtendBudgetRequest {
   string run_id = 1;
-  int64 amount_micros = 2;
-  string idempotency_key = 3;
+  int64 amount_micros = 2;          // added to the run's limit; must be positive
+  string idempotency_key = 3;       // required: a retried request with the same key adds nothing
 }
 
 message ExplainRunRequest {

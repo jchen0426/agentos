@@ -84,6 +84,35 @@ func (q *Queries) GetBlob(ctx context.Context, sha256 string) ([]byte, error) {
 	return bytes, err
 }
 
+const getBudgetTotals = `-- name: GetBudgetTotals :one
+SELECT
+  CAST(r.budget_limit_micros + COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'EXTEND'
+  ), 0) AS INTEGER) AS limit_micros,
+  CAST(COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'SETTLE'
+  ), 0) AS INTEGER) AS spent_micros,
+  CAST(COALESCE((
+    SELECT SUM(e.amount_micros) FROM budget_entries e
+    WHERE e.workflow_id = r.workflow_id AND e.kind = 'RESERVE' AND NOT EXISTS (
+      SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'))
+  ), 0) AS INTEGER) AS held_micros
+FROM runs r WHERE r.workflow_id = ?
+`
+
+type GetBudgetTotalsRow struct {
+	LimitMicros int64
+	SpentMicros int64
+	HeldMicros  int64
+}
+
+func (q *Queries) GetBudgetTotals(ctx context.Context, workflowID string) (GetBudgetTotalsRow, error) {
+	row := q.db.QueryRowContext(ctx, getBudgetTotals, workflowID)
+	var i GetBudgetTotalsRow
+	err := row.Scan(&i.LimitMicros, &i.SpentMicros, &i.HeldMicros)
+	return i, err
+}
+
 const getEffect = `-- name: GetEffect :one
 SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at FROM effects WHERE effect_id = ?
 `
@@ -139,6 +168,32 @@ func (q *Queries) GetFinishedModelCall(ctx context.Context, arg GetFinishedModel
 	return i, err
 }
 
+const getOpenReservation = `-- name: GetOpenReservation :one
+SELECT entry_id, workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, idempotency_key, created_at FROM budget_entries e
+WHERE e.request_id = ? AND e.kind = 'RESERVE' AND NOT EXISTS (
+  SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'))
+`
+
+func (q *Queries) GetOpenReservation(ctx context.Context, requestID sql.NullString) (BudgetEntry, error) {
+	row := q.db.QueryRowContext(ctx, getOpenReservation, requestID)
+	var i BudgetEntry
+	err := row.Scan(
+		&i.EntryID,
+		&i.WorkflowID,
+		&i.Kind,
+		&i.AmountMicros,
+		&i.RequestID,
+		&i.ActivityID,
+		&i.Attempt,
+		&i.Model,
+		&i.PriceTableVersion,
+		&i.Reason,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getRun = `-- name: GetRun :one
 SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at FROM runs WHERE workflow_id = ?
 `
@@ -156,6 +211,67 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 		&i.CancelledAt,
 	)
 	return i, err
+}
+
+const insertBudgetEntry = `-- name: InsertBudgetEntry :exec
+INSERT INTO budget_entries (
+  workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertBudgetEntryParams struct {
+	WorkflowID        string
+	Kind              string
+	AmountMicros      int64
+	RequestID         sql.NullString
+	ActivityID        sql.NullString
+	Attempt           sql.NullInt64
+	Model             sql.NullString
+	PriceTableVersion sql.NullString
+	Reason            sql.NullString
+	CreatedAt         string
+}
+
+func (q *Queries) InsertBudgetEntry(ctx context.Context, arg InsertBudgetEntryParams) error {
+	_, err := q.db.ExecContext(ctx, insertBudgetEntry,
+		arg.WorkflowID,
+		arg.Kind,
+		arg.AmountMicros,
+		arg.RequestID,
+		arg.ActivityID,
+		arg.Attempt,
+		arg.Model,
+		arg.PriceTableVersion,
+		arg.Reason,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const insertBudgetExtension = `-- name: InsertBudgetExtension :execrows
+INSERT INTO budget_entries (workflow_id, kind, amount_micros, idempotency_key, created_at)
+VALUES (?, 'EXTEND', ?, ?, ?)
+ON CONFLICT DO NOTHING
+`
+
+type InsertBudgetExtensionParams struct {
+	WorkflowID     string
+	AmountMicros   int64
+	IdempotencyKey sql.NullString
+	CreatedAt      string
+}
+
+func (q *Queries) InsertBudgetExtension(ctx context.Context, arg InsertBudgetExtensionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, insertBudgetExtension,
+		arg.WorkflowID,
+		arg.AmountMicros,
+		arg.IdempotencyKey,
+		arg.CreatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const insertEffect = `-- name: InsertEffect :execrows
@@ -273,6 +389,49 @@ func (q *Queries) ListCancelledRuns(ctx context.Context) ([]Run, error) {
 			&i.BudgetLimitMicros,
 			&i.CreatedAt,
 			&i.CancelledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOpenReservations = `-- name: ListOpenReservations :many
+SELECT entry_id, workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, idempotency_key, created_at FROM budget_entries e
+WHERE e.kind = 'RESERVE' AND NOT EXISTS (
+  SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id AND c.kind IN ('SETTLE', 'RELEASE'))
+ORDER BY e.entry_id
+`
+
+func (q *Queries) ListOpenReservations(ctx context.Context) ([]BudgetEntry, error) {
+	rows, err := q.db.QueryContext(ctx, listOpenReservations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BudgetEntry
+	for rows.Next() {
+		var i BudgetEntry
+		if err := rows.Scan(
+			&i.EntryID,
+			&i.WorkflowID,
+			&i.Kind,
+			&i.AmountMicros,
+			&i.RequestID,
+			&i.ActivityID,
+			&i.Attempt,
+			&i.Model,
+			&i.PriceTableVersion,
+			&i.Reason,
+			&i.IdempotencyKey,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

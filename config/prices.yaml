@@ -1,0 +1,13 @@
+# US dollars per million tokens. Versioned: the ledger records which version priced each
+# request. Taken from the official pricing pages on 2026-10-15 (design doc, section 9).
+price_table_version: 2026-10-15
+models:
+  anthropic/claude-opus-5-5:
+    input: 4.00
+    cache_write_5m: 5.00
+    cache_write_1h: 8.00
+    cache_read: 0.20
+    output: 20.00
+  # openai/<model>: copy input, cache_read and output from OpenAI's pricing page before first
+  #   use. Caching is automatic there; there is no cache-write price.
+  # local/<model>: {input: 0, output: 0}   # self-hosted: compute is not in the budget

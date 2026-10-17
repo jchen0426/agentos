@@ -35,12 +35,18 @@ type Blob struct {
 }
 
 type BudgetEntry struct {
-	EntryID      string
-	WorkflowID   string
-	Kind         string
-	AmountMicros int64
-	ActivityID   sql.NullString
-	CreatedAt    string
+	EntryID           int64
+	WorkflowID        string
+	Kind              string
+	AmountMicros      int64
+	RequestID         sql.NullString
+	ActivityID        sql.NullString
+	Attempt           sql.NullInt64
+	Model             sql.NullString
+	PriceTableVersion sql.NullString
+	Reason            sql.NullString
+	IdempotencyKey    sql.NullString
+	CreatedAt         string
 }
 
 type Effect struct {

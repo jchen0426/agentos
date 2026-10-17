@@ -48,7 +48,7 @@ class CancelRunRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ...) -> None: ...
 
 class Run(_message.Message):
-    __slots__ = ("run_id", "temporal_run_id", "task", "state", "params", "budget_limit_micros", "created_at", "result_json", "failure")
+    __slots__ = ("run_id", "temporal_run_id", "task", "state", "params", "budget_limit_micros", "created_at", "result_json", "failure", "budget_spent_micros", "budget_reserved_micros")
     class ParamsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -65,6 +65,8 @@ class Run(_message.Message):
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     RESULT_JSON_FIELD_NUMBER: _ClassVar[int]
     FAILURE_FIELD_NUMBER: _ClassVar[int]
+    BUDGET_SPENT_MICROS_FIELD_NUMBER: _ClassVar[int]
+    BUDGET_RESERVED_MICROS_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     temporal_run_id: str
     task: str
@@ -74,7 +76,9 @@ class Run(_message.Message):
     created_at: str
     result_json: str
     failure: str
-    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., task: _Optional[str] = ..., state: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ..., created_at: _Optional[str] = ..., result_json: _Optional[str] = ..., failure: _Optional[str] = ...) -> None: ...
+    budget_spent_micros: int
+    budget_reserved_micros: int
+    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., task: _Optional[str] = ..., state: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ..., created_at: _Optional[str] = ..., result_json: _Optional[str] = ..., failure: _Optional[str] = ..., budget_spent_micros: _Optional[int] = ..., budget_reserved_micros: _Optional[int] = ...) -> None: ...
 
 class ListPendingRequest(_message.Message):
     __slots__ = ()

@@ -25,6 +25,12 @@ type Rule struct {
 	HoldAfterRecordWhileExists  string `json:"hold_after_record_while_exists"`
 	NoHeartbeat                 bool   `json:"no_heartbeat"` // this attempt sends no heartbeats
 	Status                      string `json:"status"`       // return this status instead of executing
+
+	// What the fake model provider does with this attempt's request (models.FakeFault).
+	ProviderStatus      int    `json:"provider_status"`      // answer 429 or 5xx, unbilled
+	ProviderLoseAnswer  bool   `json:"provider_lose_answer"` // bill it, then lose the answer
+	ProviderUnreachable bool   `json:"provider_unreachable"` // fail before it leaves agentd
+	ProviderServedBy    string `json:"provider_served_by"`   // answer as this fallback model
 }
 
 // Effect is what the matching rules ask of one Invoke attempt.
@@ -35,6 +41,10 @@ type Effect struct {
 	HoldAfterRecordWhileExists  string
 	NoHeartbeat                 bool
 	Status                      string
+	ProviderStatus              int
+	ProviderLoseAnswer          bool
+	ProviderUnreachable         bool
+	ProviderServedBy            string
 }
 
 // Script is a loaded fault script. A nil *Script injects nothing.
@@ -89,6 +99,14 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 		e.NoHeartbeat = e.NoHeartbeat || r.NoHeartbeat
 		if r.Status != "" {
 			e.Status = r.Status
+		}
+		if r.ProviderStatus != 0 {
+			e.ProviderStatus = r.ProviderStatus
+		}
+		e.ProviderLoseAnswer = e.ProviderLoseAnswer || r.ProviderLoseAnswer
+		e.ProviderUnreachable = e.ProviderUnreachable || r.ProviderUnreachable
+		if r.ProviderServedBy != "" {
+			e.ProviderServedBy = r.ProviderServedBy
 		}
 	}
 	return e

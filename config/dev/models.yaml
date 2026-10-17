@@ -1,4 +1,4 @@
 providers:
   fake: {adapter: fake}
 tasks:
-  audit_v1: {model: fake/audit-fixture}
+  audit_v1: {model: fake/audit-fixture, max_tokens: 4096}
