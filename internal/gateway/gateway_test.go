@@ -72,3 +72,30 @@ func TestScopeComesFromTheRunsResolvedParameters(t *testing.T) {
 		}
 	}
 }
+
+func TestFillScopeAddsWhatTheCallLeftOut(t *testing.T) {
+	args, _, err := canonicalArgs(`{"repo":"acme/payments","patch_ref":"blob:1"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := map[string]string{"repo": "acme/payments", "commit": "3f2a", "base_branch": "main"}
+	filled, canon, err := fillScope(args, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"base_branch":"main","commit":"3f2a","patch_ref":"blob:1","repo":"acme/payments"}`; string(canon) != want {
+		t.Errorf("canonical form: got %s, want %s", canon, want)
+	}
+	if filled["commit"] != "3f2a" || filled["base_branch"] != "main" {
+		t.Errorf("filled: %v", filled)
+	}
+	if _, ok := args["commit"]; ok {
+		t.Error("the caller's map was changed")
+	}
+
+	// A value the call names is kept, so the policy can deny it.
+	args = map[string]any{"repo": "acme/ledger"}
+	if filled, _, _ := fillScope(args, scope); filled["repo"] != "acme/ledger" {
+		t.Errorf("a named value was overwritten: %v", filled)
+	}
+}

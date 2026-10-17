@@ -100,7 +100,7 @@
 f22fc37 推送后，自动安全审查报了三处问题，核实都成立，已修复：
 
 1. **Runtime 代理的粘性队列**（`internal/runtimeproxy/rules.go`）。原规则对粘性队列只看 normal name，normal name 为空就放行，队列名随便填。实测 Temporal 1.32 并不把粘性队列和它的 normal name 绑在一起，代理分辨不出一个粘性队列属于谁，只收紧 normal name 不够。现在沙箱里的 Worker 关掉粘性执行（`max_cached_workflows=0`），代理拒绝一切粘性队列：粘性拉取、`RespondWorkflowTaskCompleted` 里的 `sticky_attributes`、带粘性队列名的 `ShutdownWorker`；`ResetStickyTaskQueue` 也移出了白名单。代价是每个工作流任务都要从完整历史重放，M1 的历史很短，影响不大。
-2. **工具调用不受任务自身范围约束**（`internal/policy/policy.go`）。策略只检查 repo 在不在 `repos` 列表里，所以一个对 acme/payments 启动的任务，可以对列表里的其他 repo、同一 repo 的其他 commit 或别的 base 分支发起写操作。现在任务注册时声明 `Scope`（security-audit 把工具参数 `repo`、`commit`、`base_branch` 对应到启动时解析出的 `repo`、`commit`、`base`）。网关按账本里这个任务的参数算出范围，工具调用带了这些参数、值却不同，就拒绝。
+2. **工具调用不受任务自身范围约束**（`internal/policy/policy.go`）。策略只检查 repo 在不在 `repos` 列表里，所以一个对 acme/payments 启动的任务，可以对列表里的其他 repo、同一 repo 的其他 commit 或别的 base 分支发起写操作。现在任务注册时声明 `Scope`（security-audit 把工具参数 `repo`、`commit`、`base_branch` 对应到启动时解析出的 `repo`、`commit`、`base`）。网关按账本里这个任务的参数算出范围，工具调用带了这些参数、值却不同，就拒绝；没带的由网关补上任务自己的值，工具不会退回到它自己的默认值（比如默认分支）。这一条是第二轮审查指出的：只查“带了且不同”是 fail-open。
 3. **终端转义注入**（`internal/control/server.go`、`agentctl`）。任务结果和失败信息由 Worker 写入，原来原样打到终端：转义序列能改写屏幕，换行能伪造一行输出（比如一行假的 `state SUCCEEDED`）。新的 `internal/safetext` 做两件事：Control 服务把失败信息里不可打印的字符写成 `\x1b`、`\n` 这样的文本；结果 JSON 里的 DEL、C1 控制字符和格式字符（如双向覆盖）换成 `\u` 转义，解码后的值不变。agentctl 的文本输出逐字段转义，JSON 输出同样处理；agentd 的日志也经过同样的过滤，因为里面有 Worker 自己挑的活动 ID 和调用名。
 
 修复后三种环境的测试全部通过：macOS 不加沙箱 15 个通过、1 个跳过（沙箱测试要在沙箱模式下跑），macOS + srt 16 个，Linux + bwrap 16 个。真实 Worker 的调用没有一次被代理拒绝，正常任务的工具调用也没有一次被范围检查拒绝。
