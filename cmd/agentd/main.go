@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -103,13 +104,24 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return err
 	}
 	for name := range mods.Tasks {
-		// Every model a task may reach must be priced before agentd will start.
 		route, err := mods.Route(name)
 		if err != nil {
 			return err
 		}
-		if _, err := prices.Bound(route.Candidates, 0, route.MaxTokens); err != nil {
-			return fmt.Errorf("model task %s: %w", name, err)
+		for _, hop := range append([]models.Route{route}, route.Next...) {
+			// Every model a task may reach must be priced before agentd will start.
+			if _, err := prices.Bound(hop.Candidates, 0, hop.MaxTokens); err != nil {
+				return fmt.Errorf("model task %s: %w", name, err)
+			}
+			if mods.Providers[hop.Provider].API != "chat" {
+				continue
+			}
+			// Chat Completions servers count no tokens before a request: its reservation is
+			// an estimate, and a bound only when nothing is charged (section 9).
+			if free, err := prices.Free(hop.Name()); err != nil || !free {
+				return fmt.Errorf("model task %s: %s takes api chat, whose input is only estimated: "+
+					"its prices must be 0 (a model server of your own)", name, hop.Name())
+			}
 		}
 	}
 	var script *faults.Script
@@ -157,9 +169,11 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		if err != nil {
 			return err
 		}
-		if c, ok := adapters[route.Provider].(models.RouteChecker); ok {
-			if err := c.CheckRoute(route); err != nil {
-				return fmt.Errorf("model task %s: %w", name, err)
+		for _, hop := range append([]models.Route{route}, route.Next...) {
+			if c, ok := adapters[hop.Provider].(models.RouteChecker); ok {
+				if err := c.CheckRoute(hop); err != nil {
+					return fmt.Errorf("model task %s: %s: %w", name, hop.Name(), err)
+				}
 			}
 		}
 	}
@@ -181,6 +195,9 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return err
 	}
 	if err := gateway.CheckTools(pol, toolset); err != nil {
+		return err
+	}
+	if err := gateway.CheckModels(pol, mods); err != nil {
 		return err
 	}
 	gw := &gateway.Gateway{
@@ -458,27 +475,68 @@ func temporalTLS(c *config.TLS) (*tls.Config, error) {
 
 // modelAdapters builds one adapter for each provider a task may reach, by provider name. A
 // provider's key is read from the OS keyring now, so that a missing key stops agentd at start
-// rather than failing the first run.
+// rather than failing the first run. Claude and OpenAI take none only from a simulator on this
+// machine; a Chat Completions server (Ollama, vLLM) needs one only when models.yaml names it.
+// A provider elsewhere is reached over https only: the requests carry the task's data, and
+// the key.
 func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string) (map[string]models.Adapter, error) {
 	adapters := map[string]models.Adapter{}
 	for name, p := range mods.Providers {
 		if !mods.Uses(name) {
 			continue
 		}
+		local := config.Loopback(p.BaseURL)
+		if p.BaseURL != "" && !local && !strings.HasPrefix(p.BaseURL, "https://") {
+			return nil, fmt.Errorf("provider %s: %s is not on this machine: the task's data goes there only over https", name, p.BaseURL)
+		}
+		key := ""
+		if p.Key != "" || (!local && (p.Adapter == "anthropic" || p.API == "responses")) {
+			var err error
+			if key, err = secrets.Resolve(p.Key); err != nil {
+				return nil, fmt.Errorf("provider %s: %w", name, err)
+			}
+		}
 		switch p.Adapter {
 		case "fake":
 			adapters[name] = models.Fake{Log: models.NewProviderLog(filepath.Join(dataDir, "fake-provider.jsonl"))}
 		case "anthropic":
-			key, err := secrets.Resolve(p.Key)
+			adapters[name] = models.NewAnthropic(name, key, p.BaseURL, blobs)
+		case "openai_compat":
+			id, err := safetyIdentifier(dataDir)
+			if err != nil {
+				return nil, err
+			}
+			a, err := models.NewOpenAICompat(name, p, key, id, blobs)
 			if err != nil {
 				return nil, fmt.Errorf("provider %s: %w", name, err)
 			}
-			adapters[name] = models.NewAnthropic(name, key, p.BaseURL, blobs)
+			adapters[name] = a
 		default:
 			return nil, fmt.Errorf("provider %s: adapter %q is not in this build", name, p.Adapter)
 		}
 	}
 	return adapters, nil
+}
+
+// safetyIdentifier names this agentd to OpenAI's safeguards, and nothing else about it: a
+// flagged request holds it to account, not the whole organization (design doc, section 9).
+// It is random, made the first time and kept in the data directory.
+func safetyIdentifier(dataDir string) (string, error) {
+	path := filepath.Join(dataDir, "safety-identifier")
+	if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+		return strings.TrimSpace(string(b)), nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("safety identifier: %w", err)
+	}
+	id := "agentos-" + rand.Text()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("safety identifier: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", fmt.Errorf("safety identifier: %w", err)
+	}
+	return id, nil
 }
 
 // limiters builds a token bucket for each provider with a requests_per_minute: a quarter of a

@@ -24,15 +24,18 @@ type Rule struct {
 	HoldAfterClaimWhileExists   string `json:"hold_after_claim_while_exists"`
 	HoldBeforeRecordWhileExists string `json:"hold_before_record_while_exists"`
 	HoldAfterRecordWhileExists  string `json:"hold_after_record_while_exists"`
-	NoHeartbeat                 bool   `json:"no_heartbeat"` // this attempt sends no heartbeats
-	Status                      string `json:"status"`       // return this status instead of executing
+	HoldRecordOn                string `json:"hold_record_on"` // a model call's record holds apply only to this provider's request
+	NoHeartbeat                 bool   `json:"no_heartbeat"`   // this attempt sends no heartbeats
+	Status                      string `json:"status"`         // return this status instead of executing
 
 	// What the fake model provider does with this attempt's request (models.FakeFault).
 	ProviderStatus      int    `json:"provider_status"`      // answer 429 or 5xx, unbilled
+	ProviderStatusOn    string `json:"provider_status_on"`   // only requests to this provider get ProviderStatus
 	ProviderLoseAnswer  bool   `json:"provider_lose_answer"` // bill it, then lose the answer
 	ProviderUnreachable bool   `json:"provider_unreachable"` // fail before it leaves agentd
 	ProviderServedBy    string `json:"provider_served_by"`   // answer as this fallback model
 	ProviderBadOutput   bool   `json:"provider_bad_output"`  // answer with output that breaks the schema
+	ProviderRefuses     string `json:"provider_refuses"`     // this provider's fake model declines to answer
 }
 
 // Effect is what the matching rules ask of one Invoke attempt.
@@ -42,13 +45,16 @@ type Effect struct {
 	HoldAfterClaimWhileExists   string
 	HoldBeforeRecordWhileExists string
 	HoldAfterRecordWhileExists  string
+	HoldRecordOn                string
 	NoHeartbeat                 bool
 	Status                      string
 	ProviderStatus              int
+	ProviderStatusOn            string
 	ProviderLoseAnswer          bool
 	ProviderUnreachable         bool
 	ProviderServedBy            string
 	ProviderBadOutput           bool
+	ProviderRefuses             string
 }
 
 // Script is a loaded fault script. A nil *Script injects nothing.
@@ -102,13 +108,16 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 		if r.HoldAfterRecordWhileExists != "" {
 			e.HoldAfterRecordWhileExists = r.HoldAfterRecordWhileExists
 		}
+		if r.HoldRecordOn != "" {
+			e.HoldRecordOn = r.HoldRecordOn
+		}
 		e.Delay += time.Duration(r.Delay)
 		e.NoHeartbeat = e.NoHeartbeat || r.NoHeartbeat
 		if r.Status != "" {
 			e.Status = r.Status
 		}
 		if r.ProviderStatus != 0 {
-			e.ProviderStatus = r.ProviderStatus
+			e.ProviderStatus, e.ProviderStatusOn = r.ProviderStatus, r.ProviderStatusOn
 		}
 		e.ProviderLoseAnswer = e.ProviderLoseAnswer || r.ProviderLoseAnswer
 		e.ProviderUnreachable = e.ProviderUnreachable || r.ProviderUnreachable
@@ -116,6 +125,9 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 			e.ProviderServedBy = r.ProviderServedBy
 		}
 		e.ProviderBadOutput = e.ProviderBadOutput || r.ProviderBadOutput
+		if r.ProviderRefuses != "" {
+			e.ProviderRefuses = r.ProviderRefuses
+		}
 	}
 	return e
 }

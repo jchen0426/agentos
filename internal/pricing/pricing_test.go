@@ -14,6 +14,8 @@ models:
   fake/cheap:                {input: 1.00, output: 5.00}
   fake/dear:                 {input: 2.00, output: 10.00}
   openai/not-copied-yet:     {input: null, cache_read: null, output: null}
+  openai/gpt-6.1-sol:        {input: 2.00, cache_write: 2.50, cache_read: 0.10, output: 10.00,
+                              long_context: {above: 272000, input: 2.0, output: 1.5}}
   local/llama:               {input: 0, output: 0}
 `
 
@@ -47,6 +49,14 @@ func TestCost(t *testing.T) {
 		{"fake/cheap", Usage{InputTokens: 1300, OutputTokens: 500}, 1300 + 2500},
 		{"fake/cheap", Usage{CacheReadTokens: 10}, 10}, // no cache price: charged as input
 		{"local/llama", Usage{InputTokens: 1e6, OutputTokens: 1e6}, 0},
+		// One write price, 1.25x input; a tenth of a micro per cached token.
+		{"openai/gpt-6.1-sol", Usage{InputTokens: 1000, CacheWriteTokens: 1000, CacheReadTokens: 1000, OutputTokens: 100},
+			2000 + 2500 + 100 + 1000},
+		// At the tier's edge the base prices hold; one token past it, the whole request pays 2x
+		// and 1.5x, cache reads included.
+		{"openai/gpt-6.1-sol", Usage{InputTokens: 272000, OutputTokens: 1000}, 544000 + 10000},
+		{"openai/gpt-6.1-sol", Usage{InputTokens: 271000, CacheReadTokens: 1001, OutputTokens: 1000},
+			1084000 + 201 + 15000},
 	} {
 		got, err := tbl.Cost(c.model, c.u)
 		if err != nil || got != c.want {
@@ -88,6 +98,24 @@ func TestBoundCoversEveryOutcome(t *testing.T) {
 	if _, err := tbl.Bound([]string{"fake/cheap"}, 10, 0); err == nil {
 		t.Error("max_tokens 0 bounded")
 	}
+	// The single write price is OpenAI's dearest input. Past the long-context tier, counting
+	// the 10% padding, the bound pays the tier's prices; at it, the base prices.
+	sol, _ := tbl.Bound([]string{"openai/gpt-6.1-sol"}, 1000, 1000)
+	if want := int64(1100*2500/1000 + 1000*10); sol != want {
+		t.Errorf("gpt-6.1-sol bound %d, want %d", sol, want)
+	}
+	at, _ := tbl.Bound([]string{"openai/gpt-6.1-sol"}, 247272, 1000)   // padded: 272000
+	past, _ := tbl.Bound([]string{"openai/gpt-6.1-sol"}, 247273, 1000) // padded: 272001
+	if want := int64(272000*2500/1000 + 1000*10); at != want {
+		t.Errorf("bound at the tier %d, want %d", at, want)
+	}
+	if want := int64(272001*5000/1000 + 1000*15); past != want {
+		t.Errorf("bound past the tier %d, want %d", past, want)
+	}
+	// Whatever the input turns out to be, the request costs no more than the bound.
+	if c, _ := tbl.Cost("openai/gpt-6.1-sol", Usage{CacheWriteTokens: 272001, OutputTokens: 1000}); c > past {
+		t.Errorf("cost %d over the bound %d", c, past)
+	}
 }
 
 func TestLoadRejectsBadTables(t *testing.T) {
@@ -96,6 +124,9 @@ func TestLoadRejectsBadTables(t *testing.T) {
 		"unknown key":    "price_table_version: v1\nmodels: {m/x: {input: 1, output: 1, cache: 1}}\n",
 		"negative price": "price_table_version: v1\nmodels: {m/x: {input: -1, output: 1}}\n",
 		"too precise":    "price_table_version: v1\nmodels: {m/x: {input: 0.0001, output: 1}}\n",
+		"tier below 1x":  "price_table_version: v1\nmodels: {m/x: {input: 1, output: 1, long_context: {above: 10, input: 0.5, output: 1}}}\n",
+		"tier at 0":      "price_table_version: v1\nmodels: {m/x: {input: 1, output: 1, long_context: {above: 0, input: 2, output: 1}}}\n",
+		"tier unknown":   "price_table_version: v1\nmodels: {m/x: {input: 1, output: 1, long_context: {above: 10, input: 2, cache: 2}}}\n",
 	} {
 		path := filepath.Join(t.TempDir(), "prices.yaml")
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -104,5 +135,17 @@ func TestLoadRejectsBadTables(t *testing.T) {
 		if _, err := Load(path); err == nil {
 			t.Errorf("%s: loaded", name)
 		}
+	}
+}
+
+func TestFree(t *testing.T) {
+	tbl := load(t, table+"  local/cache-priced:        {input: 0, cache_read: 0.01, output: 0}\n")
+	for model, want := range map[string]bool{"local/llama": true, "fake/cheap": false, "local/cache-priced": false} {
+		if free, err := tbl.Free(model); err != nil || free != want {
+			t.Errorf("Free(%s) = %v, %v", model, free, err)
+		}
+	}
+	if _, err := tbl.Free("openai/not-copied-yet"); !errors.Is(err, ErrNoPrice) {
+		t.Errorf("an unpriced model: %v", err)
 	}
 }

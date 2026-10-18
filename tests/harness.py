@@ -279,6 +279,30 @@ class Stack:
         assert p.alive(), p.text()
         self.github_url = f"http://{addr.read_text()}/"
 
+    def start_modelsim(self) -> str:
+        """The simulated model providers T13 injects faults through (internal/modelsim): one
+        server for Anthropic's Messages API, OpenAI's Responses API and Chat Completions.
+        Returns its base URL."""
+        addr = self.tmp / "modelsim.addr"
+        self.modelsim_log = self.tmp / "modelsim.jsonl"
+        self.modelsim_faults = self.tmp / "modelsim-faults.json"
+        p = Proc("modelsim", [BIN / "modelsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
+                              "--log", self.modelsim_log, "--faults", self.modelsim_faults],
+                 self.tmp / "modelsim.log")
+        self.procs.append(p)
+        wait_for(lambda: addr.exists() or not p.alive(), "the simulated model providers")
+        assert p.alive(), p.text()
+        return f"http://{addr.read_text()}"
+
+    def model_faults(self, script: dict) -> None:
+        """The faults the simulated model providers answer with next, each once, per API."""
+        self.modelsim_faults.write_text(json.dumps(script))
+
+    def modelsim_requests(self, api: str) -> list[dict]:
+        """The simulated model providers' own record of the requests one API got."""
+        lines = self.modelsim_log.read_text().splitlines() if self.modelsim_log.exists() else []
+        return [e for e in map(json.loads, lines) if e["api"] == api]
+
     def hold_github(self, action: str, path: Path) -> None:
         """The simulated GitHub holds its answer to the next successful `action` (create_pull,
         create_comment, ...) after the write took effect, while `path` exists."""
@@ -519,10 +543,15 @@ class Stack:
         return any(e["msg"] == "model answered" and e.get("workflow_id") == run["run_id"] for e in self.agentd_log())
 
     def model_value(self, run: dict) -> dict:
-        """What the workflow got from the run's accepted model answer."""
-        [row] = [r for r in self.model_calls(run) if r["response_blob"] and r["stop_reason"] != "invalid_output"]
-        [blob] = self.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
-        return json.loads(blob["bytes"])["value"]
+        """What the workflow got from the run's accepted model answer: the one answer with
+        status ok, whatever refusals (a fallback's) or broken answers came before it."""
+        answers = []
+        for r in self.model_calls(run):
+            if r["response_blob"]:
+                [blob] = self.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", r["response_blob"].removeprefix("sha256:"))
+                answers.append(json.loads(blob["bytes"]))
+        [accepted] = [a for a in answers if a["status"] == "ok"]
+        return accepted["value"]
 
     def provider_calls(self, run: dict) -> list[dict]:
         """The fake model provider's own record of the requests it received for the run."""

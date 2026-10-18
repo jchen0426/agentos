@@ -1,9 +1,15 @@
-# models.yaml: which provider and model serve each task name (D11).
-# The openai_compat adapter arrives in M2c. Paths are relative to this file.
+# models.yaml: which provider and model serve each task name (D11). Paths are relative to this
+# file.
 providers:
   anthropic: {adapter: anthropic,     key: "keyring:agentos-anthropic-api-key", requests_per_minute: 20}   # account: the user agentd runs as
-  openai:    {adapter: openai_compat, base_url: "https://api.openai.com/v1", key: "keyring:agentos-openai-api-key"}
-  local:     {adapter: openai_compat, base_url: "http://127.0.0.1:11434/v1"}   # Ollama; vLLM uses the same adapter
+  # OpenAI's Responses API. GPT-6 models take efforts low to max.
+  openai:    {adapter: openai_compat, api: responses, base_url: "https://api.openai.com/v1",
+              key: "keyring:agentos-openai-api-key", requests_per_minute: 20, efforts: [low, medium, high, xhigh, max]}
+  # Ollama, on Chat Completions; vLLM uses the same adapter. Start Ollama with
+  # OLLAMA_CONTEXT_LENGTH=65536, the context_tokens here: it cuts longer input without a word.
+  # gpt-oss takes efforts low to high.
+  local:     {adapter: openai_compat, api: chat, base_url: "http://127.0.0.1:11434/v1", context_tokens: 65536,
+              efforts: [low, medium, high]}
 tasks:
   audit_v1:
     model: anthropic/claude-opus-5-5
@@ -13,5 +19,8 @@ tasks:
     output_schema: schemas/audit_report.json
     blobs: [patch]                         # stored as blobs; the workflow gets patch_ref
     # Server-side fallback for refusals: the reservation covers it, priced in prices.yaml.
-    # Cross-provider fallback (M2c) stays off unless listed here too.
     fallback: [anthropic/claude-opus-4-8]
+    # Other providers' models, asked in turn when the answer is still a refusal, each in a
+    # request of its own (design doc, section 9). Off unless listed; the policy must allow
+    # each provider for the task:
+    # cross_provider_fallback: [openai/gpt-6.1-sol, local/gpt-oss:20b]

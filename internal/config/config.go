@@ -217,14 +217,14 @@ func Load(path string) (*Config, error) {
 		if g.AuthorEmail == "" {
 			g.AuthorEmail = "agentos@agentos.invalid"
 		}
-		if g.Token == "" && !loopback(g.APIURL) {
+		if g.Token == "" && !Loopback(g.APIURL) {
 			return nil, fmt.Errorf("config %s: github.token is required for %s", path, g.APIURL)
 		}
 		// A lookup that finds nothing proves a write never took effect only once a request
 		// still in flight could no longer: past the client's timeout and GitHub's own 10s
 		// limit. A simulator on this machine applies a write as it receives it.
 		least := g.RequestTimeout + 10*time.Second
-		if loopback(g.APIURL) {
+		if Loopback(g.APIURL) {
 			least = g.RequestTimeout
 		}
 		if g.Settle < least {
@@ -243,8 +243,8 @@ func (c *Config) Mirrors() map[string]string {
 	return out
 }
 
-// loopback reports whether a URL points at this machine: only a simulator listens there.
-func loopback(raw string) bool {
+// Loopback reports whether a URL points at this machine: a simulator, or a local model server.
+func Loopback(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return false

@@ -30,12 +30,11 @@ UPDATE model_calls
 SET response_blob = ?, stop_reason = ?, usage_json = ?, finished_at = ?
 WHERE workflow_id = ? AND activity_id = ? AND attempt = ? AND request_seq = ?;
 
--- name: GetFinishedModelCall :one
+-- name: ListFinishedModelCalls :many
+-- The answered requests of one model call, in the order they were sent.
 SELECT * FROM model_calls
 WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
-  AND (stop_reason IS NULL OR stop_reason <> 'invalid_output')
-ORDER BY attempt, request_seq
-LIMIT 1;
+ORDER BY attempt, request_seq;
 
 -- name: InsertEffect :execrows
 INSERT INTO effects (
@@ -157,6 +156,11 @@ ORDER BY e.entry_id;
 INSERT INTO calls (workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT DO NOTHING;
+
+-- name: ListSameCalls :many
+-- Every call of a run with the same kind, name and arguments: a call that waited is sent
+-- again under a new activity.
+SELECT * FROM calls WHERE workflow_id = ? AND kind = ? AND name = ? AND args_sha256 = ?;
 
 -- name: SetCallOutcome :exec
 UPDATE calls SET outcome = ? WHERE workflow_id = ? AND activity_id = ? AND scheduled_at = ?;
