@@ -28,9 +28,11 @@ type OpenDraftPR struct {
 	DenyPaths []string // the policy's: the tool checks the patch itself
 }
 
-// githubPaths are refused whatever the policy says: GitHub itself acts on them (workflows run
-// with the repository's secrets, CODEOWNERS routes reviews, dependabot opens pull requests).
-var githubPaths = []string{".github/**"}
+// githubPaths are refused whatever the policy says: GitHub itself acts on them. Workflows run
+// with the repository's secrets, CODEOWNERS (in any of its three places) decides who must
+// review, dependabot opens pull requests, and a dev container's commands run in the Codespace
+// of whoever opens the branch there.
+var githubPaths = []string{".github/**", "CODEOWNERS", "docs/CODEOWNERS", ".devcontainer/**", ".devcontainer.json"}
 
 var prArgs = tools.MustSchema(`{
   "type": "object", "additionalProperties": false, "required": ["repo", "commit", "base_branch", "patch_ref"],

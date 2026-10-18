@@ -208,14 +208,19 @@ func TestOpenDraftPRLeavesAForeignBranchAlone(t *testing.T) {
 
 func TestOpenDraftPRDeniesProtectedPaths(t *testing.T) {
 	f := setup(t)
-	bad := strings.ReplaceAll(fix, "app/db.py", ".github/workflows/ci.yml")
-	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(bad))
-	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, DenyPaths: []string{".github/**"}}
-	_, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
-		"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref}))
-	var denied *tools.DeniedError
-	if !errors.As(err, &denied) {
-		t.Fatalf("got %v, want denied", err)
+	// No deny_paths in the policy: the paths GitHub acts on are refused anyway.
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs}
+	for _, path := range []string{".github/workflows/ci.yml", "CODEOWNERS", "docs/CODEOWNERS", ".devcontainer/devcontainer.json",
+		".devcontainer.json"} {
+		newFile := "diff --git a/" + path + " b/" + path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + path +
+			"\n@@ -0,0 +1 @@\n+x\n"
+		ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(newFile))
+		_, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
+			"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref}))
+		var denied *tools.DeniedError
+		if !errors.As(err, &denied) {
+			t.Errorf("%s: got %v, want denied", path, err)
+		}
 	}
 }
 
