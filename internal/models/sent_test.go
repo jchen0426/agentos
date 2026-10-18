@@ -66,6 +66,32 @@ func TestSentIsWhetherTheRequestWasWritten(t *testing.T) {
 			t.Errorf("%s: received %d, then %v: a request the provider read is not 'not sent'", name, received.Load(), err)
 		}
 
+		// The same over HTTP/2: the server reads the request whole, then resets the stream.
+		var h2 atomic.Int32
+		srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/show" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.ReadAll(r.Body)
+			if r.ProtoMajor == 2 {
+				h2.Add(1)
+			}
+			panic(http.ErrAbortHandler)
+		}))
+		srv.EnableHTTP2 = true
+		srv.StartTLS()
+		pool = x509.NewCertPool()
+		pool.AddCert(srv.Certificate())
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, NextProtos: []string{"h2", "http/1.1"}}
+		a, req = adapter(srv.URL)
+		_, err = a.Call(context.Background(), req)
+		tr.TLSClientConfig = saved
+		srv.Close()
+		if h2.Load() != 1 || err == nil || errors.Is(err, ErrNotSent) {
+			t.Errorf("%s: %d HTTP/2 requests read, then %v: a request the provider read is not 'not sent'", name, h2.Load(), err)
+		}
+
 		// A proxy refuses the tunnel: the request never reached the provider.
 		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusForbidden)

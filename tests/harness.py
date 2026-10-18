@@ -543,10 +543,15 @@ class Stack:
         return any(e["msg"] == "model answered" and e.get("workflow_id") == run["run_id"] for e in self.agentd_log())
 
     def model_value(self, run: dict) -> dict:
-        """What the workflow got from the run's accepted model answer."""
-        [row] = [r for r in self.model_calls(run) if r["response_blob"] and r["stop_reason"] != "invalid_output"]
-        [blob] = self.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
-        return json.loads(blob["bytes"])["value"]
+        """What the workflow got from the run's accepted model answer: the one answer with
+        status ok, whatever refusals (a fallback's) or broken answers came before it."""
+        answers = []
+        for r in self.model_calls(run):
+            if r["response_blob"]:
+                [blob] = self.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", r["response_blob"].removeprefix("sha256:"))
+                answers.append(json.loads(blob["bytes"]))
+        [accepted] = [a for a in answers if a["status"] == "ok"]
+        return accepted["value"]
 
     def provider_calls(self, run: dict) -> list[dict]:
         """The fake model provider's own record of the requests it received for the run."""

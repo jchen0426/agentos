@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -134,11 +135,15 @@ func (a *OpenAICompat) local(ctx context.Context, model string) error {
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("%w: %s answered %s about %s", ErrUnverified, a.provider, resp.Status, model)
 	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("ask %s about %s: %w", a.provider, model, err) // cut off: may pass
+	}
 	var show struct {
 		RemoteHost  string `json:"remote_host"`
 		RemoteModel string `json:"remote_model"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+	if err := json.Unmarshal(b, &show); err != nil {
 		return fmt.Errorf("%w: %s answered about %s with something else: %v", ErrUnverified, a.provider, model, err)
 	}
 	if show.RemoteHost != "" || show.RemoteModel != "" {
