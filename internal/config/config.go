@@ -1,5 +1,5 @@
 // Package config loads agentd.yaml. Relative paths are resolved against the directory of
-// the config file.
+// the config file; a path that starts with ~/ is in the home directory.
 package config
 
 import (
@@ -119,18 +119,22 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	home, homeErr := os.UserHomeDir()
+	var missingHome error // a ~/ path, and no home directory
 	abs := func(p string) string {
+		if rest, ok := strings.CutPrefix(p, "~/"); ok {
+			if homeErr != nil {
+				missingHome = homeErr
+			}
+			return filepath.Join(home, rest)
+		}
 		if p == "" || filepath.IsAbs(p) {
 			return p
 		}
 		return filepath.Join(base, p)
 	}
 	if c.DataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		c.DataDir = filepath.Join(home, ".agentos")
+		c.DataDir = "~/.agentos"
 	}
 	c.DataDir = abs(c.DataDir)
 	if c.ControlSocket == "" {
@@ -197,6 +201,9 @@ func Load(path string) (*Config, error) {
 	}
 	if len(c.GitTools.Sandbox) > 0 {
 		c.GitTools.Sandbox[0] = abs(c.GitTools.Sandbox[0])
+	}
+	if missingHome != nil {
+		return nil, fmt.Errorf("config %s: a ~/ path needs the home directory: %w", path, missingHome)
 	}
 	if c.GitTools.Timeout <= 0 {
 		c.GitTools.Timeout = time.Minute

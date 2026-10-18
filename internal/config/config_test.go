@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +81,84 @@ func TestDevClaudeConfigLoads(t *testing.T) {
 	// meet: injected text in a diff could open a pull request. This config only dry-runs.
 	if c.GitHub != nil {
 		t.Error("agentd-claude.yaml configures GitHub: with the dev policy, nothing would ask before writing")
+	}
+}
+
+// The tests and the README give a Worker the repository as its code directory, and its sandbox
+// lets it read all of that directory (and, on Linux, connect to any socket in it). So the dev
+// configs keep agentd's data, its sockets and the mirror out of the repository, in the home
+// directory, which the macOS sandbox cannot read and the Linux one does not mount.
+func TestDevConfigsKeepDataOutOfTheRepository(t *testing.T) {
+	repo, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"agentd.yaml", "agentd-claude.yaml"} {
+		c, err := Load(filepath.Join(repo, "config/dev", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths := []string{c.DataDir, c.ControlSocket}
+		if p, ok := strings.CutPrefix(c.RuntimeListen, "unix://"); ok {
+			paths = append(paths, p)
+		}
+		for _, r := range c.Repos {
+			paths = append(paths, r.Mirror)
+		}
+		for _, p := range paths {
+			if within(p, repo) || !within(p, home) {
+				t.Errorf("%s: %s is in the repository, or outside the home directory", name, p)
+			}
+		}
+	}
+}
+
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func TestPathsInTheHomeDirectory(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agentd.yaml")
+	if err := os.WriteFile(path, []byte("data_dir: ~/agentos-data\npolicy_file: p\nmodels_file: ~/m.yaml\nprices_file: x\n"+
+		"repos:\n  a/b: ~/mirrors/b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range [][2]string{
+		{c.DataDir, filepath.Join(home, "agentos-data")},
+		{c.ControlSocket, filepath.Join(home, "agentos-data", "control", "control.sock")},
+		{c.ModelsFile, filepath.Join(home, "m.yaml")},
+		{c.Repos["a/b"].Mirror, filepath.Join(home, "mirrors", "b")},
+		{c.PolicyFile, filepath.Join(dir, "p")}, // relative: next to the config
+	} {
+		if p[0] != p[1] {
+			t.Errorf("got %s, want %s", p[0], p[1])
+		}
+	}
+
+	// Without a home directory, a ~/ path is an error, not a directory named ~.
+	t.Setenv("HOME", "")
+	if c, err := Load(path); err == nil {
+		t.Errorf("loaded without a home directory: data_dir %s", c.DataDir)
+	}
+	if err := os.WriteFile(path, []byte("data_dir: d\npolicy_file: p\nmodels_file: m\nprices_file: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Errorf("a config without ~/ paths needs no home directory: %v", err)
 	}
 }
 

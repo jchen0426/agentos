@@ -2,14 +2,14 @@
 # the agentos-anthropic-api-key item in the login keychain; see the README. No github section, on
 # purpose: the dev policy opens PRs without approval, and until approvals arrive (M4) text in a
 # diff could steer a real model into one. The GitHub tools only dry-run.
-data_dir: ../../.agentos
+data_dir: ~/.agentos
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml
 models_file: ../models.yaml
 prices_file: ../prices.yaml
 repos:
-  acme/payments: ../../.agentos/mirror      # any local git repository
+  acme/payments: ~/.agentos/mirror      # any local git repository
 # agentd reads repositories through the git tool server, run per call in this sandbox (macOS;
 # on Linux, ../../sandbox/linux/run-tool.sh). It needs `npm ci` in sandbox/macos.
 git_tools: {sandbox: [../../sandbox/macos/run-tool.sh]}

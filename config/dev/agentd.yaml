@@ -1,14 +1,16 @@
 # Development setup: Temporal's dev server on 127.0.0.1:7233, the fake model. No github section:
 # the GitHub tools only dry-run (see the README to write to a test repository).
-# Paths are relative to this file. On Linux, use the default unix:// Runtime socket instead.
-data_dir: ../../.agentos
+# Paths are relative to this file, or to the home directory (~/). On Linux, use the default
+# unix:// Runtime socket instead. agentd's data stays out of this repository: a sandboxed Worker
+# is given it as its code directory, and could read anything in it.
+data_dir: ~/.agentos
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml
 models_file: models.yaml
 prices_file: prices.yaml
 repos:
-  acme/payments: ../../.agentos/mirror      # any local git repository
+  acme/payments: ~/.agentos/mirror      # any local git repository
 # agentd reads repositories through the git tool server, run per call in this sandbox (macOS;
 # on Linux, ../../sandbox/linux/run-tool.sh). It needs `npm ci` in sandbox/macos.
 git_tools: {sandbox: [../../sandbox/macos/run-tool.sh]}

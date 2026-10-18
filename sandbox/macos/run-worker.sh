@@ -7,7 +7,11 @@
 #   - network: allowedDomains = ["127.0.0.1:<runtime port>"], allowLocalBinding = false
 #   - files: the home directory, and any colon-separated paths in AGENTOS_SANDBOX_DENY_READ,
 #     are unreadable except the Python environment and the task code; writes only to a
-#     private temporary directory
+#     private temporary directory. Everything else can be read, so agentd's data directory
+#     belongs under the home directory (or in AGENTOS_SANDBOX_DENY_READ), and the launcher
+#     refuses a Python environment or code directory that holds it: the Worker could read its
+#     ledger. It looks when it starts the Worker. Unix sockets need no such check: srt lets the
+#     sandbox connect to none
 #   - environment: cleared, except what srt adds (its proxy variables)
 #
 # Usage: run-worker.sh <runtime-port> <python-env-dir> <code-dir> -- <command> [args...]
@@ -20,6 +24,13 @@ fi
 port=$1 pyenv=$2 code=$3
 shift 4
 [[ $port =~ ^[0-9]{1,5}$ ]] || { echo "$0: bad port $port" >&2; exit 2; }
+for dir in "$pyenv" "$code"; do
+  found=$(find -H "$dir" -name ledger.db -print -quit) || { echo "$0: cannot look through $dir" >&2; exit 1; }
+  if [[ -n $found ]]; then
+    echo "$0: $dir holds agentd's data directory, whose ledger ($found) the Worker could read" >&2
+    exit 1
+  fi
+done
 here=$(cd "$(dirname "$0")" && pwd)
 srt="$here/node_modules/.bin/srt"
 [[ -x $srt ]] || { echo "$0: run 'npm ci' in $here first" >&2; exit 1; }

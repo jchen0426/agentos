@@ -4,7 +4,11 @@
 #     so neither the host's Temporal port nor anything else on the network is reachable;
 #   - allowlisted mounts only: /usr read-only, the Python environment and the task code
 #     read-only. The home directory and the host's /run (D-Bus session bus, ssh-agent,
-#     docker.sock) are never mounted;
+#     docker.sock) are never mounted. The Worker sees all of the two directories it is given,
+#     so the launcher refuses either if it holds a Unix socket, which a read-only mount does not
+#     stop the Worker from connecting to, or agentd's data directory (its ledger, and by default
+#     its Control socket). It looks when it starts the Worker; what appears there later, the
+#     Worker sees too;
 #   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root and
 #     /dev, tmpfs mounts bwrap makes as large as half the memory, are read-only; /tmp and /run
 #     are only directories in the root. A tmpfs's data, inodes and extended attributes are
@@ -43,6 +47,17 @@ runtime_dir=$(dirname "$runtime_sock")
 sock_name=$(basename "$runtime_sock")
 extra=$(find "$runtime_dir" -mindepth 1 -maxdepth 1 ! -name "$sock_name" -print -quit)
 [[ -z $extra ]] || { echo "$0: $runtime_dir must hold only the Runtime socket, found $extra" >&2; exit 1; }
+for dir in "$pyenv" "$code"; do
+  found=$(find -H "$dir" \( -type s -o -name ledger.db \) -print -quit) ||
+    { echo "$0: cannot look through $dir" >&2; exit 1; }
+  if [[ -S $found ]]; then
+    echo "$0: $dir holds the Unix socket $found, which the Worker could connect to" >&2
+    exit 1
+  elif [[ -n $found ]]; then
+    echo "$0: $dir holds agentd's data directory, whose ledger ($found) the Worker could read" >&2
+    exit 1
+  fi
+done
 
 inner_sock=/run/agentos/$sock_name
 args=(

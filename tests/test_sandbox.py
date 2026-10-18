@@ -1,7 +1,9 @@
 """The Worker sandbox and its bridge to Temporal (design doc, section 8; the M1 prototype
 of T9). Inside the sandbox the Temporal SDK reaches Temporal through agentd's Runtime entry,
 and nothing else: not Temporal's own port, not the Control socket, not the network, not the
-home directory, not the caller's environment. On Linux it can create no files at all.
+home directory, not the caller's environment. On Linux it can create no files at all. The
+launchers refuse a code directory or Python environment that would expose agentd's data or, on
+Linux, any Unix socket.
 
 Run with AGENTOS_SANDBOX=srt on macOS or AGENTOS_SANDBOX=bwrap on Linux.
 """
@@ -69,18 +71,57 @@ print(json.dumps(report))
 """
 
 
+REACH_PROBE = r"""
+import json, socket, sys
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f"read {len(f.read())} bytes"
+    except OSError as e:
+        return f"refused: {type(e).__name__}"
+
+def connect(path):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(3)
+            s.connect(path)
+            return "connected"
+    except OSError as e:
+        return f"refused: {type(e).__name__}"
+
+print(json.dumps({"file": read(sys.argv[1]), "socket": connect(sys.argv[2])}))
+"""
+
+
+def launcher(runtime: Path | int, pyenv: str | Path = sys.prefix, code: Path = REPO) -> list[str]:
+    """How Workers are launched: forwarding to the Runtime socket (Linux) or port (macOS), with
+    the Python environment and the code directory the sandbox lets them see."""
+    script = "sandbox/linux/run-worker.sh" if SANDBOX == "bwrap" else "sandbox/macos/run-worker.sh"
+    return [str(REPO / script), str(runtime), str(pyenv), str(code), "--"]
+
+
+def runtime_entry(stack: Stack) -> Path | int:
+    return stack.runtime_socket if SANDBOX == "bwrap" else stack.runtime_port
+
+
+def reach(launch: list[str], file: Path, sock: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Runs REACH_PROBE in the sandbox. The interpreter itself, not a virtual environment's link
+    to it: the Python environment the launcher is given need not be one."""
+    return subprocess.run([*launch, os.path.realpath(sys.executable), "-I", "-c", REACH_PROBE, str(file), str(sock)],
+                          capture_output=True, text=True, timeout=60, cwd=REPO, env=env)
+
+
 def probe(stack: Stack, canary: Path) -> dict:
     args = [sys.executable, REPO / "tests/sandbox_probe.py",
             "--temporal-port", stack.temporal_address.rsplit(":", 1)[1],
             "--control-socket", stack.control_socket, "--home", Path.home(), "--home-canary", canary,
             "--ledger", stack.data_dir / "ledger.db"]
     if SANDBOX == "bwrap":
-        launcher = [REPO / "sandbox/linux/run-worker.sh", stack.runtime_socket, sys.prefix, REPO, "--"]
         args += ["--runtime", "127.0.0.1:7233"]
     else:
-        launcher = [REPO / "sandbox/macos/run-worker.sh", stack.runtime_port, sys.prefix, REPO, "--"]
         args += ["--runtime", f"127.0.0.1:{stack.runtime_port}", "--proxy", "env"]
-    r = subprocess.run([str(a) for a in [*launcher, *args]], capture_output=True, text=True, timeout=120,
+    r = subprocess.run([*launcher(runtime_entry(stack)), *map(str, args)], capture_output=True, text=True, timeout=120,
                        cwd=REPO, env={**stack.sandbox_env(), "AGENTOS_TEST_CANARY": "a secret the Worker must not see"})
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -103,6 +144,56 @@ def test_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack) -> No
                 "keychains", "keychain_items"):
         assert report[key].startswith("refused"), (key, report[key])
     assert "AGENTOS_TEST_CANARY" not in report["env"]
+
+
+@pytest.mark.parametrize("holder", ["code", "code-symlink", "python-env"])
+def test_worker_launcher_refuses_agentd_data_in_reach(stack: Stack, holder: str) -> None:
+    """A Worker sees the whole of its code directory and its Python environment. Given one that
+    holds agentd's data directory, it could read the ledger and, on Linux, connect to the
+    Control socket in it: a read-only mount does not stop connect(). The dev configs once kept
+    their data in the repository, which the tests and the README give Workers as their code.
+    The launchers refuse such a directory, so that mistake cannot go unnoticed."""
+    exposed = stack.sock_dir / "exposed"  # under /tmp: the Control socket's path must stay short
+    stack.data_dir = exposed / "data"
+    if holder != "python-env":
+        # As in the dev configs: the Control socket in the data directory. Otherwise the ledger
+        # alone, which the launchers must recognize without a socket next to it.
+        stack.control_socket = stack.data_dir / "control" / "control.sock"
+    stack.start_agentd()
+    clean = stack.sock_dir / "clean"
+    clean.mkdir()
+    given = exposed  # the directory as the launcher is given it
+    if holder == "code-symlink":
+        given = stack.sock_dir / "link"
+        given.symlink_to(exposed, target_is_directory=True)
+    pyenv, code = (given, clean) if holder == "python-env" else (sys.prefix, given)
+    sock = stack.control_socket if holder == "python-env" else given / "data" / "control" / "control.sock"
+    r = reach(launcher(runtime_entry(stack), pyenv, code), given / "data" / "ledger.db", sock, env=stack.sandbox_env())
+    assert r.returncode != 0 and not r.stdout, f"the Worker started and reached {r.stdout}"
+    assert str(given) in r.stderr, r.stderr  # the launcher names what it refused
+
+
+@pytest.mark.skipif(SANDBOX != "bwrap", reason="the macOS sandbox can connect to no Unix socket at all")
+def test_worker_launcher_refuses_a_socket_in_the_code_dir() -> None:
+    """Any Unix socket the Linux sandbox can see is a way out of it: the Runtime socket is
+    reached just that way, from a directory that holds nothing else. The launcher refuses a code
+    directory with another socket in it, here standing in for ssh-agent's, Docker's or a second
+    agentd's."""
+    sock_dir = Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
+    try:
+        (sock_dir / "runtime").mkdir()
+        code = sock_dir / "code"
+        code.mkdir()
+        with socket.socket(socket.AF_UNIX) as runtime, socket.socket(socket.AF_UNIX) as other:
+            runtime.bind(str(sock_dir / "runtime" / "runtime.sock"))
+            other.bind(str(code / "other.sock"))
+            other.listen()
+            r = reach(launcher(sock_dir / "runtime" / "runtime.sock", sys.prefix, code), code / "absent",
+                      code / "other.sock")
+    finally:
+        shutil.rmtree(sock_dir, ignore_errors=True)
+    assert r.returncode != 0 and not r.stdout, f"the Worker started and reached {r.stdout}"
+    assert str(code / "other.sock") in r.stderr, r.stderr
 
 
 @pytest.mark.skipif(SANDBOX != "bwrap", reason="the Linux sandbox's own mounts")

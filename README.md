@@ -55,13 +55,14 @@ runs without the global configuration, so `safe.directory` does not apply.
 
 ```bash
 uv sync --group dev && make build
-temporal server start-dev --db-filename .agentos/temporal.db --search-attribute AgentState=Keyword
+mkdir -p -m 700 ~/.agentos
+temporal server start-dev --db-filename ~/.agentos/temporal.db --search-attribute AgentState=Keyword
 ```
 
 Without `--db-filename` the dev server keeps everything in memory and loses every run when
-it exits.
+it exits. The dev configs keep agentd's data in `~/.agentos` too, out of the repository.
 
-In another shell, with any git repository at `.agentos/mirror` standing in for `acme/payments`
+In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under
 sandbox-runtime: run `npm ci` in `sandbox/macos` once):
 
@@ -77,7 +78,7 @@ uv run python -m agentos_worker --endpoint 127.0.0.1:7244
 ```
 
 ```bash
-bin/agentctl --socket .agentos/control/control.sock runs start security-audit --repo acme/payments --commit <sha> --base main
+bin/agentctl runs start security-audit --repo acme/payments --commit <sha> --base main
 ```
 
 The dev configs leave GitHub out, so the GitHub tools only dry-run: they render and record the
@@ -87,7 +88,7 @@ fine-grained token in the keychain, and map the logical repository to its GitHub
 
 ```yaml
 repos:
-  acme/payments: {mirror: ../../.agentos/mirror, github: <owner>/<test-repo>}
+  acme/payments: {mirror: ~/.agentos/mirror, github: <owner>/<test-repo>}
 github: {token: "keyring:agentos-github-token"}
 ```
 
@@ -98,11 +99,11 @@ A write whose outcome nobody knows (agentd stopped after sending it, and the too
 up) waits in `WAITING_RECONCILE`. Check the outside world, then say what you found:
 
 ```bash
-bin/agentctl --socket .agentos/control/control.sock reconcile list
+bin/agentctl reconcile list
 ```
 
 ```bash
-bin/agentctl --socket .agentos/control/control.sock reconcile resolve <effect-id> --not-executed
+bin/agentctl reconcile resolve <effect-id> --not-executed
 ```
 
 `--executed --result '{...}'` records what the write produced instead, and `--executed --lookup`
@@ -153,12 +154,18 @@ ollama pull gpt-oss:20b
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 
 ```bash
-bin/agentctl --socket .agentos/control/control.sock budget extend <run-id> --usd 2.50
+bin/agentctl budget extend <run-id> --usd 2.50
 ```
 
 That Worker runs unsandboxed, for development only. Sandboxed, it starts through
-`sandbox/macos/run-worker.sh` (macOS) or `sandbox/linux/run-worker.sh` (Linux); see the
-headers of those scripts.
+`sandbox/macos/run-worker.sh` (macOS) or `sandbox/linux/run-worker.sh` (Linux), with `python`
+as its code directory; see the headers of those scripts. A sandboxed Worker can read all of its
+code directory and Python environment, so a launcher refuses either if it holds agentd's data
+directory or, on Linux, any Unix socket (a read-only mount does not stop `connect()`).
+
+```bash
+sandbox/macos/run-worker.sh 7244 "$PWD/.venv" "$PWD/python" -- "$PWD/.venv/bin/python" -m agentos_worker --endpoint 127.0.0.1:7244 --http-connect-proxy env
+```
 
 ## Tests
 
