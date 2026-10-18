@@ -42,6 +42,12 @@ func TestDevConfigLoads(t *testing.T) {
 	if c.TaskQueues.Gateway != "gateway" || c.TaskQueues.Workflows != "agentos-workflows" {
 		t.Errorf("task queues: %+v", c.TaskQueues)
 	}
+	if len(c.GitTools.Sandbox) != 1 {
+		t.Fatalf("git_tools.sandbox: %v", c.GitTools.Sandbox)
+	}
+	if _, err := os.Stat(c.GitTools.Sandbox[0]); err != nil {
+		t.Errorf("the git tool launcher: %v", err)
+	}
 	if _, err := policy.Load(c.PolicyFile); err != nil {
 		t.Error(err)
 	}

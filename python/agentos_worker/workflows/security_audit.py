@@ -23,6 +23,9 @@ WAIT_STATES = {  # gateway status -> AgentState while waiting
     "needs_reconcile": "WAITING_RECONCILE",
     "budget_exhausted": "PAUSED_BUDGET",
 }
+# github.comment_commit refuses an outcome over 100,000 characters and shows 2,000 of it. An
+# error's text can be any length: the report must go out all the same.
+MAX_OUTCOME = 4000
 
 
 @dataclass
@@ -95,6 +98,7 @@ class SecurityAudit:
             if isinstance(e.cause, CancelledError):
                 raise  # a cancelled run posts no report
             outcome, report_ref, pr_url = f"failed: {e.cause}", self.report_ref, None
+        outcome = outcome[:MAX_OUTCOME]
         # Every other end path posts a report (section 3).
         status, _ = await self.call(
             "tool", "github.comment_commit", repo=a.repo, commit=a.commit,

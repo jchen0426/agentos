@@ -28,11 +28,11 @@ type OpenDraftPR struct {
 	DenyPaths []string // the policy's: the tool checks the patch itself
 }
 
-// githubPaths are refused whatever the policy says: GitHub itself acts on them. Workflows run
+// ProtectedPaths are refused whatever the policy says: GitHub itself acts on them. Workflows run
 // with the repository's secrets, CODEOWNERS (in any of its three places) decides who must
 // review, dependabot opens pull requests, and a dev container's commands run in the Codespace
 // of whoever opens the branch there.
-var githubPaths = []string{".github/**", "CODEOWNERS", "docs/CODEOWNERS", ".devcontainer/**", ".devcontainer.json"}
+var ProtectedPaths = []string{".github/**", "CODEOWNERS", "docs/CODEOWNERS", ".devcontainer/**", ".devcontainer.json"}
 
 var prArgs = tools.MustSchema(`{
   "type": "object", "additionalProperties": false, "required": ["repo", "commit", "base_branch", "patch_ref"],
@@ -93,7 +93,7 @@ func (t *OpenDraftPR) Prepare(ctx context.Context, req tools.Request) (json.RawM
 		return nil, &tools.DeniedError{Reason: "no GitHub repository is configured for " + tools.String(req.Args, "repo")}
 	}
 	commit, ref := tools.String(req.Args, "commit"), tools.String(req.Args, "patch_ref")
-	changes, err := tools.CheckedPatch(ctx, t.Blobs, req.WorkflowID, ref, append(githubPaths, t.DenyPaths...), repo.Mirror, commit)
+	changes, err := tools.CheckedPatch(ctx, t.Blobs, req.WorkflowID, ref, append(slices.Clone(ProtectedPaths), t.DenyPaths...), repo.Mirror, commit)
 	if err != nil {
 		return nil, err
 	}

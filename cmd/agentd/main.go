@@ -11,10 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +38,7 @@ import (
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gateway"
 	"github.com/jchen0426/agentos/internal/githubtool"
+	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
@@ -54,6 +57,7 @@ func main() {
 	configPath := flag.String("config", "agentd.yaml", "path to agentd.yaml")
 	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the tools and the fake model")
 	testTools := flag.Bool("test-tools", false, "TESTS ONLY: also offer test.unsafe_write, a write to a local log")
+	insecureDev := flag.Bool("insecure-dev", false, "DEVELOPMENT ONLY: run the git tool server without a sandbox when git_tools.sandbox is unset")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	flag.Parse()
 
@@ -64,13 +68,13 @@ func main() {
 	}
 	// The log carries values the Worker chose (activity IDs, call names): no raw controls.
 	log := slog.New(slog.NewJSONHandler(safetext.JSONWriter(os.Stderr), &slog.HandlerOptions{Level: level}))
-	if err := run(*configPath, *faultScript, *testTools, log); err != nil {
+	if err := run(*configPath, *faultScript, *testTools, *insecureDev, log); err != nil {
 		log.Error("agentd stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath, faultScript string, testTools bool, log *slog.Logger) error {
+func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -160,7 +164,16 @@ func run(configPath, faultScript string, testTools bool, log *slog.Logger) error
 			}
 		}
 	}
-	toolset, err := buildTools(cfg, pol, led, testTools, log)
+	git, err := gitServer(cfg, insecureDev, log)
+	if err != nil {
+		return err
+	}
+	// Real calls through the launcher before any run: a sandbox that cannot work stops agentd
+	// here, instead of failing every run's first tool call.
+	if err := git.SelfCheck(ctx); err != nil {
+		return fmt.Errorf("the git tool server does not work: %w", err)
+	}
+	toolset, err := buildTools(cfg, pol, led, git, testTools, log)
 	if err != nil {
 		return err
 	}
@@ -323,7 +336,7 @@ func lockDataDir(dir string) (*os.File, error) {
 
 // buildTools makes the tools agentd offers. The GitHub tools need the github section of the
 // config and a token; without them they only dry-run.
-func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, testTools bool, log *slog.Logger) (tools.Registry, error) {
+func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git *gitmcp.Client, testTools bool, log *slog.Logger) (tools.Registry, error) {
 	var gh *githubtool.Client
 	if g := cfg.GitHub; g != nil {
 		var token string
@@ -348,8 +361,12 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, test
 		repos[id] = githubtool.Repo{Mirror: r.Mirror, Owner: owner, Name: name}
 	}
 	reg := tools.Registry{}
-	reg.Add(&tools.ShowDiff{Blobs: led})
-	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: pol.Tools["git.apply_check"].DenyPaths})
+	reg.Add(&tools.ShowDiff{Blobs: led, Mirrors: cfg.Mirrors(), Git: git})
+	// git.apply_check refuses what github.open_draft_pr would: a patch it passes is one that tool
+	// takes, whatever the two tools' deny_paths say.
+	applyDeny := slices.Concat(githubtool.ProtectedPaths, pol.Tools["git.apply_check"].DenyPaths,
+		pol.Tools["github.open_draft_pr"].DenyPaths)
+	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
 	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths})
 	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: led})
 	if testTools {
@@ -357,6 +374,53 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, test
 		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})
 	}
 	return reg, nil
+}
+
+// gitServer is how agentd runs the read-only git MCP server. Its sandbox launcher is required:
+// the server reads repositories, which are untrusted. --insecure-dev lets a developer run it
+// without one, and every start says so.
+func gitServer(cfg *config.Config, insecureDev bool, log *slog.Logger) (*gitmcp.Client, error) {
+	g := cfg.GitTools
+	if g.Server == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		g.Server = filepath.Join(filepath.Dir(self), "agentos-mcp-git")
+	}
+	if _, err := os.Stat(g.Server); err != nil {
+		return nil, fmt.Errorf("git tool server: %w (build it with make build, or set git_tools.server)", err)
+	}
+	switch {
+	case len(g.Sandbox) > 0:
+		if _, err := os.Stat(g.Sandbox[0]); err != nil {
+			return nil, fmt.Errorf("git_tools.sandbox: %w", err)
+		}
+	case insecureDev:
+		log.Warn("THE GIT TOOL SERVER RUNS WITHOUT A SANDBOX (--insecure-dev): development only")
+	default:
+		return nil, errors.New("git_tools.sandbox is required: the launcher in sandbox/macos or sandbox/linux " +
+			"(or start agentd with --insecure-dev, for development only)")
+	}
+	return gitmcp.NewClient(gitmcp.Options{Server: g.Server, Sandbox: g.Sandbox, DenyRead: toolDenyRead(cfg),
+		Timeout: g.Timeout, Log: log.With("component", "git-tools")})
+}
+
+// toolDenyRead is what the git tool server must not read, whatever its launcher allows:
+// agentd's data, its control socket and Runtime socket, the Temporal client certificate and
+// key, and every mirror (the launcher lets the server read the call's own).
+func toolDenyRead(cfg *config.Config) []string {
+	deny := []string{cfg.DataDir, filepath.Dir(cfg.ControlSocket)}
+	if p, ok := strings.CutPrefix(cfg.RuntimeListen, "unix://"); ok {
+		deny = append(deny, filepath.Dir(p))
+	}
+	if t := cfg.Temporal.TLS; t != nil {
+		deny = append(deny, t.CertFile, t.KeyFile)
+	}
+	for _, id := range slices.Sorted(maps.Keys(cfg.Repos)) {
+		deny = append(deny, cfg.Repos[id].Mirror)
+	}
+	return deny
 }
 
 func mkdirPrivate(dir string) error {

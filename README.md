@@ -14,7 +14,9 @@ loop limits ([docs/m2-notes.md](docs/m2-notes.md)). M3a adds the effect protocol
 writes: each one is rendered and recorded before it is claimed and sent, recovered by its class
 after a crash, and settled by a person when nobody can tell what happened; plus the GitHub
 write tools, tool argument schemas, dry runs and a lock that keeps one agentd per data
-directory ([docs/m3-notes.md](docs/m3-notes.md)).
+directory ([docs/m3-notes.md](docs/m3-notes.md)). M3b reads repositories through a read-only
+git MCP server that agentd runs once per call in a sandbox: the call's mirror read-only, a
+private temporary directory, no network.
 
 ## Layout
 
@@ -24,6 +26,7 @@ directory ([docs/m3-notes.md](docs/m3-notes.md)).
 | `cmd/agentd`, `cmd/agentctl` | the daemon and its command line |
 | `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol (claims, recovery by class, reconciliation) |
 | `internal/tools`, `internal/patch` | the tools and the effect class and argument schema each declares; checks and applies a model's patch |
+| `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`) and agentd's client, which runs it once per call in a sandbox |
 | `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
 | `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to |
 | `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |
@@ -33,16 +36,18 @@ directory ([docs/m3-notes.md](docs/m3-notes.md)).
 | `internal/control` | the Control service on the 0700 control socket |
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
-| `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T7 (concurrent calls against one budget), T8, T10, T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the sandbox probe, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T7 (concurrent calls against one budget), T8, T10, T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
 ## Requirements
 
 Go 1.26, Python 3.12 with [uv](https://docs.astral.sh/uv/), the Temporal CLI
-(`brew install temporal`), git. For the macOS sandbox: Node 22 (`npm ci` in
-`sandbox/macos`). For the Linux sandbox: bubblewrap and socat, or the Lima VM
-(`brew install lima`, then `make vm`).
+(`brew install temporal`), git 2.41 or later (the git tool server reads attributes from the
+empty tree, `GIT_ATTR_SOURCE`). For the macOS sandbox: Node 22 (`npm ci` in
+`sandbox/macos`). For the Linux sandbox: bubblewrap 0.8 or later and socat, or the Lima VM
+(`brew install lima`, then `make vm`). Mirrors must belong to the user agentd runs as: git
+runs without the global configuration, so `safe.directory` does not apply.
 
 ## Run it by hand
 
@@ -54,11 +59,16 @@ temporal server start-dev --db-filename .agentos/temporal.db --search-attribute 
 Without `--db-filename` the dev server keeps everything in memory and loses every run when
 it exits.
 
-In another shell, with any git repository at `.agentos/mirror` standing in for `acme/payments`:
+In another shell, with any git repository at `.agentos/mirror` standing in for `acme/payments`
+(agentd reads it through the git tool server, which the dev config runs per call under
+sandbox-runtime: run `npm ci` in `sandbox/macos` once):
 
 ```bash
 bin/agentd --config config/dev/agentd.yaml
 ```
+
+Without a sandbox for the git tool server, agentd refuses to start; `--insecure-dev` runs the
+server unsandboxed, for development only, and says so at every start.
 
 ```bash
 uv run python -m agentos_worker --endpoint 127.0.0.1:7244
@@ -140,6 +150,17 @@ AGENTOS_MODEL=claude AGENTOS_SANDBOX=srt uv run pytest tests/test_t1_worker_cras
 
 ```bash
 AGENTOS_LIVE=1 go test ./internal/models -run Live
+```
+
+T2 once against a real test repository (design doc, section 11), with the fake model. The
+repository holds `scripts/make-audit-target.sh`'s fixture, has Actions turned off and no
+secrets, and agentd gets a fine-grained token for it alone (Contents and Pull requests: read
+and write) from its own login keychain item, `agentos-github-test-token`. The Worker runs in its
+sandbox, since agentd holds a real token; the run leaves one draft PR and one commit comment
+there.
+
+```bash
+AGENTOS_GITHUB=live AGENTOS_GITHUB_REPO=<owner>/<name> AGENTOS_SANDBOX=srt uv run pytest tests/test_t2_live.py -s
 ```
 `go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation.
 
