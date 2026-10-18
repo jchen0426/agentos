@@ -81,7 +81,8 @@ type CountRunEffectsParams struct {
 	EffectID   string
 }
 
-// A run's effects of one tool that went out or may have, other than the one asked about.
+// A run's effects of one tool that went out or may have, or that the tool refused as it was to
+// send them (DENIED: its checks may have cost requests), other than the one asked about.
 func (q *Queries) CountRunEffects(ctx context.Context, arg CountRunEffectsParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRunEffects, arg.WorkflowID, arg.Tool, arg.EffectID)
 	var column_1 int64

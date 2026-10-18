@@ -29,7 +29,7 @@ run's commit and reads the files a patch touches through the same server.
 | `internal/tools`, `internal/patch` | the tools and the effect class and argument schema each declares; checks and applies a model's patch |
 | `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`, `resolve_commit`, `read_files`) and agentd's client, which runs it once per call in a sandbox |
 | `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
-| `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to |
+| `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to, which holds the mirror's commits and trees |
 | `internal/modelsim`, `cmd/modelsim` | the simulated model providers (Anthropic, OpenAI's Responses API, Chat Completions) that T13 injects faults through |
 | `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |
 | `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude, OpenAI-compatible and fake adapters; keys from the OS keyring |

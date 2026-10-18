@@ -1,11 +1,14 @@
 // Package githubsim stands in for the parts of GitHub's REST API that the GitHub tools use,
 // for tests (design doc, section 11: T2 and T3 run against a simulated external API). It keeps
-// everything in memory and logs every request it answers. A fault file can hold the answer to
-// a write after the write took effect, which puts a crash between the write and agentd
-// recording it. It checks no credentials: it logs whether a request carried a token.
+// what the tools write in memory and logs every request it answers; a repository's own commits
+// and trees it reads from a local copy. A fault file can hold the answer to a write after the
+// write took effect, which puts a crash between the write and agentd recording it, or make
+// GitHub's trees disagree with that copy. It checks no credentials: it logs whether a request
+// carried a token.
 package githubsim
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -13,27 +16,45 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jchen0426/agentos/internal/gitenv"
 )
 
 // Faults is the fault file: for each action ("create_pull", "create_comment", ...), a path
 // the answer waits on, after the write took effect, while that path exists.
 type Faults struct {
 	HoldAfter map[string]string `json:"hold_after"`
+	// Entries changes the entry of that name in every tree GitHub lists: GitHub then holds
+	// something other than the repository's copy, and the mirror agentd reads.
+	Entries map[string]Entry `json:"entries"`
+}
+
+// Entry is what a tree listing shows of one entry in place of the repository's: the fields
+// set.
+type Entry struct {
+	Mode string `json:"mode,omitempty"`
+	Type string `json:"type,omitempty"`
+	SHA  string `json:"sha,omitempty"`
 }
 
 type Server struct {
 	Login      string // the account the token belongs to
 	LogPath    string // one JSON line per request
-	FaultsPath string // read on every write; may be absent
+	FaultsPath string // read on every write and tree listing; may be absent
+	// Repos holds, for "owner/name", a local copy of the repository on GitHub: GitHub has its
+	// commits and trees, and no others. A repository not listed has any 40-hex SHA as a
+	// commit, whose tree nobody can list.
+	Repos map[string]string
 
 	mu       sync.Mutex
-	commits  map[string]commit // created through the API; any other 40-hex SHA is an existing commit
+	commits  map[string]commit // created through the API
 	refs     map[string]string // "owner/repo heads/branch" -> commit
 	pulls    map[string][]*pull
 	comments map[string][]*comment // "owner/repo commit" -> comments
@@ -71,8 +92,10 @@ type comment struct {
 
 var (
 	reUser     = regexp.MustCompile(`^/user$`)
+	reRepo     = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)$`)
 	reCommit   = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/commits/([0-9a-f]{40})$`)
 	reCommits  = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/commits$`)
+	reTree     = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/trees/([0-9a-f]{40})$`)
 	reTrees    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/trees$`)
 	reRef      = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/ref/(heads/.+)$`)
 	reRefs     = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/refs$`)
@@ -95,8 +118,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch m := match(p); {
 	case r.Method == http.MethodGet && reUser.MatchString(p):
 		s.answer(w, r, "get_user", http.StatusOK, map[string]any{"login": s.Login}, nil)
+	case r.Method == http.MethodGet && m(reRepo) != nil:
+		g := m(reRepo)
+		s.answer(w, r, "get_repo", http.StatusOK, map[string]any{"name": g[2], "full_name": g[1] + "/" + g[2],
+			"owner": map[string]any{"login": g[1]}}, nil)
 	case r.Method == http.MethodGet && m(reCommit) != nil:
-		s.getCommit(w, r, m(reCommit)[3])
+		g := m(reCommit)
+		s.getCommit(w, r, g[1]+"/"+g[2], g[3])
+	case r.Method == http.MethodGet && m(reTree) != nil:
+		g := m(reTree)
+		s.getTree(w, r, g[1]+"/"+g[2], g[3])
 	case r.Method == http.MethodPost && m(reTrees) != nil:
 		sha := hash(body)
 		s.answer(w, r, "create_tree", http.StatusCreated, map[string]any{"sha": sha}, nil)
@@ -136,12 +167,19 @@ func match(path string) func(*regexp.Regexp) []string {
 	return func(re *regexp.Regexp) []string { return re.FindStringSubmatch(path) }
 }
 
-func (s *Server) getCommit(w http.ResponseWriter, r *http.Request, sha string) {
+func (s *Server) getCommit(w http.ResponseWriter, r *http.Request, repo, sha string) {
 	s.mu.Lock()
 	c, ok := s.commits[sha]
 	s.mu.Unlock()
-	if !ok {
-		// A commit the API did not create: one of the repository's own.
+	switch dir, local := s.Repos[repo]; {
+	case ok:
+	case local:
+		// One of the repository's own.
+		if c, ok = readCommit(dir, sha); !ok {
+			s.answer(w, r, "get_commit", http.StatusNotFound, map[string]any{"message": "Not Found"}, nil)
+			return
+		}
+	default:
 		c = commit{Tree: hash(map[string]any{"tree of": sha})}
 	}
 	parents := []map[string]any{}
@@ -149,6 +187,89 @@ func (s *Server) getCommit(w http.ResponseWriter, r *http.Request, sha string) {
 		parents = append(parents, map[string]any{"sha": p})
 	}
 	s.answer(w, r, "get_commit", http.StatusOK, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.Tree}, "parents": parents}, nil)
+}
+
+// readCommit reads a commit's tree and parents from the repository's copy.
+func readCommit(dir, sha string) (commit, bool) {
+	if t, err := gitIn(dir, "cat-file", "-t", sha); err != nil || string(bytes.TrimSpace(t)) != "commit" {
+		return commit{}, false
+	}
+	raw, err := gitIn(dir, "cat-file", "commit", sha)
+	if err != nil {
+		return commit{}, false
+	}
+	var c commit
+	headers, _, _ := bytes.Cut(raw, []byte("\n\n"))
+	for line := range strings.Lines(string(headers)) {
+		switch k, v, _ := strings.Cut(strings.TrimSuffix(line, "\n"), " "); k {
+		case "tree":
+			c.Tree = v
+		case "parent":
+			c.Parents = append(c.Parents, v)
+		}
+	}
+	return c, c.Tree != ""
+}
+
+// getTree lists one tree of the repository's copy, one level, as GitHub's Git Trees API does
+// without recursive: each entry's name, mode, type, object, and a blob's size. Like GitHub, it
+// takes a commit for its tree, and refuses another kind of object (422).
+func (s *Server) getTree(w http.ResponseWriter, r *http.Request, repo, sha string) {
+	dir, local := s.Repos[repo]
+	if r.URL.Query().Has("recursive") {
+		s.answer(w, r, "get_tree", http.StatusUnprocessableEntity, map[string]any{"message": "the simulator lists one level at a time"}, nil)
+		return
+	}
+	var out []byte
+	if local {
+		switch t, err := gitIn(dir, "cat-file", "-t", sha); string(bytes.TrimSpace(t)) {
+		case "tree", "commit":
+			out, _ = gitIn(dir, "ls-tree", "-z", "-l", sha)
+		case "blob", "tag":
+			if err == nil {
+				s.answer(w, r, "get_tree", http.StatusUnprocessableEntity,
+					map[string]any{"message": "Invalid object requested. SHA must identify a commit or a tree."}, nil)
+				return
+			}
+		}
+	}
+	if out == nil {
+		s.answer(w, r, "get_tree", http.StatusNotFound, map[string]any{"message": "Not Found"}, nil)
+		return
+	}
+	faults := s.faults().Entries
+	entries := []map[string]any{}
+	for line := range bytes.SplitSeq(out, []byte{0}) {
+		meta, name, ok := bytes.Cut(line, []byte{'\t'})
+		f := strings.Fields(string(meta)) // mode, type, object, size ("-" for a tree or a commit)
+		if !ok || len(f) != 4 {
+			continue
+		}
+		e := map[string]any{"path": string(name), "mode": f[0], "type": f[1], "sha": f[2]}
+		if n, err := strconv.Atoi(f[3]); err == nil {
+			e["size"] = n
+		}
+		if fault, ok := faults[string(name)]; ok {
+			for k, v := range map[string]string{"mode": fault.Mode, "type": fault.Type, "sha": fault.SHA} {
+				if v != "" {
+					e[k] = v
+				}
+			}
+		}
+		if t := e["type"]; t == "blob" || t == "tree" {
+			e["url"] = fmt.Sprintf("https://github.example/api/repos/%s/git/%ss/%s", repo, t, e["sha"])
+		}
+		entries = append(entries, e)
+	}
+	s.answer(w, r, "get_tree", http.StatusOK, map[string]any{"sha": sha, "tree": entries, "truncated": false,
+		"url": fmt.Sprintf("https://github.example/api/repos/%s/git/trees/%s", repo, sha)}, nil)
+}
+
+// gitIn runs git on a repository's copy: the tests' own, trusted.
+func gitIn(dir string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = gitenv.ForMirror(dir)
+	return cmd.Output()
 }
 
 func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[string]any) {

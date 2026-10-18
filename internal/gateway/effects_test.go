@@ -26,6 +26,7 @@ type writer struct {
 	sent    atomic.Int64
 	release chan struct{} // when set, Execute waits for it before it asks to proceed
 	err     error         // what Execute returns, once sent
+	deny    string        // when set, Execute refuses the payload before it sends anything
 }
 
 var noArgs = tools.MustSchema(`{"type": "object"}`)
@@ -45,6 +46,9 @@ func (w *writer) Prepare(_ context.Context, req tools.Request) (json.RawMessage,
 func (w *writer) Execute(ctx context.Context, _ json.RawMessage, _ string, proceed tools.Proceed) (map[string]any, error) {
 	if w.release != nil {
 		<-w.release
+	}
+	if w.deny != "" {
+		return nil, &tools.DeniedError{Reason: w.deny}
 	}
 	if err := proceed(ctx); err != nil {
 		return nil, err
@@ -199,6 +203,35 @@ func TestACancelledRunSendsNothing(t *testing.T) {
 	status, err := f.do(t, w)
 	if err != nil || status != StatusDenied || w.sent.Load() != 0 || f.status(t).Status != effectAbandoned {
 		t.Fatalf("status %s, err %v, sent %d, effect %s", status, err, w.sent.Load(), f.status(t).Status)
+	}
+}
+
+// A tool that refuses its payload while executing it, before anything went out (it does not
+// match what GitHub holds, say), ends the effect: it never will be sent, and the call is denied
+// with the tool's reason. It counts against the run's writes: the check may have cost requests
+// of its own, and a workflow must not be able to have them made again and again.
+func TestAToolsDenialEndsTheEffect(t *testing.T) {
+	for _, class := range []string{policy.EffectUnsafe, policy.EffectLookup} {
+		f := newFixture(t, false)
+		w := &finder{writer: writer{class: class, deny: "app/db.py is not what the mirror has"}}
+		res, err := f.g.effect(context.Background(), f.run, w, class, 1, f.req(), faults.Effect{})
+		e := f.status(t)
+		if err != nil || res.GetStatus() != StatusDenied || !strings.Contains(res.GetValueJson(), w.deny) ||
+			e.Status != effectDenied || e.Reason.String != w.deny || w.sent.Load() != 0 {
+			t.Fatalf("%s: result %v, err %v, effect %s %q, sent %d", class, res, err, e.Status, e.Reason.String, w.sent.Load())
+		}
+		// The same call again gets the same answer, and nothing is sent.
+		if res, err := f.g.effect(context.Background(), f.run, w, class, 1, f.req(), faults.Effect{}); err != nil ||
+			res.GetStatus() != StatusDenied || w.sent.Load() != 0 {
+			t.Fatalf("%s: again: %v %v", class, res, err)
+		}
+		// Another payload of the same tool is one write too many.
+		other := f.req()
+		other.EffectID, other.Args = strings.Repeat("f", 64), map[string]any{"n": 2}
+		res, err = f.g.effect(context.Background(), f.run, &writer{class: class}, class, 1, other, faults.Effect{})
+		if err != nil || res.GetStatus() != StatusDenied || !strings.Contains(res.GetValueJson(), "already has 1") {
+			t.Fatalf("%s: another payload: %v %v", class, res, err)
+		}
 	}
 }
 

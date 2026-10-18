@@ -267,12 +267,13 @@ class Stack:
 
     def _start_github(self) -> None:
         """The simulated GitHub the GitHub tools write to: its log is the record of what
-        really reached "GitHub"."""
+        really reached "GitHub". It holds the mirror's commits and trees, as GitHub would."""
         addr = self.tmp / "githubsim.addr"
         self.github_log_path = self.tmp / "github.jsonl"
         self.github_faults = self.tmp / "github-faults.json"
         p = Proc("githubsim", [BIN / "githubsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
-                               "--log", self.github_log_path, "--faults", self.github_faults],
+                               "--log", self.github_log_path, "--faults", self.github_faults,
+                               "--repo", f"acme/payments={self.tmp / 'mirror'}"],
                  self.tmp / "githubsim.log")
         self.procs.append(p)
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated GitHub")
@@ -306,9 +307,19 @@ class Stack:
     def hold_github(self, action: str, path: Path) -> None:
         """The simulated GitHub holds its answer to the next successful `action` (create_pull,
         create_comment, ...) after the write took effect, while `path` exists."""
-        faults = json.loads(self.github_faults.read_text()) if self.github_faults.exists() else {"hold_after": {}}
-        faults["hold_after"][action] = str(path)
+        faults = self._github_faults()
+        faults.setdefault("hold_after", {})[action] = str(path)
         self.github_faults.write_text(json.dumps(faults))
+
+    def change_github_entry(self, name: str, **entry: str) -> None:
+        """The simulated GitHub's trees show the entry `name` with these fields (mode, type,
+        sha) in place of the mirror's: GitHub and the mirror disagree."""
+        faults = self._github_faults()
+        faults.setdefault("entries", {})[name] = entry
+        self.github_faults.write_text(json.dumps(faults))
+
+    def _github_faults(self) -> dict:
+        return json.loads(self.github_faults.read_text()) if self.github_faults.exists() else {}
 
     def github_requests(self, action: str | None = None) -> list[dict]:
         """The simulated GitHub's own record of the requests it answered; writes that took
