@@ -105,12 +105,33 @@ f22fc37 推送后，自动安全审查报了三处问题，核实都成立，已
 
 修复后三种环境的测试全部通过：macOS 不加沙箱 15 个通过、1 个跳过（沙箱测试要在沙箱模式下跑），macOS + srt 16 个，Linux + bwrap 16 个。真实 Worker 的调用没有一次被代理拒绝，正常任务的工具调用也没有一次被范围检查拒绝。
 
+## Worker 沙箱里不能再建文件（2026-10-18）
+
+M3b 给工具服务器补探针时发现，bwrap 自己建的根目录是可写的 tmpfs，最大可到内存的一半（见 `docs/m3-notes.md`）。Worker 的 `sandbox/linux/run-worker.sh` 也一样，而且有四处：根目录、`/dev`（含 `/dev/shm`）、`/tmp`、`/run`。tmpfs 占的内存不记在任何进程名下，被攻破的 Worker 把它写满时，OOM killer 不会挑中它，先被杀的会是 agentd、Temporal 这些进程。
+
+改之前先看了 Worker 到底写什么：把四处都换成虚拟机磁盘上的目录跑整套测试，34 次沙箱启动后哪里都没留下东西；再在沙箱里用 strace 跑一遍，记下建、删、改名文件和 memfd、共享内存的系统调用，Worker 的近 4 万次调用全是只读的 openat。所以现在 Worker 在哪儿都不能建文件：
+
+- 根目录和 `/dev` 只读（`--remount-ro`，放在参数最后，前面的挂载要先在上面建好挂载点）。
+- `/tmp` 和 `/run` 不再挂 tmpfs，只是根目录里的目录，跟着只读；`/run` 里放 Runtime socket 的挂载点。起初给 `/tmp` 留了 64 MiB（`--size`），两个评审代理都实测发现 `--size` 只限文件内容：inode 数还是内核默认的内存页数的一半，空文件和 xattr 照样占不记在进程名下的内核内存（实测 6 万个空文件占了 51 MiB 不可回收的 slab，`/tmp` 却显示用了 0 字节），合起来能到内存的约 1/8。bwrap 设不了 inode 数，Worker 又用不着 `/tmp`，就整个去掉了。以后真要临时文件，`tempfile` 会明确报 “No usable temporary directory found”。
+- 不许再建用户命名空间（`--disable-userns`）。补探针时发现：没有这一条，沙箱里的 Python 能自己建用户和挂载命名空间，挂一个任意大小的 tmpfs（实测挂了 2 GiB、写进 256 MiB），上面几条等于白改。
+- 没有可写的 `/dev/shm`，POSIX 信号量和共享内存（`multiprocessing` 的锁、队列）都会报 EROFS。Worker 不用；真要用，在 `--dev /dev` 后面挂一个限了大小的 tmpfs。
+
+`tests/test_sandbox.py` 加了一个探针，经启动脚本在沙箱里试：在根目录、`/dev/shm`、`/run`、`/tmp` 建文件都得到 EROFS（只读挂载，不是权限不够或目录不存在）；`/proc/self/mountinfo` 里除了 `/proc`、伪终端和设备节点，没有一个挂载可写；建用户命名空间得到 ENOSPC（`--disable-userns` 设的上限）；IPC 命名空间是沙箱自己的。沙箱外先确认宿主机的 `/dev/shm` 和 `/tmp` 能写、能建用户命名空间，写的东西也没出现在宿主机上。改之前它失败：四处都写进去了，`/tmp` 有 3.1 GB，用户命名空间也建得出来。逐条改坏启动脚本，它都在对应的检查上失败，包括把代码目录、Python 环境或 Runtime socket 的目录改成可写挂载，多挂一个 tmpfs，不再单独建 IPC 命名空间。
+
+没有照工具服务器加 `ulimit`：
+
+- `-v` 只管单个进程。Worker 可以 fork 出很多个小进程，每个都比 agentd 小，内存用光时 OOM killer 照样先杀 agentd（评审实测过）。Worker 的地址空间还随 CPU 数增长：glibc 给 SDK 的线程各分一个 malloc arena，4 核时 SDK 运行时约 0.4 GB，设 `MALLOC_ARENA_MAX=1` 只有 0.09 GB。整套测试里 Worker 的地址空间最高 0.78 GB，常驻内存最高 74 MB。
+- `-f` 也管 Worker 的 stdout/stderr。它们常常重定向到普通的日志文件，日志一过上限（或者追加到本来就超过上限的日志），Worker 就被 SIGXFSZ 杀掉。反过来，这个输出是 Worker 唯一能无限写的东西，能写满日志所在的磁盘，该交给管道或 journald，由读的一方限住，不要直接指向普通文件。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
 - 工作流代码里取不到的键（比如 `diff["blob"]`）会让工作流任务无限重试：任务挂住，也不发报告。这是第 7 节工作流代码的行为，T12 时要处理。
 - Runtime 代理不限制 `GetWorkflowExecutionHistory` 读哪个工作流，同一命名空间里任何工作流的历史，Worker 都能读到。M1 只有一种任务，所有 Worker 同样不可信，问题不大。以后有可信的工作流，或者按租户分 Worker 时，要么给沙箱 Worker 单独一个命名空间，要么让代理只放行分给这个 Worker 的工作流。
 - `Scope` 只约束列出来的参数名。如果工具还接受别的能指定目标的参数（比如 `head_repo`），就能绕过去。M3 接真实工具时，参数要按 schema 校验，未知参数一律拒绝。
+- Linux 沙箱里还有不记在任何进程名下的内存，OOM killer 挑不中 Worker：memfd、SysV 共享内存和消息队列（沙箱里能改 `kernel.msgmnb` 这些 IPC 参数，以前就是这样），以及管道和 Unix socket 的缓冲区。实测在改好的沙箱里 memfd 和 SysV 共享内存各占 128 MiB，宿主机的 Shmem 多了 256 MiB，进程自己的常驻内存只有 10 MB；评审实测 3000 个管道占 83 MiB，200 对 socket 占 91 MiB。匿名内存分散到很多小进程时也一样（见上）。进程数只受这个用户的 `ulimit -u` 限制，和 agentd、Temporal 共用：Worker 把它用光，它们的 Go 运行时建不了线程就会退出。这些都要靠 cgroup v2（`memory.max`、`memory.swap.max`、`pids.max`；评审实测上面这些内存都记在 memcg 上）或者 seccomp，M5 定稿沙箱时一起做。`/dev/pts` 还能占宿主机共用的伪终端。macOS 的 Worker 沙箱则不限私有目录的大小，能写满磁盘。
+- Runtime 代理每条请求最多收 128 MiB，并发流数不限（grpc-go 的默认值），转发前还要把整条请求读进内存检查。被攻破的 Worker 开很多流，就能让 agentd 自己占满内存，OOM killer 杀的就是 agentd。可以加 `grpc.MaxConcurrentStreams`、按方法收紧大小上限、限每个 Worker 的连接数（看代码得出，没实测）。
+- 开发配置 `config/dev/agentd.yaml` 把数据目录放在仓库里（`.agentos`），Linux 的启动脚本又把代码目录整个只读挂进沙箱，而测试用的代码目录就是仓库根。照这样起的 Worker 能读账本、连 Control socket：只读挂载挡不住 `connect()`，Runtime socket 就是这样连的。测试把数据放在仓库外面，所以没测到。要么把开发配置的数据目录挪出仓库，要么只挂 Worker 自己的代码。
 
 ## 后续（不在 M1 范围）
 

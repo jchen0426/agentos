@@ -386,7 +386,8 @@ M3 拆成两段（设计文档第 12 节，rev 262）：M3a 副作用协议和 G
 - **sandbox-runtime 自己加的环境变量会留在沙箱里**：代理设置、`GIT_SSH_COMMAND`、`GIT_CONFIG_PARAMETERS` 等。服务器跑 git 前去掉了所有 `GIT_` 变量，沙箱也不允许任何网络。
 - **在 macOS 上，自己调用 `setsid()` 的进程能逃出进程组的整组击杀**。在 Linux 上，bwrap 的 `--die-with-parent` 会结束它。
 - **bwrap 没有 seccomp 过滤**。
-- **Worker 的 Linux 沙箱（`run-worker.sh`）也有根目录可写的问题**：根目录、`/tmp`、`/run` 都是不限大小的可写 tmpfs。那是 M1 的启动脚本，M5 定稿沙箱时一起改。
+- **Worker 的 Linux 沙箱（`run-worker.sh`）**：原来根目录、`/dev`、`/tmp`、`/run` 四处都是不限大小的可写 tmpfs。2026-10-18 已修：Worker 哪儿都不能建文件，也不许再建用户命名空间（见 `docs/m1-notes.md`）。
+- **工具服务器的 `/tmp` 只限文件内容**：`--size` 管不住 inode 和 xattr。在 Worker 的沙箱上实测过同样的 tmpfs：6 万个空文件占了 51 MiB 不记在进程名下的内核内存，上限约为内存的 1/8，每次调用一份，最多 4 个同时，调用结束才释放。要靠 cgroup（M5）。
 - **Linux 启动脚本不看 `AGENTOS_SANDBOX_DENY_READ`**：只挂载 `/usr`、镜像和服务器，所以只有 agentd 要屏蔽的东西放在 `/usr` 下面时才有影响。
 - **镜像目前是测试自己 clone 的普通仓库**：属性从空树读，所以工作树不会被读到。以后自动建镜像时，用裸仓库，只取分支和标签。
 - **镜像必须属于运行 agentd 的用户**：git 不读全局配置，也就不认 `safe.directory`。属于别的用户的镜像，git 一律拒绝（“dubious ownership”）。agentd 解析提交号时会把 git 的原话报给 agentctl；服务器那边按协议错误处理，原因记进 agentd 的日志。
