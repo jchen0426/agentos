@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sys/unix"
 
 	"github.com/jchen0426/agentos/internal/gitenv"
 )
@@ -78,7 +78,8 @@ func NewClient(o Options) (*Client, error) {
 		prefix: fmt.Sprintf("agentos-tools.%d.", os.Getpid()), slots: make(chan struct{}, n)}, nil
 }
 
-// sweepStale removes the state directories of agentd processes that no longer run.
+// sweepStale removes the state directories of agentd processes that no longer run: real
+// directories of this user's only, whatever else /tmp holds under such a name.
 func sweepStale() {
 	dirs, _ := filepath.Glob(filepath.Join(stateRoot, "agentos-tools.*"))
 	for _, d := range dirs {
@@ -90,23 +91,48 @@ func sweepStale() {
 		if err != nil || pid == os.Getpid() {
 			continue
 		}
+		fi, err := os.Lstat(d)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
+			continue
+		}
 		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			removeAll(d)
 		}
 	}
 }
 
-// removeAll removes a call's directory, also when the server took the permissions off part of
-// it (a subverted one could, to leave its files behind): os.RemoveAll changes no modes.
-// Symbolic links are removed, never followed.
+// removeAll removes a call's directory. When that fails, the server may have taken the
+// permissions off part of it (a subverted one could, to leave its files behind; os.RemoveAll
+// changes no modes): the owner gets them back, and the directory goes.
 func removeAll(dir string) {
-	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700) // before WalkDir reads it
-		}
-		return nil
-	})
+	if os.RemoveAll(dir) == nil {
+		return
+	}
+	unlock(unix.AT_FDCWD, dir)
 	_ = os.RemoveAll(dir)
+}
+
+// unlock gives the owner rwx on the directory name in parent and every directory below it,
+// through file descriptors and never through a symbolic link: a server still running (one that
+// left the process group) could swap a directory for a link to one of the user's. On Linux
+// this needs fchmodat2 (Linux 6.6); there the sandbox never mounts the call's directory anyway.
+func unlock(parent int, name string) {
+	_ = unix.Fchmodat(parent, name, 0o700, unix.AT_SYMLINK_NOFOLLOW)
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return // gone, or not a directory (any more)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	entries, _ := f.ReadDir(-1)
+	for _, e := range entries {
+		if e.IsDir() {
+			unlock(fd, e.Name())
+		}
+	}
 }
 
 // ToolError is the server's refusal: git failed on what it was given.
