@@ -7,17 +7,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -379,20 +378,27 @@ type RouteChecker interface {
 // ErrNotSent marks a request that failed before it left agentd: nothing was billed.
 var ErrNotSent = errors.New("request not sent")
 
-// unsent reports an error from before the request could reach the provider: the name did not
-// resolve, the connection or a proxy's tunnel was not made, or TLS did not trust the server.
-func unsent(err error) bool {
-	var dnsErr *net.DNSError
-	var opErr *net.OpError
-	var verifyErr *tls.CertificateVerificationError
-	var recordErr tls.RecordHeaderError
-	var authorityErr x509.UnknownAuthorityError
-	var hostErr x509.HostnameError
-	var certErr x509.CertificateInvalidError
-	return errors.As(err, &dnsErr) || (errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect")) ||
-		errors.As(err, &verifyErr) || errors.As(err, &recordErr) || errors.As(err, &authorityErr) ||
-		errors.As(err, &hostErr) || errors.As(err, &certErr)
+// traceWrite marks, on a request's context, when the whole request has been written to the
+// connection. Until then nothing reached the provider, whatever error comes back: the name
+// did not resolve, no connection or proxy tunnel was made, TLS did not trust the server. Once
+// it has, the provider may have run and billed it, whatever error comes after. The adapters'
+// SDKs make one request per call (their retries are off).
+func traceWrite(ctx context.Context) (context.Context, func() bool) {
+	var written atomic.Bool
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(i httptrace.WroteRequestInfo) {
+			if i.Err == nil {
+				written.Store(true)
+			}
+		},
+	}), written.Load
 }
+
+// Declined is a provider declining a request before it was sent, while its tokens were being
+// counted: a refusal like any, billed nothing.
+type Declined struct{ Category, Explanation string }
+
+func (d *Declined) Error() string { return fmt.Sprintf("declined (%s): %s", d.Category, d.Explanation) }
 
 // NonStreamingLimit is the longest a request may be expected to take: the adapters do not
 // stream, and the Anthropic SDK refuses a non-streaming request expected to take longer.
@@ -400,8 +406,9 @@ const NonStreamingLimit = 10 * time.Minute
 
 // ExpectedDuration is how long a request for maxTokens of output may take without streaming:
 // the Anthropic SDK's estimate, an hour for 128,000 tokens, which is slow for any provider.
+// Past a million tokens, which no model takes, it stays at a million's.
 func ExpectedDuration(maxTokens int64) time.Duration {
-	return time.Duration(maxTokens) * time.Hour / 128000
+	return time.Duration(min(maxTokens, 1_000_000)) * time.Hour / 128000
 }
 
 // RejectedError is a provider's error answer: 429 or 529 (overloaded) and other 4xx mean it

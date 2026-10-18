@@ -286,13 +286,13 @@ func TestOpenAIErrors(t *testing.T) {
 	if resp, err := a.Call(ctx, req); err != nil || resp.Status != "refused" || resp.Value["category"] != "invalid_prompt" {
 		t.Errorf("invalid_prompt: %+v, %v", resp, err)
 	}
-	// Declined while counting: turned away for good, not retried.
+	// Declined while counting: a refusal, before anything is reserved or sent.
 	f.counted = func(w http.ResponseWriter) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "flagged", "code": "invalid_prompt"}})
 	}
-	var rejected *RejectedError
-	if _, err := a.CountTokens(ctx, req); !errors.As(err, &rejected) || rejected.Retryable() {
+	var declined *Declined
+	if _, err := a.CountTokens(ctx, req); !errors.As(err, &declined) || declined.Category != "invalid_prompt" || declined.Explanation != "flagged" {
 		t.Errorf("declined while counting: %v", err)
 	}
 	f.counted = nil
@@ -440,13 +440,20 @@ func TestOpenAICloudModels(t *testing.T) {
 	if _, err := a.CountTokens(context.Background(), req); err != nil {
 		t.Errorf("405: %v", err)
 	}
+	// The question turned away for good: not sent, and not asked again in vain.
 	f.refuse = http.StatusUnauthorized
-	if _, err := a.CountTokens(context.Background(), req); err == nil {
-		t.Error("401 from /api/show: counted anyway")
+	if _, err := a.CountTokens(context.Background(), req); !errors.Is(err, ErrUnverified) {
+		t.Errorf("401 from /api/show: counted anyway, or retryable: %v", err)
 	}
-	if _, err := a.Call(context.Background(), req); !errors.Is(err, ErrNotSent) {
+	if _, err := a.Call(context.Background(), req); !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrUnverified) {
 		t.Errorf("401 from /api/show: %v", err)
 	}
+	// A server error may pass: asked again on the next attempt.
+	f.refuse = http.StatusServiceUnavailable
+	if _, err := a.CountTokens(context.Background(), req); err == nil || errors.Is(err, ErrUnverified) {
+		t.Errorf("503 from /api/show: %v", err)
+	}
+	f.refuse = 0
 }
 
 func TestCountInPieces(t *testing.T) {

@@ -59,9 +59,10 @@ func (a *Anthropic) Call(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: %v", ErrNotSent, err)
 	}
-	msg, err := a.client.Beta.Messages.New(ctx, p)
+	sendCtx, written := traceWrite(ctx)
+	msg, err := a.client.Beta.Messages.New(sendCtx, p)
 	if err != nil {
-		return Response{}, classify(err)
+		return Response{}, classify(err, written())
 	}
 	resp := Response{Model: a.name(string(msg.Model)), StopReason: string(msg.StopReason), Effort: req.Route.Effort,
 		Billed: a.billed(msg)}
@@ -190,15 +191,15 @@ func usage(input, cacheWrites int64, split anthropic.BetaCacheCreation, cacheRea
 }
 
 // classify sorts an SDK error into the three kinds the budget tells apart: an HTTP error
-// answer is the provider declining to serve the request, unbilled; a failure to connect
-// never left agentd; after anything else (a timeout, a connection lost mid-answer) nobody
-// knows whether the provider billed it.
-func classify(err error) error {
+// answer is the provider declining to serve the request, unbilled; a request never written
+// out whole (traceWrite) never left agentd; after anything else (a timeout, a connection lost
+// mid-answer) nobody knows whether the provider billed it.
+func classify(err error, written bool) error {
 	var apiErr *anthropic.Error
 	if errors.As(err, &apiErr) {
 		return &RejectedError{StatusCode: apiErr.StatusCode, Message: apiErr.Error()}
 	}
-	if unsent(err) {
+	if !written {
 		return fmt.Errorf("%w: %v", ErrNotSent, err)
 	}
 	return err

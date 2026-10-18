@@ -32,6 +32,10 @@ var ErrTooLong = errors.New("input too long for the model's context")
 // elsewhere (an Ollama cloud model): the task's data would leave the machine.
 var ErrCloudModel = errors.New("a cloud model, not a local one")
 
+// ErrUnverified means the server would not say whether the model runs on it: it turned the
+// question away, or answered it with something else. Asking again will not help.
+var ErrUnverified = errors.New("cannot tell whether the model runs on the server")
+
 // OpenAICompat is the OpenAI-compatible adapter (openai-go). It speaks OpenAI's Responses
 // API to OpenAI (api: responses), and Chat Completions to Ollama and vLLM (api: chat), the
 // one surface those serve. Each Call is one request: the SDK's own retries are off, and the
@@ -125,15 +129,17 @@ func (a *OpenAICompat) local(ctx context.Context, model string) error {
 	switch {
 	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed:
 		return nil
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return fmt.Errorf("ask %s about %s: %s", a.provider, model, resp.Status) // may pass
 	case resp.StatusCode != http.StatusOK:
-		return fmt.Errorf("ask %s about %s: %s", a.provider, model, resp.Status)
+		return fmt.Errorf("%w: %s answered %s about %s", ErrUnverified, a.provider, resp.Status, model)
 	}
 	var show struct {
 		RemoteHost  string `json:"remote_host"`
 		RemoteModel string `json:"remote_model"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
-		return fmt.Errorf("ask %s about %s: %w", a.provider, model, err)
+		return fmt.Errorf("%w: %s answered about %s with something else: %v", ErrUnverified, a.provider, model, err)
 	}
 	if show.RemoteHost != "" || show.RemoteModel != "" {
 		return fmt.Errorf("%w: %s runs %s on %s", ErrCloudModel, a.name(model), show.RemoteModel, show.RemoteHost)
@@ -175,13 +181,12 @@ func (a *OpenAICompat) CountTokens(ctx context.Context, req Request) (int64, err
 	}
 	r, err := a.responses.InputTokens.Count(ctx, p)
 	if err != nil {
-		declined, sorted := a.failed(req.Route.Model, err)
-		switch {
-		case sorted != nil:
+		declined, sorted := a.failed(req.Route.Model, err, true)
+		if sorted == nil && declined.Status == "refused" {
+			return 0, &Declined{Category: fmt.Sprint(declined.Value["category"]), Explanation: fmt.Sprint(declined.Value["explanation"])}
+		}
+		if sorted != nil {
 			err = sorted
-		case declined.Status == "refused":
-			// Declined before any request: it will be declined again, at no cost.
-			err = &RejectedError{StatusCode: http.StatusBadRequest, Message: fmt.Sprintf("declined: %v", declined.Value["explanation"])}
 		}
 		return 0, fmt.Errorf("count tokens for %s: %w", req.Route.Model, err)
 	}
@@ -303,9 +308,10 @@ func (a *OpenAICompat) callResponses(ctx context.Context, req Request, user stri
 	if a.safetyID != "" {
 		p.SafetyIdentifier = openai.String(a.safetyID)
 	}
-	resp, err := a.responses.New(ctx, p)
+	sendCtx, written := traceWrite(ctx)
+	resp, err := a.responses.New(sendCtx, p)
 	if err != nil {
-		return a.failed(name, err)
+		return a.failed(name, err, written())
 	}
 	u := resp.Usage
 	// Billed as the model asked for: the answer may name a dated snapshot of it, which the
@@ -386,9 +392,10 @@ func (a *OpenAICompat) callChat(ctx context.Context, req Request, user string) (
 	if e := a.cfg.Effort(req.Route.Effort); e != "" {
 		p.ReasoningEffort = shared.ReasoningEffort(e)
 	}
-	resp, err := a.chat.New(ctx, p)
+	sendCtx, written := traceWrite(ctx)
+	resp, err := a.chat.New(sendCtx, p)
 	if err != nil {
-		return a.failed(name, err)
+		return a.failed(name, err, written())
 	}
 	u := resp.Usage
 	out := Response{Model: name, Effort: a.cfg.Effort(req.Route.Effort), Billed: []Billed{{Model: name, Usage: pricing.Usage{
@@ -442,10 +449,11 @@ func decodeObject(text string) map[string]any {
 	return out
 }
 
-// failed sorts an SDK error as classify does for Claude. OpenAI's safeguards decline a
-// request with an error, not an answer: that is a refusal, billed nothing. An input over the
-// context window is turned away with a 400 by OpenAI, vLLM and Ollama alike.
-func (a *OpenAICompat) failed(name string, err error) (Response, error) {
+// failed sorts an SDK error as classify does for Claude; written is whether the request was
+// written out whole (traceWrite). OpenAI's safeguards decline a request with an error, not an
+// answer: that is a refusal, billed nothing. An input over the context window is turned away
+// with a 400 by OpenAI, vLLM and Ollama alike.
+func (a *OpenAICompat) failed(name string, err error, written bool) (Response, error) {
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
 		if slices.Contains(policyCodes, apiErr.Code) {
@@ -459,7 +467,7 @@ func (a *OpenAICompat) failed(name string, err error) (Response, error) {
 		}
 		return Response{}, rejected
 	}
-	if unsent(err) {
+	if !written {
 		return Response{}, fmt.Errorf("%w: %v", ErrNotSent, err)
 	}
 	return Response{}, err

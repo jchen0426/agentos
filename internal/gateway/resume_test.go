@@ -95,11 +95,11 @@ func (f *resumeFixture) request(id string, attempt, seq int64, hop models.Route,
 
 func (f *resumeFixture) resume(info activity.Info, hops ...models.Route) ([]bool, *models.Response, *models.Response) {
 	f.t.Helper()
-	declined, refusal, answer, err := f.g.resume(context.Background(), info, f.run, "args", hops)
+	p, err := f.g.resume(context.Background(), info, f.run, "args", hops)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	return declined, refusal, answer
+	return p.declined, p.refusal, p.answer
 }
 
 func hop(provider, model string) models.Route {
@@ -137,11 +137,14 @@ func TestResumeWithinOneActivity(t *testing.T) {
 		t.Errorf("declined %v, refusal %+v, answer %+v", declined, refusal, answer)
 	}
 
-	// An answer that broke the schema was asked for again, or returned: never served, never a refusal.
+	// An answer that broke the schema is neither served nor a refusal: it counts against its
+	// hop's generations, whichever attempt got it.
 	info = f.call("3:audit_v1", t0.Add(2*time.Second), "")
 	f.request(info.ActivityID, 1, 1, opus, StatusInvalidOutput)
-	if declined, refusal, answer := f.resume(info, opus, sol); answer != nil || refusal != nil || slices.Contains(declined, true) {
-		t.Errorf("an invalid answer: declined %v, refusal %+v, answer %+v", declined, refusal, answer)
+	p, err := f.g.resume(context.Background(), info, f.run, "args", []models.Route{opus, sol})
+	if err != nil || p.answer != nil || p.refusal != nil || slices.Contains(p.declined, true) ||
+		!slices.Equal(p.invalid, []int{1, 0}) || p.lastInvalid[0] == nil {
+		t.Errorf("an invalid answer: %+v, %v", p, err)
 	}
 }
 

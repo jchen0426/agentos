@@ -306,6 +306,22 @@ func (g *Gateway) callModel(ctx context.Context, info activity.Info, run db.Run,
 			return g.modelCallOnce(exec, info, run, route, adapter, args, argsHash, fx)
 		})
 	})
+	var failed *temporal.ApplicationError
+	var unrecorded recordError
+	if err != nil && g.lastAttempt(info) && !(errors.As(err, &failed) && failed.NonRetryable()) && !errors.As(err, &unrecorded) {
+		// The execution was an earlier attempt's, which this one joined: for it, a fallback's
+		// failure could still pass. On the last attempt, what the call already got stands.
+		hops := append([]models.Route{route}, route.Next...)
+		if p, perr := g.resume(context.WithoutCancel(ctx), info, run, argsHash, hops); perr == nil {
+			switch {
+			case p.answer != nil:
+				return result(p.answer.Status, p.answer.Value)
+			case p.refusal != nil:
+				g.Log.Warn("the last attempt keeps the refusal", "workflow_id", run.WorkflowID, "error", err)
+				return result(p.refusal.Status, p.refusal.Value)
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -319,18 +335,19 @@ func (g *Gateway) callModel(ctx context.Context, info activity.Info, run db.Run,
 func (g *Gateway) modelCallOnce(ctx context.Context, info activity.Info, run db.Run, route models.Route,
 	adapter models.Adapter, args map[string]any, argsHash string, fx faults.Effect) (models.Response, error) {
 	hops := append([]models.Route{route}, route.Next...)
-	declined, refusal, answer, err := g.resume(ctx, info, run, argsHash, hops)
+	p, err := g.resume(ctx, info, run, argsHash, hops)
 	if err != nil {
 		return models.Response{}, err
 	}
-	if answer != nil {
+	if p.answer != nil {
 		// An earlier attempt got an answer Temporal never recorded (its completion was
 		// lost). Serve that answer instead of paying for a second call.
-		return *answer, nil
+		return *p.answer, nil
 	}
+	refusal := p.refusal
 	seq := 0
 	for hop, r := range hops {
-		if declined[hop] {
+		if p.declined[hop] {
 			continue
 		}
 		if hop > 0 {
@@ -347,13 +364,21 @@ func (g *Gateway) modelCallOnce(ctx context.Context, info activity.Info, run db.
 			g.Log.Warn("the model declined; falling back to another provider", "workflow_id", run.WorkflowID,
 				"activity_id", info.ActivityID, "from", refusal.Model, "to", r.Name())
 		}
-		resp, err := g.ask(ctx, info, run, r, adapter, args, fx, &seq)
+		// Answers of this hop that broke the output schema count against its generations,
+		// whichever attempt got them: one that had them all, or was cut off at max_tokens,
+		// has had its answer.
+		if last := p.lastInvalid[hop]; last != nil && (p.invalid[hop] >= generations || last.StopReason == "max_tokens") {
+			return *last, nil
+		}
+		resp, err := g.ask(ctx, info, run, r, adapter, args, fx, &seq, p.invalid[hop]+1)
 		var failed *temporal.ApplicationError
+		var unrecorded recordError
 		switch {
-		case err != nil && hop > 0 && (g.lastAttempt(info) ||
+		case err != nil && hop > 0 && !errors.As(err, &unrecorded) && (g.lastAttempt(info) ||
 			errors.As(err, &failed) && failed.NonRetryable() && slices.Contains(hopFailures, failed.Type())):
 			// The refusal stands if none of the later providers answers. On the last attempt, a
 			// failure that might pass is no different: nothing would ask this provider again.
+			// An answer the ledger failed to record is: it may have been paid for.
 			g.Log.Warn("not falling back: the request failed", "workflow_id", run.WorkflowID, "to", r.Name(), "error", err)
 			continue
 		case err != nil:
@@ -369,14 +394,15 @@ func (g *Gateway) modelCallOnce(ctx context.Context, info activity.Info, run db.
 	return *refusal, nil
 }
 
-// ask sends one route's request, and once more when the answer breaks the output schema.
+// ask sends one route's request, from generation gen on: once more when the answer breaks the
+// output schema, up to generations in all.
 func (g *Gateway) ask(ctx context.Context, info activity.Info, run db.Run, r models.Route,
-	adapter models.Adapter, args map[string]any, fx faults.Effect, seq *int) (models.Response, error) {
-	for gen := 1; ; gen++ {
+	adapter models.Adapter, args map[string]any, fx faults.Effect, seq *int, gen int) (models.Response, error) {
+	for ; ; gen++ {
 		*seq++
 		resp, err := g.modelRequest(ctx, info, run, r, adapter, args, fx, *seq)
 		// An answer cut off at max_tokens would be cut off again: only a larger max_tokens helps.
-		if err != nil || resp.Status != StatusInvalidOutput || gen == generations || resp.StopReason == "max_tokens" {
+		if err != nil || resp.Status != StatusInvalidOutput || gen >= generations || resp.StopReason == "max_tokens" {
 			return resp, err
 		}
 		g.Log.Warn("the answer broke the output schema; asking again", "workflow_id", run.WorkflowID,
@@ -384,48 +410,58 @@ func (g *Gateway) ask(ctx context.Context, info activity.Info, run db.Run, r mod
 	}
 }
 
+// past is what a model call's earlier requests left, hop by hop (resume).
+type past struct {
+	answer      *models.Response   // an answer one of the call's attempts got: served
+	refusal     *models.Response   // the latest refusal: returned if no other hop answers
+	declined    []bool             // the hops that declined: never asked, and paid, again
+	invalid     []int              // the hops' answers that broke the output schema
+	lastInvalid []*models.Response // the latest of those, per hop
+}
+
 // resume finds what a model call got before: in its own earlier attempts, and in the
 // activities that sent it, with the same arguments, before it waited for budget (the workflow
-// sends a call that waited again, under a new activity). It returns an answer one of the
-// call's attempts got; or else the hops that declined already, never to be asked, and paid,
-// again, and the latest of their refusals, to return if none of the other hops answers. A
-// refusal counts for a hop of the same provider, model, prompt and effort: one under a prompt
-// edited since, or by a model no longer listed, does not.
+// sends a call that waited again, under a new activity). A request counts for a hop of the
+// same provider, model, prompt and effort: one under a prompt edited since, or by a model no
+// longer listed, does not.
 func (g *Gateway) resume(ctx context.Context, info activity.Info, run db.Run, argsHash string,
-	hops []models.Route) (declined []bool, refusal, answer *models.Response, err error) {
+	hops []models.Route) (past, error) {
 	activities, err := g.pausedBefore(ctx, info, run, hops[0].Task, argsHash)
 	if err != nil {
-		return nil, nil, nil, err
+		return past{}, err
 	}
-	declined = make([]bool, len(hops))
+	p := past{declined: make([]bool, len(hops)), invalid: make([]int, len(hops)), lastInvalid: make([]*models.Response, len(hops))}
 	for _, id := range append(activities, info.ActivityID) {
 		rows, err := g.Ledger.Q.ListFinishedModelCalls(ctx, db.ListFinishedModelCallsParams{WorkflowID: run.WorkflowID, ActivityID: id})
 		if err != nil {
-			return nil, nil, nil, err
+			return past{}, err
 		}
 		for _, row := range rows {
-			if row.StopReason.String == StatusInvalidOutput {
-				continue // asked again, or returned and not worth serving twice
-			}
 			resp, err := g.loadResponse(ctx, row.ResponseBlob.String)
 			if err != nil {
-				return nil, nil, nil, err
+				return past{}, err
 			}
-			if resp.Status != StatusRefused {
+			if row.StopReason.String != StatusInvalidOutput && resp.Status != StatusRefused {
 				if id == info.ActivityID {
-					return nil, nil, &resp, nil
+					return past{answer: &resp}, nil
 				}
 				continue // a call that waited for budget got no answer
 			}
 			for i, r := range hops {
-				if r.Provider == row.Provider && r.Model == row.Model && r.PromptVersion == row.PromptVersion &&
-					r.Effort == row.Effort.String {
-					declined[i], refusal = true, &resp
+				if r.Provider != row.Provider || r.Model != row.Model || r.PromptVersion != row.PromptVersion ||
+					r.Effort != row.Effort.String {
+					continue
+				}
+				if resp.Status == StatusRefused {
+					p.declined[i], p.refusal = true, &resp
+				} else {
+					p.invalid[i]++
+					p.lastInvalid[i] = &resp
 				}
 			}
 		}
 	}
-	return declined, refusal, nil, nil
+	return p, nil
 }
 
 // lastAttempt reports whether Temporal will not retry this attempt: the workflow's retry
@@ -569,7 +605,11 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 	}
 	// Reserve the most the request can cost before it goes out (section 9).
 	tokens, err := adapter.CountTokens(ctx, req)
-	if err != nil {
+	var declined *models.Declined
+	switch {
+	case errors.As(err, &declined):
+		return g.recordDeclined(ctx, info, run, route, args, seq, declined)
+	case err != nil:
 		if failed := nonRetryable(err); failed != nil {
 			return models.Response{}, failed
 		}
@@ -593,6 +633,11 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 	}
 
 	if err := g.waitTurn(ctx, route.Provider); err != nil {
+		g.closeUnanswered(ctx, breq, reserved, fmt.Errorf("%w: %v", models.ErrNotSent, err))
+		return models.Response{}, err
+	}
+	// Counting and the wait for a turn took time too.
+	if err := g.tooLate(ctx, info, route, seq); err != nil {
 		g.closeUnanswered(ctx, breq, reserved, fmt.Errorf("%w: %v", models.ErrNotSent, err))
 		return models.Response{}, err
 	}
@@ -621,7 +666,7 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 		if resp.Value, err = g.accept(ctx, run.WorkflowID, route, resp.Output); err != nil {
 			var invalid invalidOutputError
 			if !errors.As(err, &invalid) {
-				return models.Response{}, err
+				return models.Response{}, recordError{err}
 			}
 			resp.Status, stop = StatusInvalidOutput, StatusInvalidOutput
 			resp.Value = map[string]any{"reason": invalid.Error(), "stop_reason": resp.StopReason}
@@ -629,15 +674,15 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 	}
 	respJSON, err := json.Marshal(resp)
 	if err != nil {
-		return models.Response{}, err
+		return models.Response{}, recordError{err}
 	}
 	respRef, err := g.Ledger.PutBlob(ctx, respJSON)
 	if err != nil {
-		return models.Response{}, err
+		return models.Response{}, recordError{err}
 	}
 	billed, err := json.Marshal(resp.Billed)
 	if err != nil {
-		return models.Response{}, err
+		return models.Response{}, recordError{err}
 	}
 	// The answer and its charge are recorded together. A crash or a failed write before
 	// this leaves the reservation open: it stays held, and agentd charges it in full when
@@ -655,10 +700,49 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 		_, err := budget.Settle(ctx, q, req.RequestID, cost, resp.Model, g.Prices.Version, budget.ReasonUsage)
 		return err
 	}); err != nil {
-		return models.Response{}, err
+		return models.Response{}, recordError{err}
 	}
 	fx.StallAfterRecord(ctx.Done())
 	return resp, nil
+}
+
+// recordError is a failure to record an answer the provider gave and may have billed: its
+// reservation stays open, to be charged in full when agentd starts again, and the call cannot
+// carry on as if there had been no answer.
+type recordError struct{ error }
+
+func (e recordError) Unwrap() error { return e.error }
+
+// recordDeclined records a provider's refusal while counting a request: a refusal like any
+// other, in the ledger so that no later attempt asks again, with nothing reserved or charged.
+func (g *Gateway) recordDeclined(ctx context.Context, info activity.Info, run db.Run, route models.Route,
+	args map[string]any, seq int, d *models.Declined) (models.Response, error) {
+	resp := models.Response{Status: StatusRefused, Model: route.Name(), StopReason: d.Category,
+		Value: map[string]any{"category": d.Category, "explanation": d.Explanation}, Billed: []models.Billed{{Model: route.Name()}}}
+	g.Log.Warn("the provider declined the request while counting it", "workflow_id", run.WorkflowID,
+		"model", route.Name(), "category", d.Category)
+	if err := g.recordRequest(ctx, info, run, route, args, seq); err != nil {
+		return models.Response{}, err
+	}
+	respJSON, err := json.Marshal(resp)
+	if err != nil {
+		return models.Response{}, err
+	}
+	respRef, err := g.Ledger.PutBlob(ctx, respJSON)
+	if err != nil {
+		return models.Response{}, err
+	}
+	billed, err := json.Marshal(resp.Billed)
+	if err != nil {
+		return models.Response{}, err
+	}
+	return resp, g.Ledger.Q.FinishModelCall(ctx, db.FinishModelCallParams{
+		ResponseBlob: sql.NullString{String: respRef, Valid: true},
+		StopReason:   sql.NullString{String: d.Category, Valid: true},
+		UsageJson:    sql.NullString{String: string(billed), Valid: true},
+		FinishedAt:   sql.NullString{String: ledger.Now(), Valid: true},
+		WorkflowID:   run.WorkflowID, ActivityID: info.ActivityID, Attempt: int64(info.Attempt), RequestSeq: int64(seq),
+	})
 }
 
 // nonRetryable is the error Temporal must not retry for an adapter's err, or nil: what a request
@@ -673,6 +757,8 @@ func nonRetryable(err error) error {
 		kind = "InputTooLong"
 	case errors.Is(err, models.ErrCloudModel):
 		kind = "CloudModel"
+	case errors.Is(err, models.ErrUnverified):
+		kind = "Unverified"
 	case errors.As(err, &rejected) && !rejected.Retryable():
 		kind = "ProviderRejected"
 	default:
@@ -683,7 +769,7 @@ func nonRetryable(err error) error {
 
 // hopFailures are the errors of one provider's request that leave the next provider to ask:
 // what one fallback cannot take, another may.
-var hopFailures = []string{"Unpriced", "InputTooLong", "CloudModel", "ProviderRejected", "NoTimeLeft"}
+var hopFailures = []string{"Unpriced", "InputTooLong", "CloudModel", "Unverified", "ProviderRejected", "NoTimeLeft"}
 
 // charge is what resp was billed: each attempt within the request at its own model's price,
 // so that a server-side fallback is charged at the fallback's rates. An answer the price
@@ -869,13 +955,19 @@ func sha256Hex(parts ...[]byte) string {
 
 // detach gives an execution that several attempts may wait on a context of its own: it
 // keeps the activity's values but not the attempt's cancellation, and it ends at the
-// start-to-close timeout.
+// start-to-close timeout, or at the activity's deadline if that is sooner.
 func detach(ctx context.Context, info activity.Info) (context.Context, context.CancelFunc) {
 	timeout := info.StartToCloseTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	deadline := time.Now().Add(timeout)
+	// The activity's own deadline when it is sooner: a schedule-to-close timeout ends the
+	// activity early. One already past is another clock's: it is not followed.
+	if d := info.Deadline; !d.IsZero() && d.After(time.Now()) && d.Before(deadline) {
+		deadline = d
+	}
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
 }
 
 // heartbeatInterval is a third of the heartbeat timeout, but never under 100ms. The
