@@ -60,7 +60,11 @@ temporal server start-dev --db-filename ~/.agentos/temporal.db --search-attribut
 ```
 
 Without `--db-filename` the dev server keeps everything in memory and loses every run when
-it exits. The dev configs keep agentd's data in `~/.agentos` too, out of the repository.
+it exits. The dev configs keep agentd's data in `~/.agentos` too, out of the repository; move a
+checkout's own `.agentos` from before out of it as well (the Worker launchers refuse a code
+directory that holds one). All checkouts share `~/.agentos`: run one dev stack at a time, or give
+another a config with a `data_dir` of its own. A ledger a newer branch has migrated is not for
+an older agentd.
 
 In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under

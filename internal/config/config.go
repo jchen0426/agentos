@@ -120,11 +120,18 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	home, homeErr := os.UserHomeDir()
-	var missingHome error // a ~/ path, and no home directory
+	if homeErr == nil && !filepath.IsAbs(home) {
+		homeErr = fmt.Errorf("the home directory %q is not absolute", home)
+	}
+	var tildeErr error // a ~ path that names no directory
 	abs := func(p string) string {
-		if rest, ok := strings.CutPrefix(p, "~/"); ok {
-			if homeErr != nil {
-				missingHome = homeErr
+		if strings.HasPrefix(p, "~") {
+			rest, ok := strings.CutPrefix(p, "~/")
+			switch {
+			case !ok:
+				tildeErr = fmt.Errorf("%q: only ~/ is expanded", p)
+			case homeErr != nil:
+				tildeErr = fmt.Errorf("%q: %w", p, homeErr)
 			}
 			return filepath.Join(home, rest)
 		}
@@ -202,8 +209,8 @@ func Load(path string) (*Config, error) {
 	if len(c.GitTools.Sandbox) > 0 {
 		c.GitTools.Sandbox[0] = abs(c.GitTools.Sandbox[0])
 	}
-	if missingHome != nil {
-		return nil, fmt.Errorf("config %s: a ~/ path needs the home directory: %w", path, missingHome)
+	if tildeErr != nil {
+		return nil, fmt.Errorf("config %s: %w", path, tildeErr)
 	}
 	if c.GitTools.Timeout <= 0 {
 		c.GitTools.Timeout = time.Minute

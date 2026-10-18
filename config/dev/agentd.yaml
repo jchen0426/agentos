@@ -1,9 +1,10 @@
 # Development setup: Temporal's dev server on 127.0.0.1:7233, the fake model. No github section:
 # the GitHub tools only dry-run (see the README to write to a test repository).
 # Paths are relative to this file, or to the home directory (~/). On Linux, use the default
-# unix:// Runtime socket instead. agentd's data stays out of this repository: a sandboxed Worker
-# is given it as its code directory, and could read anything in it.
-data_dir: ~/.agentos
+# unix:// Runtime socket instead. agentd keeps its data in the default data_dir, ~/.agentos, out
+# of this repository: a sandboxed Worker is given it as its code directory, and could read
+# anything in it. (Left out, not spelled ~/.agentos: an agentd built before ~/ paths existed
+# would make a directory named ~ here.)
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml

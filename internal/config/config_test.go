@@ -149,10 +149,24 @@ func TestPathsInTheHomeDirectory(t *testing.T) {
 		}
 	}
 
-	// Without a home directory, a ~/ path is an error, not a directory named ~.
-	t.Setenv("HOME", "")
-	if c, err := Load(path); err == nil {
-		t.Errorf("loaded without a home directory: data_dir %s", c.DataDir)
+	// Only ~/ is expanded: another ~ would otherwise name a directory next to the config.
+	for _, dataDir := range []string{`"~"`, "~someone/agentos"} {
+		other := filepath.Join(dir, "other.yaml")
+		if err := os.WriteFile(other, []byte("data_dir: "+dataDir+"\npolicy_file: p\nmodels_file: m\nprices_file: x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := Load(other); err == nil {
+			t.Errorf("data_dir %s: loaded as %s", dataDir, c.DataDir)
+		}
+	}
+
+	// Without an absolute home directory, a ~/ path is an error: not a directory named ~, nor a
+	// data directory relative to wherever agentd runs while its sockets are next to the config.
+	for _, h := range []string{"", "relative/home"} {
+		t.Setenv("HOME", h)
+		if c, err := Load(path); err == nil {
+			t.Errorf("HOME=%q: loaded, data_dir %s", h, c.DataDir)
+		}
 	}
 	if err := os.WriteFile(path, []byte("data_dir: d\npolicy_file: p\nmodels_file: m\nprices_file: x\n"), 0o600); err != nil {
 		t.Fatal(err)

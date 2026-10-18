@@ -8,10 +8,13 @@
 #   - files: the home directory, and any colon-separated paths in AGENTOS_SANDBOX_DENY_READ,
 #     are unreadable except the Python environment and the task code; writes only to a
 #     private temporary directory. Everything else can be read, so agentd's data directory
-#     belongs under the home directory (or in AGENTOS_SANDBOX_DENY_READ), and the launcher
-#     refuses a Python environment or code directory that holds it: the Worker could read its
-#     ledger. It looks when it starts the Worker. Unix sockets need no such check: srt lets the
-#     sandbox connect to none
+#     belongs under the home directory or in AGENTOS_SANDBOX_DENY_READ. Seatbelt matches real
+#     paths, and srt keeps a symlink's spelling when it leads elsewhere, so each denied path goes
+#     in as given and as its real path; agentd's default data directory, ~/.agentos, is denied
+#     wherever it really is. The launcher refuses a Python environment or code directory that
+#     holds dev data, which the Worker could read: agentd's ledger, a .agentos directory,
+#     Temporal's dev database. It looks when it starts the Worker. Unix sockets and FIFOs there
+#     need no such check: srt lets the sandbox connect to no socket, and write to neither
 #   - environment: cleared, except what srt adds (its proxy variables)
 #
 # Usage: run-worker.sh <runtime-port> <python-env-dir> <code-dir> -- <command> [args...]
@@ -24,10 +27,14 @@ fi
 port=$1 pyenv=$2 code=$3
 shift 4
 [[ $port =~ ^[0-9]{1,5}$ ]] || { echo "$0: bad port $port" >&2; exit 2; }
+# -H: a directory given as a symlink is looked into. A scan fails when a directory goes away
+# under it (npm ci in the code directory, say): try again.
+scan() { find -H "$1" \( -name 'ledger.db*' -o -name 'temporal.db*' -o -name .agentos \) -print -quit; }
 for dir in "$pyenv" "$code"; do
-  found=$(find -H "$dir" -name ledger.db -print -quit) || { echo "$0: cannot look through $dir" >&2; exit 1; }
+  found=$(scan "$dir" 2>/dev/null) || found=$(scan "$dir" 2>/dev/null) || found=$(scan "$dir") ||
+    { echo "$0: cannot look through $dir" >&2; exit 1; }
   if [[ -n $found ]]; then
-    echo "$0: $dir holds agentd's data directory, whose ledger ($found) the Worker could read" >&2
+    echo "$0: $dir holds $found, agentd's or Temporal's data, which the Worker could read" >&2
     exit 1
   fi
 done
@@ -40,11 +47,19 @@ state=$(mktemp -d /tmp/agentos-sandbox.XXXXXX)
 mkdir "$state/work"
 # Built with node (which srt needs anyway) so that paths are JSON-escaped.
 node -e '
+  const fs = require("fs"), path = require("path");
   const [port, pyenv, code, home, work, deny] = process.argv.slice(1);
+  const real = p => {
+    try { return fs.realpathSync(p); } catch {
+      const dir = path.dirname(p);
+      return dir === p ? p : path.join(real(dir), path.basename(p));
+    }
+  };
+  const denied = [home, path.join(home, ".agentos"), ...deny.split(":").filter(Boolean)];
   console.log(JSON.stringify({
     network: { allowedDomains: [`127.0.0.1:${port}`], deniedDomains: [], allowLocalBinding: false },
     filesystem: {
-      denyRead: [home, ...deny.split(":").filter(Boolean)],
+      denyRead: [...new Set(denied.flatMap(p => [p, real(p)]))],
       allowRead: [pyenv, code],
       allowWrite: [work],
       denyWrite: [],

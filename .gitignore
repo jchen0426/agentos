@@ -3,7 +3,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-/.agentos/
+# agentd's and Temporal's dev data, which belongs in ~/.agentos: never commit a ledger
+.agentos/
+ledger.db*
+temporal.db*
 /sandbox/macos/node_modules/
 /.claude/*.log
 /.claude/settings.local.json
