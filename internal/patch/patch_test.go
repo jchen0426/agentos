@@ -86,6 +86,8 @@ func TestCheckRefuses(t *testing.T) {
 		{newFile(":/app/db.py", "100644"), "only letters"},       // git pathspec magic
 		{newFile("\u017fcripts/x.sh", "100644"), "only letters"}, // folds to "scripts" in some places
 		{newFile(".g\u200cit/config", "100644"), "only letters"}, // a zero-width joiner
+		{"diff --git a/app/db.py b/app/db.py\n", "changes nothing"},
+		{"diff --git a/app/db.py b/app/db.py\nindex 1111111..2222222 100644\n", "changes nothing"},
 	} {
 		p, err := Parse([]byte(tc.patch))
 		if err == nil {

@@ -51,6 +51,18 @@ models:
 
 AUDIT_SCHEMA = REPO / "config/schemas/audit_report.json"
 
+# AGENTOS_GITHUB=live lets tests/test_t2_live.py, and only it (through the live_stack fixture),
+# write to a real test repository instead of the simulated GitHub: the one in AGENTOS_GITHUB_REPO
+# (owner/name), holding scripts/make-audit-target.sh's fixture, with a fine-grained token for it
+# in the login keychain item agentos-github-test-token. The gh CLI reads GitHub for the checks.
+GITHUB_LIVE_REPO = os.environ.get("AGENTOS_GITHUB_REPO", "") if os.environ.get("AGENTOS_GITHUB") == "live" else ""
+# The audited commit of scripts/make-audit-target.sh's fixture: its commits have fixed authors
+# and dates. A live repository must hold exactly that.
+FIXTURE_COMMIT = "01f7b30c0dd024bac65d30d17395693903c759ed"
+
+# How agentd launches the git tool server in each sandbox mode.
+TOOL_LAUNCHER = {"srt": REPO / "sandbox/macos/run-tool.sh", "bwrap": REPO / "sandbox/linux/run-tool.sh"}
+
 # AGENTOS_MODEL=claude sends the model task to Claude: the real prompt, schema, fallback and
 # prices, with the key from the keychain. It costs money; the tests that make sense with a
 # real model are T1's, which check that crashes never repeat or lose a model call.
@@ -185,29 +197,19 @@ class Worker(Proc):
         os.kill(self.worker_pid(), signal.SIGSTOP)
 
 
-SAFE_QUERY = """def find_user(conn, name):
-    return conn.execute("SELECT * FROM users WHERE name = ?", (name,))
-"""
-VULNERABLE_QUERY = SAFE_QUERY.replace('name = ?", (name,))', "name = '%s'\" % name)")
-
-
-def make_mirror(path: Path) -> str:
-    """A git repository standing in for the read-only mirror of acme/payments. Its last commit,
-    the one audited, introduces the SQL injection the stub diff shows, which the fake model's
-    patch fixes."""
-    path.mkdir(parents=True)
-    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
-    run = lambda *a: subprocess.run(["git", "-C", str(path), *a], env=env, check=True, capture_output=True, text=True)
-    run("init", "-q", "-b", "main")
-    (path / "app.py").write_text("print('hello')\n")
-    (path / "app").mkdir()
-    (path / "app" / "db.py").write_text(SAFE_QUERY)
-    run("add", ".")
-    run("commit", "-q", "-m", "init")
-    (path / "app" / "db.py").write_text(VULNERABLE_QUERY)
-    run("commit", "-q", "-am", "find users by name")
-    return run("rev-parse", "HEAD").stdout.strip()
+def make_mirror(path: Path, live_repo: str = "") -> str:
+    """The read-only mirror of acme/payments: the audit fixture, whose last commit (the one
+    audited) introduces a SQL injection that the fake model's patch fixes. For a live run, a
+    clone of the test repository, which must hold that same fixture. Returns the audited commit."""
+    if live_repo:
+        subprocess.run(["git", "clone", "-q", f"https://github.com/{live_repo}.git", str(path)], check=True)
+        head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        assert head == FIXTURE_COMMIT, f"{live_repo} does not hold the fixture: HEAD is {head}"
+        return head
+    r = subprocess.run([REPO / "scripts/make-audit-target.sh", path], check=True, capture_output=True, text=True)
+    assert r.stdout.strip() == FIXTURE_COMMIT, r.stdout
+    return FIXTURE_COMMIT
 
 
 class Stack:
@@ -218,14 +220,15 @@ class Stack:
     temporal_tls: TLSConfig | None = None
     agentd_tls: dict | None = None
 
-    def __init__(self, tmp: Path) -> None:
+    def __init__(self, tmp: Path, live_repo: str = "") -> None:
         self.tmp = tmp
+        self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
         # Unix socket paths must stay under 104 bytes (macOS), so they live in a short /tmp dir.
         self.sock_dir = Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
         self.procs: list[Proc] = []
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
-        self.commit = make_mirror(tmp / "mirror")
+        self.commit = make_mirror(tmp / "mirror", live_repo)
         self.data_dir = tmp / "agentd" / "data"
         # Separate directories: the Linux sandbox mounts the Runtime socket's directory.
         self.control_socket = self.sock_dir / "control" / "control.sock"
@@ -310,14 +313,18 @@ class Stack:
             "policy_file": "policy.yaml",
             "models_file": "models.yaml",
             "prices_file": "prices.yaml",
-            "repos": {"acme/payments": str(self.tmp / "mirror")},
+            "repos": {"acme/payments": {"mirror": str(self.tmp / "mirror"), "github": self.live_repo or "acme/payments"}},
             # The simulated GitHub needs no token, and applies a write as it receives it: a
             # lookup that finds nothing past the request timeout means it never took effect.
-            "github": {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"},
+            "github": ({"token": "keyring:agentos-github-test-token"} if self.live_repo
+                       else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"}),
+            **({"git_tools": {"sandbox": [str(TOOL_LAUNCHER[SANDBOX])]}} if SANDBOX in TOOL_LAUNCHER else {}),
             **(extra or {}),
         }
         (d / "agentd.yaml").write_text(json.dumps(config))
         self._agentd_args = [BIN / "agentd", "--config", d / "agentd.yaml"]
+        if SANDBOX == "none":
+            self._agentd_args.append("--insecure-dev")  # the git tool server runs unsandboxed too
         if test_tools:
             self._agentd_args.append("--test-tools")
         if faults:
@@ -463,7 +470,9 @@ class Stack:
 
     def external(self, run: dict, tool: str) -> list[dict]:
         """The external writes of a run's tool that took effect, as the outside world recorded
-        them: the simulated GitHub's log, or the test tool's own."""
+        them: the simulated GitHub's log, the real GitHub in live mode, or the test tool's own."""
+        if self.live_repo and tool.startswith("github."):
+            return self.live_github(run, tool)
         if tool == "test.unsafe_write":
             path = self.data_dir / "test-external.jsonl"
             lines = path.read_text().splitlines() if path.exists() else []
@@ -476,6 +485,21 @@ class Stack:
             mine = {e["effect_id"] for e in self.effects(run)}
             return [e for e in self.github_requests("create_comment") if e["status"] == 201 and e["effect"] in mine]
         raise ValueError(f"no external record for {tool}")
+
+    def live_github(self, run: dict, tool: str) -> list[dict]:
+        """The run's pull requests (by its head branch) or report comments (by their markers) on
+        the real test repository."""
+        def api(path: str) -> list[dict]:
+            out = subprocess.run(["gh", "api", "--paginate", "--slurp", path], check=True, capture_output=True,
+                                 text=True).stdout
+            return [item for page in json.loads(out) for item in page]
+        if tool == "github.open_draft_pr":
+            return [{"number": pr["number"], "url": pr["html_url"], "head": pr["head"]["ref"]}
+                    for pr in api(f"repos/{self.live_repo}/pulls?state=all&per_page=100")
+                    if f"-{run['run_id'][:8]}-" in pr["head"]["ref"]]
+        markers = {f"<!-- agent-effect:{e['effect_id']} -->" for e in self.effects(run)}
+        return [{"id": c["id"], "url": c["html_url"]} for c in api(f"repos/{self.live_repo}/commits/{self.commit}/comments")
+                if c["body"].rstrip().splitlines()[-1] in markers]
 
     def effect(self, run: dict, tool: str) -> sqlite3.Row:
         [e] = [e for e in self.effects(run) if e["tool"] == tool]

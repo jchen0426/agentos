@@ -27,7 +27,8 @@ type Config struct {
 	Repos         map[string]Repo `yaml:"repos"`       // by logical repo id
 	// GitHub is how the GitHub tools reach GitHub. Without it they only dry-run: nothing is
 	// written anywhere.
-	GitHub *GitHub `yaml:"github"`
+	GitHub   *GitHub  `yaml:"github"`
+	GitTools GitTools `yaml:"git_tools"`
 	// How long a cancelled run may keep running before agentd terminates it: Temporal's
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
@@ -73,6 +74,16 @@ type GitHub struct {
 	Settle      time.Duration `yaml:"settle"`
 	AuthorName  string        `yaml:"author_name"`  // who the patch commits are by; default agentos
 	AuthorEmail string        `yaml:"author_email"` // default agentos@agentos.invalid, which is nobody's
+}
+
+// GitTools is how agentd runs the read-only git MCP server: once per call, through a sandbox
+// launcher.
+type GitTools struct {
+	Server string `yaml:"server"` // agentos-mcp-git; default: next to agentd's own binary
+	// Sandbox is the launcher and its leading arguments: ../sandbox/macos/run-tool.sh or
+	// ../sandbox/linux/run-tool.sh. Leaving it out needs agentd's --insecure-dev.
+	Sandbox []string      `yaml:"sandbox"`
+	Timeout time.Duration `yaml:"timeout"` // per call; default 60s
 }
 
 type Temporal struct {
@@ -180,6 +191,15 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("config %s: repo %s: github must be owner/name, not %q", path, id, r.GitHub)
 		}
 		c.Repos[id] = r
+	}
+	if c.GitTools.Server != "" {
+		c.GitTools.Server = abs(c.GitTools.Server)
+	}
+	if len(c.GitTools.Sandbox) > 0 {
+		c.GitTools.Sandbox[0] = abs(c.GitTools.Sandbox[0])
+	}
+	if c.GitTools.Timeout <= 0 {
+		c.GitTools.Timeout = time.Minute
 	}
 	if g := c.GitHub; g != nil {
 		if g.APIURL == "" {

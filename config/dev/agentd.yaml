@@ -9,3 +9,6 @@ models_file: models.yaml
 prices_file: prices.yaml
 repos:
   acme/payments: ../../.agentos/mirror      # any local git repository
+# agentd reads repositories through the git tool server, run per call in this sandbox (macOS;
+# on Linux, ../../sandbox/linux/run-tool.sh). It needs `npm ci` in sandbox/macos.
+git_tools: {sandbox: [../../sandbox/macos/run-tool.sh]}

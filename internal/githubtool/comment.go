@@ -39,7 +39,7 @@ var commentArgs = tools.MustSchema(`{
     "repo": {"type": "string", "minLength": 1},
     "commit": {"type": "string", "pattern": "` + tools.CommitPattern + `"},
     "report_ref": {"anyOf": [{"type": "string", "pattern": "` + tools.BlobPattern + `"}, {"type": "null"}]},
-    "outcome": {"type": "string", "maxLength": 2000},
+    "outcome": {"type": "string", "maxLength": 100000},
     "pr_url": {"anyOf": [{"type": "string"}, {"type": "null"}]}
   }
 }`)
@@ -125,6 +125,7 @@ func (t *CommentCommit) Prepare(ctx context.Context, req tools.Request) (json.Ra
 const (
 	maxText      = 60000
 	maxBackticks = 16
+	maxOutcome   = 2000
 )
 
 // render builds the comment from what agentd checked itself (the commit, the severities, the
@@ -153,6 +154,10 @@ func render(commit, outcome string, rep *report, pr int64, marker string) string
 	}
 	if pr > 0 {
 		fmt.Fprintf(&b, "A draft pull request proposes a fix: #%d\n\n", pr)
+	}
+	// The workflow's outcome may carry a long error: cut it rather than refuse the report.
+	if len(outcome) > maxOutcome {
+		outcome = strings.ToValidUTF8(outcome[:maxOutcome], "") + " [truncated]"
 	}
 	var text strings.Builder
 	text.WriteString("Outcome: " + outcome)

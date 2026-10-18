@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path"
 	"regexp"
@@ -18,6 +17,8 @@ import (
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 	"github.com/bmatcuk/doublestar/v4"
+
+	"github.com/jchen0426/agentos/internal/gitenv"
 )
 
 // Limits on a patch. A fix for one finding is small.
@@ -117,6 +118,8 @@ func (p *Patch) Check(denyPaths []string) error {
 			return violation("%s: renames and copies are not accepted", n)
 		case f.OldMode != 0 && f.NewMode != 0 && f.OldMode != f.NewMode:
 			return violation("%s: mode changes are not accepted", n)
+		case !f.IsNew && !f.IsDelete && len(f.TextFragments) == 0:
+			return violation("%s: the patch changes nothing in it", n) // git apply refuses it as no patch at all
 		}
 		mode := f.NewMode
 		if f.IsDelete {
@@ -252,19 +255,22 @@ func MirrorSource(ctx context.Context, mirror, commit string) Source {
 	}
 }
 
-// git runs a read-only git command in the mirror, without the user's or the system's git
-// configuration, and with paths taken literally. Its errors name the mirror "<mirror>": they
-// may reach the workflow, and from there a public report.
+// git runs a read-only git command in the mirror, in gitenv's environment: replace refs, say,
+// could hand over another file than the commit's. A crafted tree too large to read within
+// gitenv.AllocLimit is a violation: it always will be. Its errors name the mirror "<mirror>":
+// they may reach the workflow, and from there a public report.
 func git(ctx context.Context, mirror string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", mirror}, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0",
-		"GIT_LITERAL_PATHSPECS=1")
+	cmd.Env = gitenv.ForMirror(mirror)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
+			if gitenv.TooLarge(stderr.String()) {
+				return nil, violation("the commit is too large for git to read within its memory limit")
+			}
 			msg := strings.ReplaceAll(strings.TrimSpace(stderr.String()), mirror, "<mirror>")
 			return nil, fmt.Errorf("git %s: %s", args[0], msg)
 		}
