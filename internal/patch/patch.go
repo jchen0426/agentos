@@ -1,27 +1,26 @@
 // Package patch reads the patches a model proposes and checks them before any tool acts on
 // one: which files it changes and how, whether the policy lets it, and what the files become.
-// No git command ever reads a patch; the files' current contents come from the read-only
-// mirror, through git cat-file, which runs no filters, hooks or diff drivers.
+// No git command ever reads a patch, and agentd runs none on the mirror: the files' current
+// contents come from the git tool server's read_files, in its sandbox. The patch is applied
+// here, in Go.
 package patch
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 	"github.com/bmatcuk/doublestar/v4"
 
-	"github.com/jchen0426/agentos/internal/gitenv"
+	"github.com/jchen0426/agentos/internal/gitmcp"
 )
 
-// Limits on a patch. A fix for one finding is small.
+// Limits on a patch. A fix for one finding is small. The git tool server takes as many files
+// and reads files as large (gitmcp.MaxPaths, gitmcp.MaxReadBytes).
 const (
 	MaxBytes     = 256 << 10 // the patch itself
 	MaxFiles     = 20        // files it touches
@@ -170,20 +169,21 @@ func checkPath(n string) error {
 	return nil
 }
 
-// Source reads a file as it is at the commit the patch is for; ok is false when the commit
-// has no such file.
-type Source func(path string) (content []byte, ok bool, err error)
+// Source reads files as they are at the commit the patch is for, all in one go: the content of
+// each path the commit has a file at. A path it has nothing at is left out.
+type Source func(paths []string) (map[string][]byte, error)
 
 // Apply applies the patch to the files src reads, exactly where its hunks say: a hunk whose
 // context does not match is a violation, not something to fuzz.
 func (p *Patch) Apply(src Source) ([]Change, error) {
+	files, err := src(p.Paths())
+	if err != nil {
+		return nil, fmt.Errorf("read the files at the commit: %w", err)
+	}
 	changes := make([]Change, 0, len(p.files))
 	for _, f := range p.files {
 		n := name(f)
-		orig, exists, err := src(n)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", n, err)
-		}
+		orig, exists := files[n]
 		switch {
 		case f.IsNew && exists:
 			return nil, violation("%s: the patch creates it, but it exists", n)
@@ -211,70 +211,40 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 	return changes, nil
 }
 
-// MirrorSource reads files at commit from the read-only mirror. Only regular files count,
-// under directories: a patch to a symlink or a submodule, or to a path under one, is refused
-// when it is applied. A file over MaxFileBytes is refused before it is read.
-func MirrorSource(ctx context.Context, mirror, commit string) Source {
-	return func(n string) ([]byte, bool, error) {
-		// The file and each directory above it, in one listing.
-		parts := strings.Split(n, "/")
-		paths := make([]string, len(parts))
-		for i := range parts {
-			paths[i] = strings.Join(parts[:i+1], "/")
-		}
-		out, err := git(ctx, mirror, append([]string{"ls-tree", "-z", "-l", "--full-tree", commit, "--"}, paths...)...)
-		if err != nil {
-			return nil, false, err
-		}
-		entries := map[string][]string{} // path -> mode, type, object, size
-		for entry := range bytes.SplitSeq(bytes.TrimSuffix(out, []byte{0}), []byte{0}) {
-			meta, p, ok := bytes.Cut(entry, []byte{'\t'})
-			fields := strings.Fields(string(meta))
-			if !ok || len(fields) != 4 {
-				return nil, false, fmt.Errorf("git ls-tree: unexpected entry %q", entry)
-			}
-			entries[string(p)] = fields
-		}
-		for _, dir := range paths[:len(paths)-1] {
-			if e, ok := entries[dir]; ok && e[1] != "tree" {
-				return nil, false, violation("%s: %s is not a directory at the commit", n, dir)
-			}
-		}
-		e, ok := entries[n]
+// MirrorSource reads files at commit from the read-only mirror, through the git tool server
+// (read_files), which runs git in its sandbox. Only regular files count, under directories: a
+// patch to a symlink or a submodule, or to a path under one, is refused when it is applied. A
+// file over MaxFileBytes is refused unread. The server's refusals (a crafted tree too large for
+// git to read, say) are violations: they always will be. Its failures are errors, and the call
+// is tried again.
+func MirrorSource(ctx context.Context, git gitmcp.Caller, mirror, commit string) Source {
+	return func(paths []string) (map[string][]byte, error) {
+		files, err := gitmcp.ReadFiles(ctx, git, mirror, commit, paths)
 		switch {
-		case !ok:
-			return nil, false, nil
-		case e[1] != "blob" || e[0] != "100644":
-			return nil, false, violation("%s: not a regular file at the commit (%s %s)", n, e[0], e[1])
+		case gitmcp.IsToolError(err):
+			return nil, violation("%s", err)
+		case err != nil:
+			return nil, err
 		}
-		if size, err := strconv.ParseInt(e[3], 10, 64); err != nil || size > MaxFileBytes {
-			return nil, false, violation("%s: %s bytes, over the limit of %d", n, e[3], MaxFileBytes)
-		}
-		b, err := git(ctx, mirror, "cat-file", "blob", e[2])
-		return b, err == nil, err
-	}
-}
-
-// git runs a read-only git command in the mirror, in gitenv's environment: replace refs, say,
-// could hand over another file than the commit's. A crafted tree too large to read within
-// gitenv.AllocLimit is a violation: it always will be. Its errors name the mirror "<mirror>":
-// they may reach the workflow, and from there a public report.
-func git(ctx context.Context, mirror string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", mirror}, args...)...)
-	cmd.Env = gitenv.ForMirror(mirror)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			if gitenv.TooLarge(stderr.String()) {
-				return nil, violation("the commit is too large for git to read within its memory limit")
+		contents := map[string][]byte{}
+		for _, f := range files {
+			switch {
+			case f.NotDir != "":
+				return nil, violation("%s: %s is not a directory at the commit", f.Path, f.NotDir)
+			case f.Type == "":
+				// nothing there: a file the patch may create
+			case f.Type != "blob" || f.Mode != "100644":
+				return nil, violation("%s: not a regular file at the commit (%s %s)", f.Path, f.Mode, f.Type)
+			case f.Size > MaxFileBytes:
+				return nil, violation("%s: %d bytes, over the limit of %d", f.Path, f.Size, MaxFileBytes)
+			case int64(len(f.Content)) != f.Size:
+				// Not read whole (were the server's limit below this package's): never take it
+				// for an empty file, which a patch could delete.
+				return nil, fmt.Errorf("%s: %d bytes read of %d", f.Path, len(f.Content), f.Size)
+			default:
+				contents[f.Path] = f.Content
 			}
-			msg := strings.ReplaceAll(strings.TrimSpace(stderr.String()), mirror, "<mirror>")
-			return nil, fmt.Errorf("git %s: %s", args[0], msg)
 		}
-		return nil, fmt.Errorf("git %s: %w", args[0], err)
+		return contents, nil
 	}
-	return out, nil
 }

@@ -63,7 +63,11 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 		return nil, status.Errorf(codes.InvalidArgument, "unknown task %q", req.GetTask())
 	}
 	input, params, err := t.Resolve(ctx, req.GetParams())
-	if err != nil {
+	var unavailable *tasks.Unavailable
+	switch {
+	case errors.As(err, &unavailable):
+		return nil, status.Error(codes.Unavailable, err.Error()) // the start may work later
+	case err != nil:
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	budget := req.GetBudgetLimitMicros()

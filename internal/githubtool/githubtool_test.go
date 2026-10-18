@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/jchen0426/agentos/internal/githubsim"
+	"github.com/jchen0426/agentos/internal/gitmcp"
+	"github.com/jchen0426/agentos/internal/gitmcp/gitmcptest"
 	"github.com/jchen0426/agentos/internal/tools"
 )
 
@@ -67,6 +69,7 @@ type fixture struct {
 	blobs  blobs
 	repos  map[string]Repo
 	commit string
+	git    *gitmcp.Client // the real git tool server, unsandboxed
 }
 
 func setup(t *testing.T) *fixture {
@@ -99,7 +102,11 @@ func setup(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{sim: sim, client: client, blobs: blobs{},
+	server, err := gitmcp.NewClient(gitmcp.Options{Server: gitmcptest.Server(t), Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &fixture{sim: sim, client: client, blobs: blobs{}, git: server,
 		repos: map[string]Repo{"acme/payments": {Mirror: dir, Owner: "acme", Name: "payments"}}, commit: git("rev-parse", "HEAD")}
 }
 
@@ -143,7 +150,7 @@ func (f *fixture) allCarriedTheToken(t *testing.T) bool {
 func TestOpenDraftPROpensOnceAndFindsItAgain(t *testing.T) {
 	f := setup(t)
 	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
-	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs}
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, Git: f.git}
 	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
 	if err := tool.Args().Validate(req.Args); err != nil {
 		t.Fatal(err)
@@ -187,7 +194,7 @@ func TestOpenDraftPROpensOnceAndFindsItAgain(t *testing.T) {
 func TestOpenDraftPRLeavesAForeignBranchAlone(t *testing.T) {
 	f := setup(t)
 	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
-	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs}
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, Git: f.git}
 	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
 	payload, err := tool.Prepare(context.Background(), req)
 	if err != nil {
@@ -209,7 +216,7 @@ func TestOpenDraftPRLeavesAForeignBranchAlone(t *testing.T) {
 func TestOpenDraftPRDeniesProtectedPaths(t *testing.T) {
 	f := setup(t)
 	// No deny_paths in the policy: the paths GitHub acts on are refused anyway.
-	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs}
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, Git: f.git}
 	for _, path := range []string{".github/workflows/ci.yml", "CODEOWNERS", "docs/CODEOWNERS", ".devcontainer/devcontainer.json",
 		".devcontainer.json"} {
 		newFile := "diff --git a/" + path + " b/" + path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + path +
@@ -286,7 +293,7 @@ func TestRenderKeepsWithinGitHubsLimit(t *testing.T) {
 func TestACancelStopsThePullRequest(t *testing.T) {
 	f := setup(t)
 	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
-	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs}
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, Git: f.git}
 	payload, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
 		"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref}))
 	if err != nil {

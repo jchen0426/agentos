@@ -8,6 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jchen0426/agentos/internal/gitmcp"
+	"github.com/jchen0426/agentos/internal/gitmcp/gitmcptest"
 )
 
 const vulnerable = "def find_user(conn, name):\n    return conn.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)\n"
@@ -22,9 +26,14 @@ const fix = `diff --git a/app/db.py b/app/db.py
 `
 
 func files(m map[string]string) Source {
-	return func(n string) ([]byte, bool, error) {
-		s, ok := m[n]
-		return []byte(s), ok, nil
+	return func(paths []string) (map[string][]byte, error) {
+		out := map[string][]byte{}
+		for _, p := range paths {
+			if s, ok := m[p]; ok {
+				out[p] = []byte(s)
+			}
+		}
+		return out, nil
 	}
 }
 
@@ -110,54 +119,136 @@ func TestApplyRefuses(t *testing.T) {
 	refused(t, err, "changes no file")
 }
 
+// The patch's limits are what the git tool server reads.
+func TestLimitsMatchTheServer(t *testing.T) {
+	if MaxFiles != gitmcp.MaxPaths || MaxFileBytes != gitmcp.MaxReadBytes || MaxBytes != gitmcp.MaxPatchBytes {
+		t.Errorf("patch: %d files of %d bytes, %d bytes in all; the git tool server: %d, %d, %d",
+			MaxFiles, MaxFileBytes, MaxBytes, gitmcp.MaxPaths, gitmcp.MaxReadBytes, gitmcp.MaxPatchBytes)
+	}
+}
+
+type mirrorRepo struct {
+	t   *testing.T
+	dir string
+}
+
+func newMirror(t *testing.T) *mirrorRepo {
+	t.Helper()
+	r := &mirrorRepo{t: t, dir: t.TempDir()}
+	r.git("init", "-q", "-b", "main")
+	return r
+}
+
+func (r *mirrorRepo) git(args ...string) string {
+	r.t.Helper()
+	return r.gitIn("", args...)
+}
+
+func (r *mirrorRepo) gitIn(stdin string, args ...string) string {
+	r.t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", r.dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (r *mirrorRepo) write(name string, body []byte, mode os.FileMode) {
+	r.t.Helper()
+	full := filepath.Join(r.dir, name)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.WriteFile(full, body, mode); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// server is the real git tool server, unsandboxed, as MirrorSource calls it.
+func server(t *testing.T) *gitmcp.Client {
+	t.Helper()
+	c, err := gitmcp.NewClient(gitmcp.Options{Server: gitmcptest.Server(t), Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// MirrorSource reads through the git tool server: regular files only, under directories, and
+// none over the limit.
 func TestMirrorSource(t *testing.T) {
-	dir := t.TempDir()
-	run := func(args ...string) string {
-		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
-		out, err := cmd.CombinedOutput()
+	r := newMirror(t)
+	r.write("app/db.py", []byte(vulnerable), 0o644)
+	r.write("app/run.sh", []byte("#!/bin/sh\n"), 0o755)
+	r.write("app/big.py", make([]byte, MaxFileBytes+1), 0o644)
+	if err := os.Symlink("db.py", filepath.Join(r.dir, "app", "link.py")); err != nil {
+		t.Fatal(err)
+	}
+	r.git("add", ".")
+	r.git("commit", "-q", "-m", "x")
+	base := r.git("rev-parse", "HEAD")
+	r.git("update-index", "--add", "--cacheinfo", "160000,"+base+",vendor/lib")
+	r.git("commit", "-q", "-m", "a submodule")
+	head := r.git("rev-parse", "HEAD")
+	git := server(t)
+	read := func(paths ...string) (map[string][]byte, error) {
+		return MirrorSource(context.Background(), git, r.dir, head)(paths)
+	}
+
+	got, err := read("app/db.py", "app/missing.py", "new/dir/file.py")
+	if err != nil || len(got) != 1 || string(got["app/db.py"]) != vulnerable {
+		t.Fatalf("app/db.py, a missing file, one in a new directory: %q %v", got, err)
+	}
+	for path, want := range map[string]string{
+		"app/link.py":           "not a regular file at the commit (120000 blob)",
+		"app/run.sh":            "not a regular file at the commit (100755 blob)",
+		"app":                   "not a regular file at the commit (040000 tree)",
+		"vendor/lib":            "not a regular file at the commit (160000 commit)",
+		"app/link.py/inside.py": "app/link.py is not a directory", // a new file under a symlink
+		"vendor/lib/x.py":       "vendor/lib is not a directory",
+		"app/big.py":            "over the limit",
+	} {
+		_, err := read("app/db.py", path)
+		refused(t, err, want)
+	}
+
+	// The server's refusal is a violation: here a crafted tree that lists a name twice.
+	blob := r.git("rev-parse", head+":app/db.py")
+	tree := r.gitIn("100644 blob "+blob+"\tdup\n100644 blob "+blob+"\tdup\n", "mktree")
+	dup := r.git("commit-tree", tree, "-m", "a name twice")
+	_, err = MirrorSource(context.Background(), git, r.dir, dup)([]string{"dup"})
+	refused(t, err, "lists it more than once")
+
+	// The server's failure is not: the call is tried again. Errors never carry the mirror's
+	// path: they can end up in a public report.
+	_, err = MirrorSource(context.Background(), git, r.dir, strings.Repeat("0", 40))([]string{"app/db.py"})
+	var v *Violation
+	if err == nil || errors.As(err, &v) || strings.Contains(err.Error(), r.dir) {
+		t.Fatalf("an unknown commit: %v, want a failure", err)
+	}
+}
+
+// A patch that creates a file at the top of the tree, or in a directory the commit does not
+// have yet, applies.
+func TestApplyCreatesNewFiles(t *testing.T) {
+	r := newMirror(t)
+	r.write("app/db.py", []byte(vulnerable), 0o644)
+	r.git("add", ".")
+	r.git("commit", "-q", "-m", "x")
+	git, head := server(t), r.git("rev-parse", "HEAD")
+	for _, name := range []string{"SECURITY.md", "tests/sql/test_db.py"} {
+		p, err := Parse([]byte("diff --git a/" + name + " b/" + name + "\nnew file mode 100644\n" +
+			"--- /dev/null\n+++ b/" + name + "\n@@ -0,0 +1 @@\n+new\n"))
 		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
+			t.Fatal(err)
 		}
-		return strings.TrimSpace(string(out))
-	}
-	run("init", "-q", "-b", "main")
-	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "app", "db.py"), []byte(vulnerable), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("db.py", filepath.Join(dir, "app", "link.py")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "app", "big.py"), make([]byte, MaxFileBytes+1), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run("add", ".")
-	run("commit", "-q", "-m", "x")
-	src := MirrorSource(context.Background(), dir, run("rev-parse", "HEAD"))
-
-	b, ok, err := src("app/db.py")
-	if err != nil || !ok || string(b) != vulnerable {
-		t.Fatalf("app/db.py: %q %v %v", b, ok, err)
-	}
-	if _, ok, err := src("app/missing.py"); err != nil || ok {
-		t.Fatalf("missing file: ok=%v err=%v", ok, err)
-	}
-	_, _, err = src("app/link.py")
-	refused(t, err, "not a regular file")
-	_, _, err = src("app")
-	refused(t, err, "not a regular file")
-	_, _, err = src("app/link.py/inside.py") // a new file under a symlink
-	refused(t, err, "not a directory")
-	_, _, err = src("app/big.py")
-	refused(t, err, "over the limit")
-
-	// Errors never carry the mirror's path: they can end up in a public report.
-	_, _, err = MirrorSource(context.Background(), dir, strings.Repeat("0", 40))("app/db.py")
-	if err == nil || strings.Contains(err.Error(), dir) {
-		t.Fatalf("got %v", err)
+		changes, err := p.Apply(MirrorSource(context.Background(), git, r.dir, head))
+		if err != nil || len(changes) != 1 || changes[0].Path != name || string(changes[0].Content) != "new\n" {
+			t.Errorf("%s: changes %+v, %v", name, changes, err)
+		}
 	}
 }
