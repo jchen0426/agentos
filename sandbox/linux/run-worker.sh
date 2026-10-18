@@ -3,14 +3,28 @@
 #   - an empty network namespace (--unshare-net): only the sandbox's own loopback exists,
 #     so neither the host's Temporal port nor anything else on the network is reachable;
 #   - allowlisted mounts only: /usr read-only, the Python environment and the task code
-#     read-only, a private /tmp. The home directory and /run (D-Bus session bus,
-#     ssh-agent, docker.sock) are never mounted;
+#     read-only. The home directory and the host's /run (D-Bus session bus, ssh-agent,
+#     docker.sock) are never mounted;
+#   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root and
+#     /dev, tmpfs mounts bwrap makes as large as half the memory, are read-only; /tmp and /run
+#     are only directories in the root. A tmpfs's data, inodes and extended attributes are
+#     charged to no process, so the OOM killer would kill other processes, not a Worker that
+#     filled one (--size bounds the data only). Without a writable /dev/shm, POSIX semaphores
+#     and shared memory (multiprocessing) fail with EROFS;
+#   - no further user namespaces (--disable-userns): in one, the Worker could mount a tmpfs of
+#     its own;
 #   - --clearenv: no inherited environment variables;
 #   - the Runtime socket is the only way out: socat inside the sandbox forwards
 #     127.0.0.1:7233 to it, because the Temporal SDK only dials host:port. Its directory is
 #     mounted rather than the socket file: agentd re-creates the socket when it restarts,
 #     and a mounted file would keep pointing at the old one. So that directory must hold
 #     nothing but the socket.
+# Unlike run-tool.sh, no ulimit. -v bounds one process, and the Worker can fork; its address
+# space also grows with the CPU count (glibc gives the SDK's threads malloc arenas). -f would
+# kill the Worker once a log file its output goes to grew past the limit. That output is the
+# one thing it can write without bound: give it a pipe or journald, not a plain file. Memory
+# charged to no process remains (memfd, SysV IPC, pipe and socket buffers); bounding it takes
+# a cgroup (docs/m1-notes.md).
 #
 # Usage: run-worker.sh <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...]
 # Ubuntu 23.10+ also needs an AppArmor profile that grants bwrap user namespaces
@@ -32,16 +46,17 @@ extra=$(find "$runtime_dir" -mindepth 1 -maxdepth 1 ! -name "$sock_name" -print 
 
 inner_sock=/run/agentos/$sock_name
 args=(
-  --unshare-all --die-with-parent --new-session --clearenv
+  --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8
   --setenv PYTHONDONTWRITEBYTECODE 1
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
-  --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run
+  --proc /proc --dev /dev --dir /tmp
   --ro-bind "$pyenv" "$pyenv"
   --ro-bind "$code" "$code" --chdir "$code"
   --ro-bind "$runtime_dir" /run/agentos
 )
 [[ -e /usr/lib64 ]] && args+=(--symlink usr/lib64 /lib64)
+args+=(--remount-ro /dev --remount-ro /) # last: the mounts above need their mount points made first
 
 # Inside: start socat, wait until it listens (127.0.0.1:7233 is 0100007F:1C41 in
 # /proc/net/tcp, state 0A is LISTEN), then hand over to the command.
