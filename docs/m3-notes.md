@@ -414,6 +414,8 @@ M3 拆成两段（设计文档第 12 节，rev 262）：M3a 副作用协议和 G
 
 M3b 三轮审查都把这一条列为最大的遗留风险：agentd 自己在沙箱外对不可信的镜像跑 git。`internal/patch.MirrorSource`（`git ls-tree -l`、`git cat-file blob`，apply_check 和 open_draft_pr 都要经过它）和 `internal/tasks.resolveCommit`（任务开始时的 `git rev-parse --disambiguate`、`git cat-file --batch-check`）都是这样。精心构造的对象要是触发了 git 的漏洞，代码就以 agentd 的身份运行，而 agentd 持有 API 密钥。现在这些读取都挪到了沙箱里的 git MCP 服务器后面。agentd 自己只在自检时、在它自己新建的临时仓库上跑 git，不再碰任何镜像。
 
+合并为 PR #12。设计文档 rev 299 按你批准的清单改了信任边界的写法：第 3 节（validate_patch 一行、“触发”一条、威胁表“借仓库逃逸”一行）、第 4 节（开头一段、组件表“MCP 工具服务器”一行）、第 8 节（威胁表新增“解析不可信数据的代码被攻破”一行）、第 12 节（M3b 一条）。
+
 ### 做了什么
 
 - **服务器加两个工具**（`internal/gitmcp`）：
