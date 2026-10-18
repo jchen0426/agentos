@@ -6,7 +6,7 @@ import json
 
 from temporalio.api.enums.v1 import EventType
 
-from tests.harness import MODEL_TIMEOUT, Stack, TERMINAL, gateway_calls, wait_for
+from tests.harness import MODEL_TIMEOUT, REAL_MODEL, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
 
@@ -18,7 +18,9 @@ def model_activities(stack: Stack, run: dict) -> list[dict]:
 def assert_finished_once(stack: Stack, run: dict) -> None:
     final = stack.wait_state(run, TERMINAL, timeout=MODEL_TIMEOUT + 60)
     assert final["state"] == "SUCCEEDED", final
-    assert json.loads(final["result_json"])["outcome"] == "ok"
+    result = json.loads(final["result_json"])
+    # A real model's patch may not apply to the fixture; the run still ends normally.
+    assert result["outcome"] in ({"ok", "patch rejected"} if REAL_MODEL else {"ok"}), result
     rows = stack.model_calls(run)
     # One call, one attempt, one accepted answer. (A real model may take a second request
     # within the attempt, when its first answer broke the schema.)
@@ -26,8 +28,8 @@ def assert_finished_once(stack: Stack, run: dict) -> None:
     accepted = [r for r in rows if r["response_blob"] is not None and r["stop_reason"] != "invalid_output"]
     assert len(accepted) == 1, [dict(r) for r in rows]
     assert len(model_activities(stack, run)) == 1  # and Temporal scheduled it once
-    # The rest of the run went on normally: a PR when the model gave a patch, one report.
-    assert len(stack.external(run, "github.open_draft_pr")) == (1 if "patch_ref" in stack.model_value(run) else 0)
+    # The rest of the run went on normally: a PR when the model's patch applied, one report.
+    assert len(stack.external(run, "github.open_draft_pr")) == (1 if result["pr_url"] else 0)
     assert len(stack.external(run, "github.comment_commit")) == 1
 
 

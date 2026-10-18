@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
@@ -18,123 +19,680 @@ import (
 	"github.com/jchen0426/agentos/internal/tools"
 )
 
-// effectOutcome is what an effect's execution produced; it is stored as the effect's result.
-type effectOutcome struct {
-	Status string         `json:"status"` // a Result status, or "failed"
-	Value  map[string]any `json:"value"`
+// Effect statuses in the effects ledger (design doc, section 6).
+const (
+	effectAwaitingApproval = "AWAITING_APPROVAL" // M4
+	effectPending          = "PENDING"           // recorded; maybe claimed, maybe sent
+	effectSucceeded        = "SUCCEEDED"
+	effectFailed           = "FAILED"    // the external system refused it: nothing happened
+	effectUnknown          = "UNKNOWN"   // nobody can tell whether it happened: a person reconciles it
+	effectAbandoned        = "ABANDONED" // never sent, and never will be
+	effectDryRun           = "DRY_RUN"   // rendered and recorded, not sent
+)
+
+// errEffectBusy is retryable: another execution in this process holds the effect, or changed
+// it while this one looked. The next attempt finds it settled.
+var errEffectBusy = temporal.NewApplicationError("the effect is being executed or changed; retry", "EffectBusy")
+
+// CheckTools matches the policy's tools against the tools agentd has, at start: each tool the
+// policy lists exists, and a class the policy states is never weaker than the tool's own.
+func CheckTools(p *policy.Policy, reg tools.Registry) error {
+	for name, rule := range p.Tools {
+		t, ok := reg[name]
+		if !ok {
+			return fmt.Errorf("policy: tool %s is not a tool agentd has", name)
+		}
+		if _, err := effectClass(t, rule.Effect); err != nil {
+			return fmt.Errorf("policy: tool %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
-// callTool runs one tool call. Writes follow the effect protocol of section 6: record the
-// intent, execute, record the result. M1 implements the part T8 needs; recovery by effect
-// class after an agentd crash arrives in M3.
-func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, tool, class string,
+// effectClass is the class a call of t runs under: the tool's own, or unsafe when the policy
+// says so for a write. A policy cannot make a write look safer than its tool declares.
+func effectClass(t tools.Tool, stated string) (string, error) {
+	declared := t.Class()
+	_, isWriter := t.(tools.Writer)
+	_, isFinder := t.(tools.Finder)
+	switch {
+	case isWriter == (declared == policy.EffectNone), declared == policy.EffectLookup && !isFinder:
+		return "", fmt.Errorf("the tool declares class %q but does not implement it", declared)
+	case stated == "" || stated == declared:
+		return declared, nil
+	case stated == policy.EffectUnsafe && isWriter:
+		return stated, nil
+	}
+	return "", fmt.Errorf("effect %q, but the tool declares %q; a policy may state the tool's own class, or unsafe for a write", stated, declared)
+}
+
+// callTool runs one tool call. A read just runs. A write follows the effect protocol of
+// section 6: record the payload, claim it, send it, record the result; and when nobody knows
+// what happened, recover by the tool's class. maxPerRun caps the run's effects of a write.
+func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, t tools.Tool, class string, maxPerRun int,
 	args map[string]any, canon []byte, fx faults.Effect) (*agentosv1.Result, error) {
-	if class == policy.EffectNone {
-		// Pure reads: no effect record; a retry simply reads again.
+	created, err := time.Parse(time.RFC3339Nano, run.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("run %s: created_at: %w", run.WorkflowID, err)
+	}
+	req := tools.Request{WorkflowID: run.WorkflowID, RunCreatedAt: created, Args: args}
+	if r, ok := t.(tools.Reader); ok {
 		v, err := g.track(func() (any, error) {
 			exec, cancel := detach(ctx, info)
 			defer cancel()
 			fx.Stall(exec.Done())
-			return g.Tools.Call(exec, tools.Request{WorkflowID: run.WorkflowID, Tool: tool, Args: args})
+			return r.Read(exec, req)
 		})
 		if err != nil {
-			return nil, err
+			return toolError(t.Name(), err)
 		}
 		return result(StatusOK, v.(map[string]any))
 	}
-
+	w := t.(tools.Writer)
 	// The same payload in the same run is the same effect, on every attempt.
-	effectID := sha256Hex([]byte(run.WorkflowID), []byte(tool), canon)
-	v, err, _ := g.effects.Do(effectID, func() (any, error) {
+	req.EffectID = sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon)
+	v, err, _ := g.effects.Do(req.EffectID, func() (any, error) {
 		return g.track(func() (any, error) {
 			exec, cancel := detach(ctx, info)
 			defer cancel()
-			return g.effectOnce(exec, run, tool, class, effectID, canon, args, fx)
+			return g.effect(exec, run, w, class, maxPerRun, req, fx)
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := v.(effectOutcome)
-	if out.Status == "failed" {
-		return nil, temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("tool %s failed: %v", tool, out.Value["error"]), "ToolFailed", nil)
-	}
-	return result(out.Status, out.Value)
+	return v.(*agentosv1.Result), nil
 }
 
-func (g *Gateway) effectOnce(ctx context.Context, run db.Run, tool, class, effectID string, canon []byte,
-	args map[string]any, fx faults.Effect) (effectOutcome, error) {
-	q := g.Ledger.Q
-	now := ledger.Now()
-	idempotencyKey := "agentos-" + effectID[:32]
-	inserted, err := q.InsertEffect(ctx, db.InsertEffectParams{
-		EffectID: effectID, WorkflowID: run.WorkflowID, Tool: tool, EffectClass: class,
-		PayloadSha256: sha256Hex(canon), IdempotencyKey: idempotencyKey, Status: "PENDING",
-		CreatedAt: now, UpdatedAt: now,
-	})
-	if err != nil {
-		return effectOutcome{}, err
-	}
-	if inserted == 0 {
-		// An earlier attempt recorded this effect and is no longer running here (a
-		// concurrent attempt would have joined it through singleflight instead).
-		e, err := q.GetEffect(ctx, effectID)
-		if err != nil {
-			return effectOutcome{}, err
-		}
-		if e.Status == "SUCCEEDED" || e.Status == "FAILED" {
-			return g.loadEffect(ctx, e)
-		}
-		// PENDING with no execution behind it (agentd restarted mid-call), UNKNOWN or
-		// AWAITING_APPROVAL. M3 recovers by effect class; until then a person decides.
-		return effectOutcome{Status: StatusNeedsReconcile,
-			Value: map[string]any{"effect_id": effectID, "effect_status": e.Status}}, nil
-	}
-
-	// The intent is committed; only now does the request go out.
-	fx.Stall(ctx.Done())
-	value, callErr := g.Tools.Call(ctx, tools.Request{
-		WorkflowID: run.WorkflowID, Tool: tool, Args: args, IdempotencyKey: idempotencyKey,
-	})
-	fx.StallBeforeRecord(ctx.Done())
-	out, status := effectOutcome{Status: StatusOK, Value: value}, "SUCCEEDED"
+// toolError turns a tool's error into the call's outcome: a denial is a result, a refusal
+// fails the call for good, and anything else is retried by Temporal.
+func toolError(tool string, err error) (*agentosv1.Result, error) {
+	var denied *tools.DeniedError
+	var refused *tools.RefusedError
 	switch {
-	case callErr == nil:
-	case errors.Is(callErr, tools.ErrNotSent):
-		// The request never left: nothing happened outside, a definite failure.
-		out, status = effectOutcome{Status: "failed", Value: map[string]any{"error": callErr.Error()}}, "FAILED"
-	default:
-		// The write may or may not have happened (a timeout after sending, a broken
-		// connection): a person has to check. M3 adds lookups by effect class first.
-		out, status = effectOutcome{Status: StatusNeedsReconcile,
-			Value: map[string]any{"effect_id": effectID, "error": callErr.Error()}}, "UNKNOWN"
+	case errors.As(err, &denied):
+		return result(StatusDenied, map[string]any{"reason": denied.Reason})
+	case errors.As(err, &refused) && !refused.Retryable:
+		return nil, temporal.NewNonRetryableApplicationError(fmt.Sprintf("tool %s: %s", tool, refused.Reason), "ToolFailed", nil)
 	}
-	body, err := json.Marshal(out)
-	if err != nil {
-		return effectOutcome{}, err
-	}
-	ref, err := g.Ledger.PutBlob(ctx, body)
-	if err != nil {
-		return effectOutcome{}, err
-	}
-	// A failure here leaves the effect PENDING: the next attempt then asks a person.
-	if _, err := q.FinishEffect(ctx, db.FinishEffectParams{
-		Status: status, ResultBlob: sql.NullString{String: ref, Valid: true},
-		UpdatedAt: ledger.Now(), EffectID: effectID,
-	}); err != nil {
-		return effectOutcome{}, err
-	}
-	fx.StallAfterRecord(ctx.Done())
-	return out, nil
+	return nil, err
 }
 
-func (g *Gateway) loadEffect(ctx context.Context, e db.Effect) (effectOutcome, error) {
-	b, err := g.Ledger.GetBlob(ctx, e.ResultBlob.String)
-	if err != nil {
-		return effectOutcome{}, err
+// effect takes one write through the protocol, from wherever the ledger says it is. The
+// effect's first call renders and records its payload; every later call goes on with the
+// recorded payload, which is what went out or will, whatever has changed since.
+func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class string, maxPerRun int,
+	req tools.Request, fx faults.Effect) (*agentosv1.Result, error) {
+	e, err := g.Ledger.Q.GetEffect(ctx, req.EffectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if res, err := g.record(ctx, run, t, class, maxPerRun, req); res != nil || err != nil {
+			return res, err
+		}
+		e, err = g.Ledger.Q.GetEffect(ctx, req.EffectID)
 	}
-	var out effectOutcome
-	err = json.Unmarshal(b, &out)
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	if e.Status != effectPending {
+		return g.effectResult(ctx, e)
+	}
+	payload, err := g.payload(ctx, e)
+	if err != nil {
+		return nil, err
+	}
+	fx.Stall(ctx.Done()) // recorded, not yet claimed
+	for {
+		switch {
+		case e.Status != effectPending:
+			return g.effectResult(ctx, e)
+		case !e.ClaimedBy.Valid:
+			if run.DryRun != 0 || !t.Live() {
+				return g.settle(ctx, e, effectDryRun, t.DryRun(payload), "")
+			}
+			claimed, ok, err := g.claimToSend(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				return g.send(ctx, run, t, claimed, payload, fx)
+			}
+			if cancelled, err := g.runCancelled(ctx, run.WorkflowID); err != nil {
+				return nil, err
+			} else if cancelled {
+				if e, err = g.Ledger.Q.GetEffect(ctx, e.EffectID); err != nil {
+					return nil, err
+				}
+				if e.Status == effectPending && !e.ClaimedBy.Valid {
+					return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
+				}
+			}
+		case e.ClaimedBy.String == g.Incarnation && g.isSending(e.EffectID):
+			return nil, errEffectBusy
+		default:
+			// Claimed by an agentd process that is gone, or by this one with nothing in
+			// flight: the request may or may not have gone out.
+			return g.recoverEffect(ctx, run, t, e, payload, "agentd lost track of the request after claiming it", true)
+		}
+		// Another change came first: look again.
+		if e, err = g.Ledger.Q.GetEffect(ctx, e.EffectID); err != nil {
+			return nil, err
+		}
+	}
 }
+
+// record renders a new effect's payload and records it, unless the run already has as many
+// effects of the tool as the policy allows: those that went out or may have. It returns a
+// result only when the call ends here.
+func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class string, maxPerRun int,
+	req tools.Request) (*agentosv1.Result, error) {
+	payload, err := t.Prepare(ctx, req)
+	if err != nil {
+		return toolError(t.Name(), err)
+	}
+	ref, err := g.Ledger.PutBlob(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	var already int64
+	err = g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.CountRunEffects(ctx, db.CountRunEffectsParams{WorkflowID: run.WorkflowID, Tool: t.Name(), EffectID: req.EffectID})
+		if err != nil {
+			return err
+		}
+		if maxPerRun > 0 && n >= int64(maxPerRun) {
+			already = n
+			return nil
+		}
+		now := ledger.Now()
+		_, err = q.InsertEffect(ctx, db.InsertEffectParams{
+			EffectID: req.EffectID, WorkflowID: run.WorkflowID, Tool: t.Name(), EffectClass: class,
+			PayloadSha256: sha256Hex(payload), PayloadBlob: valid(ref), IdempotencyKey: "agentos-" + req.EffectID[:32],
+			CreatedAt: now, UpdatedAt: now,
+		})
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if already > 0 {
+		return result(StatusDenied, map[string]any{"reason": fmt.Sprintf(
+			"the run already has %d %s write(s); the policy allows %d per run", already, t.Name(), maxPerRun)})
+	}
+	return nil, nil
+}
+
+// payload is an effect's recorded payload.
+func (g *Gateway) payload(ctx context.Context, e db.Effect) (json.RawMessage, error) {
+	if !e.PayloadBlob.Valid {
+		return nil, fmt.Errorf("effect %s has no recorded payload", e.EffectID)
+	}
+	b, err := g.Ledger.GetBlob(ctx, e.PayloadBlob.String)
+	if err != nil {
+		return nil, err
+	}
+	if sha256Hex(b) != e.PayloadSha256 {
+		return nil, fmt.Errorf("effect %s: the payload does not match its hash", e.EffectID)
+	}
+	return b, nil
+}
+
+// claim lets this process send e, if nobody changed e since it was read and its run was not
+// cancelled. It returns e as claimed.
+func (g *Gateway) claim(ctx context.Context, e db.Effect) (db.Effect, bool, error) {
+	now := ledger.Now()
+	n, err := g.Ledger.Q.ClaimEffect(ctx, db.ClaimEffectParams{
+		ClaimedBy: valid(g.Incarnation), ClaimedAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+	})
+	if err != nil || n == 0 {
+		return e, false, err
+	}
+	e.ClaimedBy, e.ClaimedAt, e.Version = valid(g.Incarnation), valid(now), e.Version+1
+	return e, true, nil
+}
+
+// claimToSend claims e and marks it as being sent, as one step for this process: whoever here
+// sees the claim also sees the send, and does not take the effect for one nobody is sending.
+func (g *Gateway) claimToSend(ctx context.Context, e db.Effect) (db.Effect, bool, error) {
+	g.sendMu.Lock()
+	defer g.sendMu.Unlock()
+	claimed, ok, err := g.claim(ctx, e)
+	if ok {
+		if g.sending == nil {
+			g.sending = map[string]bool{}
+		}
+		g.sending[e.EffectID] = true
+	}
+	return claimed, ok, err
+}
+
+func (g *Gateway) isSending(effectID string) bool {
+	g.sendMu.Lock()
+	defer g.sendMu.Unlock()
+	return g.sending[effectID]
+}
+
+// proceed is what a tool asks before each visible request of e: the run must not have been
+// cancelled since, and the request's time is recorded, for a later lookup's wait.
+func (g *Gateway) proceed(e db.Effect) tools.Proceed {
+	return func(ctx context.Context) error {
+		now := ledger.Now()
+		n, err := g.Ledger.Q.TouchEffect(ctx, db.TouchEffectParams{
+			ClaimedAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version, ClaimedBy: valid(g.Incarnation),
+		})
+		switch {
+		case err != nil:
+			return fmt.Errorf("%w: %v", tools.ErrNotSent, err)
+		case n == 0:
+			return fmt.Errorf("%w: the run was cancelled, or the effect changed", tools.ErrNotSent)
+		}
+		return nil
+	}
+}
+
+// send sends an effect claimed with claimToSend and records what came of it.
+func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage,
+	fx faults.Effect) (*agentosv1.Result, error) {
+	defer func() {
+		g.sendMu.Lock()
+		delete(g.sending, e.EffectID)
+		g.sendMu.Unlock()
+	}()
+	fx.StallAfterClaim(ctx.Done())
+	value, err := t.Execute(ctx, payload, e.IdempotencyKey, g.proceed(e))
+	fx.StallBeforeRecord(ctx.Done())
+	var refused *tools.RefusedError
+	var conflict *tools.ConflictError
+	switch {
+	case err == nil:
+		res, err := g.settle(ctx, e, effectSucceeded, value, "")
+		fx.StallAfterRecord(ctx.Done())
+		return res, err
+	case errors.Is(err, tools.ErrNotSent) || errors.As(err, &refused) && refused.Retryable:
+		// Nothing happened outside. A cancelled run's effect is done with; anyone else's goes
+		// back for a later attempt.
+		if cancelled, cerr := g.runCancelled(ctx, run.WorkflowID); cerr == nil && cancelled {
+			return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
+		}
+		if _, rerr := g.Ledger.Q.ReleaseEffect(ctx, db.ReleaseEffectParams{
+			UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
+		}); rerr != nil {
+			g.Log.Error("could not release an unsent effect", "effect_id", e.EffectID, "error", rerr)
+		}
+		return nil, temporal.NewApplicationError(fmt.Sprintf("tool %s: %v", t.Name(), err), "ToolNotSent")
+	case errors.As(err, &refused):
+		return g.settle(ctx, e, effectFailed, nil, refused.Reason)
+	case errors.As(err, &conflict):
+		return g.settle(ctx, e, effectUnknown, nil, conflict.Reason)
+	}
+	g.Log.Warn("effect outcome unknown", "workflow_id", run.WorkflowID, "effect_id", e.EffectID, "tool", t.Name(), "error", err)
+	return g.recoverEffect(ctx, run, t, e, payload, err.Error(), true)
+}
+
+// errEffectReleased is retryable: the effect never went out, and the next attempt sends it.
+var errEffectReleased = temporal.NewApplicationError("the effect never went out; the next attempt sends it", "EffectReleased")
+
+// recoverEffect settles an effect whose request may have gone out, by the class it was
+// recorded under (section 6): an idempotent tool sends again under the same key; a lookup
+// tool looks, and sends again only once the old request can no longer take effect; anything
+// else waits for a person. A cancelled run sends nothing more: it only looks. Without
+// mayResend (a recovery no call asked for, as at start) nothing is sent either: an effect that
+// never took effect goes back for the run's next call, which comes only if the run goes on.
+func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage,
+	why string, mayResend bool) (*agentosv1.Result, error) {
+	cancelled, err := g.runCancelled(ctx, run.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	finder, canFind := t.(tools.Finder)
+	switch class := e.EffectClass; {
+	case class == policy.EffectIdempotent && !cancelled && mayResend:
+		return g.resend(ctx, run, t, e, payload)
+	case class == policy.EffectIdempotent && !cancelled:
+		return g.release(ctx, e)
+	case class == policy.EffectUnsafe || !canFind:
+		return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown: "+why)
+	}
+	v, found, err := finder.Find(ctx, payload)
+	if err != nil {
+		return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown, and looking it up failed: "+err.Error())
+	}
+	if !found {
+		// The request may still be on its way. Look again once it no longer can be: the wait
+		// counts from its last visible request, which the tool may have sent after the claim.
+		if e, err = g.Ledger.Q.GetEffect(ctx, e.EffectID); err != nil {
+			return nil, err
+		}
+		if e.Status != effectPending {
+			return g.effectResult(ctx, e)
+		}
+		sentAt, err := time.Parse(time.RFC3339Nano, e.ClaimedAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("effect %s: claimed_at: %w", e.EffectID, err)
+		}
+		if wait := time.Until(sentAt.Add(finder.Settle())); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			if v, found, err = finder.Find(ctx, payload); err != nil {
+				return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown, and looking it up failed: "+err.Error())
+			}
+		}
+		if cancelled, err = g.runCancelled(ctx, run.WorkflowID); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case found:
+		return g.settle(ctx, e, effectSucceeded, v, "")
+	case cancelled:
+		return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled, and its request never took effect")
+	case !mayResend:
+		return g.release(ctx, e)
+	}
+	return g.resend(ctx, run, t, e, payload)
+}
+
+// release gives back a claimed effect that never took effect, for the run's next call.
+func (g *Gateway) release(ctx context.Context, e db.Effect) (*agentosv1.Result, error) {
+	n, err := g.Ledger.Q.ReleaseEffect(ctx, db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version})
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, errEffectBusy
+	}
+	g.Log.Info("the request never took effect; the run's next call sends it", "workflow_id", e.WorkflowID, "effect_id", e.EffectID)
+	return nil, errEffectReleased
+}
+
+// resend claims e again and sends it under its original key.
+func (g *Gateway) resend(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage) (*agentosv1.Result, error) {
+	claimed, ok, err := g.claimToSend(ctx, e)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// Cancelled meanwhile, or changed: a cancelled run's effect is done with.
+		if cancelled, err := g.runCancelled(ctx, run.WorkflowID); err == nil && cancelled {
+			if cur, err := g.Ledger.Q.GetEffect(ctx, e.EffectID); err == nil && cur.Status == effectPending {
+				return g.settle(ctx, cur, effectAbandoned, nil, "the run was cancelled, and its request never took effect")
+			}
+		}
+		return nil, errEffectBusy
+	}
+	g.Log.Info("sending an effect again", "workflow_id", run.WorkflowID, "effect_id", e.EffectID, "tool", t.Name())
+	return g.send(ctx, run, t, claimed, payload, faults.Effect{})
+}
+
+// settle records how an effect ended, if nobody changed it since e was read, and returns
+// what the call gets. When another change came first, it returns what that one recorded.
+func (g *Gateway) settle(ctx context.Context, e db.Effect, status string, value map[string]any, reason string) (*agentosv1.Result, error) {
+	var blob sql.NullString
+	if value != nil {
+		b, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		ref, err := g.Ledger.PutBlob(ctx, b)
+		if err != nil {
+			return nil, err
+		}
+		blob = valid(ref)
+	}
+	n, err := g.Ledger.Q.SetEffectStatus(ctx, db.SetEffectStatusParams{
+		Status: status, ResultBlob: blob, Reason: sql.NullString{String: reason, Valid: reason != ""},
+		UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		cur, err := g.Ledger.Q.GetEffect(ctx, e.EffectID)
+		if err != nil {
+			return nil, err
+		}
+		if cur.Status == effectPending {
+			return nil, errEffectBusy
+		}
+		return g.effectResult(ctx, cur)
+	}
+	if status != effectSucceeded && status != effectDryRun {
+		g.Log.Warn("effect settled", "workflow_id", e.WorkflowID, "effect_id", e.EffectID, "status", status, "reason", reason)
+	}
+	e.Status, e.ResultBlob, e.Reason = status, blob, sql.NullString{String: reason, Valid: reason != ""}
+	return g.effectResult(ctx, e)
+}
+
+// effectResult is what a call gets for an effect in a settled state.
+func (g *Gateway) effectResult(ctx context.Context, e db.Effect) (*agentosv1.Result, error) {
+	switch e.Status {
+	case effectSucceeded, effectDryRun:
+		b, err := g.Ledger.GetBlob(ctx, e.ResultBlob.String)
+		if err != nil {
+			return nil, err
+		}
+		v, err := ledger.DecodeObject(b)
+		if err != nil {
+			return nil, err
+		}
+		return result(StatusOK, v)
+	case effectFailed:
+		return nil, temporal.NewNonRetryableApplicationError(fmt.Sprintf("tool %s failed: %s", e.Tool, e.Reason.String), "ToolFailed", nil)
+	case effectUnknown:
+		return result(StatusNeedsReconcile, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
+	case effectAbandoned:
+		return result(StatusDenied, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
+	case effectAwaitingApproval:
+		return result(StatusNeedsApproval, map[string]any{"effect_id": e.EffectID})
+	}
+	return nil, fmt.Errorf("effect %s is %s", e.EffectID, e.Status)
+}
+
+func (g *Gateway) runCancelled(ctx context.Context, workflowID string) (bool, error) {
+	r, err := g.Ledger.Q.GetRun(ctx, workflowID)
+	if err != nil {
+		return false, err
+	}
+	return r.CancelledAt.Valid, nil
+}
+
+// RecoverEffects settles, as agentd starts, the effects the previous agentd process left:
+// those of cancelled runs it never sent are abandoned; those it claimed are looked up in the
+// background, under the key a retry of the call joins. Nothing is sent from here: an effect
+// that never took effect waits for its run's next call.
+func (g *Gateway) RecoverEffects(ctx context.Context) error {
+	if n, err := g.Ledger.Q.AbandonUnsentEffects(ctx, ledger.Now()); err != nil {
+		return err
+	} else if n > 0 {
+		g.Log.Info("abandoned the unsent effects of cancelled runs", "count", n)
+	}
+	claimed, err := g.Ledger.Q.ListClaimedEffects(ctx, valid(g.Incarnation))
+	if err != nil {
+		return err
+	}
+	for _, e := range claimed {
+		g.Log.Warn("recovering an effect agentd claimed before it stopped", "workflow_id", e.WorkflowID,
+			"effect_id", e.EffectID, "tool", e.Tool, "class", e.EffectClass)
+		go func() {
+			v, err, _ := g.effects.Do(e.EffectID, func() (any, error) {
+				return g.track(func() (any, error) { return g.recoverClaimed(ctx, e.EffectID) })
+			})
+			switch {
+			case errors.Is(err, errEffectReleased):
+			case err != nil:
+				g.Log.Warn("effect recovery did not finish; the next call or start tries again", "effect_id", e.EffectID, "error", err)
+			default:
+				g.Log.Info("effect recovered", "effect_id", e.EffectID, "status", v.(*agentosv1.Result).GetStatus())
+			}
+		}()
+	}
+	return nil
+}
+
+func (g *Gateway) recoverClaimed(ctx context.Context, effectID string) (*agentosv1.Result, error) {
+	e, err := g.Ledger.Q.GetEffect(ctx, effectID)
+	if err != nil {
+		return nil, err
+	}
+	if e.Status != effectPending || !e.ClaimedBy.Valid || e.ClaimedBy.String == g.Incarnation {
+		return g.effectResult(ctx, e) // a call got there first
+	}
+	run, err := g.Ledger.Q.GetRun(ctx, e.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	t, ok := g.Tools[e.Tool].(tools.Writer)
+	if !ok {
+		return g.settle(ctx, e, effectUnknown, nil, "agentd no longer has the tool to look up or resend this effect")
+	}
+	payload, err := g.payload(ctx, e)
+	if err != nil {
+		return g.settle(ctx, e, effectUnknown, nil, "agentd cannot look up or resend this effect: "+err.Error())
+	}
+	return g.recoverEffect(ctx, run, t, e, payload, "agentd stopped while the request was in flight", false)
+}
+
+// Resolution is a person's finding about an effect whose outcome nobody knew.
+type Resolution struct {
+	EffectID   string
+	Executed   bool
+	ResultJSON string // when executed: what the effect produced
+	Lookup     bool   // when executed: let agentd find the result itself
+	Key        string // idempotency key: the same finding sent again applies once
+	RunClosed  bool   // the run's workflow has ended: nobody will send the effect again
+}
+
+// Resolution errors, for the Control service to map.
+var (
+	ErrNoSuchEffect = errors.New("no such effect")
+	ErrNotUnknown   = errors.New("the effect is not waiting for reconciliation")
+	ErrBadResult    = errors.New("bad result")
+	ErrTooEarly     = errors.New("too early")
+	ErrKeyReused    = errors.New("the idempotency key was used for a different finding")
+)
+
+// Reconcile records a person's finding about an effect in UNKNOWN (section 6). Executed, with
+// its result (given, or looked up by agentd), makes it SUCCEEDED: the next call returns that
+// result. Not executed puts it back to PENDING, sent again under its original key by the run's
+// next call; or ABANDONED when the run was cancelled or has ended. A finding sent again under
+// the same key applies once, however the effect has moved on since. It returns the status the
+// finding gave the effect, and the effect's run.
+func (g *Gateway) Reconcile(ctx context.Context, r Resolution) (string, string, error) {
+	e, err := g.Ledger.Q.GetEffect(ctx, r.EffectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrNoSuchEffect
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if prev, err := g.Ledger.Q.GetResolution(ctx, db.GetResolutionParams{EffectID: r.EffectID, ResolveKey: r.Key}); err == nil {
+		if (prev.Executed != 0) != r.Executed {
+			return "", "", ErrKeyReused
+		}
+		return prev.Status, e.WorkflowID, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", err
+	}
+	if e.Status != effectUnknown {
+		return "", "", fmt.Errorf("%w: it is %s", ErrNotUnknown, e.Status)
+	}
+	t, _ := g.Tools[e.Tool].(tools.Writer)
+	status := effectPending
+	var blob sql.NullString
+	if r.Executed {
+		status = effectSucceeded
+		value, err := g.reportedResult(ctx, e, t, r)
+		if err != nil {
+			return "", "", err
+		}
+		b, err := json.Marshal(value)
+		if err != nil {
+			return "", "", err
+		}
+		ref, err := g.Ledger.PutBlob(ctx, b)
+		if err != nil {
+			return "", "", err
+		}
+		blob = valid(ref)
+	} else {
+		cancelled, err := g.runCancelled(ctx, e.WorkflowID)
+		if err != nil {
+			return "", "", err
+		}
+		if cancelled || r.RunClosed {
+			status = effectAbandoned
+		} else if f, ok := t.(tools.Finder); ok && e.ClaimedAt.Valid {
+			// The request may still land while GitHub works on it: the finding can wait.
+			if sentAt, err := time.Parse(time.RFC3339Nano, e.ClaimedAt.String); err == nil {
+				if until := sentAt.Add(f.Settle()); time.Now().Before(until) {
+					return "", "", fmt.Errorf("%w: the request may still take effect until %s; look again then",
+						ErrTooEarly, until.UTC().Format(time.RFC3339))
+				}
+			}
+		}
+	}
+	now := ledger.Now()
+	err = g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.ResolveEffect(ctx, db.ResolveEffectParams{
+			Status: status, ResultBlob: blob, UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: it changed meanwhile; look again", ErrNotUnknown)
+		}
+		var executed int64
+		if r.Executed {
+			executed = 1
+		}
+		return q.InsertResolution(ctx, db.InsertResolutionParams{
+			EffectID: e.EffectID, ResolveKey: r.Key, Executed: executed, Status: status, ResolvedAt: now,
+		})
+	})
+	if err != nil {
+		return "", "", err
+	}
+	g.Log.Info("effect reconciled", "workflow_id", e.WorkflowID, "effect_id", e.EffectID, "executed", r.Executed, "status", status)
+	return status, e.WorkflowID, nil
+}
+
+// reportedResult is the result of an effect a person found executed: the one they give,
+// checked against the tool's result schema, or the one agentd looks up.
+func (g *Gateway) reportedResult(ctx context.Context, e db.Effect, t tools.Writer, r Resolution) (map[string]any, error) {
+	if r.Lookup {
+		f, ok := t.(tools.Finder)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s cannot be looked up; give its result instead", ErrBadResult, e.Tool)
+		}
+		payload, err := g.payload(ctx, e)
+		if err != nil {
+			return nil, err
+		}
+		v, found, err := f.Find(ctx, payload)
+		if err != nil {
+			return nil, fmt.Errorf("look up effect %s: %w", e.EffectID, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: agentd looked and found nothing; check by hand and give the result", ErrBadResult)
+		}
+		return v, nil
+	}
+	if r.ResultJSON == "" {
+		return nil, fmt.Errorf("%w: an executed effect needs its result, or a lookup", ErrBadResult)
+	}
+	v, err := ledger.DecodeObject([]byte(r.ResultJSON))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadResult, err)
+	}
+	if t != nil {
+		if err := t.Result().Validate(v); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrBadResult, err)
+		}
+	}
+	return v, nil
+}
+
+func valid(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }

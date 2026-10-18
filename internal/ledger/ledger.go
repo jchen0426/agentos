@@ -3,11 +3,13 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -165,4 +167,38 @@ func (l *Ledger) GetBlob(ctx context.Context, ref string) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 	return b, err
+}
+
+// LatestEffectResult returns the result of the run's latest finished effect of tool, sent or
+// dry-run.
+func (l *Ledger) LatestEffectResult(ctx context.Context, workflowID, tool string) (map[string]any, bool, error) {
+	e, err := l.Q.GetLatestEffect(ctx, db.GetLatestEffectParams{WorkflowID: workflowID, Tool: tool})
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	case !e.ResultBlob.Valid:
+		return nil, false, nil
+	}
+	b, err := l.GetBlob(ctx, e.ResultBlob.String)
+	if err != nil {
+		return nil, false, err
+	}
+	v, err := DecodeObject(b)
+	return v, err == nil, err
+}
+
+// DecodeObject decodes a JSON object, keeping numbers exact.
+func DecodeObject(b []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v map[string]any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, errors.New("not a JSON object")
+	}
+	return v, nil
 }

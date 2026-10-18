@@ -1,4 +1,5 @@
-# Development setup: Temporal's dev server on 127.0.0.1:7233, the fake model, stub tools.
+# Development setup: Temporal's dev server on 127.0.0.1:7233, the fake model. No github section:
+# the GitHub tools only dry-run (see the README to write to a test repository).
 # Paths are relative to this file. On Linux, use the default unix:// Runtime socket instead.
 data_dir: ../../.agentos
 runtime_listen: tcp://127.0.0.1:7244

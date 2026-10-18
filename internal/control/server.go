@@ -22,6 +22,7 @@ import (
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/budget"
+	"github.com/jchen0426/agentos/internal/gateway"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/safetext"
@@ -42,11 +43,18 @@ type Server struct {
 
 	Ledger      *ledger.Ledger
 	Budget      *budget.Budget
+	Effects     Reconciler
 	Temporal    client.Client
 	Tasks       tasks.Registry
 	TaskQueue   string        // where the Python Worker polls
 	CancelGrace time.Duration // how long a cancelled run may keep running before it is terminated
 	Log         *slog.Logger
+}
+
+// Reconciler records a person's finding about an effect whose outcome nobody knew: the
+// gateway, which knows the tools.
+type Reconciler interface {
+	Reconcile(ctx context.Context, r gateway.Resolution) (status, workflowID string, err error)
 }
 
 func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (*agentosv1.Run, error) {
@@ -73,9 +81,13 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 	// Record the run before starting it, so the gateway recognizes its first call; the
 	// run ID follows once Temporal has assigned one.
 	workflowID, createdAt := uuid.NewString(), ledger.Now()
+	var dryRun int64
+	if req.GetDryRun() {
+		dryRun = 1
+	}
 	if err := s.Ledger.Q.InsertRun(ctx, db.InsertRunParams{
 		WorkflowID: workflowID, Task: t.Name, ParamsJson: string(paramsJSON),
-		BudgetLimitMicros: budget, CreatedAt: createdAt,
+		BudgetLimitMicros: budget, DryRun: dryRun, CreatedAt: createdAt,
 	}); err != nil {
 		return nil, err
 	}
@@ -104,12 +116,12 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 		}
 		return nil, status.Errorf(codes.Internal, "record run: %v", err)
 	}
-	s.Log.Info("run started", "workflow_id", workflowID, "run_id", we.GetRunID(), "task", t.Name)
+	s.Log.Info("run started", "workflow_id", workflowID, "run_id", we.GetRunID(), "task", t.Name, "dry_run", req.GetDryRun())
 	// Answer from what agentd knows: an error here would invite a retry, and a retry
 	// starts a second run.
 	return &agentosv1.Run{
 		RunId: workflowID, TemporalRunId: we.GetRunID(), Task: t.Name, State: "RUNNING",
-		Params: params, BudgetLimitMicros: budget, CreatedAt: createdAt,
+		Params: params, BudgetLimitMicros: budget, CreatedAt: createdAt, DryRun: req.GetDryRun(),
 	}, nil
 }
 
@@ -261,16 +273,82 @@ func closed(state string) bool {
 	return false
 }
 
-func (s *Server) ListPending(context.Context, *agentosv1.ListPendingRequest) (*agentosv1.ListPendingResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "approvals and reconciliations arrive in M3 and M4")
+// ListPending lists what waits for a person. M3 has reconciliations: effects whose outcome
+// nobody knows. Approvals arrive in M4. What the external system was to receive and the
+// reason come from tools and the outside world: neither leaves with raw control characters.
+func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingRequest) (*agentosv1.ListPendingResponse, error) {
+	rows, err := s.Ledger.Q.ListEffectsByStatus(ctx, "UNKNOWN")
+	if err != nil {
+		return nil, err
+	}
+	resp := &agentosv1.ListPendingResponse{}
+	for _, e := range rows {
+		item := &agentosv1.PendingItem{Kind: "reconciliation", Id: e.EffectID, RunId: e.WorkflowID, Tool: e.Tool,
+			Reason: safetext.Line(e.Reason.String), Since: e.UpdatedAt}
+		if e.PayloadBlob.Valid {
+			b, err := s.Ledger.GetBlob(ctx, e.PayloadBlob.String)
+			if err != nil {
+				return nil, err
+			}
+			item.PayloadJson = string(safetext.JSON(b))
+		}
+		resp.Items = append(resp.Items, item)
+	}
+	return resp, nil
 }
 
 func (s *Server) ResolveApproval(context.Context, *agentosv1.ResolveApprovalRequest) (*agentosv1.ResolveApprovalResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "approvals arrive in M4")
 }
 
-func (s *Server) ResolveReconciliation(context.Context, *agentosv1.ResolveReconciliationRequest) (*agentosv1.ResolveReconciliationResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "reconciliation arrives in M3")
+// ResolveReconciliation records a person's finding about an effect whose outcome nobody knew
+// (design doc, section 6), then rings the run's doorbell: its call waiting in
+// WAITING_RECONCILE asks again and gets the result, or sends the effect again.
+func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.ResolveReconciliationRequest) (*agentosv1.ResolveReconciliationResponse, error) {
+	if req.GetIdempotencyKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency_key is required")
+	}
+	if !req.GetExecuted() && (req.GetLookup() || req.GetResultJson() != "") {
+		return nil, status.Error(codes.InvalidArgument, "a result or a lookup only goes with executed")
+	}
+	e, err := s.Ledger.Q.GetEffect(ctx, req.GetEffectId())
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, status.Errorf(codes.NotFound, "no effect %q", req.GetEffectId())
+	}
+	if err != nil {
+		return nil, err
+	}
+	r, err := s.lookup(ctx, e.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	// Once the run has ended, nothing will send the effect again: not executed means dropped.
+	current, err := s.describe(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	ctx = context.WithoutCancel(ctx) // once recorded, the doorbell must ring
+	st, _, err := s.Effects.Reconcile(ctx, gateway.Resolution{
+		EffectID: req.GetEffectId(), Executed: req.GetExecuted(), ResultJSON: req.GetResultJson(),
+		Lookup: req.GetLookup(), Key: req.GetIdempotencyKey(), RunClosed: closed(current.GetState()),
+	})
+	switch {
+	case errors.Is(err, gateway.ErrNoSuchEffect):
+		return nil, status.Errorf(codes.NotFound, "no effect %q", req.GetEffectId())
+	case errors.Is(err, gateway.ErrNotUnknown), errors.Is(err, gateway.ErrTooEarly), errors.Is(err, gateway.ErrKeyReused):
+		return nil, status.Error(codes.FailedPrecondition, safetext.Line(err.Error()))
+	case errors.Is(err, gateway.ErrBadResult):
+		return nil, status.Error(codes.InvalidArgument, safetext.Line(err.Error()))
+	case err != nil:
+		return nil, err
+	}
+	// Rung for a repeated request too: its first doorbell may have been lost.
+	if r.RunID.Valid {
+		if err := s.Temporal.SignalWorkflow(ctx, r.WorkflowID, r.RunID.String, "doorbell", nil); err != nil {
+			s.Log.Warn("doorbell failed; the waiting call rechecks within the hour", "workflow_id", r.WorkflowID, "error", err)
+		}
+	}
+	return &agentosv1.ResolveReconciliationResponse{Status: st}, nil
 }
 
 // ExtendBudget raises a run's budget and rings its doorbell: calls paused in PAUSED_BUDGET
@@ -335,7 +413,7 @@ func (s *Server) getRun(ctx context.Context, workflowID string) (*agentosv1.Run,
 // the failure message come from the Worker: neither leaves here with raw control characters.
 func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error) {
 	out := &agentosv1.Run{
-		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task, CreatedAt: r.CreatedAt,
+		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task, CreatedAt: r.CreatedAt, DryRun: r.DryRun != 0,
 	}
 	if err := json.Unmarshal([]byte(r.ParamsJson), &out.Params); err != nil {
 		return nil, err

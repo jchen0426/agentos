@@ -3,9 +3,9 @@
 repos: [acme/payments]           # logical ids, mapped to read-only mirrors by agentd
 tools:
   git.show_diff:         {decision: allow, effect: none}
-  git.apply_check:       {decision: allow, effect: none, deny_paths: [".github/**", "Makefile", "scripts/**"]}
-  github.open_draft_pr:  {decision: require_approval, effect: lookup, approval_ttl: 24h,
-                          deny_paths: [".github/**", "Makefile", "scripts/**"]}   # the write tool checks the patch itself
+  git.apply_check:       {decision: allow, effect: none, deny_paths: [".github/**", "Makefile", "GNUmakefile", "scripts/**"]}
+  github.open_draft_pr:  {decision: require_approval, effect: lookup, approval_ttl: 24h,  # the write tool checks the patch itself
+                          deny_paths: [".github/**", "Makefile", "GNUmakefile", "scripts/**"]}   # GNU make reads GNUmakefile first
   github.comment_commit: {decision: allow, effect: lookup, render: template}
 models:                          # providers allowed to receive each task's data (D11)
   audit_v1: {allowed_providers: [anthropic, openai, local]}

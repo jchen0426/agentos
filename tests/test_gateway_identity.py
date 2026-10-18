@@ -15,7 +15,7 @@ def test_gateway_refuses_an_execution_that_reuses_a_finished_runs_workflow_id(st
     stack.start_worker()
     first = stack.start_run()
     assert stack.wait_state(first, TERMINAL)["state"] == "SUCCEEDED"
-    writes_before = stack.external(first)
+    writes_before = [e for e in stack.github_requests() if e["method"] == "POST"]
 
     other = stack.start_workflow_directly(first["run_id"], {
         "repo": "acme/payments", "commit": stack.commit, "base_branch": "main"})
@@ -25,4 +25,5 @@ def test_gateway_refuses_an_execution_that_reuses_a_finished_runs_workflow_id(st
     refused = [e for e in stack.agentd_log()
                if e["msg"] == "invoke from an unknown run" and e.get("workflow_id") == first["run_id"]]
     assert refused and all(e["run_id"] == other for e in refused), refused
-    assert stack.external(first) == writes_before  # nothing ran under the finished run's name
+    # Nothing ran under the finished run's name.
+    assert [e for e in stack.github_requests() if e["method"] == "POST"] == writes_before

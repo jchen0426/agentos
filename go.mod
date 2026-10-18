@@ -4,6 +4,9 @@ go 1.26.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.82.0
+	github.com/bluekeyes/go-gitdiff v0.9.0
+	github.com/bmatcuk/doublestar/v4 v4.10.2
+	github.com/google/go-github/v92 v92.0.0
 	github.com/google/uuid v1.6.0
 	github.com/mwitkow/grpc-proxy v0.0.0-20250813121105-2866842de9a5
 	github.com/pressly/goose/v3 v3.29.0
@@ -32,6 +35,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect
+	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

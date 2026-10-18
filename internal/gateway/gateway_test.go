@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"maps"
 	"path/filepath"
 	"testing"
@@ -86,7 +88,8 @@ func TestFillScopeAddsWhatTheCallLeftOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope := map[string]string{"repo": "acme/payments", "commit": "3f2a", "base_branch": "main"}
-	filled, canon, err := fillScope(args, scope)
+	declared := []string{"base_branch", "commit", "patch_ref", "repo"}
+	filled, canon, err := fillScope(args, scope, declared)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +105,13 @@ func TestFillScopeAddsWhatTheCallLeftOut(t *testing.T) {
 
 	// A value the call names is kept, so the policy can deny it.
 	args = map[string]any{"repo": "acme/ledger"}
-	if filled, _, _ := fillScope(args, scope); filled["repo"] != "acme/ledger" {
+	if filled, _, _ := fillScope(args, scope, declared); filled["repo"] != "acme/ledger" {
 		t.Errorf("a named value was overwritten: %v", filled)
+	}
+
+	// A tool that takes no base branch is not given one: its schema would refuse it.
+	if filled, _, _ := fillScope(map[string]any{}, scope, []string{"commit", "repo"}); len(filled) != 2 {
+		t.Errorf("filled beyond what the tool declares: %v", filled)
 	}
 }
 
@@ -150,6 +158,35 @@ func TestLoopGuard(t *testing.T) {
 		if reason := call(s.activityID, s.kind, s.name, s.args); (reason != "") != s.refused {
 			t.Errorf("%s %s: refused=%q, want refused=%v", s.activityID, s.args, reason, s.refused)
 		}
+	}
+
+	// A call that only waited (here for a reconciliation) is sent again after the wait: that
+	// is a step, not a repeat of the call.
+	g.Limits = LoopLimits{GatewayCalls: 10, SameToolCalls: 1}
+	if err := l.Q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "wf3", Task: "security-audit", ParamsJson: "{}",
+		BudgetLimitMicros: 1, CreatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	waited := func(activityID, outcome string) string {
+		at := time.Now()
+		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf3"}, activity.Info{ActivityID: activityID, ScheduledTime: at},
+			&agentosv1.Call{Kind: "tool", Name: "github.open_draft_pr"}, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Q.SetCallOutcome(ctx, db.SetCallOutcomeParams{Outcome: sql.NullString{String: outcome, Valid: true},
+			WorkflowID: "wf3", ActivityID: activityID, ScheduledAt: at.UTC().Format(time.RFC3339Nano)}); err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	for i, outcome := range []string{"needs_reconcile", "needs_reconcile", "needs_reconcile", "ok"} {
+		if reason := waited(fmt.Sprintf("%d:github.open_draft_pr", i+1), outcome); reason != "" {
+			t.Fatalf("call %d after %d waits was refused: %s", i+1, i, reason)
+		}
+	}
+	if waited("5:github.open_draft_pr", "ok") == "" {
+		t.Error("a repeat after the call went through was not refused")
 	}
 
 	// A Worker that reuses an activity ID for a new call cannot hide it: Temporal schedules

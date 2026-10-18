@@ -26,6 +26,7 @@ type StartRunRequest struct {
 	Task              string                 `protobuf:"bytes,1,opt,name=task,proto3" json:"task,omitempty"`                                                                               // a registered task, e.g. "security-audit"
 	Params            map[string]string      `protobuf:"bytes,2,rep,name=params,proto3" json:"params,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // validated and resolved by agentd, e.g. repo, commit, base
 	BudgetLimitMicros int64                  `protobuf:"varint,3,opt,name=budget_limit_micros,json=budgetLimitMicros,proto3" json:"budget_limit_micros,omitempty"`                         // 0 means the task's default
+	DryRun            bool                   `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`                                                            // write tools render and record their payloads, and send nothing
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -79,6 +80,13 @@ func (x *StartRunRequest) GetBudgetLimitMicros() int64 {
 		return x.BudgetLimitMicros
 	}
 	return 0
+}
+
+func (x *StartRunRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
 }
 
 type GetRunRequest struct {
@@ -272,6 +280,7 @@ type Run struct {
 	Failure              string            `protobuf:"bytes,9,opt,name=failure,proto3" json:"failure,omitempty"`                                                                         // the failure message once FAILED
 	BudgetSpentMicros    int64             `protobuf:"varint,10,opt,name=budget_spent_micros,json=budgetSpentMicros,proto3" json:"budget_spent_micros,omitempty"`                        // settled model requests
 	BudgetReservedMicros int64             `protobuf:"varint,11,opt,name=budget_reserved_micros,json=budgetReservedMicros,proto3" json:"budget_reserved_micros,omitempty"`               // reserved by requests not yet settled
+	DryRun               bool              `protobuf:"varint,12,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`                                                           // started with dry_run: nothing it writes is sent
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -383,6 +392,13 @@ func (x *Run) GetBudgetReservedMicros() int64 {
 	return 0
 }
 
+func (x *Run) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
 type ListPendingRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -468,7 +484,11 @@ type PendingItem struct {
 	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // "approval" or "reconciliation"
 	Id            string                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`     // approval_id or effect_id
 	RunId         string                 `protobuf:"bytes,3,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	ExpiresAt     string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"` // RFC 3339; approvals only
+	ExpiresAt     string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`       // RFC 3339; approvals only
+	Tool          string                 `protobuf:"bytes,5,opt,name=tool,proto3" json:"tool,omitempty"`                                  // the tool whose effect it is
+	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`                              // why it waits: for a reconciliation, what is unknown
+	Since         string                 `protobuf:"bytes,7,opt,name=since,proto3" json:"since,omitempty"`                                // RFC 3339: when it started waiting
+	PayloadJson   string                 `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"` // exactly what the external system was to receive
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -527,6 +547,34 @@ func (x *PendingItem) GetRunId() string {
 func (x *PendingItem) GetExpiresAt() string {
 	if x != nil {
 		return x.ExpiresAt
+	}
+	return ""
+}
+
+func (x *PendingItem) GetTool() string {
+	if x != nil {
+		return x.Tool
+	}
+	return ""
+}
+
+func (x *PendingItem) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *PendingItem) GetSince() string {
+	if x != nil {
+		return x.Since
+	}
+	return ""
+}
+
+func (x *PendingItem) GetPayloadJson() string {
+	if x != nil {
+		return x.PayloadJson
 	}
 	return ""
 }
@@ -840,9 +888,10 @@ func (x *ResolveApprovalResponse) GetDecidedAt() string {
 type ResolveReconciliationRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	EffectId       string                 `protobuf:"bytes,1,opt,name=effect_id,json=effectId,proto3" json:"effect_id,omitempty"`
-	Executed       bool                   `protobuf:"varint,2,opt,name=executed,proto3" json:"executed,omitempty"`                      // the person's finding: did the external write happen?
-	ResultJson     string                 `protobuf:"bytes,3,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"` // when executed: what it produced, e.g. the PR's URL
-	IdempotencyKey string                 `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	Executed       bool                   `protobuf:"varint,2,opt,name=executed,proto3" json:"executed,omitempty"`                                  // the person's finding: did the external write happen?
+	ResultJson     string                 `protobuf:"bytes,3,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`             // when executed: what it produced, e.g. the PR's URL
+	IdempotencyKey string                 `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // required: the same finding sent again applies once
+	Lookup         bool                   `protobuf:"varint,5,opt,name=lookup,proto3" json:"lookup,omitempty"`                                      // when executed: agentd looks the result up itself (lookup tools)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -905,9 +954,18 @@ func (x *ResolveReconciliationRequest) GetIdempotencyKey() string {
 	return ""
 }
 
+func (x *ResolveReconciliationRequest) GetLookup() bool {
+	if x != nil {
+		return x.Lookup
+	}
+	return false
+}
+
 type ResolveReconciliationResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The effect's status now: SUCCEEDED (executed), PENDING (not executed: the run's next call
+	// sends it again under its original key) or ABANDONED (not executed, and the run was cancelled).
+	Status        string `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1126,11 +1184,12 @@ var File_agentos_v1_control_proto protoreflect.FileDescriptor
 const file_agentos_v1_control_proto_rawDesc = "" +
 	"\n" +
 	"\x18agentos/v1/control.proto\x12\n" +
-	"agentos.v1\"\xd1\x01\n" +
+	"agentos.v1\"\xea\x01\n" +
 	"\x0fStartRunRequest\x12\x12\n" +
 	"\x04task\x18\x01 \x01(\tR\x04task\x12?\n" +
 	"\x06params\x18\x02 \x03(\v2'.agentos.v1.StartRunRequest.ParamsEntryR\x06params\x12.\n" +
-	"\x13budget_limit_micros\x18\x03 \x01(\x03R\x11budgetLimitMicros\x1a9\n" +
+	"\x13budget_limit_micros\x18\x03 \x01(\x03R\x11budgetLimitMicros\x12\x17\n" +
+	"\adry_run\x18\x04 \x01(\bR\x06dryRun\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"&\n" +
@@ -1141,7 +1200,7 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x10ListRunsResponse\x12#\n" +
 	"\x04runs\x18\x01 \x03(\v2\x0f.agentos.v1.RunR\x04runs\")\n" +
 	"\x10CancelRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xce\x03\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xe7\x03\n" +
 	"\x03Run\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12&\n" +
 	"\x0ftemporal_run_id\x18\x02 \x01(\tR\rtemporalRunId\x12\x12\n" +
@@ -1156,19 +1215,24 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\afailure\x18\t \x01(\tR\afailure\x12.\n" +
 	"\x13budget_spent_micros\x18\n" +
 	" \x01(\x03R\x11budgetSpentMicros\x124\n" +
-	"\x16budget_reserved_micros\x18\v \x01(\x03R\x14budgetReservedMicros\x1a9\n" +
+	"\x16budget_reserved_micros\x18\v \x01(\x03R\x14budgetReservedMicros\x12\x17\n" +
+	"\adry_run\x18\f \x01(\bR\x06dryRun\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x14\n" +
 	"\x12ListPendingRequest\"D\n" +
 	"\x13ListPendingResponse\x12-\n" +
-	"\x05items\x18\x01 \x03(\v2\x17.agentos.v1.PendingItemR\x05items\"g\n" +
+	"\x05items\x18\x01 \x03(\v2\x17.agentos.v1.PendingItemR\x05items\"\xcc\x01\n" +
 	"\vPendingItem\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\tR\x02id\x12\x15\n" +
 	"\x06run_id\x18\x03 \x01(\tR\x05runId\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\x04 \x01(\tR\texpiresAt\"\xc2\x02\n" +
+	"expires_at\x18\x04 \x01(\tR\texpiresAt\x12\x12\n" +
+	"\x04tool\x18\x05 \x01(\tR\x04tool\x12\x16\n" +
+	"\x06reason\x18\x06 \x01(\tR\x06reason\x12\x14\n" +
+	"\x05since\x18\a \x01(\tR\x05since\x12!\n" +
+	"\fpayload_json\x18\b \x01(\tR\vpayloadJson\"\xc2\x02\n" +
 	"\x16ResolveApprovalRequest\x12\x1f\n" +
 	"\vapproval_id\x18\x01 \x01(\tR\n" +
 	"approvalId\x12%\n" +
@@ -1189,13 +1253,14 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\n" +
 	"decided_by\x18\x02 \x01(\tR\tdecidedBy\x12\x1d\n" +
 	"\n" +
-	"decided_at\x18\x03 \x01(\tR\tdecidedAt\"\xa1\x01\n" +
+	"decided_at\x18\x03 \x01(\tR\tdecidedAt\"\xb9\x01\n" +
 	"\x1cResolveReconciliationRequest\x12\x1b\n" +
 	"\teffect_id\x18\x01 \x01(\tR\beffectId\x12\x1a\n" +
 	"\bexecuted\x18\x02 \x01(\bR\bexecuted\x12\x1f\n" +
 	"\vresult_json\x18\x03 \x01(\tR\n" +
 	"resultJson\x12'\n" +
-	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"7\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\x12\x16\n" +
+	"\x06lookup\x18\x05 \x01(\bR\x06lookup\"7\n" +
 	"\x1dResolveReconciliationResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\"z\n" +
 	"\x13ExtendBudgetRequest\x12\x15\n" +

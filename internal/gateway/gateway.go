@@ -60,13 +60,19 @@ type Gateway struct {
 	Adapters map[string]models.Adapter // by provider name in models.yaml
 	Limiters map[string]*rate.Limiter  // by provider name; none for a provider without a limit
 	Limits   LoopLimits
-	Tools    *tools.Stubs
+	Tools    tools.Registry
 	Faults   *faults.Script // nil unless agentd runs with --fault-script
 	Log      *slog.Logger
+	// Incarnation names this agentd process in the effects it claims. One data directory has
+	// one agentd at a time, so an effect another incarnation claimed has nobody sending it.
+	Incarnation string
 
 	modelCalls singleflight.Group // in-flight model calls, by workflow and activity ID
-	effects    singleflight.Group // in-flight external effects, by effect ID
+	effects    singleflight.Group // in-flight effects and their recoveries, by effect ID
 	executions sync.WaitGroup     // detached executions, drained on shutdown
+
+	sendMu  sync.Mutex      // makes claiming an effect and marking it sent one step
+	sending map[string]bool // effect IDs this process has claimed and is sending
 }
 
 // LoopLimits cap the logical calls of one run, and the attempts of one call; 0 is no limit.
@@ -151,6 +157,14 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 		log.Info("invoke failed", "error", err)
 		return nil, err
 	}
+	// The loop guard counts a call that only waited (for an approval, a reconciliation or
+	// budget) as a step, not as a repeat or a model call.
+	if err := g.Ledger.Q.SetCallOutcome(context.WithoutCancel(ctx), db.SetCallOutcomeParams{
+		Outcome: sql.NullString{String: res.GetStatus(), Valid: true}, WorkflowID: run.WorkflowID,
+		ActivityID: info.ActivityID, ScheduledAt: info.ScheduledTime.UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		log.Error("could not record the call's outcome", "error", err)
+	}
 	log.Info("invoke finished", "status", res.GetStatus())
 	return res, nil
 }
@@ -171,16 +185,25 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		}
 		return g.callModel(ctx, info, run, route, args, fx)
 	case "tool":
+		t, ok := g.Tools[c.GetName()]
+		if !ok {
+			return result(StatusDenied, map[string]any{"reason": "no such tool"})
+		}
 		scope, err := g.scope(run)
 		if err != nil {
 			return result(StatusDenied, map[string]any{"reason": err.Error()})
 		}
 		// A call that leaves part of its run's scope out gets the run's own value, never the
 		// tool's default (the default branch, the latest commit). One that names another
-		// value is denied by the policy.
-		args, canon, err = fillScope(args, scope)
+		// value is denied by the policy, and one that passes an argument the tool does not
+		// declare is refused by its schema.
+		args, canon, err = fillScope(args, scope, t.Args().Props())
 		if err != nil {
 			return nil, err
+		}
+		if err := t.Args().Validate(args); err != nil {
+			return nil, temporal.NewNonRetryableApplicationError(
+				fmt.Sprintf("arguments of %s: %v", c.GetName(), err), "BadArguments", nil)
 		}
 		v := g.Policy.EvaluateTool(c.GetName(), args, scope)
 		switch v.Decision {
@@ -190,10 +213,20 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 			// M4 replaces this with the approvals table; until then nobody can approve.
 			return result(StatusNeedsApproval, nil)
 		}
+		class, err := effectClass(t, v.Effect)
+		if err != nil {
+			return nil, temporal.NewNonRetryableApplicationError(err.Error(), "BadPolicy", err)
+		}
 		if fx.Status != "" {
 			return result(fx.Status, nil)
 		}
-		return g.callTool(ctx, info, run, c.GetName(), v.Effect, args, canon, fx)
+		// A write may have one effect per run unless the policy allows more: a workflow that
+		// varies its arguments gets new effects, and each would reach the outside world.
+		maxPerRun := v.MaxPerRun
+		if maxPerRun == 0 {
+			maxPerRun = 1
+		}
+		return g.callTool(ctx, info, run, t, class, maxPerRun, args, canon, fx)
 	default:
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("unknown call kind %q", c.GetKind()), "BadCall", nil)
@@ -222,12 +255,13 @@ func (g *Gateway) scope(run db.Run) (map[string]string, error) {
 	return scope, nil
 }
 
-// fillScope adds each scoped argument the call left out, with the run's value, and encodes
-// the result again: the canonical form, and so the effect ID, covers what the tool receives.
-func fillScope(args map[string]any, scope map[string]string) (map[string]any, []byte, error) {
+// fillScope adds each scoped argument the tool declares and the call left out, with the
+// run's value, and encodes the result again: the canonical form, and so the effect ID, covers
+// what the tool receives.
+func fillScope(args map[string]any, scope map[string]string, declared []string) (map[string]any, []byte, error) {
 	filled := maps.Clone(args)
 	for arg, v := range scope {
-		if _, ok := filled[arg]; !ok {
+		if _, ok := filled[arg]; !ok && slices.Contains(declared, arg) {
 			filled[arg] = v
 		}
 	}

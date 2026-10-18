@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	tlog "go.temporal.io/sdk/log"
@@ -34,6 +35,7 @@ import (
 	"github.com/jchen0426/agentos/internal/control"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gateway"
+	"github.com/jchen0426/agentos/internal/githubtool"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
@@ -50,7 +52,8 @@ const drainTimeout = 30 * time.Second
 
 func main() {
 	configPath := flag.String("config", "agentd.yaml", "path to agentd.yaml")
-	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the stub tools and the fake model")
+	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the tools and the fake model")
+	testTools := flag.Bool("test-tools", false, "TESTS ONLY: also offer test.unsafe_write, a write to a local log")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	flag.Parse()
 
@@ -61,13 +64,13 @@ func main() {
 	}
 	// The log carries values the Worker chose (activity IDs, call names): no raw controls.
 	log := slog.New(slog.NewJSONHandler(safetext.JSONWriter(os.Stderr), &slog.HandlerOptions{Level: level}))
-	if err := run(*configPath, *faultScript, log); err != nil {
+	if err := run(*configPath, *faultScript, *testTools, log); err != nil {
 		log.Error("agentd stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath, faultScript string, log *slog.Logger) error {
+func run(configPath, faultScript string, testTools bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -78,6 +81,11 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	if err := mkdirPrivate(cfg.DataDir); err != nil {
 		return err
 	}
+	lock, err := lockDataDir(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	pol, err := policy.Load(cfg.PolicyFile)
 	if err != nil {
 		return err
@@ -136,7 +144,7 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	}
 	defer tc.Close()
 
-	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Repos)}
+	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors())}
 	adapters, err := modelAdapters(mods, led, cfg.DataDir)
 	if err != nil {
 		return err
@@ -152,6 +160,13 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 			}
 		}
 	}
+	toolset, err := buildTools(cfg, pol, led, testTools, log)
+	if err != nil {
+		return err
+	}
+	if err := gateway.CheckTools(pol, toolset); err != nil {
+		return err
+	}
 	gw := &gateway.Gateway{
 		Ledger:   led,
 		Policy:   pol,
@@ -163,9 +178,15 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 		Limiters: limiters(mods),
 		Limits: gateway.LoopLimits{ModelCalls: cfg.LoopLimits.ModelCalls, GatewayCalls: cfg.LoopLimits.GatewayCalls,
 			SameToolCalls: cfg.LoopLimits.SameToolCalls, Attempts: cfg.LoopLimits.Attempts},
-		Tools:  &tools.Stubs{Blobs: led, External: tools.NewExternalLog(filepath.Join(cfg.DataDir, "stub-external.jsonl"))},
-		Faults: script,
-		Log:    log.With("component", "gateway"),
+		Tools:       toolset,
+		Faults:      script,
+		Log:         log.With("component", "gateway"),
+		Incarnation: uuid.NewString(),
+	}
+	// Before any call is served: effects the last agentd process claimed are recovered by
+	// their class, in the background; the calls that ask for them join the recovery.
+	if err := gw.RecoverEffects(ctx); err != nil {
+		return fmt.Errorf("recover effects: %w", err)
 	}
 	// On shutdown, wait for running Invokes, then for the executions they started to record
 	// their results: an effect left PENDING needs a person to reconcile it.
@@ -214,6 +235,7 @@ func run(configPath, faultScript string, log *slog.Logger) error {
 	ctl := &control.Server{
 		Ledger:      led,
 		Budget:      bud,
+		Effects:     gw,
 		Temporal:    tc,
 		Tasks:       registry,
 		TaskQueue:   cfg.TaskQueues.Workflows,
@@ -278,6 +300,63 @@ func listen(addr string) (net.Listener, error) {
 		return net.Listen("tcp", hostport)
 	}
 	return nil, fmt.Errorf("%s: want unix:///path or tcp://127.0.0.1:port", addr)
+}
+
+// lockDataDir makes this process the only agentd on the data directory, before anything
+// touches the ledger or the sockets. A second agentd would take the sockets over, charge the
+// first one's open reservations in full, and recover effects the first one is still sending.
+// The lock goes with the process, however it ends.
+func lockDataDir(dir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dir, "agentd.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another agentd is using the data directory %s", dir)
+		}
+		return nil, fmt.Errorf("lock the data directory %s: %w", dir, err)
+	}
+	return f, nil
+}
+
+// buildTools makes the tools agentd offers. The GitHub tools need the github section of the
+// config and a token; without them they only dry-run.
+func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, testTools bool, log *slog.Logger) (tools.Registry, error) {
+	var gh *githubtool.Client
+	if g := cfg.GitHub; g != nil {
+		var token string
+		if g.Token != "" {
+			var err error
+			if token, err = secrets.Resolve(g.Token); err != nil {
+				return nil, fmt.Errorf("github token: %w", err)
+			}
+		}
+		var err error
+		gh, err = githubtool.New(githubtool.Config{APIURL: g.APIURL, Token: token, RequestTimeout: g.RequestTimeout,
+			Settle: g.Settle, Author: githubtool.Author{Name: g.AuthorName, Email: g.AuthorEmail}})
+		if err != nil {
+			return nil, fmt.Errorf("github: %w", err)
+		}
+	} else {
+		log.Warn("GitHub is not configured: the github.* tools only dry-run, and nothing is written")
+	}
+	repos := map[string]githubtool.Repo{}
+	for id, r := range cfg.Repos {
+		owner, name, _ := strings.Cut(r.GitHub, "/")
+		repos[id] = githubtool.Repo{Mirror: r.Mirror, Owner: owner, Name: name}
+	}
+	reg := tools.Registry{}
+	reg.Add(&tools.ShowDiff{Blobs: led})
+	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: pol.Tools["git.apply_check"].DenyPaths})
+	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths})
+	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: led})
+	if testTools {
+		log.Warn("TEST TOOLS ENABLED: never run this outside tests")
+		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})
+	}
+	return reg, nil
 }
 
 func mkdirPrivate(dir string) error {

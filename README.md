@@ -10,7 +10,11 @@ prototypes ([docs/m1-notes.md](docs/m1-notes.md)). M2a adds the budget: a versio
 table, a reservation for every model request before it is sent and a settlement after, and
 `agentctl budget extend`. M2b adds the Claude adapter: keys from the OS keyring, structured
 output checked against the task's schema, refusals and server-side fallback, rate limits and
-loop limits ([docs/m2-notes.md](docs/m2-notes.md)).
+loop limits ([docs/m2-notes.md](docs/m2-notes.md)). M3a adds the effect protocol for external
+writes: each one is rendered and recorded before it is claimed and sent, recovered by its class
+after a crash, and settled by a person when nobody can tell what happened; plus the GitHub
+write tools, tool argument schemas, dry runs and a lock that keeps one agentd per data
+directory ([docs/m3-notes.md](docs/m3-notes.md)).
 
 ## Layout
 
@@ -18,7 +22,10 @@ loop limits ([docs/m2-notes.md](docs/m2-notes.md)).
 | --- | --- |
 | `proto/agentos/v1/` | `gateway.proto` (Invoke's `Call`/`Result`), `control.proto` (the Control service) |
 | `cmd/agentd`, `cmd/agentctl` | the daemon and its command line |
-| `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol |
+| `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol (claims, recovery by class, reconciliation) |
+| `internal/tools`, `internal/patch` | the tools and the effect class and argument schema each declares; checks and applies a model's patch |
+| `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
+| `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to |
 | `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |
 | `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude and fake adapters; keys from the OS keyring |
 | `config/prompts`, `config/schemas` | each model task's prompt and output schema |
@@ -27,7 +34,7 @@ loop limits ([docs/m2-notes.md](docs/m2-notes.md)).
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T7 (concurrent calls against one budget), T8, T10, the replay gate, the sandbox probe, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T7 (concurrent calls against one budget), T8, T10, T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the sandbox probe, mTLS, gateway identity, agentd restart, cancel and its enforcement |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
 ## Requirements
@@ -60,6 +67,34 @@ uv run python -m agentos_worker --endpoint 127.0.0.1:7244
 ```bash
 bin/agentctl --socket .agentos/control/control.sock runs start security-audit --repo acme/payments --commit <sha> --base main
 ```
+
+The dev configs leave GitHub out, so the GitHub tools only dry-run: they render and record the
+PR and the comment, and send nothing. `runs start ... --dry-run` does the same for one run on
+an agentd that has GitHub. To write to GitHub, give agentd a `github` section with a
+fine-grained token in the keychain, and map the logical repository to its GitHub name:
+
+```yaml
+repos:
+  acme/payments: {mirror: ../../.agentos/mirror, github: <owner>/<test-repo>}
+github: {token: "keyring:agentos-github-token"}
+```
+
+Until approvals arrive (M4), do that only with the fake model: with the dev policy nothing asks
+before a PR is opened, and a real model can be steered by text in the diff.
+
+A write whose outcome nobody knows (agentd stopped after sending it, and the tool cannot look it
+up) waits in `WAITING_RECONCILE`. Check the outside world, then say what you found:
+
+```bash
+bin/agentctl --socket .agentos/control/control.sock reconcile list
+```
+
+```bash
+bin/agentctl --socket .agentos/control/control.sock reconcile resolve <effect-id> --not-executed
+```
+
+`--executed --result '{...}'` records what the write produced instead, and `--executed --lookup`
+lets agentd look it up for tools that can.
 
 To send the audit to Claude instead of the fake model, store an API key in the login keychain
 (the command asks for it, so it stays out of your shell history), then start agentd with
@@ -106,7 +141,7 @@ AGENTOS_MODEL=claude AGENTOS_SANDBOX=srt uv run pytest tests/test_t1_worker_cras
 ```bash
 AGENTOS_LIVE=1 go test ./internal/models -run Live
 ```
-`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, and the proxy's method allowlist and request rules.
+`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation.
 
 After a workflow change that is meant to be compatible, the replay gate
 (`tests/test_replay.py`) must still pass. To add samples to it, run

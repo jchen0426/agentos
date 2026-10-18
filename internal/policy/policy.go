@@ -31,7 +31,8 @@ func (d Decision) String() string {
 	}
 }
 
-// Effect classes (design doc, section 6). A tool that declares none is unsafe.
+// Effect classes (design doc, section 6). A tool declares its own; one that declares none
+// is unsafe.
 const (
 	EffectNone       = "none"
 	EffectIdempotent = "idempotent"
@@ -40,11 +41,16 @@ const (
 )
 
 type Tool struct {
-	Decision    string   `yaml:"decision"`
+	Decision string `yaml:"decision"`
+	// Effect is optional: the tool declares its class. When set it must be that class, or
+	// unsafe for a write, which only makes recovery more careful.
 	Effect      string   `yaml:"effect"`
-	DenyPaths   []string `yaml:"deny_paths"`   // enforced by the tool itself (M3)
+	DenyPaths   []string `yaml:"deny_paths"`   // enforced by the tool itself, not by the workflow
 	ApprovalTTL string   `yaml:"approval_ttl"` // M4
-	Render      string   `yaml:"render"`       // M3
+	Render      string   `yaml:"render"`       // "template": the tool renders what it writes (all of agentd's do)
+	// MaxPerRun is how many effects of a write one run may have, sent or maybe sent; 0 is
+	// the default, 1.
+	MaxPerRun int `yaml:"max_per_run"`
 }
 
 type Model struct {
@@ -77,12 +83,17 @@ func Load(path string) (*Policy, error) {
 			return nil, fmt.Errorf("policy %s: tool %s: unknown decision %q", path, name, t.Decision)
 		}
 		switch t.Effect {
-		case EffectNone, EffectIdempotent, EffectLookup, EffectUnsafe:
-		case "":
-			t.Effect = EffectUnsafe
-			p.Tools[name] = t
+		case "", EffectNone, EffectIdempotent, EffectLookup, EffectUnsafe:
 		default:
 			return nil, fmt.Errorf("policy %s: tool %s: unknown effect class %q", path, name, t.Effect)
+		}
+		switch t.Render {
+		case "", "template":
+		default:
+			return nil, fmt.Errorf("policy %s: tool %s: unknown render %q", path, name, t.Render)
+		}
+		if t.MaxPerRun < 0 {
+			return nil, fmt.Errorf("policy %s: tool %s: max_per_run must not be negative", path, name)
 		}
 	}
 	return &p, nil
@@ -92,7 +103,9 @@ func Load(path string) (*Policy, error) {
 type Verdict struct {
 	Decision Decision
 	Reason   string
-	Effect   string // the tool's effect class; empty for model calls
+	Effect   string // the effect class the policy states for the tool, if any; empty for model calls
+	// MaxPerRun is the tool's max_per_run; 0 when the policy leaves the default.
+	MaxPerRun int
 }
 
 // EvaluateTool decides a tool call. args is the decoded JSON object of the call; scope holds
@@ -121,9 +134,9 @@ func (p *Policy) EvaluateTool(name string, args map[string]any, scope map[string
 	}
 	switch t.Decision {
 	case "allow":
-		return Verdict{Decision: Allow, Effect: t.Effect}
+		return Verdict{Decision: Allow, Effect: t.Effect, MaxPerRun: t.MaxPerRun}
 	case "require_approval":
-		return Verdict{Decision: RequireApproval, Effect: t.Effect}
+		return Verdict{Decision: RequireApproval, Effect: t.Effect, MaxPerRun: t.MaxPerRun}
 	default:
 		return Verdict{Decision: Deny, Reason: "denied by policy"}
 	}

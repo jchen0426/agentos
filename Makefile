@@ -3,11 +3,12 @@ VM ?= agentos
 
 .PHONY: build build-linux proto sqlc test test-srt test-linux vm temporal-server
 
+# githubsim is the black-box tests' stand-in for GitHub.
 build:
-	go build -o bin/ ./cmd/agentd ./cmd/agentctl
+	go build -o bin/ ./cmd/agentd ./cmd/agentctl ./cmd/githubsim
 
 build-linux:
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux-arm64/ ./cmd/agentd ./cmd/agentctl
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux-arm64/ ./cmd/agentd ./cmd/agentctl ./cmd/githubsim
 
 proto:
 	./scripts/gen-proto.sh

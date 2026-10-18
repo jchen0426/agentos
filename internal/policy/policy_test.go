@@ -53,7 +53,9 @@ func TestLoadRejectsTyposAndUnknownValues(t *testing.T) {
 	}
 }
 
-func TestUndeclaredEffectIsUnsafe(t *testing.T) {
+// A policy need not state a tool's effect class: the tool declares its own (section 6), and
+// the gateway refuses a policy that states a weaker one.
+func TestEffectClassIsOptional(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "policy.yaml")
 	if err := os.WriteFile(path, []byte("tools:\n  x: {decision: allow}\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -62,8 +64,8 @@ func TestUndeclaredEffectIsUnsafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := p.EvaluateTool("x", nil, nil).Effect; got != EffectUnsafe {
-		t.Errorf("effect: got %q, want unsafe", got)
+	if got := p.EvaluateTool("x", nil, nil).Effect; got != "" {
+		t.Errorf("effect: got %q, want none stated", got)
 	}
 }
 

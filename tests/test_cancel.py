@@ -8,8 +8,8 @@ from tests.harness import TERMINAL, TEST_POLICY, Stack, wait_for
 # The design doc's own rule for opening the PR: approval required. M1 has no approvals
 # table, so the run waits in WAITING_APPROVAL until someone cancels it.
 APPROVAL_POLICY = TEST_POLICY.replace(
-    "github.open_draft_pr:  {decision: allow, effect: lookup}",
-    "github.open_draft_pr:  {decision: require_approval, effect: lookup}",
+    "github.open_draft_pr:  {decision: allow,",
+    "github.open_draft_pr:  {decision: require_approval,",
 )
 
 

@@ -1,4 +1,5 @@
-"""Workflows that misbehave, for the tests of agentd's own enforcement (tests/test_cancel.py)."""
+"""Workflows that misbehave, for the tests of agentd's own enforcement (tests/test_cancel.py,
+tests/test_write_limits.py)."""
 
 import asyncio
 
@@ -28,3 +29,19 @@ class IgnoresCancel(SecurityAudit):
         super().doorbell()
 
 
+@workflow.defn(name="security-audit")
+class ManyReports(SecurityAudit):
+    """Posts three reports on the commit, each a little different, so each is a new effect."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        statuses = []
+        for i in range(3):
+            status, _ = await self.call("tool", "github.comment_commit", repo=a.repo, commit=a.commit,
+                                        outcome=f"report {i}", report_ref=None, pr_url=None)
+            statuses.append(status)
+        return {"statuses": statuses}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
