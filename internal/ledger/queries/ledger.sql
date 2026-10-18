@@ -61,7 +61,8 @@ WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
 -- name: CountRunEffects :one
--- A run's effects of one tool that went out or may have, other than the one asked about.
+-- A run's effects of one tool that went out or may have, or that the tool refused as it was to
+-- send them (DENIED: its checks may have cost requests), other than the one asked about.
 SELECT CAST(COUNT(*) AS INTEGER) FROM effects
 WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED');
 

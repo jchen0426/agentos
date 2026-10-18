@@ -8,6 +8,8 @@ package patch
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"regexp"
@@ -25,6 +27,7 @@ const (
 	MaxBytes     = 256 << 10 // the patch itself
 	MaxFiles     = 20        // files it touches
 	MaxFileBytes = 1 << 20   // any file before or after the patch
+	MaxDepth     = 32        // parts of a path: github.open_draft_pr lists each directory above one on GitHub
 )
 
 // regularFile is the only mode a patch may leave a file with: no symlinks, submodules or
@@ -48,6 +51,10 @@ type Change struct {
 	Path    string
 	Content []byte // the file after the patch; nil when Delete
 	Delete  bool
+	// OldBlob is git's name for the file the patch was applied to, as Source read it:
+	// whoever writes the change can check that it is what the commit really holds. Empty
+	// when the patch creates the file.
+	OldBlob string
 }
 
 // Parse reads a unified diff, git's or a plain one. A plain one names its files with a
@@ -102,9 +109,9 @@ func (p *Patch) Paths() []string {
 
 // Check applies the rules every patch must meet, then the policy's deny_paths. Patterns
 // match without regard to case: on a case-insensitive file system "makefile" is "Makefile",
-// and make reads either.
+// and make reads either. Paths are told apart the same way.
 func (p *Patch) Check(denyPaths []string) error {
-	seen := map[string]bool{}
+	seen := map[string]string{} // lower case -> as the patch names it
 	for _, f := range p.files {
 		n := name(f)
 		if err := checkPath(n); err != nil {
@@ -128,15 +135,25 @@ func (p *Patch) Check(denyPaths []string) error {
 			return violation("%s: only regular files without the executable bit (mode 100644) are accepted, not %o", n, uint32(mode))
 		}
 		key := strings.ToLower(n)
-		if seen[key] {
+		if _, twice := seen[key]; twice {
 			return violation("%s: changed twice in one patch", n)
 		}
-		seen[key] = true
+		seen[key] = n
 		for _, pattern := range denyPaths {
 			if ok, err := doublestar.Match(strings.ToLower(pattern), key); err != nil {
 				return fmt.Errorf("deny_paths pattern %q: %w", pattern, err)
 			} else if ok {
 				return violation("%s: the policy protects %s", n, pattern)
+			}
+		}
+	}
+	// A path above another one would be a file and a directory at once, in the one tree that
+	// github.open_draft_pr sends. git apply accepts a patch that creates both.
+	for _, f := range p.files {
+		n := name(f)
+		for i := strings.LastIndexByte(n, '/'); i > 0; i = strings.LastIndexByte(n[:i], '/') {
+			if above, ok := seen[strings.ToLower(n[:i])]; ok {
+				return violation("%s: the patch also changes %s, a directory above it", n, above)
 			}
 		}
 	}
@@ -156,6 +173,9 @@ func checkPath(n string) error {
 	}
 	if strings.HasPrefix(n, "/") || path.Clean(n) != n {
 		return violation("%q: not a plain relative path", n)
+	}
+	if parts := strings.Count(n, "/") + 1; parts > MaxDepth {
+		return violation("%.200q: %d parts deep, over the limit of %d", n, parts, MaxDepth)
 	}
 	for part := range strings.SplitSeq(n, "/") {
 		if !pathPart.MatchString(part) {
@@ -196,19 +216,33 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		if err := gitdiff.Apply(&out, bytes.NewReader(orig), f); err != nil {
 			return nil, violation("%s: the patch does not apply: %v", n, err)
 		}
+		c := Change{Path: n}
+		if exists {
+			c.OldBlob = BlobID(orig)
+		}
 		if f.IsDelete {
 			if out.Len() != 0 {
 				return nil, violation("%s: the patch deletes it but does not remove all of it", n)
 			}
-			changes = append(changes, Change{Path: n, Delete: true})
+			c.Delete = true
+			changes = append(changes, c)
 			continue
 		}
 		if out.Len() > MaxFileBytes {
 			return nil, violation("%s: %d bytes after the patch, over the limit of %d", n, out.Len(), MaxFileBytes)
 		}
-		changes = append(changes, Change{Path: n, Content: out.Bytes()})
+		c.Content = out.Bytes()
+		changes = append(changes, c)
 	}
 	return changes, nil
+}
+
+// BlobID is the name git gives a file of content b: the SHA-1 of its blob object.
+func BlobID(b []byte) string {
+	h := sha1.New()
+	fmt.Fprintf(h, "blob %d\x00", len(b))
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // MirrorSource reads files at commit from the read-only mirror, through the git tool server
@@ -216,7 +250,8 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 // patch to a symlink or a submodule, or to a path under one, is refused when it is applied. A
 // file over MaxFileBytes is refused unread. The server's refusals (a crafted tree too large for
 // git to read, say) are violations: they always will be. Its failures are errors, and the call
-// is tried again.
+// is tried again. agentd can check the shape of what it reads, not its word: the Changes name
+// the blobs read (OldBlob), and github.open_draft_pr checks them against GitHub.
 func MirrorSource(ctx context.Context, git gitmcp.Caller, mirror, commit string) Source {
 	return func(paths []string) (map[string][]byte, error) {
 		files, err := gitmcp.ReadFiles(ctx, git, mirror, commit, paths)

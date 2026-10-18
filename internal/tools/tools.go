@@ -50,8 +50,9 @@ type Writer interface {
 	Prepare(ctx context.Context, req Request) (json.RawMessage, error)
 	// Execute sends the payload, calling proceed before each request whose effect someone
 	// could see; when proceed fails, Execute stops and returns its error. Its error tells what
-	// happened outside: ErrNotSent and a *RefusedError mean nothing did; any other error leaves
-	// the outcome unknown.
+	// happened outside: ErrNotSent, a *RefusedError and a *DeniedError mean nothing did (a
+	// *DeniedError, before anything was sent, refuses the payload for good); any other error
+	// leaves the outcome unknown.
 	Execute(ctx context.Context, payload json.RawMessage, idempotencyKey string, proceed Proceed) (map[string]any, error)
 	// DryRun is what a dry run returns to the workflow instead of Execute's result.
 	DryRun(payload json.RawMessage) map[string]any
@@ -83,7 +84,8 @@ type Finder interface {
 var ErrNotSent = errors.New("request not sent")
 
 // DeniedError refuses a call as it stands, before anything is sent: for example a patch that
-// touches a file the policy protects. The workflow gets a "denied" result.
+// touches a file the policy protects, or (from Execute, which then ends the effect) one whose
+// files are not what GitHub holds. The workflow gets a "denied" result.
 type DeniedError struct{ Reason string }
 
 func (e *DeniedError) Error() string { return "denied: " + e.Reason }

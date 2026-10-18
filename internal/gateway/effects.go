@@ -27,6 +27,7 @@ const (
 	effectFailed           = "FAILED"    // the external system refused it: nothing happened
 	effectUnknown          = "UNKNOWN"   // nobody can tell whether it happened: a person reconciles it
 	effectAbandoned        = "ABANDONED" // never sent, and never will be
+	effectDenied           = "DENIED"    // the tool refused the payload before sending anything: counts against the run
 	effectDryRun           = "DRY_RUN"   // rendered and recorded, not sent
 )
 
@@ -302,11 +303,15 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 	fx.StallBeforeRecord(ctx.Done())
 	var refused *tools.RefusedError
 	var conflict *tools.ConflictError
+	var denied *tools.DeniedError
 	switch {
 	case err == nil:
 		res, err := g.settle(ctx, e, effectSucceeded, value, "")
 		fx.StallAfterRecord(ctx.Done())
 		return res, err
+	case errors.As(err, &denied):
+		// The tool refused the recorded payload before sending anything: it never will be.
+		return g.settle(ctx, e, effectDenied, nil, denied.Reason)
 	case errors.Is(err, tools.ErrNotSent) || errors.As(err, &refused) && refused.Retryable:
 		// Nothing happened outside. A cancelled run's effect is done with; anyone else's goes
 		// back for a later attempt.
@@ -482,7 +487,7 @@ func (g *Gateway) effectResult(ctx context.Context, e db.Effect) (*agentosv1.Res
 		return nil, temporal.NewNonRetryableApplicationError(fmt.Sprintf("tool %s failed: %s", e.Tool, e.Reason.String), "ToolFailed", nil)
 	case effectUnknown:
 		return result(StatusNeedsReconcile, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
-	case effectAbandoned:
+	case effectAbandoned, effectDenied:
 		return result(StatusDenied, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
 	case effectAwaitingApproval:
 		return result(StatusNeedsApproval, map[string]any{"effect_id": e.EffectID})

@@ -63,6 +63,27 @@ func TestApplyFix(t *testing.T) {
 	if len(changes) != 1 || changes[0].Path != "app/db.py" || !strings.Contains(string(changes[0].Content), "name = ?") {
 		t.Fatalf("changes = %+v", changes)
 	}
+	// What the patch was applied to, as git names it (git hash-object): what GitHub must hold.
+	if changes[0].OldBlob != "40f0c5d58706e66e4df57ca3877eb3fe9c77a649" {
+		t.Fatalf("old blob %s", changes[0].OldBlob)
+	}
+}
+
+// A deleted file names the blob it deletes; a new file names none.
+func TestApplyNamesTheOldBlob(t *testing.T) {
+	p, err := Parse([]byte("diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n" +
+		"@@ -1 +0,0 @@\n-x\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := p.Apply(files(map[string]string{"gone.txt": "x\n"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 || !changes[0].Delete || changes[0].OldBlob != "587be6b4c3f93f93c489c0111bba5596147a26cb" ||
+		changes[1].Delete || changes[1].OldBlob != "" {
+		t.Fatalf("changes = %+v", changes)
+	}
 }
 
 func TestPlainDiffDropsThePrefix(t *testing.T) {
@@ -97,6 +118,7 @@ func TestCheckRefuses(t *testing.T) {
 		{newFile(".g\u200cit/config", "100644"), "only letters"}, // a zero-width joiner
 		{"diff --git a/app/db.py b/app/db.py\n", "changes nothing"},
 		{"diff --git a/app/db.py b/app/db.py\nindex 1111111..2222222 100644\n", "changes nothing"},
+		{newFile(strings.Repeat("d/", MaxDepth)+"f.txt", "100644"), "33 parts deep, over the limit of 32"},
 	} {
 		p, err := Parse([]byte(tc.patch))
 		if err == nil {
@@ -117,6 +139,38 @@ func TestApplyRefuses(t *testing.T) {
 	refused(t, err, "no such file")
 	_, err = Parse([]byte("not a patch\n"))
 	refused(t, err, "changes no file")
+}
+
+// A path of the patch may not be a directory above another one: GitHub would get a file and
+// a file under it in one tree. git apply --check accepts a patch that creates both.
+func TestCheckRefusesAFileAboveAnother(t *testing.T) {
+	newFile := func(name string) string {
+		return "diff --git a/" + name + " b/" + name + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + name +
+			"\n@@ -0,0 +1 @@\n+x\n"
+	}
+	deleted := "diff --git a/a b/a\ndeleted file mode 100644\n--- a/a\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+	for _, tc := range []struct{ patch, want string }{
+		{newFile("a") + newFile("a/b"), "a/b: the patch also changes a"},
+		{newFile("a/b/c") + newFile("a"), "a/b/c: the patch also changes a"}, // either order, any depth
+		{newFile("A") + newFile("a/b"), "a/b: the patch also changes A"},     // case-insensitive, as deny_paths
+		{deleted + newFile("a/b"), "a/b: the patch also changes a"},          // a file that becomes a directory
+	} {
+		p, err := Parse([]byte(tc.patch))
+		if err == nil {
+			err = p.Check(nil)
+		}
+		refused(t, err, tc.want)
+	}
+	deepest := strings.Repeat("d/", MaxDepth-1) + "f.txt"
+	for _, ok := range []string{newFile("a") + newFile("ab/c"), newFile("a.d") + newFile("a/b"), newFile("a/b") + newFile("a/c"), newFile(deepest)} {
+		p, err := Parse([]byte(ok))
+		if err == nil {
+			err = p.Check(nil)
+		}
+		if err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
 }
 
 // The patch's limits are what the git tool server reads.
