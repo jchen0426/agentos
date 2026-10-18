@@ -2,8 +2,8 @@
 of T9). Inside the sandbox the Temporal SDK reaches Temporal through agentd's Runtime entry,
 and nothing else: not Temporal's own port, not the Control socket, not the network, not the
 home directory, not the caller's environment. On Linux it can create no files at all. The
-launchers refuse a code directory or Python environment that would expose agentd's data or, on
-Linux, a way out (a Unix socket, a FIFO).
+launchers refuse a code directory or Python environment that would expose dev data, a FIFO, or
+on Linux a Unix socket.
 
 Run with AGENTOS_SANDBOX=srt on macOS or AGENTOS_SANDBOX=bwrap on Linux.
 """
@@ -11,6 +11,7 @@ Run with AGENTOS_SANDBOX=srt on macOS or AGENTOS_SANDBOX=bwrap on Linux.
 import contextlib
 import json
 import os
+import pwd
 import secrets
 import shutil
 import socket
@@ -216,13 +217,16 @@ def test_worker_launcher_refuses_dev_data_by_name(name: str) -> None:
     assert str(code / name) in r.stderr, r.stderr
 
 
-@pytest.mark.skipif(SANDBOX != "bwrap", reason="Linux only: the macOS sandbox connects to no socket, writes no FIFO")
-@pytest.mark.parametrize("kind", ["socket", "fifo"])
+@pytest.mark.parametrize("kind", [
+    pytest.param("socket", marks=pytest.mark.skipif(SANDBOX != "bwrap", reason="the macOS sandbox connects to no socket")),
+    "fifo",
+])
 def test_worker_launcher_refuses_a_way_out_in_the_code_dir(kind: str) -> None:
-    """A Unix socket or a FIFO the Linux sandbox can see is a way out of it: a read-only mount
-    stops neither connect() nor a write to a FIFO. The Runtime socket is reached just that way,
-    from a directory that holds nothing else. The launcher refuses a code directory with another
-    one in it, here standing in for ssh-agent's or Docker's socket, or a second agentd's."""
+    """A Unix socket or a FIFO the sandbox can see joins the Worker to a process outside: a
+    read-only mount stops neither connect() nor a write to a FIFO (Linux), and the macOS sandbox
+    can still read one. The Runtime socket is reached just that way, from a directory that holds
+    nothing else. The launchers refuse a code directory with another one in it, here standing in
+    for ssh-agent's or Docker's socket, or a second agentd's."""
     with scratch() as (base, runtime):
         code = base / "code"
         code.mkdir()
@@ -238,6 +242,23 @@ def test_worker_launcher_refuses_a_way_out_in_the_code_dir(kind: str) -> None:
             r = reach(launcher(runtime, sys.prefix, code), code / "absent", path)
     assert r.returncode != 0 and not r.stdout, f"the Worker started and reached {r.stdout}"
     assert str(path) in r.stderr, r.stderr
+
+
+def test_worker_launcher_refuses_a_directory_it_cannot_look_through() -> None:
+    """What the launcher cannot list it cannot vouch for, and the Worker may still open a file
+    there by name: a directory that can be searched but not read (0111), holding a ledger."""
+    with scratch() as (base, runtime):
+        code = base / "code"
+        hidden = code / "hidden"
+        hidden.mkdir(parents=True)
+        (hidden / "ledger.db").write_text("a ledger")
+        hidden.chmod(0o111)
+        try:
+            r = reach(launcher(runtime, sys.prefix, code), hidden / "ledger.db", code / "absent")
+        finally:
+            hidden.chmod(0o700)
+    assert r.returncode != 0 and not r.stdout, f"the Worker started and reached {r.stdout}"
+    assert str(hidden) in r.stderr, r.stderr  # find says what it could not read
 
 
 @pytest.mark.skipif(SANDBOX != "bwrap", reason="the Linux sandbox's Runtime socket directory")
@@ -284,7 +305,27 @@ def test_worker_sandbox_denies_data_behind_a_symlink(where: str) -> None:
             env["AGENTOS_SANDBOX_DENY_READ"] = str(base / "link")
         r = reach(launcher(port, sys.prefix, code), data / "ledger.db", code / "absent", env=env)
     assert r.returncode == 0, r.stderr
-    assert json.loads(r.stdout)["file"].startswith("refused"), r.stdout
+    assert json.loads(r.stdout)["file"] == "refused: PermissionError", r.stdout
+
+
+@pytest.mark.skipif(SANDBOX != "srt", reason="the macOS sandbox's deny list")
+def test_worker_sandbox_denies_the_home_directory_whatever_home_says() -> None:
+    """The macOS launcher denies the home directory the user database names as well as $HOME:
+    with HOME pointing somewhere else, or relative, the real one stays out of reach."""
+    canary = Path(pwd.getpwuid(os.getuid()).pw_dir) / f".agentos-canary-{secrets.token_hex(4)}"
+    canary.write_text("a file the Worker must not read")
+    try:
+        with scratch() as (base, port):
+            code = base / "code"
+            code.mkdir()
+            (base / "home").mkdir()
+            env = {**os.environ, "HOME": str(base / "home")}
+            env.pop("AGENTOS_SANDBOX_DENY_READ", None)
+            r = reach(launcher(port, sys.prefix, code), canary, code / "absent", env=env)
+    finally:
+        canary.unlink()
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["file"] == "refused: PermissionError", r.stdout
 
 
 @pytest.mark.skipif(SANDBOX != "bwrap", reason="the Linux sandbox's own mounts")

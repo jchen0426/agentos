@@ -63,8 +63,8 @@ Without `--db-filename` the dev server keeps everything in memory and loses ever
 it exits. The dev configs keep agentd's data in `~/.agentos` too, out of the repository; move a
 checkout's own `.agentos` from before out of it as well (the Worker launchers refuse a code
 directory that holds one). All checkouts share `~/.agentos`: run one dev stack at a time, or give
-another a config with a `data_dir` of its own. A ledger a newer branch has migrated is not for
-an older agentd.
+another a config with a `data_dir` of its own, also under the home directory. A ledger a newer
+branch has migrated is not for an older agentd.
 
 In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under
@@ -164,8 +164,11 @@ bin/agentctl budget extend <run-id> --usd 2.50
 That Worker runs unsandboxed, for development only. Sandboxed, it starts through
 `sandbox/macos/run-worker.sh` (macOS) or `sandbox/linux/run-worker.sh` (Linux), with `python`
 as its code directory; see the headers of those scripts. A sandboxed Worker can read all of its
-code directory and Python environment, so a launcher refuses either if it holds agentd's data
-directory or, on Linux, any Unix socket (a read-only mount does not stop `connect()`).
+code directory and Python environment, so a launcher refuses either if it holds dev data
+(agentd's ledger, a `.agentos` directory, Temporal's database), a FIFO, or on Linux a Unix socket
+(a read-only mount does not stop `connect()`). On macOS the sandbox can also read everything
+outside the home directory: keep agentd's data and the mirrors under it, or list their real paths
+in `AGENTOS_SANDBOX_DENY_READ`.
 
 ```bash
 sandbox/macos/run-worker.sh 7244 "$PWD/.venv" "$PWD/python" -- "$PWD/.venv/bin/python" -m agentos_worker --endpoint 127.0.0.1:7244 --http-connect-proxy env
