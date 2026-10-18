@@ -22,14 +22,17 @@ const AllocLimit = "256m"
 
 // Environ is the process's environment for git: no user or system configuration, no
 // attributes from the commits, no replace refs (which could swap a commit or a file for
-// another), paths taken literally, no optional locks, and the allocation limit. No GIT_
-// variable gets through from outside: sandbox-runtime sets GIT_CONFIG_PARAMETERS, for one.
+// another), paths taken literally and byte for byte, no optional locks, and the allocation
+// limit. No GIT_ variable gets through from outside: sandbox-runtime sets
+// GIT_CONFIG_PARAMETERS, for one. (A repository made on macOS sets core.precomposeUnicode,
+// and git would then turn a path given in decomposed Unicode into another one.)
 func Environ(extra ...string) []string {
 	env := slices.DeleteFunc(os.Environ(), func(e string) bool { return strings.HasPrefix(e, "GIT_") })
 	return append(append(env,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_TERMINAL_PROMPT=0", "GIT_LITERAL_PATHSPECS=1",
 		"GIT_OPTIONAL_LOCKS=0", "GIT_NO_REPLACE_OBJECTS=1", "GIT_ATTR_NOSYSTEM=1", "GIT_ATTR_SOURCE="+EmptyTree,
 		"GIT_ALLOC_LIMIT="+AllocLimit,
+		"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.precomposeUnicode", "GIT_CONFIG_VALUE_0=false",
 	), extra...)
 }
 

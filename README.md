@@ -16,7 +16,8 @@ after a crash, and settled by a person when nobody can tell what happened; plus 
 write tools, tool argument schemas, dry runs and a lock that keeps one agentd per data
 directory ([docs/m3-notes.md](docs/m3-notes.md)). M3b reads repositories through a read-only
 git MCP server that agentd runs once per call in a sandbox: the call's mirror read-only, a
-private temporary directory, no network.
+private temporary directory, no network. agentd itself runs no git on a mirror: it resolves a
+run's commit and reads the files a patch touches through the same server.
 
 ## Layout
 
@@ -26,7 +27,7 @@ private temporary directory, no network.
 | `cmd/agentd`, `cmd/agentctl` | the daemon and its command line |
 | `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol (claims, recovery by class, reconciliation) |
 | `internal/tools`, `internal/patch` | the tools and the effect class and argument schema each declares; checks and applies a model's patch |
-| `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`) and agentd's client, which runs it once per call in a sandbox |
+| `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`, `resolve_commit`, `read_files`) and agentd's client, which runs it once per call in a sandbox |
 | `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
 | `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to |
 | `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |

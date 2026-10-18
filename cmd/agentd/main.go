@@ -148,7 +148,6 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	}
 	defer tc.Close()
 
-	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors())}
 	adapters, err := modelAdapters(mods, led, cfg.DataDir)
 	if err != nil {
 		return err
@@ -173,6 +172,10 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	if err := git.SelfCheck(ctx); err != nil {
 		return fmt.Errorf("the git tool server does not work: %w", err)
 	}
+	// A run's commit is resolved through the server too: agentd itself runs no git on a mirror.
+	// Starts take slots of their own, so that slow tool calls of running runs never hold up
+	// another run's start.
+	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors(), git.WithOwnSlots(2))}
 	toolset, err := buildTools(cfg, pol, led, git, testTools, log)
 	if err != nil {
 		return err
@@ -367,7 +370,7 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 	applyDeny := slices.Concat(githubtool.ProtectedPaths, pol.Tools["git.apply_check"].DenyPaths,
 		pol.Tools["github.open_draft_pr"].DenyPaths)
 	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
-	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths})
+	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
 	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: led})
 	if testTools {
 		log.Warn("TEST TOOLS ENABLED: never run this outside tests")

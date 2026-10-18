@@ -61,7 +61,7 @@ func TestHeartbeatIntervalNeverPanicsTheTicker(t *testing.T) {
 }
 
 func TestScopeComesFromTheRunsResolvedParameters(t *testing.T) {
-	g := &Gateway{Tasks: tasks.Registry{"security-audit": tasks.SecurityAudit(nil, nil)}}
+	g := &Gateway{Tasks: tasks.Registry{"security-audit": tasks.SecurityAudit(nil, nil, nil)}}
 	run := db.Run{Task: "security-audit", ParamsJson: `{"repo":"acme/payments","commit":"3f2a","base":"main"}`}
 	got, err := g.scope(run)
 	if err != nil {
