@@ -114,9 +114,9 @@ M3b 给工具服务器补探针时发现，bwrap 自己建的根目录是可写�
 - 根目录和 `/dev` 只读（`--remount-ro`，放在参数最后，前面的挂载要先在上面建好挂载点）。
 - `/tmp` 和 `/run` 不再挂 tmpfs，只是根目录里的目录，跟着只读；`/run` 里放 Runtime socket 的挂载点。起初给 `/tmp` 留了 64 MiB（`--size`），两个评审代理都实测发现 `--size` 只限文件内容：inode 数还是内核默认的内存页数的一半，空文件和 xattr 照样占不记在进程名下的内核内存（实测 6 万个空文件占了 51 MiB 不可回收的 slab，`/tmp` 却显示用了 0 字节），合起来能到内存的约 1/8。bwrap 设不了 inode 数，Worker 又用不着 `/tmp`，就整个去掉了。以后真要临时文件，`tempfile` 会明确报 “No usable temporary directory found”。
 - 不许再建用户命名空间（`--disable-userns`）。补探针时发现：没有这一条，沙箱里的 Python 能自己建用户和挂载命名空间，挂一个任意大小的 tmpfs（实测挂了 2 GiB、写进 256 MiB），上面几条等于白改。
-- 没有可写的 `/dev/shm`，POSIX 信号量和共享内存（`multiprocessing` 的锁、队列）都会报 EROFS。Worker 不用；真要用，在 `--dev /dev` 后面挂一个限了大小的 tmpfs。
+- 没有可写的 `/dev/shm`，POSIX 信号量和共享内存（`multiprocessing` 的锁、队列）都会报 EROFS。Worker 不用。真要用，得先有限住内存的 cgroup（`memory.max`）：给 `/dev/shm` 挂一个限了大小的 tmpfs，同样管不住 inode 和 xattr，探针的可写挂载检查也要跟着放开。
 
-`tests/test_sandbox.py` 加了一个探针，经启动脚本在沙箱里试：在根目录、`/dev/shm`、`/run`、`/tmp` 建文件都得到 EROFS（只读挂载，不是权限不够或目录不存在）；`/proc/self/mountinfo` 里除了 `/proc`、伪终端和设备节点，没有一个挂载可写；建用户命名空间得到 ENOSPC（`--disable-userns` 设的上限）；IPC 命名空间是沙箱自己的。沙箱外先确认宿主机的 `/dev/shm` 和 `/tmp` 能写、能建用户命名空间，写的东西也没出现在宿主机上。改之前它失败：四处都写进去了，`/tmp` 有 3.1 GB，用户命名空间也建得出来。逐条改坏启动脚本，它都在对应的检查上失败，包括把代码目录、Python 环境或 Runtime socket 的目录改成可写挂载，多挂一个 tmpfs，不再单独建 IPC 命名空间。
+`tests/test_sandbox.py` 加了一个探针，经启动脚本在沙箱里试：在根目录、`/dev/shm`、`/run`、`/tmp` 建文件都得到 EROFS（只读挂载，不是权限不够或目录不存在）；`/proc/self/mountinfo` 里除了 `/proc`、伪终端和设备节点，没有一个挂载可写；建用户命名空间得到 ENOSPC（`--disable-userns` 设的上限）；IPC 命名空间是沙箱自己的。沙箱外先确认宿主机的 `/dev/shm` 和 `/tmp` 能写、能建用户命名空间，写的东西也没出现在宿主机上。改之前它失败：四处都写进去了，根目录、`/dev`、`/tmp`、`/run` 四个 tmpfs 都是可写挂载，用户命名空间也建得出来。逐条改坏启动脚本，它都在对应的检查上失败，包括把代码目录、Python 环境或 Runtime socket 的目录改成可写挂载，多挂一个 tmpfs，不再单独建 IPC 命名空间。
 
 没有照工具服务器加 `ulimit`：
 
