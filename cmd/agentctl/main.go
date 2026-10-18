@@ -44,7 +44,9 @@ func main() {
 	runs.AddCommand(startCmd(g), getCmd(g), listCmd(g), cancelCmd(g), explainCmd(g))
 	budget := &cobra.Command{Use: "budget", Short: "Manage run budgets"}
 	budget.AddCommand(extendCmd(g))
-	root.AddCommand(runs, budget)
+	reconcile := &cobra.Command{Use: "reconcile", Short: "Settle external writes whose outcome nobody knows"}
+	reconcile.AddCommand(reconcileListCmd(g), reconcileShowCmd(g), reconcileResolveCmd(g))
+	root.AddCommand(runs, budget, reconcile)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))
@@ -62,10 +64,10 @@ func defaultSocket() string {
 
 // startCmd parses its own flags: everything after the task name is a task parameter
 // (--repo acme/payments --commit 3f2a9c1 --base main), so the platform does not have to
-// know any task's parameters (D12).
+// know any task's parameters (D12). --dry-run is the one flag without a value.
 func startCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
-		Use:                "start <task> [--<param> <value>]... [--budget-micros N]",
+		Use:                "start <task> [--<param> <value>]... [--budget-micros N] [--dry-run]",
 		Short:              "Start a run of a task",
 		Example:            "  agentctl runs start security-audit --repo acme/payments --commit 3f2a9c1 --base main",
 		DisableFlagParsing: true,
@@ -84,6 +86,10 @@ func startCmd(g *globals) *cobra.Command {
 					continue
 				}
 				name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+				if name == "dry-run" && !hasValue {
+					req.DryRun = true
+					continue
+				}
 				if !hasValue {
 					if i+1 >= len(args) {
 						return fmt.Errorf("flag %s needs a value", a)
@@ -241,6 +247,109 @@ func usd(micros int64) string {
 	return fmt.Sprintf("%s$%d.%s", sign, micros/1e6, frac)
 }
 
+func pendingReconciliations(ctx context.Context, c agentosv1.ControlClient) ([]*agentosv1.PendingItem, error) {
+	resp, err := c.ListPending(ctx, &agentosv1.ListPendingRequest{})
+	if err != nil {
+		return nil, err
+	}
+	var out []*agentosv1.PendingItem
+	for _, it := range resp.GetItems() {
+		if it.GetKind() == "reconciliation" {
+			out = append(out, it)
+		}
+	}
+	return out, nil
+}
+
+func reconcileListCmd(g *globals) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List external writes waiting for a person to say whether they happened",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(g, func(ctx context.Context, c agentosv1.ControlClient) error {
+				items, err := pendingReconciliations(ctx, c)
+				if err != nil {
+					return err
+				}
+				if g.output == "json" {
+					return printJSON(&agentosv1.ListPendingResponse{Items: items})
+				}
+				tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(tw, "EFFECT ID\tRUN ID\tTOOL\tSINCE\tREASON")
+				for _, it := range items {
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", safetext.Line(it.GetId()), safetext.Line(it.GetRunId()),
+						safetext.Line(it.GetTool()), safetext.Line(it.GetSince()), safetext.Line(it.GetReason()))
+				}
+				return tw.Flush()
+			})
+		},
+	}
+}
+
+func reconcileShowCmd(g *globals) *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <effect-id>",
+		Short: "Show one write waiting for reconciliation, with exactly what was to be sent",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(g, func(ctx context.Context, c agentosv1.ControlClient) error {
+				items, err := pendingReconciliations(ctx, c)
+				if err != nil {
+					return err
+				}
+				for _, it := range items {
+					if it.GetId() == args[0] {
+						return printJSON(it)
+					}
+				}
+				return fmt.Errorf("no effect %s waits for reconciliation", args[0])
+			})
+		},
+	}
+}
+
+func reconcileResolveCmd(g *globals) *cobra.Command {
+	var executed, notExecuted, lookup bool
+	var result, key string
+	cmd := &cobra.Command{
+		Use:   "resolve <effect-id> (--executed [--result JSON | --lookup] | --not-executed)",
+		Short: "Say whether an external write happened; the run then carries on",
+		Long: "--executed records the write as done, with what it produced (--result), or with what\n" +
+			"agentd finds when it looks (--lookup, for tools that can look). --not-executed has the\n" +
+			"run send it again under its original idempotency key, or drop it if the run was cancelled.",
+		Example: "  agentctl reconcile resolve 3c1f... --executed --result '{\"written\": true}'\n" +
+			"  agentctl reconcile resolve 3c1f... --not-executed",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if executed == notExecuted {
+				return fmt.Errorf("say either --executed or --not-executed")
+			}
+			if key == "" {
+				key = uuid.NewString()
+			}
+			return withClient(g, func(ctx context.Context, c agentosv1.ControlClient) error {
+				resp, err := c.ResolveReconciliation(ctx, &agentosv1.ResolveReconciliationRequest{
+					EffectId: args[0], Executed: executed, ResultJson: result, Lookup: lookup, IdempotencyKey: key,
+				})
+				if err != nil {
+					return err
+				}
+				return printJSON(resp)
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&executed, "executed", false, "the write happened")
+	cmd.Flags().BoolVar(&notExecuted, "not-executed", false, "the write did not happen")
+	cmd.Flags().StringVar(&result, "result", "", "with --executed: what the write produced, as a JSON object")
+	cmd.Flags().BoolVar(&lookup, "lookup", false, "with --executed: let agentd look the result up")
+	cmd.Flags().StringVar(&key, "idempotency-key", "", "reuse to make a repeated resolution apply once (default: a new key)")
+	cmd.MarkFlagsMutuallyExclusive("result", "lookup")
+	cmd.MarkFlagsMutuallyExclusive("not-executed", "result")
+	cmd.MarkFlagsMutuallyExclusive("not-executed", "lookup")
+	return cmd
+}
+
 func explainCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "explain <run-id>",
@@ -304,6 +413,9 @@ func writeRun(w io.Writer, r *agentosv1.Run) error {
 	row("budget", fmt.Sprintf("%s spent, %s reserved, limit %s",
 		usd(r.GetBudgetSpentMicros()), usd(r.GetBudgetReservedMicros()), usd(r.GetBudgetLimitMicros())))
 	row("created", r.GetCreatedAt())
+	if r.GetDryRun() {
+		row("dry run", "yes: nothing it writes is sent")
+	}
 	if r.GetResultJson() != "" {
 		row("result", r.GetResultJson())
 	}

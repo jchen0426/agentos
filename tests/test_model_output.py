@@ -2,7 +2,7 @@
 9). An answer that breaks it is asked for once more, and both requests are paid for; the
 workflow only ever sees the answer that passed, with its large parts stored as blobs."""
 
-from tests.harness import TERMINAL, Stack
+from tests.harness import TERMINAL, Stack, gateway_calls
 
 
 def test_an_answer_that_breaks_the_schema_is_asked_for_again(stack: Stack) -> None:
@@ -20,8 +20,9 @@ def test_an_answer_that_breaks_the_schema_is_asked_for_again(stack: Stack) -> No
     assert len(settled) == 2 and all(e["reason"] == "usage" and e["amount_micros"] > 0 for e in settled), settled
     assert len(stack.provider_calls(run)) == 2
 
-    # The workflow got the passing answer: the report and the patch as blobs.
-    [comment] = stack.external(run, "github.comment_commit")
-    assert comment["args"]["report_ref"].startswith("sha256:")
-    [pr] = stack.external(run, "github.open_draft_pr")
-    assert pr["args"]["patch_ref"].startswith("sha256:")
+    # The workflow got the passing answer: the report and the patch as blobs, which went on
+    # into a PR and a report on the commit.
+    args = {c["name"]: c["args"] for c in gateway_calls(stack.history(run))}
+    assert args["github.comment_commit"]["report_ref"].startswith("sha256:")
+    assert args["github.open_draft_pr"]["patch_ref"].startswith("sha256:")
+    assert len(stack.external(run, "github.comment_commit")) == len(stack.external(run, "github.open_draft_pr")) == 1

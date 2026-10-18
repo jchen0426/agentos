@@ -7,7 +7,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class StartRunRequest(_message.Message):
-    __slots__ = ("task", "params", "budget_limit_micros")
+    __slots__ = ("task", "params", "budget_limit_micros", "dry_run")
     class ParamsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -18,10 +18,12 @@ class StartRunRequest(_message.Message):
     TASK_FIELD_NUMBER: _ClassVar[int]
     PARAMS_FIELD_NUMBER: _ClassVar[int]
     BUDGET_LIMIT_MICROS_FIELD_NUMBER: _ClassVar[int]
+    DRY_RUN_FIELD_NUMBER: _ClassVar[int]
     task: str
     params: _containers.ScalarMap[str, str]
     budget_limit_micros: int
-    def __init__(self, task: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ...) -> None: ...
+    dry_run: bool
+    def __init__(self, task: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ..., dry_run: _Optional[bool] = ...) -> None: ...
 
 class GetRunRequest(_message.Message):
     __slots__ = ("run_id",)
@@ -48,7 +50,7 @@ class CancelRunRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ...) -> None: ...
 
 class Run(_message.Message):
-    __slots__ = ("run_id", "temporal_run_id", "task", "state", "params", "budget_limit_micros", "created_at", "result_json", "failure", "budget_spent_micros", "budget_reserved_micros")
+    __slots__ = ("run_id", "temporal_run_id", "task", "state", "params", "budget_limit_micros", "created_at", "result_json", "failure", "budget_spent_micros", "budget_reserved_micros", "dry_run")
     class ParamsEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -67,6 +69,7 @@ class Run(_message.Message):
     FAILURE_FIELD_NUMBER: _ClassVar[int]
     BUDGET_SPENT_MICROS_FIELD_NUMBER: _ClassVar[int]
     BUDGET_RESERVED_MICROS_FIELD_NUMBER: _ClassVar[int]
+    DRY_RUN_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     temporal_run_id: str
     task: str
@@ -78,7 +81,8 @@ class Run(_message.Message):
     failure: str
     budget_spent_micros: int
     budget_reserved_micros: int
-    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., task: _Optional[str] = ..., state: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ..., created_at: _Optional[str] = ..., result_json: _Optional[str] = ..., failure: _Optional[str] = ..., budget_spent_micros: _Optional[int] = ..., budget_reserved_micros: _Optional[int] = ...) -> None: ...
+    dry_run: bool
+    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., task: _Optional[str] = ..., state: _Optional[str] = ..., params: _Optional[_Mapping[str, str]] = ..., budget_limit_micros: _Optional[int] = ..., created_at: _Optional[str] = ..., result_json: _Optional[str] = ..., failure: _Optional[str] = ..., budget_spent_micros: _Optional[int] = ..., budget_reserved_micros: _Optional[int] = ..., dry_run: _Optional[bool] = ...) -> None: ...
 
 class ListPendingRequest(_message.Message):
     __slots__ = ()
@@ -91,16 +95,24 @@ class ListPendingResponse(_message.Message):
     def __init__(self, items: _Optional[_Iterable[_Union[PendingItem, _Mapping]]] = ...) -> None: ...
 
 class PendingItem(_message.Message):
-    __slots__ = ("kind", "id", "run_id", "expires_at")
+    __slots__ = ("kind", "id", "run_id", "expires_at", "tool", "reason", "since", "payload_json")
     KIND_FIELD_NUMBER: _ClassVar[int]
     ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    TOOL_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    SINCE_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_JSON_FIELD_NUMBER: _ClassVar[int]
     kind: str
     id: str
     run_id: str
     expires_at: str
-    def __init__(self, kind: _Optional[str] = ..., id: _Optional[str] = ..., run_id: _Optional[str] = ..., expires_at: _Optional[str] = ...) -> None: ...
+    tool: str
+    reason: str
+    since: str
+    payload_json: str
+    def __init__(self, kind: _Optional[str] = ..., id: _Optional[str] = ..., run_id: _Optional[str] = ..., expires_at: _Optional[str] = ..., tool: _Optional[str] = ..., reason: _Optional[str] = ..., since: _Optional[str] = ..., payload_json: _Optional[str] = ...) -> None: ...
 
 class ResolveApprovalRequest(_message.Message):
     __slots__ = ("approval_id", "payload_sha256", "idempotency_key", "approve", "approve_with_edits", "reject")
@@ -145,16 +157,18 @@ class ResolveApprovalResponse(_message.Message):
     def __init__(self, status: _Optional[str] = ..., decided_by: _Optional[str] = ..., decided_at: _Optional[str] = ...) -> None: ...
 
 class ResolveReconciliationRequest(_message.Message):
-    __slots__ = ("effect_id", "executed", "result_json", "idempotency_key")
+    __slots__ = ("effect_id", "executed", "result_json", "idempotency_key", "lookup")
     EFFECT_ID_FIELD_NUMBER: _ClassVar[int]
     EXECUTED_FIELD_NUMBER: _ClassVar[int]
     RESULT_JSON_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    LOOKUP_FIELD_NUMBER: _ClassVar[int]
     effect_id: str
     executed: bool
     result_json: str
     idempotency_key: str
-    def __init__(self, effect_id: _Optional[str] = ..., executed: _Optional[bool] = ..., result_json: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+    lookup: bool
+    def __init__(self, effect_id: _Optional[str] = ..., executed: _Optional[bool] = ..., result_json: _Optional[str] = ..., idempotency_key: _Optional[str] = ..., lookup: _Optional[bool] = ...) -> None: ...
 
 class ResolveReconciliationResponse(_message.Message):
     __slots__ = ("status",)

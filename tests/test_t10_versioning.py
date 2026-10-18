@@ -68,7 +68,8 @@ def test_t10_new_code_while_a_run_is_suspended(stack: Stack) -> None:
     ids = [c["activity_id"] for c in gateway_calls(events)]
     assert ids == ["1:git.show_diff", "2:audit_v1", "3:git.apply_check", "4:github.open_draft_pr",
                    "5:github.open_draft_pr", "6:git.show_diff", "7:github.comment_commit"], ids
-    assert len(stack.external(b, "git.show_diff")) == 2
+    assert len([e for e in stack.agentd_log() if e["msg"] == "invoke finished" and e.get("name") == "git.show_diff"
+                and e.get("workflow_id") == b["run_id"]]) == 2  # executed twice, not replayed
 
     # From now on B's history replays only under the new code; going back to v1 is caught too.
     history_b_done = stack.history_json(b)

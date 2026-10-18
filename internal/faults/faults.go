@@ -19,8 +19,9 @@ type Rule struct {
 
 	HoldWhileExists string   `json:"hold_while_exists"` // the execution blocks while this file exists
 	Delay           Duration `json:"delay"`             // the execution sleeps this long first
-	// Later points of the same execution: after the provider or tool answered but before
-	// the ledger records it, and right after it is recorded.
+	// Later points of the same execution: a write claimed but not sent yet; after the provider
+	// or tool answered but before the ledger records it; and right after it is recorded.
+	HoldAfterClaimWhileExists   string `json:"hold_after_claim_while_exists"`
 	HoldBeforeRecordWhileExists string `json:"hold_before_record_while_exists"`
 	HoldAfterRecordWhileExists  string `json:"hold_after_record_while_exists"`
 	NoHeartbeat                 bool   `json:"no_heartbeat"` // this attempt sends no heartbeats
@@ -38,6 +39,7 @@ type Rule struct {
 type Effect struct {
 	HoldWhileExists             string
 	Delay                       time.Duration
+	HoldAfterClaimWhileExists   string
 	HoldBeforeRecordWhileExists string
 	HoldAfterRecordWhileExists  string
 	NoHeartbeat                 bool
@@ -91,6 +93,9 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 		if r.HoldWhileExists != "" {
 			e.HoldWhileExists = r.HoldWhileExists
 		}
+		if r.HoldAfterClaimWhileExists != "" {
+			e.HoldAfterClaimWhileExists = r.HoldAfterClaimWhileExists
+		}
 		if r.HoldBeforeRecordWhileExists != "" {
 			e.HoldBeforeRecordWhileExists = r.HoldBeforeRecordWhileExists
 		}
@@ -115,8 +120,8 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 	return e
 }
 
-// Stall applies the hold and delay of e to an execution, before its request goes out. It
-// stops early when done closes.
+// Stall applies the hold and delay of e to an execution before it starts: for a write, once
+// its effect is recorded and before it is claimed. It stops early when done closes.
 func (e Effect) Stall(done <-chan struct{}) {
 	if !holdWhileExists(e.HoldWhileExists, done) {
 		return
@@ -127,6 +132,11 @@ func (e Effect) Stall(done <-chan struct{}) {
 		case <-time.After(e.Delay):
 		}
 	}
+}
+
+// StallAfterClaim holds a write after it was claimed, before its request goes out.
+func (e Effect) StallAfterClaim(done <-chan struct{}) {
+	holdWhileExists(e.HoldAfterClaimWhileExists, done)
 }
 
 // StallBeforeRecord holds an execution after its answer arrived, before the ledger records it.

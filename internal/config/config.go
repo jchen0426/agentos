@@ -5,6 +5,8 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,15 +16,18 @@ import (
 )
 
 type Config struct {
-	DataDir       string            `yaml:"data_dir"`       // ledger.db and the stub external log; created 0700
-	ControlSocket string            `yaml:"control_socket"` // its directory is created 0700
-	RuntimeListen string            `yaml:"runtime_listen"` // unix:///path (Linux) or tcp://127.0.0.1:port (macOS)
-	Temporal      Temporal          `yaml:"temporal"`
-	TaskQueues    TaskQueues        `yaml:"task_queues"`
-	PolicyFile    string            `yaml:"policy_file"`
-	ModelsFile    string            `yaml:"models_file"`
-	PricesFile    string            `yaml:"prices_file"` // versioned price table (design doc, section 9)
-	Repos         map[string]string `yaml:"repos"`       // logical repo id -> read-only mirror
+	DataDir       string          `yaml:"data_dir"`       // ledger.db and the stub external log; created 0700
+	ControlSocket string          `yaml:"control_socket"` // its directory is created 0700
+	RuntimeListen string          `yaml:"runtime_listen"` // unix:///path (Linux) or tcp://127.0.0.1:port (macOS)
+	Temporal      Temporal        `yaml:"temporal"`
+	TaskQueues    TaskQueues      `yaml:"task_queues"`
+	PolicyFile    string          `yaml:"policy_file"`
+	ModelsFile    string          `yaml:"models_file"`
+	PricesFile    string          `yaml:"prices_file"` // versioned price table (design doc, section 9)
+	Repos         map[string]Repo `yaml:"repos"`       // by logical repo id
+	// GitHub is how the GitHub tools reach GitHub. Without it they only dry-run: nothing is
+	// written anywhere.
+	GitHub *GitHub `yaml:"github"`
 	// How long a cancelled run may keep running before agentd terminates it: Temporal's
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
@@ -38,6 +43,36 @@ type LoopLimits struct {
 	// Attempts of one call. The Worker writes the activity's retry policy, so the gateway
 	// keeps its own cap.
 	Attempts int64 `yaml:"attempts"`
+}
+
+// Repo is a logical repository: its read-only mirror, and its name on GitHub. In YAML it is
+// either the mirror's path alone, or {mirror: ..., github: owner/name}; the GitHub name
+// defaults to the logical id.
+type Repo struct {
+	Mirror string `yaml:"mirror"`
+	GitHub string `yaml:"github"`
+}
+
+func (r *Repo) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		return n.Decode(&r.Mirror)
+	}
+	type plain Repo
+	return n.Decode((*plain)(r))
+}
+
+type GitHub struct {
+	APIURL string `yaml:"api_url"` // default https://api.github.com/
+	// Token is a secret reference (keyring:<service>[/<account>]); it may be left out only
+	// for a simulator on a loopback address.
+	Token          string        `yaml:"token"`
+	RequestTimeout time.Duration `yaml:"request_timeout"` // per request; default 30s
+	// Settle is how long after a request was sent a lookup that finds nothing means it never
+	// took effect: the request timeout, GitHub's own 10s limit, and a margin. Default: the
+	// request timeout plus 30s.
+	Settle      time.Duration `yaml:"settle"`
+	AuthorName  string        `yaml:"author_name"`  // who the patch commits are by; default agentos
+	AuthorEmail string        `yaml:"author_email"` // default agentos@agentos.invalid, which is nobody's
 }
 
 type Temporal struct {
@@ -133,8 +168,67 @@ func Load(path string) (*Config, error) {
 	if c.PolicyFile == "" || c.ModelsFile == "" || c.PricesFile == "" {
 		return nil, fmt.Errorf("config %s: policy_file, models_file and prices_file are required", path)
 	}
-	for id, mirror := range c.Repos {
-		c.Repos[id] = abs(mirror)
+	for id, r := range c.Repos {
+		if r.Mirror == "" {
+			return nil, fmt.Errorf("config %s: repo %s: mirror is required", path, id)
+		}
+		r.Mirror = abs(r.Mirror)
+		if r.GitHub == "" {
+			r.GitHub = id
+		}
+		if owner, name, ok := strings.Cut(r.GitHub, "/"); !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+			return nil, fmt.Errorf("config %s: repo %s: github must be owner/name, not %q", path, id, r.GitHub)
+		}
+		c.Repos[id] = r
+	}
+	if g := c.GitHub; g != nil {
+		if g.APIURL == "" {
+			g.APIURL = "https://api.github.com/"
+		}
+		if g.RequestTimeout <= 0 {
+			g.RequestTimeout = 30 * time.Second
+		}
+		if g.Settle <= 0 {
+			g.Settle = g.RequestTimeout + 30*time.Second
+		}
+		if g.AuthorName == "" {
+			g.AuthorName = "agentos"
+		}
+		if g.AuthorEmail == "" {
+			g.AuthorEmail = "agentos@agentos.invalid"
+		}
+		if g.Token == "" && !loopback(g.APIURL) {
+			return nil, fmt.Errorf("config %s: github.token is required for %s", path, g.APIURL)
+		}
+		// A lookup that finds nothing proves a write never took effect only once a request
+		// still in flight could no longer: past the client's timeout and GitHub's own 10s
+		// limit. A simulator on this machine applies a write as it receives it.
+		least := g.RequestTimeout + 10*time.Second
+		if loopback(g.APIURL) {
+			least = g.RequestTimeout
+		}
+		if g.Settle < least {
+			return nil, fmt.Errorf("config %s: github.settle must be at least %s", path, least)
+		}
 	}
 	return &c, nil
+}
+
+// Mirrors maps each logical repo id to its read-only mirror.
+func (c *Config) Mirrors() map[string]string {
+	out := make(map[string]string, len(c.Repos))
+	for id, r := range c.Repos {
+		out[id] = r.Mirror
+	}
+	return out
+}
+
+// loopback reports whether a URL points at this machine: only a simulator listens there.
+func loopback(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }

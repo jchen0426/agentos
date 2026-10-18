@@ -10,6 +10,22 @@ import (
 	"database/sql"
 )
 
+const abandonUnsentEffects = `-- name: AbandonUnsentEffects :execrows
+UPDATE effects SET status = 'ABANDONED', reason = 'the run was cancelled before the request was sent',
+  version = version + 1, updated_at = ?
+WHERE status = 'PENDING' AND claimed_by IS NULL
+  AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL)
+`
+
+// Effects of cancelled runs that were never claimed never went out, and never will.
+func (q *Queries) AbandonUnsentEffects(ctx context.Context, updatedAt string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, abandonUnsentEffects, updatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const addBlobOwner = `-- name: AddBlobOwner :exec
 INSERT INTO blob_owners (workflow_id, sha256) VALUES (?, ?) ON CONFLICT DO NOTHING
 `
@@ -24,6 +40,55 @@ func (q *Queries) AddBlobOwner(ctx context.Context, arg AddBlobOwnerParams) erro
 	return err
 }
 
+const claimEffect = `-- name: ClaimEffect :execrows
+UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING'
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
+`
+
+type ClaimEffectParams struct {
+	ClaimedBy sql.NullString
+	ClaimedAt sql.NullString
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// Lets one sender send a PENDING effect, unless its run was cancelled: the cancel is checked
+// in the same transaction that lets the request go out.
+func (q *Queries) ClaimEffect(ctx context.Context, arg ClaimEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimEffect,
+		arg.ClaimedBy,
+		arg.ClaimedAt,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const countRunEffects = `-- name: CountRunEffects :one
+SELECT CAST(COUNT(*) AS INTEGER) FROM effects
+WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED')
+`
+
+type CountRunEffectsParams struct {
+	WorkflowID string
+	Tool       string
+	EffectID   string
+}
+
+// A run's effects of one tool that went out or may have, other than the one asked about.
+func (q *Queries) CountRunEffects(ctx context.Context, arg CountRunEffectsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunEffects, arg.WorkflowID, arg.Tool, arg.EffectID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const deleteRun = `-- name: DeleteRun :exec
 DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 `
@@ -31,31 +96,6 @@ DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 func (q *Queries) DeleteRun(ctx context.Context, workflowID string) error {
 	_, err := q.db.ExecContext(ctx, deleteRun, workflowID)
 	return err
-}
-
-const finishEffect = `-- name: FinishEffect :execrows
-UPDATE effects SET status = ?, result_blob = ?, updated_at = ?
-WHERE effect_id = ? AND status = 'PENDING'
-`
-
-type FinishEffectParams struct {
-	Status     string
-	ResultBlob sql.NullString
-	UpdatedAt  string
-	EffectID   string
-}
-
-func (q *Queries) FinishEffect(ctx context.Context, arg FinishEffectParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, finishEffect,
-		arg.Status,
-		arg.ResultBlob,
-		arg.UpdatedAt,
-		arg.EffectID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
 }
 
 const finishModelCall = `-- name: FinishModelCall :exec
@@ -132,8 +172,10 @@ func (q *Queries) GetBudgetTotals(ctx context.Context, workflowID string) (GetBu
 const getCallCounts = `-- name: GetCallCounts :one
 SELECT
   CAST(COUNT(*) AS INTEGER) AS gateway_calls,
-  CAST(COALESCE(SUM(kind = 'model'), 0) AS INTEGER) AS model_calls,
-  CAST(COALESCE(SUM(kind = ?1 AND name = ?2 AND args_sha256 = ?3), 0) AS INTEGER) AS same_calls
+  CAST(COALESCE(SUM(kind = 'model'
+    AND COALESCE(outcome NOT IN ('needs_approval', 'needs_reconcile', 'budget_exhausted'), 1)), 0) AS INTEGER) AS model_calls,
+  CAST(COALESCE(SUM(kind = ?1 AND name = ?2 AND args_sha256 = ?3
+    AND COALESCE(outcome NOT IN ('needs_approval', 'needs_reconcile', 'budget_exhausted'), 1)), 0) AS INTEGER) AS same_calls
 FROM calls WHERE workflow_id = ?4
 `
 
@@ -150,6 +192,8 @@ type GetCallCountsRow struct {
 	SameCalls    int64
 }
 
+// A call that returned a wait status asked again after the wait: it counts as a step, but
+// neither as a model call nor as a repeat.
 func (q *Queries) GetCallCounts(ctx context.Context, arg GetCallCountsParams) (GetCallCountsRow, error) {
 	row := q.db.QueryRowContext(ctx, getCallCounts,
 		arg.Kind,
@@ -163,7 +207,7 @@ func (q *Queries) GetCallCounts(ctx context.Context, arg GetCallCountsParams) (G
 }
 
 const getEffect = `-- name: GetEffect :one
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at FROM effects WHERE effect_id = ?
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE effect_id = ?
 `
 
 func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error) {
@@ -180,6 +224,11 @@ func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error
 		&i.ResultBlob,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PayloadBlob,
+		&i.ClaimedBy,
+		&i.ClaimedAt,
+		&i.Version,
+		&i.Reason,
 	)
 	return i, err
 }
@@ -219,6 +268,40 @@ func (q *Queries) GetFinishedModelCall(ctx context.Context, arg GetFinishedModel
 	return i, err
 }
 
+const getLatestEffect = `-- name: GetLatestEffect :one
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
+ORDER BY updated_at DESC LIMIT 1
+`
+
+type GetLatestEffectParams struct {
+	WorkflowID string
+	Tool       string
+}
+
+// The run's latest finished effect of a tool, sent or dry-run.
+func (q *Queries) GetLatestEffect(ctx context.Context, arg GetLatestEffectParams) (Effect, error) {
+	row := q.db.QueryRowContext(ctx, getLatestEffect, arg.WorkflowID, arg.Tool)
+	var i Effect
+	err := row.Scan(
+		&i.EffectID,
+		&i.WorkflowID,
+		&i.Tool,
+		&i.EffectClass,
+		&i.PayloadSha256,
+		&i.IdempotencyKey,
+		&i.Status,
+		&i.ResultBlob,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PayloadBlob,
+		&i.ClaimedBy,
+		&i.ClaimedAt,
+		&i.Version,
+		&i.Reason,
+	)
+	return i, err
+}
+
 const getOpenReservation = `-- name: GetOpenReservation :one
 SELECT entry_id, workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, idempotency_key, created_at FROM budget_entries e
 WHERE e.request_id = ? AND e.kind = 'RESERVE' AND NOT EXISTS (
@@ -245,8 +328,30 @@ func (q *Queries) GetOpenReservation(ctx context.Context, requestID sql.NullStri
 	return i, err
 }
 
+const getResolution = `-- name: GetResolution :one
+SELECT effect_id, resolve_key, executed, status, resolved_at FROM effect_resolutions WHERE effect_id = ? AND resolve_key = ?
+`
+
+type GetResolutionParams struct {
+	EffectID   string
+	ResolveKey string
+}
+
+func (q *Queries) GetResolution(ctx context.Context, arg GetResolutionParams) (EffectResolution, error) {
+	row := q.db.QueryRowContext(ctx, getResolution, arg.EffectID, arg.ResolveKey)
+	var i EffectResolution
+	err := row.Scan(
+		&i.EffectID,
+		&i.ResolveKey,
+		&i.Executed,
+		&i.Status,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
 const getRun = `-- name: GetRun :one
-SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at FROM runs WHERE workflow_id = ?
+SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at, dry_run FROM runs WHERE workflow_id = ?
 `
 
 func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
@@ -260,6 +365,7 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 		&i.BudgetLimitMicros,
 		&i.CreatedAt,
 		&i.CancelledAt,
+		&i.DryRun,
 	)
 	return i, err
 }
@@ -356,8 +462,9 @@ func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) error {
 
 const insertEffect = `-- name: InsertEffect :execrows
 INSERT INTO effects (
-  effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  effect_id, workflow_id, tool, effect_class, payload_sha256, payload_blob, idempotency_key, status,
+  created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
 ON CONFLICT (effect_id) DO NOTHING
 `
 
@@ -367,8 +474,8 @@ type InsertEffectParams struct {
 	Tool           string
 	EffectClass    string
 	PayloadSha256  string
+	PayloadBlob    sql.NullString
 	IdempotencyKey string
-	Status         string
 	CreatedAt      string
 	UpdatedAt      string
 }
@@ -380,8 +487,8 @@ func (q *Queries) InsertEffect(ctx context.Context, arg InsertEffectParams) (int
 		arg.Tool,
 		arg.EffectClass,
 		arg.PayloadSha256,
+		arg.PayloadBlob,
 		arg.IdempotencyKey,
-		arg.Status,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 	)
@@ -426,9 +533,32 @@ func (q *Queries) InsertModelCall(ctx context.Context, arg InsertModelCallParams
 	return err
 }
 
+const insertResolution = `-- name: InsertResolution :exec
+INSERT INTO effect_resolutions (effect_id, resolve_key, executed, status, resolved_at) VALUES (?, ?, ?, ?, ?)
+`
+
+type InsertResolutionParams struct {
+	EffectID   string
+	ResolveKey string
+	Executed   int64
+	Status     string
+	ResolvedAt string
+}
+
+func (q *Queries) InsertResolution(ctx context.Context, arg InsertResolutionParams) error {
+	_, err := q.db.ExecContext(ctx, insertResolution,
+		arg.EffectID,
+		arg.ResolveKey,
+		arg.Executed,
+		arg.Status,
+		arg.ResolvedAt,
+	)
+	return err
+}
+
 const insertRun = `-- name: InsertRun :exec
-INSERT INTO runs (workflow_id, task, params_json, budget_limit_micros, created_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO runs (workflow_id, task, params_json, budget_limit_micros, dry_run, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
 `
 
 type InsertRunParams struct {
@@ -436,6 +566,7 @@ type InsertRunParams struct {
 	Task              string
 	ParamsJson        string
 	BudgetLimitMicros int64
+	DryRun            int64
 	CreatedAt         string
 }
 
@@ -445,6 +576,7 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 		arg.Task,
 		arg.ParamsJson,
 		arg.BudgetLimitMicros,
+		arg.DryRun,
 		arg.CreatedAt,
 	)
 	return err
@@ -467,7 +599,7 @@ func (q *Queries) IsBlobOwner(ctx context.Context, arg IsBlobOwnerParams) (int64
 }
 
 const listCancelledRuns = `-- name: ListCancelledRuns :many
-SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at FROM runs WHERE cancelled_at IS NOT NULL AND run_id IS NOT NULL
+SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at, dry_run FROM runs WHERE cancelled_at IS NOT NULL AND run_id IS NOT NULL
 `
 
 func (q *Queries) ListCancelledRuns(ctx context.Context) ([]Run, error) {
@@ -487,6 +619,96 @@ func (q *Queries) ListCancelledRuns(ctx context.Context) ([]Run, error) {
 			&i.BudgetLimitMicros,
 			&i.CreatedAt,
 			&i.CancelledAt,
+			&i.DryRun,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listClaimedEffects = `-- name: ListClaimedEffects :many
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND claimed_by <> ?
+ORDER BY created_at
+`
+
+// Effects another agentd process claimed and never finished: one data directory has one
+// agentd at a time, so nobody is sending them any more.
+func (q *Queries) ListClaimedEffects(ctx context.Context, claimedBy sql.NullString) ([]Effect, error) {
+	rows, err := q.db.QueryContext(ctx, listClaimedEffects, claimedBy)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Effect
+	for rows.Next() {
+		var i Effect
+		if err := rows.Scan(
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.EffectClass,
+			&i.PayloadSha256,
+			&i.IdempotencyKey,
+			&i.Status,
+			&i.ResultBlob,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.PayloadBlob,
+			&i.ClaimedBy,
+			&i.ClaimedAt,
+			&i.Version,
+			&i.Reason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEffectsByStatus = `-- name: ListEffectsByStatus :many
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE status = ? ORDER BY created_at
+`
+
+func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Effect, error) {
+	rows, err := q.db.QueryContext(ctx, listEffectsByStatus, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Effect
+	for rows.Next() {
+		var i Effect
+		if err := rows.Scan(
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.EffectClass,
+			&i.PayloadSha256,
+			&i.IdempotencyKey,
+			&i.Status,
+			&i.ResultBlob,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.PayloadBlob,
+			&i.ClaimedBy,
+			&i.ClaimedAt,
+			&i.Version,
+			&i.Reason,
 		); err != nil {
 			return nil, err
 		}
@@ -545,7 +767,7 @@ func (q *Queries) ListOpenReservations(ctx context.Context) ([]BudgetEntry, erro
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at FROM runs ORDER BY created_at DESC, workflow_id LIMIT ?
+SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at, dry_run FROM runs ORDER BY created_at DESC, workflow_id LIMIT ?
 `
 
 func (q *Queries) ListRuns(ctx context.Context, limit int64) ([]Run, error) {
@@ -565,6 +787,7 @@ func (q *Queries) ListRuns(ctx context.Context, limit int64) ([]Run, error) {
 			&i.BudgetLimitMicros,
 			&i.CreatedAt,
 			&i.CancelledAt,
+			&i.DryRun,
 		); err != nil {
 			return nil, err
 		}
@@ -580,7 +803,7 @@ func (q *Queries) ListRuns(ctx context.Context, limit int64) ([]Run, error) {
 }
 
 const listStartingRuns = `-- name: ListStartingRuns :many
-SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at FROM runs WHERE run_id IS NULL
+SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at, dry_run FROM runs WHERE run_id IS NULL
 `
 
 func (q *Queries) ListStartingRuns(ctx context.Context) ([]Run, error) {
@@ -600,6 +823,7 @@ func (q *Queries) ListStartingRuns(ctx context.Context) ([]Run, error) {
 			&i.BudgetLimitMicros,
 			&i.CreatedAt,
 			&i.CancelledAt,
+			&i.DryRun,
 		); err != nil {
 			return nil, err
 		}
@@ -645,6 +869,105 @@ func (q *Queries) PutBlob(ctx context.Context, arg PutBlobParams) error {
 	return err
 }
 
+const releaseEffect = `-- name: ReleaseEffect :execrows
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING'
+`
+
+type ReleaseEffectParams struct {
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// Returns a claimed effect whose request never took effect, for a later attempt to send.
+func (q *Queries) ReleaseEffect(ctx context.Context, arg ReleaseEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, releaseEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const resolveEffect = `-- name: ResolveEffect :execrows
+UPDATE effects
+SET status = ?, result_blob = ?, claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'UNKNOWN'
+`
+
+type ResolveEffectParams struct {
+	Status     string
+	ResultBlob sql.NullString
+	UpdatedAt  string
+	EffectID   string
+	Version    int64
+}
+
+// A person's finding about an effect whose outcome nobody knew.
+func (q *Queries) ResolveEffect(ctx context.Context, arg ResolveEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, resolveEffect,
+		arg.Status,
+		arg.ResultBlob,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const setCallOutcome = `-- name: SetCallOutcome :exec
+UPDATE calls SET outcome = ? WHERE workflow_id = ? AND activity_id = ? AND scheduled_at = ?
+`
+
+type SetCallOutcomeParams struct {
+	Outcome     sql.NullString
+	WorkflowID  string
+	ActivityID  string
+	ScheduledAt string
+}
+
+func (q *Queries) SetCallOutcome(ctx context.Context, arg SetCallOutcomeParams) error {
+	_, err := q.db.ExecContext(ctx, setCallOutcome,
+		arg.Outcome,
+		arg.WorkflowID,
+		arg.ActivityID,
+		arg.ScheduledAt,
+	)
+	return err
+}
+
+const setEffectStatus = `-- name: SetEffectStatus :execrows
+UPDATE effects SET status = ?, result_blob = ?, reason = ?, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING'
+`
+
+type SetEffectStatusParams struct {
+	Status     string
+	ResultBlob sql.NullString
+	Reason     sql.NullString
+	UpdatedAt  string
+	EffectID   string
+	Version    int64
+}
+
+func (q *Queries) SetEffectStatus(ctx context.Context, arg SetEffectStatusParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setEffectStatus,
+		arg.Status,
+		arg.ResultBlob,
+		arg.Reason,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setRunID = `-- name: SetRunID :execrows
 UPDATE runs SET run_id = ? WHERE workflow_id = ? AND run_id IS NULL
 `
@@ -656,6 +979,36 @@ type SetRunIDParams struct {
 
 func (q *Queries) SetRunID(ctx context.Context, arg SetRunIDParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, setRunID, arg.RunID, arg.WorkflowID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const touchEffect = `-- name: TouchEffect :execrows
+UPDATE effects SET claimed_at = ?, updated_at = ?
+WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
+`
+
+type TouchEffectParams struct {
+	ClaimedAt sql.NullString
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+	ClaimedBy sql.NullString
+}
+
+// Marks when a claimed effect's visible request goes out, unless its run was cancelled
+// meanwhile: a lookup's wait for a request in flight counts from here.
+func (q *Queries) TouchEffect(ctx context.Context, arg TouchEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, touchEffect,
+		arg.ClaimedAt,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+		arg.ClaimedBy,
+	)
 	if err != nil {
 		return 0, err
 	}

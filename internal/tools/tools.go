@@ -1,0 +1,175 @@
+// Package tools holds the tools the gateway runs for workflows. Every tool declares its effect
+// class (design doc, section 6) and the schema of its arguments. A tool with an external effect
+// splits each call in two: Prepare renders exactly what the outside world will receive, and
+// Execute sends it. The gateway records the payload, claims it, and after a crash recovers it
+// by the tool's class.
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+)
+
+// Request is one call of a tool.
+type Request struct {
+	WorkflowID   string
+	RunCreatedAt time.Time      // when the run was created: the same on every attempt
+	EffectID     string         // writes only: names the effect, e.g. in a marker a lookup finds
+	Args         map[string]any // after the gateway filled in the run's scope and the schema accepted them
+}
+
+// Tool is what every tool declares.
+type Tool interface {
+	Name() string
+	// Class is the tool's effect class: policy.EffectNone for a Reader; for a Writer
+	// EffectIdempotent, EffectLookup or EffectUnsafe.
+	Class() string
+	Args() *Schema
+}
+
+// Reader is a tool without external effects: a retry simply reads again.
+type Reader interface {
+	Tool
+	Read(ctx context.Context, req Request) (map[string]any, error)
+}
+
+// Writer is a tool with an external effect.
+type Writer interface {
+	Tool
+	// Prepare renders what the external system will receive. It is deterministic: the same
+	// request renders the same payload on every attempt.
+	Prepare(ctx context.Context, req Request) (json.RawMessage, error)
+	// Execute sends the payload, calling proceed before each request whose effect someone
+	// could see; when proceed fails, Execute stops and returns its error. Its error tells what
+	// happened outside: ErrNotSent and a *RefusedError mean nothing did; any other error leaves
+	// the outcome unknown.
+	Execute(ctx context.Context, payload json.RawMessage, idempotencyKey string, proceed Proceed) (map[string]any, error)
+	// DryRun is what a dry run returns to the workflow instead of Execute's result.
+	DryRun(payload json.RawMessage) map[string]any
+	// Result checks a result a person reports when reconciling.
+	Result() *Schema
+	// Live reports whether the tool can reach its external system. One that cannot only
+	// dry-runs.
+	Live() bool
+}
+
+// Proceed is asked before each visible request of a write. It fails when the request must
+// not go out (the run was cancelled meanwhile), with an error that wraps ErrNotSent, and it
+// marks the moment the request goes out: a lookup's wait for a request in flight counts from
+// the last one.
+type Proceed func(ctx context.Context) error
+
+// Finder is a Writer whose effect can be looked up afterwards.
+type Finder interface {
+	Writer
+	Find(ctx context.Context, payload json.RawMessage) (value map[string]any, found bool, err error)
+	// Settle is how long after its last visible request went out a lookup that finds nothing
+	// means the write never took effect: the client's timeout plus the server's own
+	// processing limit.
+	Settle() time.Duration
+}
+
+// ErrNotSent means the request never left agentd, or failed before anything visible
+// happened: sending it again is safe.
+var ErrNotSent = errors.New("request not sent")
+
+// DeniedError refuses a call as it stands, before anything is sent: for example a patch that
+// touches a file the policy protects. The workflow gets a "denied" result.
+type DeniedError struct{ Reason string }
+
+func (e *DeniedError) Error() string { return "denied: " + e.Reason }
+
+// RefusedError means the external system answered and did nothing.
+type RefusedError struct {
+	Reason    string
+	Retryable bool // e.g. a rate limit: the same request may succeed later
+}
+
+func (e *RefusedError) Error() string { return "refused: " + e.Reason }
+
+// ConflictError means the external system already holds something different under the name
+// the effect would create. agentd never overwrites it (section 6): a person decides.
+type ConflictError struct{ Reason string }
+
+func (e *ConflictError) Error() string { return "conflict: " + e.Reason }
+
+// BlobStore keeps large values out of activity payloads, owned by the run that produced them.
+type BlobStore interface {
+	PutRunBlob(ctx context.Context, workflowID string, b []byte) (string, error)
+	GetRunBlob(ctx context.Context, workflowID, ref string) ([]byte, error)
+}
+
+// Registry is the tools agentd offers, by name.
+type Registry map[string]Tool
+
+func (r Registry) Add(t Tool) { r[t.Name()] = t }
+
+// Schema is a compiled JSON Schema for a tool's arguments or results.
+type Schema struct {
+	compiled *jsonschema.Schema
+	props    []string
+}
+
+// MustSchema compiles a schema written into the code; a broken one is a programming error.
+func MustSchema(text string) *Schema {
+	doc, err := jsonschema.UnmarshalJSON(strings.NewReader(text))
+	if err != nil {
+		panic(err)
+	}
+	c := jsonschema.NewCompiler()
+	if err := c.AddResource("schema.json", doc); err != nil {
+		panic(err)
+	}
+	compiled, err := c.Compile("schema.json")
+	if err != nil {
+		panic(err)
+	}
+	s := &Schema{compiled: compiled}
+	if obj, ok := doc.(map[string]any); ok {
+		if props, ok := obj["properties"].(map[string]any); ok {
+			s.props = slices.Sorted(maps.Keys(props))
+		}
+	}
+	return s
+}
+
+// Props lists the properties the schema names.
+func (s *Schema) Props() []string { return s.props }
+
+// Validate checks v against the schema.
+func (s *Schema) Validate(v map[string]any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	if err := s.compiled.Validate(doc); err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	return nil
+}
+
+// Common argument schemas. The gateway fills each scoped argument with the run's own value;
+// these still check what a workflow passes.
+const (
+	CommitPattern = `^[0-9a-f]{40}$`
+	BlobPattern   = `^sha256:[0-9a-f]{64}$`
+)
+
+// String returns args[key] when it is a string.
+func String(args map[string]any, key string) string {
+	s, _ := args[key].(string)
+	return s
+}

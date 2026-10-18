@@ -1,11 +1,12 @@
-"""Black-box harness: runs Temporal's dev server, agentd and Workers as separate processes
-and drives them the way an operator would, through agentctl. Tests look at the results
-through the Temporal API, agentd's ledger and its log, and the stub tools' external log.
-Nothing here depends on how agentd is implemented.
+"""Black-box harness: runs Temporal's dev server, a simulated GitHub, agentd and Workers as
+separate processes and drives them the way an operator would, through agentctl. Tests look at
+the results through the Temporal API, agentd's ledger and its log, and the outside world's own
+records: the simulated GitHub's request log and the test tool's external log. Nothing here
+depends on how agentd is implemented.
 
 Environment:
   AGENTOS_SANDBOX  none (default), bwrap (Linux) or srt (macOS): how Workers are launched
-  AGENTOS_BIN      directory with the agentd and agentctl binaries (default: bin/)
+  AGENTOS_BIN      directory with the agentd, agentctl and githubsim binaries (default: bin/)
 """
 
 from __future__ import annotations
@@ -36,13 +37,13 @@ BIN = Path(os.environ.get("AGENTOS_BIN", REPO / "bin"))
 SANDBOX = os.environ.get("AGENTOS_SANDBOX", "none")
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
-# Tests run without approvals, like M3's test policy; M1 has no approvals table yet.
+# Tests run without approvals (M3's test policy): the approvals table arrives in M4.
 TEST_POLICY = """
 repos: [acme/payments]
 tools:
   git.show_diff:         {decision: allow, effect: none}
-  git.apply_check:       {decision: allow, effect: none}
-  github.open_draft_pr:  {decision: allow, effect: lookup}
+  git.apply_check:       {decision: allow, effect: none, deny_paths: [".github/**", "Makefile", "scripts/**"]}
+  github.open_draft_pr:  {decision: allow, effect: lookup, deny_paths: [".github/**", "Makefile", "scripts/**"]}
   github.comment_commit: {decision: allow, effect: lookup}
 models:
   audit_v1: {allowed_providers: [fake, anthropic]}
@@ -184,16 +185,28 @@ class Worker(Proc):
         os.kill(self.worker_pid(), signal.SIGSTOP)
 
 
+SAFE_QUERY = """def find_user(conn, name):
+    return conn.execute("SELECT * FROM users WHERE name = ?", (name,))
+"""
+VULNERABLE_QUERY = SAFE_QUERY.replace('name = ?", (name,))', "name = '%s'\" % name)")
+
+
 def make_mirror(path: Path) -> str:
-    """A one-commit git repository standing in for the read-only mirror of acme/payments."""
+    """A git repository standing in for the read-only mirror of acme/payments. Its last commit,
+    the one audited, introduces the SQL injection the stub diff shows, which the fake model's
+    patch fixes."""
     path.mkdir(parents=True)
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
     run = lambda *a: subprocess.run(["git", "-C", str(path), *a], env=env, check=True, capture_output=True, text=True)
     run("init", "-q", "-b", "main")
     (path / "app.py").write_text("print('hello')\n")
+    (path / "app").mkdir()
+    (path / "app" / "db.py").write_text(SAFE_QUERY)
     run("add", ".")
     run("commit", "-q", "-m", "init")
+    (path / "app" / "db.py").write_text(VULNERABLE_QUERY)
+    run("commit", "-q", "-am", "find users by name")
     return run("rev-parse", "HEAD").stdout.strip()
 
 
@@ -220,18 +233,27 @@ class Stack:
         self.runtime_socket = self.sock_dir / "runtime" / "runtime.sock"
         self.temporal_address = f"127.0.0.1:{free_port()}"
         self._start_temporal()
+        self._start_github()
 
     # --- processes ---------------------------------------------------------------------------
 
     def _start_temporal(self) -> None:
-        port = self.temporal_address.rsplit(":", 1)[1]
-        p = Proc("temporal", ["temporal", "server", "start-dev", "--ip", "127.0.0.1", "--port", port,
-                              "--ui-port", str(free_port()), "--headless", "--log-level", "warn",
-                              "--search-attribute", "AgentState=Keyword"],
-                 self.tmp / "temporal.log")
-        self.procs.append(p)
-        wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
-        assert p.alive(), p.text()
+        # free_port() hands out a port that is free now; another process can take it before the
+        # server binds it (an outgoing connection's ephemeral port, say). Then try another.
+        for attempt in range(3):
+            port = self.temporal_address.rsplit(":", 1)[1]
+            p = Proc("temporal", ["temporal", "server", "start-dev", "--ip", "127.0.0.1", "--port", port,
+                                  "--ui-port", str(free_port()), "--headless", "--log-level", "warn",
+                                  "--search-attribute", "AgentState=Keyword"],
+                     self.tmp / f"temporal{attempt or ''}.log")
+            self.procs.append(p)
+            wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
+            if p.alive():
+                return
+            if "address already in use" not in p.text():
+                break
+            self.temporal_address = f"127.0.0.1:{free_port()}"
+        raise AssertionError(p.text())
 
     def _temporal_ready(self) -> bool:
         try:
@@ -240,13 +262,41 @@ class Stack:
         except Exception:
             return False
 
+    def _start_github(self) -> None:
+        """The simulated GitHub the GitHub tools write to: its log is the record of what
+        really reached "GitHub"."""
+        addr = self.tmp / "githubsim.addr"
+        self.github_log_path = self.tmp / "github.jsonl"
+        self.github_faults = self.tmp / "github-faults.json"
+        p = Proc("githubsim", [BIN / "githubsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
+                               "--log", self.github_log_path, "--faults", self.github_faults],
+                 self.tmp / "githubsim.log")
+        self.procs.append(p)
+        wait_for(lambda: addr.exists() or not p.alive(), "the simulated GitHub")
+        assert p.alive(), p.text()
+        self.github_url = f"http://{addr.read_text()}/"
+
+    def hold_github(self, action: str, path: Path) -> None:
+        """The simulated GitHub holds its answer to the next successful `action` (create_pull,
+        create_comment, ...) after the write took effect, while `path` exists."""
+        faults = json.loads(self.github_faults.read_text()) if self.github_faults.exists() else {"hold_after": {}}
+        faults["hold_after"][action] = str(path)
+        self.github_faults.write_text(json.dumps(faults))
+
+    def github_requests(self, action: str | None = None) -> list[dict]:
+        """The simulated GitHub's own record of the requests it answered; writes that took
+        effect have status 201."""
+        lines = self.github_log_path.read_text().splitlines() if self.github_log_path.exists() else []
+        return [e for e in map(json.loads, lines) if action is None or e["action"] == action]
+
     def runtime_listen(self) -> str:
         if SANDBOX == "bwrap":
             return f"unix://{self.runtime_socket}"
         return f"tcp://127.0.0.1:{self.runtime_port}"
 
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
-                     models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None) -> Proc:
+                     models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
+                     test_tools: bool = False) -> Proc:
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -261,10 +311,15 @@ class Stack:
             "models_file": "models.yaml",
             "prices_file": "prices.yaml",
             "repos": {"acme/payments": str(self.tmp / "mirror")},
+            # The simulated GitHub needs no token, and applies a write as it receives it: a
+            # lookup that finds nothing past the request timeout means it never took effect.
+            "github": {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"},
             **(extra or {}),
         }
         (d / "agentd.yaml").write_text(json.dumps(config))
         self._agentd_args = [BIN / "agentd", "--config", d / "agentd.yaml"]
+        if test_tools:
+            self._agentd_args.append("--test-tools")
         if faults:
             (d / "faults.json").write_text(json.dumps({"rules": faults}))
             self._agentd_args += ["--fault-script", d / "faults.json"]
@@ -335,10 +390,11 @@ class Stack:
             raise AssertionError(f"agentctl {' '.join(args)} failed: {r.stderr.strip()}")
         return json.loads(r.stdout)
 
-    def start_run(self, budget_micros: int | None = None) -> dict:
+    def start_run(self, budget_micros: int | None = None, dry_run: bool = False) -> dict:
         budget = ["--budget-micros", str(budget_micros)] if budget_micros else []
+        dry = ["--dry-run"] if dry_run else []
         return self.agentctl("runs", "start", "security-audit", "--repo", "acme/payments",
-                             "--commit", self.commit[:7], "--base", "main", *budget)
+                             "--commit", self.commit[:7], "--base", "main", *budget, *dry)
 
     def get_run(self, run: dict) -> dict:
         return self.agentctl("runs", "get", run["run_id"])
@@ -405,12 +461,25 @@ class Stack:
     def effects(self, run: dict) -> list[sqlite3.Row]:
         return self.ledger("SELECT * FROM effects WHERE workflow_id = ? ORDER BY created_at", run["run_id"])
 
-    def external(self, run: dict, tool: str | None = None) -> list[dict]:
-        """What the stub tools were asked to do: the stand-in for GitHub and git."""
-        path = self.data_dir / "stub-external.jsonl"
-        lines = path.read_text().splitlines() if path.exists() else []
-        return [e for e in map(json.loads, lines)
-                if e["workflow_id"] == run["run_id"] and (tool is None or e["tool"] == tool)]
+    def external(self, run: dict, tool: str) -> list[dict]:
+        """The external writes of a run's tool that took effect, as the outside world recorded
+        them: the simulated GitHub's log, or the test tool's own."""
+        if tool == "test.unsafe_write":
+            path = self.data_dir / "test-external.jsonl"
+            lines = path.read_text().splitlines() if path.exists() else []
+            return [e for e in map(json.loads, lines) if e["workflow_id"] == run["run_id"]]
+        if tool == "github.open_draft_pr":
+            # The branch name carries the run's first 8 characters.
+            return [e for e in self.github_requests("create_pull")
+                    if e["status"] == 201 and f"-{run['run_id'][:8]}-" in e["head"]]
+        if tool == "github.comment_commit":
+            mine = {e["effect_id"] for e in self.effects(run)}
+            return [e for e in self.github_requests("create_comment") if e["status"] == 201 and e["effect"] in mine]
+        raise ValueError(f"no external record for {tool}")
+
+    def effect(self, run: dict, tool: str) -> sqlite3.Row:
+        [e] = [e for e in self.effects(run) if e["tool"] == tool]
+        return e
 
     def provider_requests(self, run: dict) -> int:
         """How many requests reached the model provider for the run: the fake provider's own

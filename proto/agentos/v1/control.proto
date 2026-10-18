@@ -22,6 +22,7 @@ message StartRunRequest {
   string task = 1;                  // a registered task, e.g. "security-audit"
   map<string, string> params = 2;   // validated and resolved by agentd, e.g. repo, commit, base
   int64 budget_limit_micros = 3;    // 0 means the task's default
+  bool dry_run = 4;                 // write tools render and record their payloads, and send nothing
 }
 
 message GetRunRequest {
@@ -54,6 +55,7 @@ message Run {
   string failure = 9;               // the failure message once FAILED
   int64 budget_spent_micros = 10;   // settled model requests
   int64 budget_reserved_micros = 11; // reserved by requests not yet settled
+  bool dry_run = 12;                // started with dry_run: nothing it writes is sent
 }
 
 message ListPendingRequest {}
@@ -67,6 +69,10 @@ message PendingItem {
   string id = 2;                    // approval_id or effect_id
   string run_id = 3;
   string expires_at = 4;            // RFC 3339; approvals only
+  string tool = 5;                  // the tool whose effect it is
+  string reason = 6;                // why it waits: for a reconciliation, what is unknown
+  string since = 7;                 // RFC 3339: when it started waiting
+  string payload_json = 8;          // exactly what the external system was to receive
 }
 
 message ResolveApprovalRequest {
@@ -100,10 +106,13 @@ message ResolveReconciliationRequest {
   string effect_id = 1;
   bool executed = 2;                // the person's finding: did the external write happen?
   string result_json = 3;           // when executed: what it produced, e.g. the PR's URL
-  string idempotency_key = 4;
+  string idempotency_key = 4;       // required: the same finding sent again applies once
+  bool lookup = 5;                  // when executed: agentd looks the result up itself (lookup tools)
 }
 
 message ResolveReconciliationResponse {
+  // The effect's status now: SUCCEEDED (executed), PENDING (not executed: the run's next call
+  // sends it again under its original key) or ABANDONED (not executed, and the run was cancelled).
   string status = 1;
 }
 

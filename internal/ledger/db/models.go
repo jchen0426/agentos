@@ -62,6 +62,7 @@ type Call struct {
 	Name        string
 	ArgsSha256  string
 	CreatedAt   string
+	Outcome     sql.NullString
 }
 
 type Effect struct {
@@ -75,6 +76,19 @@ type Effect struct {
 	ResultBlob     sql.NullString
 	CreatedAt      string
 	UpdatedAt      string
+	PayloadBlob    sql.NullString
+	ClaimedBy      sql.NullString
+	ClaimedAt      sql.NullString
+	Version        int64
+	Reason         sql.NullString
+}
+
+type EffectResolution struct {
+	EffectID   string
+	ResolveKey string
+	Executed   int64
+	Status     string
+	ResolvedAt string
 }
 
 type ModelCall struct {
@@ -102,4 +116,5 @@ type Run struct {
 	BudgetLimitMicros int64
 	CreatedAt         string
 	CancelledAt       sql.NullString
+	DryRun            int64
 }
