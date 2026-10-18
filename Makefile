@@ -3,13 +3,13 @@ VM ?= agentos
 
 .PHONY: build build-linux proto sqlc test test-srt test-linux vm temporal-server
 
-# agentos-mcp-git is the git tool server agentd runs per call; githubsim is the black-box
-# tests' stand-in for GitHub.
+# agentos-mcp-git is the git tool server agentd runs per call; githubsim and modelsim are the
+# black-box tests' stand-ins for GitHub and for the model providers.
 build:
-	go build -o bin/ ./cmd/agentd ./cmd/agentctl ./cmd/agentos-mcp-git ./cmd/githubsim
+	go build -o bin/ ./cmd/agentd ./cmd/agentctl ./cmd/agentos-mcp-git ./cmd/githubsim ./cmd/modelsim
 
 build-linux:
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux-arm64/ ./cmd/agentd ./cmd/agentctl ./cmd/agentos-mcp-git ./cmd/githubsim
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux-arm64/ ./cmd/agentd ./cmd/agentctl ./cmd/agentos-mcp-git ./cmd/githubsim ./cmd/modelsim
 
 proto:
 	./scripts/gen-proto.sh

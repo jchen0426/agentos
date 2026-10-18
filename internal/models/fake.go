@@ -25,10 +25,12 @@ type Fake struct {
 // FakeFault is what a fault script asks of the fake provider for one request.
 type FakeFault struct {
 	Status        int    // answer with this HTTP status instead: 429 or 5xx, not billed
+	StatusOn      string // only when the request is to this provider; "" is any
 	LoseAnswer    bool   // bill the request, then lose the answer, like a timeout
 	Unreachable   bool   // fail before the request leaves agentd
 	ServedBy      string // answer as this "<provider>/<model>", like a fallback
 	InvalidOutput bool   // answer with output that breaks the task's schema
+	RefusedBy     string // when the request is to this provider, the model declines (billed)
 }
 
 // fakeOutputTokens is what every fake answer is billed for on the output side.
@@ -76,6 +78,24 @@ func (l *ProviderLog) record(req Request, model string, status int, billed prici
 	return f.Close()
 }
 
+// FixtureReport is the audit_v1 answer for the test fixture's commit (scripts/make-audit-target.sh):
+// its one finding, and a patch that fixes it. The fake adapter and the model simulator answer
+// with it.
+func FixtureReport() map[string]any {
+	return map[string]any{
+		"summary": "The commit builds a SQL query with string formatting.",
+		"findings": []any{map[string]any{
+			"severity":    "high",
+			"cwe":         "CWE-89",
+			"file":        "app/db.py",
+			"line":        2,
+			"title":       "SQL built with string formatting",
+			"explanation": "find_user formats the name into the SQL text, so a crafted name changes the query.",
+		}},
+		"patch": fakePatch,
+	}
+}
+
 const fakePatch = `diff --git a/app/db.py b/app/db.py
 --- a/app/db.py
 +++ b/app/db.py
@@ -100,7 +120,7 @@ func (f Fake) Call(ctx context.Context, req Request) (Response, error) {
 		model = s
 	}
 	usage := pricing.Usage{InputTokens: fakeInputTokens(req), OutputTokens: fakeOutputTokens}
-	if req.Fault.Status != 0 {
+	if req.Fault.Status != 0 && (req.Fault.StatusOn == "" || req.Fault.StatusOn == req.Route.Provider) {
 		if err := f.Log.record(req, model, req.Fault.Status, pricing.Usage{}); err != nil {
 			return Response{}, fmt.Errorf("%w: %v", ErrNotSent, err)
 		}
@@ -113,18 +133,11 @@ func (f Fake) Call(ctx context.Context, req Request) (Response, error) {
 	if req.Fault.LoseAnswer {
 		return Response{}, fmt.Errorf("fake provider: answer lost: %w", context.DeadlineExceeded)
 	}
-	output := map[string]any{
-		"summary": "The commit builds a SQL query with string formatting.",
-		"findings": []any{map[string]any{
-			"severity":    "high",
-			"cwe":         "CWE-89",
-			"file":        "app/db.py",
-			"line":        2,
-			"title":       "SQL built with string formatting",
-			"explanation": "find_user formats the name into the SQL text, so a crafted name changes the query.",
-		}},
-		"patch": fakePatch,
+	if req.Fault.RefusedBy == req.Route.Provider {
+		return Response{Status: "refused", Model: model, StopReason: "refusal", Billed: []Billed{{Model: model, Usage: usage}},
+			Value: map[string]any{"category": "fault script", "explanation": "the fake model declines"}}, nil
 	}
+	output := FixtureReport()
 	if req.Fault.InvalidOutput {
 		delete(output, "summary")
 	}

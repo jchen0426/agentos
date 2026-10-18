@@ -233,41 +233,6 @@ func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error
 	return i, err
 }
 
-const getFinishedModelCall = `-- name: GetFinishedModelCall :one
-SELECT workflow_id, activity_id, attempt, request_seq, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls
-WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
-  AND (stop_reason IS NULL OR stop_reason <> 'invalid_output')
-ORDER BY attempt, request_seq
-LIMIT 1
-`
-
-type GetFinishedModelCallParams struct {
-	WorkflowID string
-	ActivityID string
-}
-
-func (q *Queries) GetFinishedModelCall(ctx context.Context, arg GetFinishedModelCallParams) (ModelCall, error) {
-	row := q.db.QueryRowContext(ctx, getFinishedModelCall, arg.WorkflowID, arg.ActivityID)
-	var i ModelCall
-	err := row.Scan(
-		&i.WorkflowID,
-		&i.ActivityID,
-		&i.Attempt,
-		&i.RequestSeq,
-		&i.RequestBlob,
-		&i.ResponseBlob,
-		&i.Provider,
-		&i.Model,
-		&i.PromptVersion,
-		&i.Effort,
-		&i.StopReason,
-		&i.UsageJson,
-		&i.StartedAt,
-		&i.FinishedAt,
-	)
-	return i, err
-}
-
 const getLatestEffect = `-- name: GetLatestEffect :one
 SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
 ORDER BY updated_at DESC LIMIT 1
@@ -723,6 +688,56 @@ func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Eff
 	return items, nil
 }
 
+const listFinishedModelCalls = `-- name: ListFinishedModelCalls :many
+SELECT workflow_id, activity_id, attempt, request_seq, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls
+WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
+ORDER BY attempt, request_seq
+`
+
+type ListFinishedModelCallsParams struct {
+	WorkflowID string
+	ActivityID string
+}
+
+// The answered requests of one model call, in the order they were sent.
+func (q *Queries) ListFinishedModelCalls(ctx context.Context, arg ListFinishedModelCallsParams) ([]ModelCall, error) {
+	rows, err := q.db.QueryContext(ctx, listFinishedModelCalls, arg.WorkflowID, arg.ActivityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ModelCall
+	for rows.Next() {
+		var i ModelCall
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.Attempt,
+			&i.RequestSeq,
+			&i.RequestBlob,
+			&i.ResponseBlob,
+			&i.Provider,
+			&i.Model,
+			&i.PromptVersion,
+			&i.Effort,
+			&i.StopReason,
+			&i.UsageJson,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOpenReservations = `-- name: ListOpenReservations :many
 SELECT entry_id, workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, idempotency_key, created_at FROM budget_entries e
 WHERE e.kind = 'RESERVE' AND NOT EXISTS (
@@ -788,6 +803,56 @@ func (q *Queries) ListRuns(ctx context.Context, limit int64) ([]Run, error) {
 			&i.CreatedAt,
 			&i.CancelledAt,
 			&i.DryRun,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSameCalls = `-- name: ListSameCalls :many
+SELECT workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at, outcome FROM calls WHERE workflow_id = ? AND kind = ? AND name = ? AND args_sha256 = ?
+`
+
+type ListSameCallsParams struct {
+	WorkflowID string
+	Kind       string
+	Name       string
+	ArgsSha256 string
+}
+
+// Every call of a run with the same kind, name and arguments: a call that waited is sent
+// again under a new activity.
+func (q *Queries) ListSameCalls(ctx context.Context, arg ListSameCallsParams) ([]Call, error) {
+	rows, err := q.db.QueryContext(ctx, listSameCalls,
+		arg.WorkflowID,
+		arg.Kind,
+		arg.Name,
+		arg.ArgsSha256,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Call
+	for rows.Next() {
+		var i Call
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.ScheduledAt,
+			&i.Kind,
+			&i.Name,
+			&i.ArgsSha256,
+			&i.CreatedAt,
+			&i.Outcome,
 		); err != nil {
 			return nil, err
 		}

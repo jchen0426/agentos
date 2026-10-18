@@ -29,8 +29,9 @@ private temporary directory, no network.
 | `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`) and agentd's client, which runs it once per call in a sandbox |
 | `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
 | `internal/githubsim`, `cmd/githubsim` | the simulated GitHub the tests write to |
+| `internal/modelsim`, `cmd/modelsim` | the simulated model providers (Anthropic, OpenAI's Responses API, Chat Completions) that T13 injects faults through |
 | `internal/budget`, `internal/pricing` | per-request reservations and settlements; the price table (`config/prices.yaml`) |
-| `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude and fake adapters; keys from the OS keyring |
+| `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude, OpenAI-compatible and fake adapters; keys from the OS keyring |
 | `config/prompts`, `config/schemas` | each model task's prompt and output schema |
 | `internal/runtimeproxy` | the Worker's only way to Temporal; an allowlist of WorkflowService methods |
 | `internal/control` | the Control service on the 0700 control socket |
@@ -119,6 +120,33 @@ security add-generic-password -U -s agentos-anthropic-api-key -a "$USER" -w
 
 ```bash
 bin/agentd --config config/dev/agentd-claude.yaml
+```
+
+OpenAI and a local model server work the same way. `config/models.yaml` lists both:
+- **OpenAI**, through its Responses API. Its key goes in the item `agentos-openai-api-key`, and
+  a project of its own with a monthly budget in OpenAI's console is the outer limit.
+- **Ollama**, through Chat Completions (vLLM uses the same adapter). Start it with the context
+  window that `context_tokens` names: it cuts longer input without a word, and agentd refuses to
+  send what does not fit. Its models must be priced at 0 in `config/prices.yaml`: a Chat
+  Completions server cannot count tokens before a request. Start it with cloud models off, too:
+  they run on Ollama's servers. agentd also asks Ollama about the model before every request and
+  sends nothing to a cloud model, whatever it is called.
+
+A provider that is not on this machine is reached over https only.
+
+Point a task at either with `model`. Or list them in `cross_provider_fallback`, where they are
+asked, each in a request of its own, when the model declines.
+
+```bash
+security add-generic-password -U -s agentos-openai-api-key -a "$USER" -w
+```
+
+```bash
+OLLAMA_NO_CLOUD=1 OLLAMA_CONTEXT_LENGTH=65536 ollama serve
+```
+
+```bash
+ollama pull gpt-oss:20b
 ```
 
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
