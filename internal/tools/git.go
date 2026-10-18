@@ -10,17 +10,12 @@ import (
 	"github.com/jchen0426/agentos/internal/policy"
 )
 
-// GitServer runs the read-only git MCP server's tools on a mirror (gitmcp.Client).
-type GitServer interface {
-	Call(ctx context.Context, mirror, tool string, args, out any) error
-}
-
 // ShowDiff is git.show_diff: the audited commit's diff, read by the git MCP server in its
 // sandbox and stored as a blob of the run.
 type ShowDiff struct {
 	Blobs   BlobStore
 	Mirrors map[string]string // logical repository ID -> read-only mirror
-	Git     GitServer
+	Git     gitmcp.Caller
 }
 
 var showDiffArgs = MustSchema(`{
@@ -68,7 +63,7 @@ type ApplyCheck struct {
 	Blobs     BlobStore
 	Mirrors   map[string]string // logical repository ID -> read-only mirror
 	DenyPaths []string
-	Git       GitServer
+	Git       gitmcp.Caller
 }
 
 var applyCheckArgs = MustSchema(`{
@@ -90,7 +85,7 @@ func (t *ApplyCheck) Read(ctx context.Context, req Request) (map[string]any, err
 		return nil, &DeniedError{Reason: "no mirror for the repository"}
 	}
 	commit, ref := String(req.Args, "commit"), String(req.Args, "patch_ref")
-	changes, err := CheckedPatch(ctx, t.Blobs, req.WorkflowID, ref, t.DenyPaths, mirror, commit)
+	changes, err := CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, t.DenyPaths, mirror, commit)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +105,7 @@ func (t *ApplyCheck) Read(ctx context.Context, req Request) (map[string]any, err
 		return nil, err
 	}
 	if !out.Applies {
-		return nil, &DeniedError{Reason: out.Reason}
+		return nil, &DeniedError{Reason: gitmcp.Reason(mirror, out.Reason)}
 	}
 	files := make([]any, 0, len(paths))
 	for _, p := range paths {
@@ -120,9 +115,9 @@ func (t *ApplyCheck) Read(ctx context.Context, req Request) (map[string]any, err
 }
 
 // CheckedPatch reads a patch the run produced, checks it against the rules and the policy's
-// deny_paths, and applies it to the commit in the mirror. A patch that fails is a
-// *DeniedError.
-func CheckedPatch(ctx context.Context, blobs BlobStore, workflowID, ref string, denyPaths []string,
+// deny_paths, and applies it to the commit in the mirror, whose files the git MCP server reads
+// in its sandbox. A patch that fails is a *DeniedError.
+func CheckedPatch(ctx context.Context, git gitmcp.Caller, blobs BlobStore, workflowID, ref string, denyPaths []string,
 	mirror, commit string) ([]patch.Change, error) {
 	b, err := blobs.GetRunBlob(ctx, workflowID, ref)
 	if err != nil {
@@ -134,7 +129,7 @@ func CheckedPatch(ctx context.Context, blobs BlobStore, workflowID, ref string, 
 	}
 	var changes []patch.Change
 	if err == nil {
-		changes, err = p.Apply(patch.MirrorSource(ctx, mirror, commit))
+		changes, err = p.Apply(patch.MirrorSource(ctx, git, mirror, commit))
 	}
 	if v := (*patch.Violation)(nil); errors.As(err, &v) {
 		return nil, &DeniedError{Reason: v.Reason}

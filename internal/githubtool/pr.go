@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-github/v92/github"
 
+	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -25,7 +26,8 @@ type OpenDraftPR struct {
 	Client    *Client
 	Repos     map[string]Repo
 	Blobs     tools.BlobStore
-	DenyPaths []string // the policy's: the tool checks the patch itself
+	DenyPaths []string      // the policy's: the tool checks the patch itself
+	Git       gitmcp.Caller // reads the files the patch touches, in the git MCP server's sandbox
 }
 
 // ProtectedPaths are refused whatever the policy says: GitHub itself acts on them. Workflows run
@@ -93,7 +95,7 @@ func (t *OpenDraftPR) Prepare(ctx context.Context, req tools.Request) (json.RawM
 		return nil, &tools.DeniedError{Reason: "no GitHub repository is configured for " + tools.String(req.Args, "repo")}
 	}
 	commit, ref := tools.String(req.Args, "commit"), tools.String(req.Args, "patch_ref")
-	changes, err := tools.CheckedPatch(ctx, t.Blobs, req.WorkflowID, ref, append(slices.Clone(ProtectedPaths), t.DenyPaths...), repo.Mirror, commit)
+	changes, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, append(slices.Clone(ProtectedPaths), t.DenyPaths...), repo.Mirror, commit)
 	if err != nil {
 		return nil, err
 	}
