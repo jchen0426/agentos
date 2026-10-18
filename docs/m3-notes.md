@@ -147,7 +147,7 @@ M3 拆成两段（设计文档第 12 节，rev 262）：M3a 副作用协议和 G
 
 ### 留到后面
 
-- **M3b**：只读 git MCP（show_diff、apply_check），每次调用起一个沙箱进程；真实测试仓库上的 T2，到时需要你建公开测试仓库和只授权它的细粒度令牌。
+- **M3b**：只读 git MCP（show_diff、apply_check），每次调用起一个沙箱进程；真实测试仓库上的 T2。两样都已完成，见下面 M3b 一节。
 - **M4**：审批表（AWAITING_APPROVAL，拒绝和修改后的 ABANDONED）；门铃改走 outbox，现在核对后的门铃是直接发的。
 - **其他**：
   - 同参数计数用的是工作流原样发来的参数，还没补范围参数。所以工作流可以靠写或不写某个范围参数，凑出同一调用的几个变体，最多 2³ 种。写操作有副作用去重和每任务次数上限，重复发也只算一次；读操作只是多读几次。
@@ -226,7 +226,7 @@ M3 拆成两段（设计文档第 12 节，rev 262）：M3a 副作用协议和 G
   - 两道都过才算通过。
 - **报告评论的 outcome 超过 2000 字符就截断**，加上 ` [truncated]`，不再整条拒绝。工作流也先把 outcome 截到 4000 字符：comment_commit 的参数上限是 10 万字符，而错误信息可以任意长，报告却必须发出去。
 - **agentd 解析任务的提交号也只看对象头**（`internal/tasks`）：先列出前缀匹配的对象，再查类型和大小，不再对可能巨大的提交做 peel。
-- **真实 GitHub 上的 T2 已经准备好**：
+- **真实 GitHub 上的 T2**（结果见下面“真实 GitHub 上的 T2”一节）：
   - `scripts/make-audit-target.sh` 用固定的作者和日期造 fixture，提交号固定（HEAD 是 `01f7b30c`）。
   - `tests/test_t2_live.py` 只能经 `live_stack` 这个 fixture 跑，要求 `AGENTOS_GITHUB=live`。
   - 令牌从单独的钥匙串条目 `agentos-github-test-token` 读。
@@ -371,9 +371,30 @@ M3 拆成两段（设计文档第 12 节，rev 262）：M3a 副作用协议和 G
   - 反过来也验证过：名单为空时，`/var/tmp` 下的文件在沙箱里读得到；名单里列上它，就读不到了。
 - **原有的整套测试**现在都经过 git MCP 服务器：none 模式用 `--insecure-dev`，srt 和 bwrap 模式用启动脚本。
 
+### 真实 GitHub 上的 T2（2026-10-18）
+
+通过，用时 44 秒，这是 M3b 的收尾。
+
+- **测试仓库** [jchen0426/agentos-audit-target](https://github.com/jchen0426/agentos-audit-target)：
+  - 公开：个人账号的私有仓库开不了 draft PR。
+  - 关掉了 Actions、Issues、Wiki。
+  - main 就是 fixture 的 `01f7b30c`，两个提交的作者都是 `agentos@agentos.invalid`。
+- **令牌**：fine-grained，只授权这个仓库，只给 Contents 和 Pull requests 读写，存在钥匙串 `agentos-github-test-token`。
+- **跑法**：`AGENTOS_GITHUB=live AGENTOS_GITHUB_REPO=jchen0426/agentos-audit-target AGENTOS_SANDBOX=srt uv run pytest tests/test_t2_live.py -s`。用假模型，不花钱；Worker 在沙箱里，因为 agentd 拿着真令牌。
+- **经过**（agentd 的日志）：
+  1. 第一个 agentd 在 GitHub 上开出 draft PR 后、记账之前被杀。
+  2. 第二个 agentd 启动时恢复这个副作用：按 lookup 找到这个 PR 并记下。
+  3. Temporal 重试那次调用，直接拿到记下的结果。
+  4. 发出报告评论。
+- **GitHub 上的结果**（另用 gh 核对过）：
+  - 一个 draft PR：[#1](https://github.com/jchen0426/agentos-audit-target/pull/1)，只改 `app/db.py` 一行。
+  - 除了 main 只有这个 PR 的分支。
+  - 提交上一条报告评论，标记在最后一行。
+  - PR 留着没关，供查看。
+- **gh 的账号名**：gh 钥匙串里标作 josephchen2 的账号，令牌其实是 jchen0426 的（`gh api user` 为证），大概是 GitHub 账号改过名。
+
 ### 留到后面
 
-- **真实测试仓库上的 T2**：需要你建公开测试仓库和只授权它的细粒度令牌，测试已经准备好。
 - **agentd 自己仍在沙箱外读仓库对象**。apply_check 和 open_draft_pr 都要经过 `patch.MirrorSource`，它在 agentd 进程里跑 `git ls-tree` 和 `git cat-file`；任务开始时解析提交号也是：
   - 已经限制了：只读补丁涉及的文件，先查大小，提交只看对象头，单次分配不超过 256 MiB，不读属性，不跑过滤器。
   - 剩下的风险：git 解析对象的代码要是有漏洞，会落在 agentd 身上；树对象可以接近 256 MiB。
