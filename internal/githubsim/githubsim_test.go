@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -280,6 +281,46 @@ func TestCompareLikeGitHub(t *testing.T) {
 		if resp == nil || resp.StatusCode != 404 || !errors.As(err, &answer) || answer.Message != tc.message {
 			t.Errorf("%s: %s...%s: %v", tc.repo, tc.base, tc.head, err)
 		}
+	}
+}
+
+// The log says what each tree and commit the API created was made on: a tree's base tree, a
+// commit's tree and parents. A test can then tell what a branch holds.
+func TestTheLogSaysWhatTreesAndCommitsAreMadeOn(t *testing.T) {
+	dir, head := repo(t)
+	log := filepath.Join(t.TempDir(), "github.jsonl")
+	gh := client(t, &Server{Repos: map[string]string{"acme/payments": dir}, LogPath: log})
+	ctx := context.Background()
+	base := git(t, dir, "rev-parse", head+"^{tree}")
+	tree, _, err := gh.Git.CreateTree(ctx, "acme", "payments", base, []*github.TreeEntry{
+		{Path: new("app/db.py"), Mode: new("100644"), Type: new("blob"), Content: new("y\n")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, _, err := gh.Git.CreateCommit(ctx, "acme", "payments", github.Commit{Message: new("m"),
+		Tree: &github.Tree{SHA: new(tree.GetSHA())}, Parents: []*github.Commit{{SHA: new(head)}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	for line := range strings.Lines(string(b)) {
+		var e map[string]any
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, e)
+	}
+	if len(entries) != 2 || entries[0]["action"] != "create_tree" || entries[0]["sha"] != tree.GetSHA() ||
+		entries[0]["base_tree"] != base {
+		t.Fatalf("create_tree: %v", entries)
+	}
+	if entries[1]["action"] != "create_commit" || entries[1]["sha"] != commit.GetSHA() || entries[1]["tree"] != tree.GetSHA() ||
+		fmt.Sprint(entries[1]["parents"]) != fmt.Sprint([]any{head}) {
+		t.Fatalf("create_commit: %v", entries[1])
 	}
 }
 

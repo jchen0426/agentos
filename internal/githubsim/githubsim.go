@@ -134,7 +134,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.getTree(w, r, g[1]+"/"+g[2], g[3])
 	case r.Method == http.MethodPost && m(reTrees) != nil:
 		sha := hash(body)
-		s.answer(w, r, "create_tree", http.StatusCreated, map[string]any{"sha": sha}, nil)
+		s.answer(w, r, "create_tree", http.StatusCreated, map[string]any{"sha": sha},
+			map[string]any{"sha": sha, "base_tree": body["base_tree"]})
 	case r.Method == http.MethodPost && m(reCommits) != nil:
 		s.createCommit(w, r, body)
 	case r.Method == http.MethodGet && m(reRef) != nil:
@@ -293,7 +294,8 @@ func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[s
 	s.mu.Lock()
 	s.commits[sha] = commit{Tree: tree, Parents: parents, Message: message}
 	s.mu.Unlock()
-	s.answer(w, r, "create_commit", http.StatusCreated, map[string]any{"sha": sha, "tree": map[string]any{"sha": tree}}, nil)
+	s.answer(w, r, "create_commit", http.StatusCreated, map[string]any{"sha": sha, "tree": map[string]any{"sha": tree}},
+		map[string]any{"sha": sha, "tree": tree, "parents": parents})
 }
 
 func (s *Server) getRef(w http.ResponseWriter, r *http.Request, repo, branch string) {
