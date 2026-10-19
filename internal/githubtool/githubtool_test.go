@@ -2259,3 +2259,30 @@ func TestOpenDraftPROpensThePullRequestWhenTheBaseIsForcedBackToTheBranchsParent
 		t.Fatalf("got %v %v, %d pull requests", v, err, f.log(t, "create_pull"))
 	}
 }
+
+// A resend finds the pull request an earlier attempt opened, and returns it, even when main drops
+// the branch's parent after agentd read main: the check of the base before a pull request is
+// opened comes after the lookup, and no pull request is opened.
+func TestOpenDraftPRReturnsAPullRequestItFindsAfterTheBaseDropsTheParent(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // the tip the branch goes on
+	f := newFixture(t, base.sim, base.sim, dir, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	first, err := tool.Execute(context.Background(), payload, "key", proceed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forced atomic.Bool
+	g := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.sim.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", base.commit) // the branch's parent dropped after agentd read main
+		}
+	}), dir, base.commit)
+	tool = &OpenDraftPR{Client: g.client, Repos: g.repos, Blobs: f.blobs, Git: g.git}
+	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || v["number"] != first["number"] ||
+		f.log(t, "create_pull") != 1 {
+		t.Fatalf("got %v %v, %d pull requests; want the first, #%v", v, err, f.log(t, "create_pull"), first["number"])
+	}
+}
