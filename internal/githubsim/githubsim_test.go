@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v92/github"
 )
@@ -321,6 +322,34 @@ func TestTheLogSaysWhatTreesAndCommitsAreMadeOn(t *testing.T) {
 	if entries[1]["action"] != "create_commit" || entries[1]["sha"] != commit.GetSHA() || entries[1]["tree"] != tree.GetSHA() ||
 		fmt.Sprint(entries[1]["parents"]) != fmt.Sprint([]any{head}) {
 		t.Fatalf("create_commit: %v", entries[1])
+	}
+}
+
+// A commit carries its author, as GitHub shows it: the repository's own as git recorded it,
+// one the API created as it was sent.
+func TestCommitsCarryTheirAuthor(t *testing.T) {
+	dir, head := repo(t)
+	gh := client(t, &Server{Repos: map[string]string{"acme/payments": dir}})
+	ctx := context.Background()
+	c, _, err := gh.Git.GetCommit(ctx, "acme", "payments", head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when, _ := time.Parse(time.RFC3339, git(t, dir, "log", "-1", "--format=%aI", head))
+	if c.GetAuthor().GetName() != "t" || c.GetAuthor().GetEmail() != "t@example.com" || !c.GetAuthor().GetDate().Time.Equal(when) {
+		t.Fatalf("author %+v, want t <t@example.com> at %s", c.GetAuthor(), when)
+	}
+	at := &github.Timestamp{Time: time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC)}
+	who := &github.CommitAuthor{Name: new("agentos"), Email: new("agentos@agentos.invalid"), Date: at}
+	made, _, err := gh.Git.CreateCommit(ctx, "acme", "payments", github.Commit{Message: new("m"),
+		Tree: &github.Tree{SHA: new(c.GetTree().GetSHA())}, Parents: []*github.Commit{{SHA: new(head)}}, Author: who, Committer: who}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err = gh.Git.GetCommit(ctx, "acme", "payments", made.GetSHA())
+	if err != nil || c.GetAuthor().GetName() != "agentos" || c.GetAuthor().GetEmail() != "agentos@agentos.invalid" ||
+		!c.GetAuthor().GetDate().Time.Equal(at.Time) || c.GetMessage() != "m" {
+		t.Fatalf("made %+v %v", c, err)
 	}
 }
 

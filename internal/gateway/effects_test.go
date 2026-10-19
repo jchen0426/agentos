@@ -206,6 +206,30 @@ func TestACancelledRunSendsNothing(t *testing.T) {
 	}
 }
 
+// Once the run is cancelled, a tool's proceed fails with ErrStopped: the tool can tell a cancel
+// from agentd failing to record the request, which may be tried again. A write that has sent
+// part of itself leaves the rest to a person only for the cancel.
+func TestProceedStopsOnceTheRunIsCancelled(t *testing.T) {
+	f := newFixture(t, false)
+	ctx := context.Background()
+	w := &writer{class: policy.EffectUnsafe}
+	if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, f.req()); res != nil || err != nil {
+		t.Fatalf("record: %v %v", res, err)
+	}
+	e, ok, err := f.g.claim(ctx, f.status(t))
+	if !ok || err != nil {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	proceed := f.g.proceed(e)
+	if err := proceed(ctx); err != nil {
+		t.Fatalf("before the cancel: %v", err)
+	}
+	f.cancel(t)
+	if err := proceed(ctx); !errors.Is(err, tools.ErrStopped) || !errors.Is(err, tools.ErrNotSent) {
+		t.Fatalf("after the cancel: %v, want ErrStopped", err)
+	}
+}
+
 // A tool that refuses its payload while executing it, before anything went out (it does not
 // match what GitHub holds, say), ends the effect: it never will be sent, and the call is denied
 // with the tool's reason. It counts against the run's writes: the check may have cost requests

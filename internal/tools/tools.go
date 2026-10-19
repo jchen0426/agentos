@@ -84,6 +84,11 @@ type Finder interface {
 // happened: sending it again is safe.
 var ErrNotSent = errors.New("request not sent")
 
+// ErrStopped is what Proceed fails with when the run was cancelled, or the effect changed
+// meanwhile (a person settled it, say): nothing more of the write may go out. It is ErrNotSent
+// too. Proceed failing otherwise (agentd could not record the request) may be tried again.
+var ErrStopped = fmt.Errorf("%w: the run was cancelled, or the effect changed", ErrNotSent)
+
 // DeniedError refuses a call as it stands, before anything is sent: for example a patch that
 // touches a file the policy protects, or (from Execute, which then ends the effect) one whose
 // files are not what GitHub holds. The workflow gets a "denied" result.

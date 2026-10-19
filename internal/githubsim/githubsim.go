@@ -63,9 +63,17 @@ type Server struct {
 }
 
 type commit struct {
-	Tree    string
-	Parents []string
-	Message string // as GitHub shows it: without git's last newline
+	Tree              string
+	Parents           []string
+	Message           string // as GitHub shows it: without git's last newline
+	Author, Committer person
+}
+
+// person is a commit's author or committer, as GitHub shows one.
+type person struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+	Date  string `json:"date,omitempty"` // RFC 3339
 }
 
 type pull struct {
@@ -195,7 +203,7 @@ func (s *Server) getCommit(w http.ResponseWriter, r *http.Request, repo, sha str
 		parents = append(parents, map[string]any{"sha": p})
 	}
 	s.answer(w, r, "get_commit", http.StatusOK, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.Tree}, "parents": parents,
-		"message": c.Message}, nil)
+		"message": c.Message, "author": c.Author, "committer": c.Committer}, nil)
 }
 
 // readCommit reads a commit's tree and parents from the repository's copy.
@@ -215,9 +223,26 @@ func readCommit(dir, sha string) (commit, bool) {
 			c.Tree = v
 		case "parent":
 			c.Parents = append(c.Parents, v)
+		case "author":
+			c.Author = signature(v)
+		case "committer":
+			c.Committer = signature(v)
 		}
 	}
 	return c, c.Tree != ""
+}
+
+// signature reads a commit header's "Name <email> seconds zone".
+func signature(v string) person {
+	name, rest, _ := strings.Cut(v, " <")
+	email, when, _ := strings.Cut(rest, "> ")
+	seconds, zone, _ := strings.Cut(when, " ")
+	n, _ := strconv.ParseInt(seconds, 10, 64)
+	at := time.Unix(n, 0).UTC()
+	if offset, err := time.Parse("-0700", zone); err == nil {
+		at = at.In(offset.Location())
+	}
+	return person{Name: name, Email: email, Date: at.Format(time.RFC3339)}
 }
 
 // getTree lists one tree of the repository's copy, one level, as GitHub's Git Trees API does
@@ -285,6 +310,11 @@ func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[s
 	sha := hash(body)
 	tree, _ := body["tree"].(string)
 	message, _ := body["message"].(string)
+	var who [2]person
+	for i, k := range []string{"author", "committer"} {
+		b, _ := json.Marshal(body[k])
+		_ = json.Unmarshal(b, &who[i])
+	}
 	var parents []string
 	for _, p := range anySlice(body["parents"]) {
 		if ps, ok := p.(string); ok {
@@ -292,7 +322,7 @@ func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[s
 		}
 	}
 	s.mu.Lock()
-	s.commits[sha] = commit{Tree: tree, Parents: parents, Message: message}
+	s.commits[sha] = commit{Tree: tree, Parents: parents, Message: message, Author: who[0], Committer: who[1]}
 	s.mu.Unlock()
 	s.answer(w, r, "create_commit", http.StatusCreated, map[string]any{"sha": sha, "tree": map[string]any{"sha": tree}},
 		map[string]any{"sha": sha, "tree": tree, "parents": parents})

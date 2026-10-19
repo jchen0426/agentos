@@ -23,10 +23,11 @@ import (
 
 // OpenDraftPR is github.open_draft_pr. Two steps (section 6): a branch with the patch on the
 // tip of the base branch, created under a name derived from the audited commit, the run and the
-// patch, so a retry recreates the same thing (idempotent); then a draft pull request, which is
-// looked up by its head branch before it is opened (lookup). Before either, it checks on GitHub
-// that the audited commit is in the base branch's history (inBase) and that the files the patch
-// touches are what the patch was made for, at that commit and at the tip (checkFiles).
+// patch, which a retry finds, on that tip or on the one an earlier attempt read (idempotent);
+// then a draft pull request, which is looked up by its head branch before it is opened
+// (lookup). Before either, it checks on GitHub that the audited commit is in the base branch's
+// history (inBase) and that the files the patch touches are what the patch was made for: at
+// that commit (checkFiles), and at the tip the branch goes on (atTip).
 type OpenDraftPR struct {
 	Client    *Client
 	Repos     map[string]Repo
@@ -183,27 +184,30 @@ func (t *OpenDraftPR) Execute(ctx context.Context, raw json.RawMessage, _ string
 			"GitHub has no commit %s in %s/%s (or the token cannot see the repository)", p.Commit, p.Owner, p.Repo)})
 	case err != nil:
 		return nil, t.refused(ctx, p, false, unseen(err))
-	case audited.GetSHA() != p.Commit:
-		return nil, fmt.Errorf("%w: GitHub answered for commit %s with %.100q", tools.ErrNotSent, p.Commit, audited.GetSHA())
+	case audited.GetSHA() != p.Commit || !fullSHA.MatchString(audited.GetTree().GetSHA()):
+		return nil, fmt.Errorf("%w: GitHub answered for commit %s with %.100q, of tree %.100q", tools.ErrNotSent,
+			p.Commit, audited.GetSHA(), audited.GetTree().GetSHA())
 	}
 	// Before anything is written: the pull request holds the patch alone, on the tip of the
-	// base branch, and its tree is the tip's with the patch.
+	// base branch.
 	tip, err := t.inBase(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	tree, tipTree := audited.GetTree().GetSHA(), audited.GetTree().GetSHA()
+	tipTree := audited.GetTree().GetSHA()
 	if tip != p.Commit {
 		if tipTree, err = t.commitTree(ctx, p, tip); err != nil {
 			return nil, t.refused(ctx, p, false, err)
 		}
 	}
-	if err := t.checkFiles(ctx, p, tree, tip, tipTree); err != nil {
+	// One walk lists the trees this call checks: each directory once, within one limit.
+	w := newTreeWalk(t.Client.gh, p)
+	if err := t.checkFiles(ctx, w, p, audited.GetTree().GetSHA()); err != nil {
 		return nil, t.refused(ctx, p, true, err)
 	}
 	// From here on agentd writes. GitHub declining a request leaves the branch on GitHub when
 	// this attempt or an earlier one made it.
-	v, err := t.write(ctx, p, tip, tipTree, proceed)
+	v, err := t.write(ctx, w, p, tip, tipTree, proceed)
 	if err != nil {
 		return nil, t.refused(ctx, p, true, err)
 	}
@@ -216,21 +220,20 @@ func (t *OpenDraftPR) commitTree(ctx context.Context, p prPayload, sha string) (
 	switch {
 	case err != nil:
 		return "", unseen(err)
-	case c.GetSHA() != sha:
-		return "", fmt.Errorf("%w: GitHub answered for commit %s with %.100q", tools.ErrNotSent, sha, c.GetSHA())
+	case c.GetSHA() != sha || !fullSHA.MatchString(c.GetTree().GetSHA()):
+		// An empty tree in particular: go-github leaves it out of a CreateTree, which would make
+		// a tree of the patch's files alone.
+		return "", fmt.Errorf("%w: GitHub answered for commit %s with %.100q, of tree %.100q", tools.ErrNotSent,
+			sha, c.GetSHA(), c.GetTree().GetSHA())
 	}
 	return c.GetTree().GetSHA(), nil
 }
 
-// write makes the patch's tree on top of the tip's (tipTree), the branch on the tip, and the
+// write makes the branch, with the patch on the tip (or finds an earlier attempt's), and the
 // pull request.
-func (t *OpenDraftPR) write(ctx context.Context, p prPayload, tip, tipTree string, proceed tools.Proceed) (map[string]any, error) {
+func (t *OpenDraftPR) write(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string, proceed tools.Proceed) (map[string]any, error) {
 	gh := t.Client.gh
-	tree, err := t.patchTree(ctx, p, tipTree)
-	if err != nil {
-		return nil, unseen(err)
-	}
-	if err := t.branch(ctx, p, tip, tree, proceed); err != nil {
+	if err := t.branch(ctx, w, p, tip, tipTree, proceed); err != nil {
 		return nil, err
 	}
 	// GitHub has the branch now, pushed by this attempt or an earlier one: part of the pull
@@ -242,8 +245,11 @@ func (t *OpenDraftPR) write(ctx context.Context, p prPayload, tip, tipTree strin
 	} else if found {
 		return v, nil
 	}
-	if err := proceed(ctx); err != nil {
-		return nil, &tools.ConflictError{Reason: fmt.Sprintf("branch %s exists, but the pull request was not opened (%v)", p.Branch, err)}
+	if err := proceed(ctx); errors.Is(err, tools.ErrStopped) {
+		return nil, &tools.ConflictError{Reason: "branch " + p.Branch +
+			" exists, but the pull request was not opened: the run was cancelled, or the effect changed"}
+	} else if err != nil {
+		return nil, err
 	}
 	pr, resp, err := gh.PullRequests.Create(ctx, p.Owner, p.Repo, github.CreatePullRequest{
 		Title: new(p.Title), Head: p.Branch, Base: p.Base, Body: new(p.Body), Draft: new(p.Draft),
@@ -371,7 +377,7 @@ func (t *OpenDraftPR) inBase(ctx context.Context, p prPayload) (string, error) {
 			"GitHub answered for branch %s of %s/%s with %.100q, a %.20q %.100q: agentd cannot compare the commit with it",
 			p.Base, p.Owner, p.Repo, ref.GetRef(), ref.GetObject().GetType(), tip)})
 	}
-	switch why, missing, err := t.behind(ctx, p, tip, p.Commit); {
+	switch why, missing, err := t.behind(ctx, p, tip, p.Commit, fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, tip)); {
 	case err != nil:
 		return "", t.refused(ctx, p, false, err)
 	case why != "":
@@ -380,15 +386,14 @@ func (t *OpenDraftPR) inBase(ctx context.Context, p prPayload) (string, error) {
 	return tip, nil
 }
 
-// behind says whether a commit is in the history of the base branch at tip, as GitHub compares
-// the two: the commit is the merge base, and the branch at it or ahead of it. When it is not,
-// why says so; missing, when GitHub has no comparison of the two, which have no history in
+// behind says whether commit is in the history of base, another commit, as GitHub compares the
+// two: commit is the merge base, and base at it or ahead of it. When it is not, why says so, with
+// where naming base; missing, when GitHub has no comparison of the two, which have no history in
 // common (both are on GitHub), or the token lost sight of the repository. GitHub failing is err.
-func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, tip, commit string) (why string, missing bool, err error) {
+func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, base, commit, where string) (why string, missing bool, err error) {
 	gh := t.Client.gh
-	where := fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, tip)
 	// Only the first of the commit's own commits: the answer stays small when it has many.
-	req, err := gh.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%v/%v/compare/%v...%v?per_page=1", p.Owner, p.Repo, tip, commit), nil)
+	req, err := gh.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%v/%v/compare/%v...%v?per_page=1", p.Owner, p.Repo, base, commit), nil)
 	if err != nil {
 		return "", false, fmt.Errorf("%w: %v", tools.ErrNotSent, err)
 	}
@@ -414,7 +419,7 @@ func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, tip, commit strin
 		return "", false, fmt.Errorf("%w: GitHub's comparison of commit %s with %s: %v", tools.ErrNotSent, commit, where, err)
 	}
 	if cmp.MergeBase.SHA != commit || cmp.Status != "behind" && cmp.Status != "identical" {
-		return fmt.Sprintf("commit %s is not in the history of %s: GitHub compares it as %.20q, with %d commits of its own, which a pull request on it would bring in",
+		return fmt.Sprintf("commit %s is not in the history of %s: GitHub compares it as %.20q, with %d commits of its own",
 			commit, where, cmp.Status, cmp.AheadBy), false, nil
 	}
 	return "", false, nil
@@ -435,32 +440,38 @@ const (
 
 var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// checkFiles makes sure each file the payload touches is on GitHub what the patch was made for:
-// in the audited commit's tree, what the git tool server read from the mirror; and the same in
-// the tree of the base branch's tip, which the pull request's commit is made on, when that is
-// another tree. A file the patch changes or deletes is a regular file (100644) whose blob is the
-// one the patch was applied to; where the patch creates one, GitHub has nothing, and nothing
-// above it but directories, and nothing whose name differs only in case. A crafted repository
-// can subvert the server (design doc, section 8): agentd checks the shape of its answers, and
-// here their content. A mismatch is a refusal; GitHub failing is not, and the call is tried
-// again.
-func (t *OpenDraftPR) checkFiles(ctx context.Context, p prPayload, tree, tip, tipTree string) error {
+// checkFiles makes sure each file the payload touches is, at the audited commit on GitHub (its
+// tree), what the git tool server read from the mirror: a file the patch changes or deletes is a
+// regular file (100644) whose blob is the one the patch was applied to; where the patch creates
+// one, GitHub has nothing, and nothing above it but directories, and nothing whose name differs
+// only in case. A crafted repository can subvert the server (design doc, section 8): agentd
+// checks the shape of its answers, and here their content. A mismatch is a refusal; GitHub
+// failing is not, and the call is tried again.
+func (t *OpenDraftPR) checkFiles(ctx context.Context, w *treeWalk, p prPayload, tree string) error {
 	for _, f := range p.Files {
 		if !f.New && f.OldBlob == "" {
 			return &tools.DeniedError{Reason: f.Path + ": the payload names neither the file it changes nor a new one (an older agentd recorded it)"}
 		}
 	}
-	w := newTreeWalk(t.Client.gh, p)
-	read := func(f prFile) string {
+	return t.filesIn(ctx, w, p, tree, " at commit "+p.Commit, func(f prFile) string {
 		return "the git tool server read the regular file " + f.OldBlob + " from the mirror"
-	}
-	if err := t.filesIn(ctx, w, p, tree, " at commit "+p.Commit, read); err != nil || tipTree == tree {
-		return err
-	}
-	madeFor := func(f prFile) string {
+	})
+}
+
+// atTip makes sure the files the patch touches are, at the tip of the base branch (tipTree),
+// what they were at the audited commit, by the same rules: a branch on the tip then holds the
+// tip and the patch, and nothing else. A file the base branch has changed since, or something
+// in the way of a new one, is a refusal: the operator can audit the tip. Where the tip's tree is
+// the audited commit's, its listings are those checkFiles read.
+func (t *OpenDraftPR) atTip(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string) error {
+	return t.filesIn(ctx, w, p, tipTree, fmt.Sprintf(" at commit %s, the tip of branch %s", tip, p.Base), madeFor(p))
+}
+
+// madeFor says what the patch was made for, of a file it changes or deletes.
+func madeFor(p prPayload) func(prFile) string {
+	return func(f prFile) string {
 		return "the patch was made for the regular file " + f.OldBlob + " at commit " + p.Commit
 	}
-	return t.filesIn(ctx, w, p, tipTree, fmt.Sprintf(" at commit %s, the tip of branch %s", tip, p.Base), madeFor)
 }
 
 // filesIn checks the payload's files in one tree, root, which at says where it is on GitHub.
@@ -650,15 +661,22 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 // branch makes sure the branch exists and holds the patch on the base branch: on the tip, as this
-// attempt makes it (tree), or as an earlier attempt made it on the tip it read (checkBranch). A
-// branch of that name that holds anything else is left alone: a person decides.
-func (t *OpenDraftPR) branch(ctx context.Context, p prPayload, tip, tree string, proceed tools.Proceed) error {
+// attempt makes it, or as an earlier attempt made it on the tip it read (checkBranch). A branch
+// of that name that holds anything else is left alone: a person decides.
+func (t *OpenDraftPR) branch(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string, proceed tools.Proceed) error {
 	gh := t.Client.gh
 	ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Branch)
 	switch {
 	case err == nil:
-		return onBranch(p, t.checkBranch(ctx, p, ref.GetObject().GetSHA(), tip, tree))
+		return onBranch(p, t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree))
 	case status(resp) != http.StatusNotFound:
+		return unseen(err)
+	}
+	if err := t.atTip(ctx, w, p, tip, tipTree); err != nil {
+		return err
+	}
+	tree, err := t.patchTree(ctx, p, tipTree)
+	if err != nil {
 		return unseen(err)
 	}
 	date, err := time.Parse(time.RFC3339, p.Author.Date)
@@ -674,6 +692,9 @@ func (t *OpenDraftPR) branch(ctx context.Context, p prPayload, tip, tree string,
 	if err != nil {
 		return unseen(err)
 	}
+	if err := t.stillHolds(ctx, p, tip); err != nil {
+		return err
+	}
 	if err := proceed(ctx); err != nil {
 		return err
 	}
@@ -685,10 +706,15 @@ func (t *OpenDraftPR) branch(ctx context.Context, p prPayload, tip, tree string,
 		return unseen(err)
 	}
 	// GitHub declined to create it: the branch appeared meanwhile, or for a reason of its own.
-	declined := unseen(err)
+	declined, exists := unseen(err), strings.Contains(err.Error(), "Reference already exists")
 	switch ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Branch); {
 	case err == nil:
-		return onBranch(p, t.checkBranch(ctx, p, ref.GetObject().GetSHA(), tip, tree))
+		return onBranch(p, t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree))
+	case status(resp) == http.StatusNotFound && exists:
+		// GitHub's read behind its write (an earlier attempt's, whose answer was lost, say): as
+		// far as agentd can tell, the branch is there.
+		return &tools.ConflictError{Reason: "GitHub refused to create branch " + p.Branch +
+			", which it says exists, and does not show it; so part of the pull request may have gone out"}
 	case status(resp) == http.StatusNotFound:
 		return declined
 	default:
@@ -696,51 +722,119 @@ func (t *OpenDraftPR) branch(ctx context.Context, p prPayload, tip, tree string,
 	}
 }
 
-// checkBranch compares the commit a branch points at with the patch on the base branch: the
-// commit this attempt would create, the patch's tree on the tip; or the one an earlier attempt
-// created on the tip it read, which the branch has moved on from since: one parent, in the
-// branch's history, and that parent's tree with the patch. (An older agentd made it on the
-// audited commit, which is in the history too.) Not the commit's hash, which would need GitHub
+// stillHolds makes sure, just before the branch goes out, that the base branch still holds the
+// tip it goes on. The branch may have been rewritten while agentd checked (a force push that
+// took the tip out of its history, as in an incident), and a push on that tip would run its
+// workflows again. Then nothing goes out, and the call is tried again, on the tip there is by
+// then. Anything odd in GitHub's answer is tried again too: the next attempt checks the branch
+// from the start.
+func (t *OpenDraftPR) stillHolds(ctx context.Context, p prPayload, tip string) error {
+	ref, resp, err := t.Client.gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Base)
+	now := ref.GetObject().GetSHA()
+	switch {
+	case status(resp) == http.StatusNotFound:
+		return fmt.Errorf("%w: GitHub no longer shows branch %s", tools.ErrNotSent, p.Base)
+	case err != nil:
+		return unseen(err)
+	case now == tip:
+		return nil
+	case ref.GetRef() != "refs/heads/"+p.Base || ref.GetObject().GetType() != "commit" || !fullSHA.MatchString(now):
+		return fmt.Errorf("%w: GitHub answered for branch %s with %.100q, a %.20q %.100q", tools.ErrNotSent,
+			p.Base, ref.GetRef(), ref.GetObject().GetType(), now)
+	}
+	why, _, err := t.behind(ctx, p, now, tip, fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, now))
+	switch {
+	case err != nil:
+		return err
+	case why != "":
+		return fmt.Errorf("%w: branch %s moved while agentd checked it, and %s", tools.ErrNotSent, p.Base, why)
+	}
+	return nil
+}
+
+// checkBranch compares the commit a branch points at with the one an attempt makes for the
+// payload, and leaves anything else to a person. Not the commit's hash, which would need GitHub
 // to keep the commit object exactly as sent (no signature added, for example).
-func (t *OpenDraftPR) checkBranch(ctx context.Context, p prPayload, sha, tip, tree string) error {
+func (t *OpenDraftPR) checkBranch(ctx context.Context, w *treeWalk, p prPayload, sha, tip, tipTree string) error {
 	c, _, err := t.Client.gh.Git.GetCommit(ctx, p.Owner, p.Repo, sha)
 	if err != nil {
 		return unseen(err)
 	}
-	var why string
-	switch parents := c.Parents; {
-	case len(parents) != 1:
-		why = fmt.Sprintf("a commit of %d parents", len(parents))
-	case parents[0].GetSHA() == tip && c.GetTree().GetSHA() == tree:
-		return nil
-	case parents[0].GetSHA() == tip:
-		why = "its tree is not the patch on the tip " + tip
-	default:
-		old := parents[0].GetSHA()
-		if notIn, _, err := t.behind(ctx, p, tip, old); err != nil {
-			return err
-		} else if notIn != "" {
-			why = "its parent: " + notIn
-			break
-		}
-		oldTree, err := t.commitTree(ctx, p, old)
-		if err != nil {
-			return err
-		}
-		// Made again on the parent's tree: GitHub names a tree by its content, and nothing
-		// points at this one.
-		patched, err := t.patchTree(ctx, p, oldTree)
-		if err != nil {
-			return unseen(err)
-		}
-		if c.GetTree().GetSHA() == patched {
-			return nil
-		}
-		why = "its tree is not the patch on its parent " + old
+	why, err := t.notAttempt(ctx, w, p, c, tip, tipTree)
+	if err != nil || why == "" {
+		return err
 	}
 	return &tools.ConflictError{Reason: fmt.Sprintf(
-		"branch %s already exists and points at %s, which is not this patch on branch %s (%s); agentd does not overwrite it",
+		"branch %s already exists and points at %s, which is not this patch on branch %s as agentd makes it (%s); agentd does not overwrite it",
 		p.Branch, sha, p.Base, why)}
+}
+
+// notAttempt says why c is not the commit an attempt makes for the payload, or "" when it is:
+// the patch on the tip this attempt read; or on the tip an earlier attempt read, which the
+// branch has moved on from since. That commit has one parent, in the branch's history, with
+// the audited commit in its own history (an older agentd made it on the audited commit itself);
+// the files the patch touches are, at the parent, what it was made for; and its tree is the
+// parent's with the patch. A commit on an older parent must also carry the payload's message
+// and author, as every attempt makes it: someone else's could be on any commit of the history.
+func (t *OpenDraftPR) notAttempt(ctx context.Context, w *treeWalk, p prPayload, c *github.Commit, tip, tipTree string) (string, error) {
+	if len(c.Parents) != 1 {
+		return fmt.Sprintf("a commit of %d parents", len(c.Parents)), nil
+	}
+	parent := c.Parents[0].GetSHA()
+	if parent == tip {
+		return t.patchOn(ctx, w, p, c, tip, tipTree, fmt.Sprintf(" at commit %s, the tip of branch %s", tip, p.Base))
+	}
+	if !madeAs(c, p) {
+		return "a commit on an older parent, without the message and author agentd gives this one", nil
+	}
+	switch why, _, err := t.behind(ctx, p, tip, parent, fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, tip)); {
+	case err != nil:
+		return "", err
+	case why != "":
+		return "its parent: " + why, nil
+	}
+	if parent != p.Commit {
+		switch why, _, err := t.behind(ctx, p, parent, p.Commit, "commit "+parent+", its parent"); {
+		case err != nil:
+			return "", err
+		case why != "":
+			return why, nil
+		}
+	}
+	parentTree, err := t.commitTree(ctx, p, parent)
+	if err != nil {
+		return "", err
+	}
+	return t.patchOn(ctx, w, p, c, parent, parentTree, fmt.Sprintf(" at commit %s, its parent", parent))
+}
+
+// patchOn says why c is not the patch on parent (whose tree is parentTree), or "" when it is: the
+// files the patch touches are, there, what it was made for, and c's tree is parent's with the
+// patch, made again (GitHub names a tree by its content, and nothing points at this one).
+func (t *OpenDraftPR) patchOn(ctx context.Context, w *treeWalk, p prPayload, c *github.Commit, parent, parentTree, at string) (string, error) {
+	err := t.filesIn(ctx, w, p, parentTree, at, madeFor(p))
+	if denied := (*tools.DeniedError)(nil); errors.As(err, &denied) {
+		return denied.Reason, nil
+	} else if err != nil {
+		return "", err
+	}
+	tree, err := t.patchTree(ctx, p, parentTree)
+	if err != nil {
+		return "", unseen(err)
+	}
+	if c.GetTree().GetSHA() != tree {
+		return "its tree is not the patch on " + parent, nil
+	}
+	return "", nil
+}
+
+// madeAs reports whether c carries what every attempt gives the payload's commit: its message,
+// and its author at the run's creation time. (GitHub may sign a commit, which changes neither.)
+func madeAs(c *github.Commit, p prPayload) bool {
+	date, err := time.Parse(time.RFC3339, p.Author.Date)
+	a := c.GetAuthor()
+	return err == nil && strings.TrimRight(c.GetMessage(), "\n") == strings.TrimRight(p.Message, "\n") &&
+		a.GetName() == p.Author.Name && a.GetEmail() == p.Author.Email && a.GetDate().Time.Equal(date)
 }
 
 func (t *OpenDraftPR) Find(ctx context.Context, raw json.RawMessage) (map[string]any, bool, error) {
