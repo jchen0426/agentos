@@ -68,7 +68,7 @@
 1. **按方法过滤挡不住命令级的越权**（第 4 节原来的“所以它发不了信号，也终止不了任务”说过头了）。Worker 必须能调用 `RespondWorkflowTaskCompleted`，而这个请求里可以带 `SignalExternalWorkflowExecution`、`RequestCancelExternalWorkflowExecution`、`StartChildWorkflowExecution`，以及排到任意任务队列的活动。M1 补做里已经修了，见下面“M1 补做”。
 2. **所有调用都是同一个活动类型 Invoke，Temporal 的重放检查看不出调用顺序变了**。重放只比较活动类型和活动 ID，不比较输入。实测：默认活动 ID（"1"、"2"……）下，把 `git.apply_check` 和 `github.open_draft_pr` 对调，重放不报错，记录的结果被交给了错误的调用。改成按调用命名的活动 ID 后，同样的改动报 `Activity id of scheduled event '3:git.apply_check' does not match activity id of activity command '3:github.open_draft_pr'`。T10 的“不兼容的改动在 CI 的重放测试里就被拦下”靠的就是这一点。还剩一个盲区：只改参数、不改调用顺序的改动重放查不出来。
 3. **重放只能拦下改动点之前已经有历史的任务**。挂起在改动点之前的任务，即使改动没有用 `patched()` 包起来，恢复后也照样能跑。所以 CI 的重放样本要覆盖走完全程的历史，`tests/histories/` 里两份都要留。
-4. **代理的 gRPC 参数要和 Temporal 对齐**。grpc-go 服务端默认只容许客户端每 5 分钟一次 keepalive ping，Python SDK 每 30 秒一次，会被回 GOAWAY（too_many_pings）断开；默认 4 MiB 的消息上限也会截断大的历史。代理已按 Temporal frontend 的设置放宽（10 秒、128 MiB）。
+4. **代理的 gRPC 参数要和 Temporal 对齐**。grpc-go 服务端默认只容许客户端每 5 分钟一次 keepalive ping，Python SDK 每 30 秒一次，会被回 GOAWAY（too_many_pings）断开；默认 4 MiB 的消息上限也会截断大的历史。代理已按 Temporal frontend 的设置放宽（10 秒、128 MiB）。（2026-10-19 更正：128 MiB 只该给响应，那是 Temporal 的客户端收历史的上限；Temporal frontend 收请求的上限就是 grpc-go 默认的 4 MiB，见下面“Runtime 代理的资源上限”。）
 5. T8 里旧尝试被拒的证据来自 Go SDK 的日志（`Task processing failed with error ... activity already timed out`），历史里看到的是第 2 次尝试的完成和第 1 次的心跳超时。
 
 ## 代码评审后修复的问题
@@ -154,6 +154,65 @@ PR #11 的对抗评审指出过：开发配置把数据目录放在仓库里（`
 
 推送前，两个评审代理（安全、对抗）在各自的副本里做了实验，都没找到高危问题。上面 Runtime 目录、FIFO、macOS 符号链接、旧 agentd、`~` 写法、扫描重试这几条都是它们找出来的。它们还发现，macOS 上原来的测试数据放在 `/tmp`，本来就读得到，测不出真正的漏洞；现在测试先把它拒读。改完再请对抗评审复查了一轮：上面那些都修好了；它又找出 macOS 能读 FIFO、`HOME` 不可靠、“查不完就拒绝”没有用例这三处，也都补上了。
 
+## Runtime 代理的资源上限（2026-10-19）
+
+原来记在“还没解决的风险”里的一条：代理每条请求收 128 MiB、并发流数不限、整条读进内存再检查，被攻破的 Worker 能让 agentd 自己占满内存，OOM killer 杀的就是 agentd。这次先实测再改。测量工具像 Worker 一样连 Runtime 入口（macOS 上是回环端口，Lima 虚拟机里是 Unix socket），直接写 HTTP/2 帧，所以能做 gRPC 客户端不会做的事：留着请求的最后一个字节不发、不理服务器的流数上限、从不读响应、发超大的头。每个场景用新起的 agentd 和 Temporal 开发服务器（1.32），每 0.1 秒用 `ps` 取常驻内存。
+
+先确认的两件事：
+
+- Temporal 的 frontend 收请求的上限就是 grpc-go 默认的 4 MiB，超过的一律回 ResourceExhausted（`grpc: received message larger than max (N vs. 4194304)`），直连和经代理都一样，也没有动态配置能改。所以代理收 128 MiB 的请求毫无用处：大于 4 MiB 的请求永远不会成功，只会先在 agentd 里占着内存。
+- 正常的 Worker 用得很少。用插桩的 agentd 跑整套测试（47 个）：请求最大 11.7 KB（`RespondWorkflowTaskCompleted`），响应最大 88 KB（带历史的 `PollWorkflowTaskQueue`），同时最多 2 个调用、2 个连接，元数据最多 179 字节。Python SDK 的请求是 gzip 压缩的；它自己检查单个 payload（2 MiB），不查整条请求。
+
+改之前（macOS；括号里是虚拟机里经 Unix socket 的同类场景）：
+
+| 场景 | agentd 常驻内存 |
+| --- | --- |
+| 8 个流各声明 100 MiB 的请求，留最后一个字节不发 | +809 MiB（Linux +816 MiB），连接不断就一直占着 |
+| 4 个连接 × 8 个流，同上 | 峰值 2.4 GB（macOS 压缩了一部分内存，实际占着 3.2 GB 数据） |
+| 4 个连接 × 64 个流 × 4 MiB，同上（即使上限降到 4 MiB） | +1.0 GB；grpc-go 的动态窗口把流窗口撑到了 1.4 MB |
+| 8 个完整的 100 MiB 请求（命名空间不对，被规则拒绝） | +3.2 GB：接收、拷贝、解码，每条约 4 倍 |
+| 32 个 3.9 MiB 的请求，全是最短的 START_TIMER 命令（在 Temporal 的上限以内，会被转发） | 峰值 4.1 GB：每条解码出约 100 万个命令，约 30 倍 |
+| 1 个 4 MB 的 `RecordWorkerHeartbeat`，里面是 200 万个空心跳 | 峰值 +700 MiB（Linux +428 MiB），Temporal 还照收了；4 个同时来 2.8 GB |
+| 2000 个空闲连接 | +83 MiB，2017 个文件描述符，没有上限 |
+| 8 个流各带 8 MiB 的头 | 照收（grpc-go 默认 16 MiB） |
+| 一个 45 MB 的历史页，4 个连接 × 8 个流请求、从不读响应 | 峰值 2.6 GB（Linux 1 个连接 × 8 个流 +657 MiB），连接不断就一直占着 |
+
+改了什么（`internal/runtimeproxy/limits.go`，数值都在 `DefaultLimits`）：
+
+- **请求最多 4 MiB**（解压后），就是 Temporal 自己的上限。不压缩的请求，grpc-go 读到 5 字节的长度前缀就拒绝；SDK 发的是 gzip 请求，grpc-go 读完最多 4 MiB 的压缩数据、解压到 4 MiB 加 1 字节就停下拒绝，每条最多占约 8 MiB。返回的仍是 ResourceExhausted，SDK 照旧把工作流任务记成 GRPC_MESSAGE_TOO_LARGE，Temporal 以 `GrpcMessageTooLarge` 终止这个任务，Worker 照常运行，跟以前由 Temporal 拒绝时一样；agentd 记一行 `runtime call refused`。
+- **不带任务结果的方法，请求最多 64 KiB**：除了 `RespondWorkflowTaskCompleted`、`RespondWorkflowTaskFailed`、`RespondQueryTaskCompleted`，其余都是轮询、心跳、取历史这类请求，SDK 发的都在 0.5 KB 以内。取历史的请求里带着 Temporal 自己给的 `next_page_token`：经 Runtime 入口把 302 个事件的历史每页 5 个翻完（61 页），令牌最长 310 字节（黑盒测试 `test_a_long_history_pages_through_the_runtime_entry` 每次都这样翻一遍）。
+- **解码之前先数值**：在线路格式上数字段值，嵌套消息和 packed 列表的每个元素都算，超过 5 万个就拒绝，嵌套超过 100 层也拒绝。解码的开销跟值的个数成正比，跟字节数关系不大：一个空心跳在线路上 2 字节，解码后约 350 字节。正常的请求只有几百个值。
+- 这三种超限的拒绝都用 grpc 自己的措辞（`grpc: received message larger than max (...)`）。SDK（sdk-core 的 `retry.rs`）只认这几个开头：认出来就把工作流任务记成 GRPC_MESSAGE_TOO_LARGE、任务结束；认不出来就当成可重试的错误，工作流任务一次次超时，永远停在那里（评审发现；`tests/test_runtime_limits.py` 的值超限用例在改措辞前就是这样超时的）。
+- **每个连接最多 32 个同时的调用**（`SETTINGS_MAX_CONCURRENT_STREAMS`），多出来的流被 REFUSED_STREAM 拒绝；正常的 HTTP/2 客户端会自己排队。
+- **最多 4 个连接**，多的留在内核的 accept 队列里，不占 agentd 的内存和文件描述符；满了记一行日志（每分钟最多一行）。5 分钟没有调用的连接会被关掉：活着的 Worker 总有一个轮询开着，所以只有没人用的连接会让出位置。
+- **同一时间只有 4 个请求在读、检查和转发**（所有连接合计）。等着的调用只占它的流窗口：流窗口固定为 64 KiB，关掉了 grpc-go 的动态窗口。正在读的消息会按自己的大小开窗口，所以不变慢。
+- **交给 Temporal 而 Temporal 还没回答的请求合计最多 16 MiB**。请求交给 agentd 到 Temporal 的连接以后，Temporal 读走以前一直在 agentd 里；Temporal 慢下来时，这些请求以前可以一直攒下去（评审发现）。现在一个请求要在自己的名额里等到这 16 MiB 里有它的份，Temporal 回答（发出响应头）时还回来，所以 Temporal 跟不上时请求留在 Worker 那边。长轮询要等 Temporal 回答才还，所以轮询请求才限在 64 KiB。
+- **头最多 16 KiB。**
+- **一个调用只能带一条请求**：以前第二条请求不经检查就转给了 Temporal（Temporal 只用第一条）。
+- **慢的 Worker 会被断开**：30 秒还没发完一条请求、或者发完了却不结束自己那一半调用，agentd 断开它的连接（它的调用跟着结束，占的内存释放）；30 秒还没开始 HTTP/2 的连接也断开。
+- **响应**：agentd 跟着每个连接两个方向的 HTTP/2 帧，记每个调用的响应还有多少没写出去：响应的大小是它第一个 DATA 帧开头的 gRPC 长度前缀，写出 trailers 就算完，任何一方重置这个流就算作废（grpc-go 不会再写它剩下的部分）。所以知道 Worker 还有多少响应没读。起初只按连接数“交出去的减去写出去的”，对抗评审第二轮发现：守规矩的 Worker 因为调用超时取消一个读到一半的大响应，剩下的部分会一直算没读，连接 30 秒后就被断开；现在取消的调用不再算。只剩一个窄缝：流在响应的头 5 个字节写出去之前就被重置，这个响应还算没读，只有给调用的窗口是 0 再重置它的 Worker 才做得到，代价是它自己的连接。没读的超过 8 MiB 时，这个连接的下一个响应先留在 Temporal（agentd 只收一个流窗口），等 Worker 读；有响应在等、Worker 又 30 秒不读，就断开连接，记一行日志。没有响应在等时不断开：没读的那些已经有上限（8 MiB 加一个响应）。每个连接一次只从 Temporal 收一个响应，所有连接合计同时最多收两个（收的时候 agentd 里约有这个响应的三份拷贝）；Worker 读完了前面的，这个响应才去排这两个名额，所以不读响应的 Worker 占不住它们。起初是所有连接合计一次一个，两个评审都指出这会让一个 Worker 的大响应卡住所有 Worker（Temporal 不在本机、或者先发响应头时尤其严重）；改成每个连接一个以后，自动安全审查又指出 4 个连接能同时各收一个 128 MiB 的响应，所以加了合计两个的上限。实测 Temporal 把响应头和响应一起发（空的长轮询头和消息都在 56 秒后才到），所以长轮询等的时候不占名额。这个前提没有专门的测试：要是哪天 Temporal 先发头，等着的长轮询会挡住同一个连接上的其他响应，每次最多约 60 秒。为了按字节数得准，发给 Worker 的响应不再压缩（以前 Worker 发 gzip 的请求，响应也是 gzip）。
+- 连 Temporal 的后端连接同样用固定的 64 KiB 流窗口（agentd 读一个响应时，grpc-go 会按这个响应的大小给它开窗口，所以单个大响应不受它限），连接窗口是 16 MiB：grpc-go 收到数据就补连接窗口，不管读没读，所以它不占内存；评审实测连接窗口也是 64 KiB 时，离 Temporal 10 ms 的 45 MiB 历史要 8 秒，改成 16 MiB 后约 0.1 秒。请求上限 4 MiB，响应上限仍是 128 MiB（大的历史在响应里）。
+- 被拒绝的调用：每一类（方法、命令、哪条规则拒的，不含 Worker 填的值；这个 API 版本不认识的命令类型都算同一类，否则 Worker 能编出无数类，每类都记全文，这是又一次自动安全审查指出的）每小时第一次照记全文，最多 256 类，一阵刷屏盖不住另一类尝试；其余所有连接合计每秒最多记一行（先放过 20 行），没记的最迟一分钟内记一个数；所以同一类的后续尝试只留下次数，不留各自的目标（比如给哪个工作流发信号），这些调用照样都被拒绝。方法名最多记 128 字节，原因最多 300 字节（原因里会引用 Worker 发的值，最长 4 MiB）。以前一个 Worker 能以每秒约 60 MB 的速度写满日志（评审实测）；按连接限速会被重连绕过，只在连接关闭时记数又会让人看不到正在发生的事（自动安全审查）。
+
+改之后，同样的场景：
+
+| 场景 | agentd 常驻内存 |
+| --- | --- |
+| 声明 100 MiB 的请求（留着不发或者发完） | 读到长度前缀就拒绝，内存不变 |
+| 4 个连接 × 64 个流 × 4 MiB，留最后一个字节 | +22 MiB：每个连接后 32 个流被拒绝，4 个请求读完，其余每个最多 64 KiB |
+| 32 个 3.9 MiB 的 START_TIMER 请求 | 峰值 +115 MiB，全部在解码前被拒绝 |
+| 4 个 4 MB 的空心跳请求 | +81 MiB（Linux 1 个 +27 MiB），全部被拒绝（现在先撞上 64 KiB） |
+| 128 个 3.8 MiB 的请求，Temporal 在建好连接后停住（SIGSTOP） | 峰值 182 MiB；第一轮修改后的代码是 776 MiB，请求全攒在去 Temporal 的连接里 |
+| 200 个连接 | 4 个被服务，其余留在内核队列（满了以后连接超时），agentd 共 21 个文件描述符 |
+| 8 MiB 的头 | 连接被重置 |
+| 45 MB 的历史页，4 个连接 × 8 个流，从不读 | 峰值 424 MiB，之后 243 MiB（每个连接排着一个响应），30 秒后 4 个连接都被断开（Linux 1 个连接 +133 MiB） |
+
+最坏情况有了上限，不再随 Worker 开的流和连接增长：请求一侧是 4 个正在读的请求（每个 4 MiB 的几份拷贝，加上解码：5 万个值，最大的结构约 350 字节一个），约 110 MB，加上交给 Temporal 还没回答的 16 MiB，和等着的流（每个最多 64 KiB 窗口加 16 KiB 的头，4 个连接 × 32 个流约 10 MB）；响应一侧每个连接是 8 MiB 加一个排着的响应，其中最多两个连接正在收（收的时候约有三份拷贝）。响应按最大的 128 MiB 算，合计约 1.2 GB；按 Temporal 默认 50 MB 的历史上限算，约 0.55 GB。Go 的垃圾回收还会让常驻内存高出这些活的数据。
+
+`internal/runtimeproxy/limits_test.go` 用一个假的 Temporal 和上面那种手写 HTTP/2 帧的客户端逐条测试，第一轮改之前 7 个失败（超大请求、值太多、流数、连接数、同时读的请求数、头、第二条请求），评审后加的 12 个在改之前也都失败（短调用的上限、拒绝的措辞、Temporal 没回答时请求要等、Worker 不读时不挡别人的请求和响应、一个连接的慢响应不挡别的连接、同时收的响应数、空闲连接被关、一阵拒绝盖不住另一类也写不满日志、后端连接的窗口、取消一个读到一半的响应不丢连接、两个方向的流记账）；另有响应记账、两种超时、固定窗口、gzip 客户端、帧计数和数值的测试。最后对现在的代码逐条改坏全部机制（36 处变异，比如去掉某个选项、把请求上限改回 128 MiB、不再强制不压缩、所有连接共用一个收响应的名额、先占收响应的名额再等 Worker 读、不理 Worker 的重置），对应的测试都失败。黑盒测试时发现 SDK 的请求是 gzip 压缩的（agentd 的拒绝写的是 `received message after decompression larger than max`，SDK 照样认作 GRPC_MESSAGE_TOO_LARGE）。响应若照旧跟着压缩，写到 socket 上的字节会远少于从 Temporal 收的字节，记账就会把 Worker 当成不读响应，所以有了上面的不压缩和 gzip 客户端的测试。`tests/test_runtime_limits.py` 有两个黑盒用例：完成请求超过 4 MiB（三个 1.5 MiB 的网关调用），和值超过 5 万（一次排 5000 个网关调用）；两者都由 agentd 拒绝、Temporal 以 `GrpcMessageTooLarge` 结束任务、Worker 照常运行。
+
+推送前有两个独立的评审代理（安全、对抗）各自在副本里做实验。都没发现绕过请求检查的路，也都确认了记账只会往多算、内存有上限。安全评审的三个中等问题（交给 Temporal 的请求能攒到 512 MiB、4 个空闲连接能把别的 Worker 永远挡在外面、后端连接窗口太小）和几个小问题（值超限的拒绝 SDK 认不出、日志能被刷满、计时器边界、说明里言过其实的地方），对抗评审的中等问题（所有连接共用一个收响应的名额）和文档问题（gzip 请求并不是读到长度前缀就停）都按上面改了，各有测试。之后提交上的自动安全审查又指出两处（拒绝日志限速后，一阵刷屏能藏住别的尝试；每个连接各收一个响应时，4 个连接同时收的内存比原来多），也按上面改了。两个评审代理又复审了改动：安全评审逐条用实验确认修好，另提了取历史的令牌会不会超过 64 KiB（实测最长 310 字节，加了翻页的黑盒测试）；对抗评审确认没有泄漏、重复释放或死锁（约 3900 次随机取消的压力测试），另发现取消读到一半的响应会断开连接，改成了按流记账。最后一轮两个评审都没有新的问题：安全评审用 736 轮“收下响应再重置”的攻击确认按流记账压不到实际以下（常驻内存稳定在约 276 MiB，没有连接被断开），对抗评审试了快速开流再重置、2000 个被拒的流、窗口为 0 再重置，记账都只会往多算，流表也有上限。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
@@ -161,7 +220,7 @@ PR #11 的对抗评审指出过：开发配置把数据目录放在仓库里（`
 - Runtime 代理不限制 `GetWorkflowExecutionHistory` 读哪个工作流，同一命名空间里任何工作流的历史，Worker 都能读到。M1 只有一种任务，所有 Worker 同样不可信，问题不大。以后有可信的工作流，或者按租户分 Worker 时，要么给沙箱 Worker 单独一个命名空间，要么让代理只放行分给这个 Worker 的工作流。
 - `Scope` 只约束列出来的参数名。如果工具还接受别的能指定目标的参数（比如 `head_repo`），就能绕过去。M3 接真实工具时，参数要按 schema 校验，未知参数一律拒绝。
 - Linux 沙箱里还有不记在任何进程名下的内存，OOM killer 挑不中 Worker：memfd、SysV 共享内存和消息队列（沙箱里能改 `kernel.msgmnb` 这些 IPC 参数，以前就是这样），以及管道和 Unix socket 的缓冲区。实测在改好的沙箱里 memfd 和 SysV 共享内存各占 128 MiB，宿主机的 Shmem 多了 256 MiB，进程自己的常驻内存只有 10 MB；评审实测 3000 个管道占 83 MiB，200 对 socket 占 91 MiB。匿名内存分散到很多小进程时也一样（见上）。进程数只受这个用户的 `ulimit -u` 限制，和 agentd、Temporal 共用：Worker 把它用光，它们的 Go 运行时建不了线程就会退出。这些都要靠 cgroup v2（`memory.max`、`memory.swap.max`、`pids.max`；评审实测上面这些内存都记在 memcg 上）或者 seccomp，M5 定稿沙箱时一起做。`/dev/pts` 还能占宿主机共用的伪终端。macOS 的 Worker 沙箱则不限私有目录的大小，能写满磁盘。
-- Runtime 代理每条请求最多收 128 MiB，并发流数不限（grpc-go 的默认值），转发前还要把整条请求读进内存检查。被攻破的 Worker 开很多流，就能让 agentd 自己占满内存，OOM killer 杀的就是 agentd。可以加 `grpc.MaxConcurrentStreams`、按方法收紧大小上限、限每个 Worker 的连接数（看代码得出，没实测）。
+- Runtime 代理的资源上限（见上面那节）之后还剩下的：被攻破的 Worker（macOS 上本机任何进程）开着调用占住 4 个连接，就能把同一个 agentd 的其他 Worker 挡在外面，空闲的连接 5 分钟后才会让出来，要按 Worker 分开入口（Linux 上每个 Worker 一个 socket，macOS 上启动时给一个凭据）才能解决；它占着 4 个请求名额，每轮最多 30 秒，也能让其他 Worker 的工作流任务（10 秒超时）超时，但弄不垮 agentd。Worker 并发读大历史时，生成和排队响应的内存记在 Temporal 名下（实测 32 个 45 MB 的历史请求让 Temporal 从 470 MiB 涨到 2.7 GB，改之前是 2.1 GB，另加 agentd 自己的 2 GB），要再收紧得按连接限制会带回历史的调用，或者让 `GetWorkflowExecutionHistory` 只能读分给这个 Worker 的工作流。响应的头 5 个字节还没写出去、Worker 就重置了这个流时（只有给调用的窗口是 0 才会这样），这个响应一直算没读，攒过 8 MiB 后，下一个响应等 30 秒，这个连接被断开，重连后重新计数。交给 Temporal 还没回答的 16 MiB 是所有 Worker 共用的：一个 Worker 用快到 64 KiB 的长轮询能占住其中约 8 MiB。Temporal 进程卡住而连接还在时（比如被 SIGSTOP），请求名额会都等在这 16 MiB 上，代理停顿，直到后端连接的 keepalive（30 秒加 15 秒）断开卡住的连接；内存仍有上限。另外可以给 agentd 设 `GOMEMLIMIT`，让常驻内存贴近上面的上限；Linux 上把沙箱里 Worker 的 `oom_score_adj` 调高、agentd 的调低，内存真不够时 OOM killer 先杀 Worker，它的连接一断，agentd 为它占的内存也就放了。
 - Worker 启动脚本只在启动时检查一次代码目录和 Python 环境。之后才出现在里面的 socket 或数据目录，比如后起的、数据目录放在里面的 agentd，正在跑的 Worker 照样看得到。M5 改由 agentd 拉起 Worker 时，可以在源头比较代码目录和自己的数据目录、socket。
 - macOS 的 Worker 沙箱按黑名单拦读，家目录以外默认都能读。数据目录和镜像的真实路径不在家目录里时，得列进 `AGENTOS_SANDBOX_DENY_READ`，启动脚本不知道它们在哪：第二套开发环境的数据目录、`~/.agentos` 里指向家目录外的镜像都是这样（评审实测读到了；`~/.agentos` 本身不用列，启动脚本总会拒读它的真实路径，但它只在启动时解析：那时还悬空的符号链接，指向的地方之后才建出来，正在跑的 Worker 就读得到）。agentd 给工具服务器算拒读列表时本来就有这些路径（`toolDenyRead`），可以让启动脚本直接用它，不靠手写的环境变量。Linux 按白名单挂载，没有这个问题。
 - 启动脚本只按名字认开发数据，改了名的副本、硬链接和压缩包都认不出来（评审实测过硬链接和改名的副本）。代码目录给得太大，里面别的东西照样被 Worker 看到：镜像、`.git/config` 里的凭据、别的 worktree。代码目录应该只放任务代码。README 用的是 `python`；测试要加载 `tests.*` 里的工作流，用的还是仓库根，可以改成每个测试会话把 `python/` 和 `tests/` 复制到一个临时目录交给 Worker。
