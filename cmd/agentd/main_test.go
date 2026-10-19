@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,6 +34,47 @@ func TestToolDenyRead(t *testing.T) {
 	cfg.RuntimeListen = "tcp://127.0.0.1:7233"
 	if slices.Contains(toolDenyRead(cfg), "127.0.0.1:7233") || len(toolDenyRead(cfg)) != len(want)-1 {
 		t.Errorf("a TCP Runtime endpoint: %q", toolDenyRead(cfg))
+	}
+}
+
+// On Linux the launcher mounts all of the call's mirror: whatever else toolDenyRead keeps from the
+// git tool server, a config that makes it a repo's mirror does not load.
+func TestNoMirrorIsWhatToolsMustNotRead(t *testing.T) {
+	dir := t.TempDir()
+	repos := map[string]string{"acme/payments": filepath.Join(dir, "payments"), "acme/ledger": filepath.Join(dir, "ledger")}
+	load := func() (*config.Config, error) {
+		t.Helper()
+		b, err := json.Marshal(map[string]any{ // JSON is YAML
+			"data_dir":       filepath.Join(dir, "data"),
+			"control_socket": filepath.Join(dir, "control", "control.sock"),
+			"runtime_listen": "unix://" + filepath.Join(dir, "runtime", "runtime.sock"),
+			"temporal": map[string]any{"tls": map[string]string{
+				"cert_file": filepath.Join(dir, "tls", "agentd.crt"), "key_file": filepath.Join(dir, "tls", "agentd.key")}},
+			"policy_file": "p", "models_file": "m", "prices_file": "x",
+			"repos": repos,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return config.Load(path)
+	}
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := cfg.Repos["acme/payments"].Mirror
+	for _, p := range toolDenyRead(cfg) {
+		if p == own {
+			continue
+		}
+		repos["acme/payments"] = p
+		if _, err := load(); err == nil {
+			t.Errorf("acme/payments with the mirror %s: loaded", p)
+		}
 	}
 }
 

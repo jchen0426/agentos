@@ -117,9 +117,93 @@ func TestDevConfigsKeepDataOutOfTheRepository(t *testing.T) {
 	}
 }
 
-func within(path, dir string) bool {
-	rel, err := filepath.Rel(dir, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+// On Linux the git tool server's launcher mounts all of a call's mirror, and a read-only mount
+// stops neither reads nor connect(): a mirror around the data directory would hand the server
+// the ledger and the Control socket. So no mirror may hold anything else of agentd's, or another
+// repo's mirror (design doc, section 8), whatever name a config gives it.
+func TestMirrorsHoldNothingElse(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	for _, d := range []string{"home", "real/made"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// link is another name for the mirror real; inner leads into it.
+	for name, target := range map[string]string{"link": "real", "inner": "real/made"} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	load := func(body string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\n"+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path)
+	}
+	// Sockets out of the data directory, where they are by default: then the data directory is
+	// all the mirror holds.
+	const apart = "control_socket: c/control.sock\nruntime_listen: tcp://127.0.0.1:7244\n"
+	// Each refusal names what the mirror holds, as the config gives it.
+	type refusal struct{ body, held string }
+	refused := map[string]refusal{
+		"the data directory":              {"data_dir: m/data\n" + apart + "repos: {a/b: m}\n", "m/data"},
+		"the data directory itself":       {"data_dir: m\n" + apart + "repos: {a/b: m}\n", "m"},
+		"the Control socket's directory":  {"data_dir: d\ncontrol_socket: m/control/control.sock\nrepos: {a/b: m}\n", "m/control"},
+		"the Runtime socket's directory":  {"data_dir: d\nruntime_listen: unix://m/runtime/runtime.sock\nrepos: {a/b: m}\n", "m/runtime"},
+		"the Temporal client certificate": {"data_dir: d\ntemporal: {tls: {cert_file: m/agentd.crt, key_file: agentd.key}}\nrepos: {a/b: m}\n", "m/agentd.crt"},
+		"the Temporal client key":         {"data_dir: d\ntemporal: {tls: {cert_file: agentd.crt, key_file: m/agentd.key}}\nrepos: {a/b: m}\n", "m/agentd.key"},
+		"another repo's mirror":           {"data_dir: d\nrepos: {a/b: m, c/d: m/d}\n", "m/d"},
+		"another repo's mirror, reversed": {"data_dir: d\nrepos: {a/b: m/b, c/d: m}\n", "m/b"},
+		"another repo's mirror, the same": {"data_dir: d\nrepos: {a/b: m, c/d: m}\n", "m"},
+		// All else by default: the data directory is ~/.agentos.
+		"the home directory":                  {"repos: {a/b: \"~/\"}\n", "home/.agentos"},
+		"a mirror through a symlink":          {"data_dir: real/data\n" + apart + "repos: {a/b: link}\n", "real/data"},
+		"a mirror not made yet":               {"data_dir: real/later/data\n" + apart + "repos: {a/b: link/later}\n", "real/later/data"},
+		"a data directory through a symlink":  {"data_dir: inner\n" + apart + "repos: {a/b: real}\n", "inner"},
+		"a data directory not made yet":       {"data_dir: inner/data\n" + apart + "repos: {a/b: real}\n", "inner/data"},
+		"a Runtime directory not made yet":    {"data_dir: d\nruntime_listen: unix://inner/runtime/runtime.sock\nrepos: {a/b: real}\n", "inner/runtime"},
+		"a socket's directory through a link": {"data_dir: d\ncontrol_socket: link/control.sock\nrepos: {a/b: real}\n", "link"},
+	}
+	// Another name for the same directory, which only the file system knows: on macOS, a
+	// firmlink, or another case. (On Linux a bind mount, which a test cannot make.)
+	real, err := filepath.EvalSymlinks(filepath.Join(dir, "real"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	realInfo, err := os.Stat(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, alias := range map[string]string{"firmlink": "/System/Volumes/Data" + real, "case": strings.ToUpper(real)} {
+		if a, err := os.Stat(alias); err != nil || !os.SameFile(a, realInfo) {
+			t.Logf("%s: %s has no such name here", name, real)
+			continue
+		}
+		if err := os.Symlink(filepath.Join(alias, "made"), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+		refused["the mirror by another name: "+name] = refusal{"data_dir: real/data\n" + apart + "repos: {a/b: \"" + alias + "\"}\n", "real/data"}
+		// The symlink leads into the mirror by the other name: where the data directory will be
+		// is known only from the real path.
+		refused["a symlink into the mirror by another name: "+name] = refusal{"data_dir: " + name + "/data\n" + apart + "repos: {a/b: real}\n", name + "/data"}
+	}
+	for name, c := range refused {
+		if _, err := load(c.body); err == nil || !strings.Contains(err.Error(), filepath.Join(dir, c.held)) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	for name, body := range map[string]string{
+		"a mirror in the data directory": "data_dir: d\nrepos: {a/b: d/mirror}\n", // the dev configs' layout
+		"names that share a prefix":      "data_dir: m-data\ncontrol_socket: m-control/control.sock\nrepos: {a/b: m, c/d: m2}\n",
+	} {
+		if _, err := load(body); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
 }
 
 func TestPathsInTheHomeDirectory(t *testing.T) {

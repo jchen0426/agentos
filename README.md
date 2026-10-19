@@ -49,7 +49,10 @@ Go 1.26, Python 3.12 with [uv](https://docs.astral.sh/uv/), the Temporal CLI
 empty tree, `GIT_ATTR_SOURCE`). For the macOS sandbox: Node 22 (`npm ci` in
 `sandbox/macos`). For the Linux sandbox: bubblewrap 0.8 or later and socat, or the Lima VM
 (`brew install lima`, then `make vm`). Mirrors must belong to the user agentd runs as: git
-runs without the global configuration, so `safe.directory` does not apply.
+runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
+mirror that holds its data directory, either socket's directory, the Temporal client certificate
+or key, or another repo's mirror: on Linux the git tool server's sandbox mounts all of the call's
+mirror.
 
 ## Run it by hand
 

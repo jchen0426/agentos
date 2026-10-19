@@ -428,7 +428,9 @@ func gitServer(cfg *config.Config, insecureDev bool, log *slog.Logger) (*gitmcp.
 
 // toolDenyRead is what the git tool server must not read, whatever its launcher allows:
 // agentd's data, its control socket and Runtime socket, the Temporal client certificate and
-// key, and every mirror (the launcher lets the server read the call's own).
+// key, and every mirror (the launcher lets the server read the call's own). config.Load
+// refuses a mirror that holds any of the rest: the Linux launcher mounts all of the call's
+// mirror.
 func toolDenyRead(cfg *config.Config) []string {
 	deny := []string{cfg.DataDir, filepath.Dir(cfg.ControlSocket)}
 	if p, ok := strings.CutPrefix(cfg.RuntimeListen, "unix://"); ok {

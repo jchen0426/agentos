@@ -5,10 +5,12 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -212,6 +214,9 @@ func Load(path string) (*Config, error) {
 	if tildeErr != nil {
 		return nil, fmt.Errorf("config %s: %w", path, tildeErr)
 	}
+	if err := c.checkMirrors(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
 	if c.GitTools.Timeout <= 0 {
 		c.GitTools.Timeout = time.Minute
 	}
@@ -246,6 +251,79 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	return &c, nil
+}
+
+// checkMirrors refuses a mirror that holds anything else the git tool server must not read,
+// whatever name the config gives either: agentd's data directory, its sockets' directories, the
+// Temporal client certificate and key (what agentd's toolDenyRead denies), or another repo's
+// mirror. On Linux the server's launcher mounts all of the call's mirror, and a read-only mount
+// stops neither reads nor connect(); the server reads no keys, ledger or other mirrors (design
+// doc, section 8). A mirror may be inside one of them: the dev configs keep theirs in the data
+// directory.
+func (c *Config) checkMirrors() error {
+	type named struct{ repo, what, path string } // repo: whose mirror it is
+	paths := []named{{"", "the data directory", c.DataDir}, {"", "the Control socket's directory", filepath.Dir(c.ControlSocket)}}
+	if p, ok := strings.CutPrefix(c.RuntimeListen, "unix://"); ok {
+		paths = append(paths, named{"", "the Runtime socket's directory", filepath.Dir(p)})
+	}
+	if t := c.Temporal.TLS; t != nil {
+		paths = append(paths, named{"", "the Temporal client certificate", t.CertFile}, named{"", "the Temporal client key", t.KeyFile})
+	}
+	ids := slices.Sorted(maps.Keys(c.Repos))
+	for _, id := range ids {
+		paths = append(paths, named{id, "repo " + id + "'s mirror", c.Repos[id].Mirror})
+	}
+	for _, id := range ids {
+		mirror := c.Repos[id].Mirror
+		for _, p := range paths {
+			if p.repo != id && p.path != "" && holds(mirror, p.path) {
+				return fmt.Errorf("repo %s: the mirror %s holds %s %s, and the git tool server may read all of its mirror",
+					id, mirror, p.what, p.path)
+			}
+		}
+	}
+	return nil
+}
+
+// holds reports whether the directory dir holds path, or is it: by their names, by their real
+// paths, or because one of the directories path is in is dir by another name, which only the
+// file system knows (on macOS a firmlink or another case, on Linux a bind mount of dir).
+func holds(dir, path string) bool {
+	real := resolve(path)
+	if within(path, dir) || within(real, resolve(dir)) {
+		return true
+	}
+	d, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	for p := real; ; p = filepath.Dir(p) {
+		if fi, err := os.Stat(p); err == nil && os.SameFile(fi, d) {
+			return true
+		}
+		if p == filepath.Dir(p) {
+			return false
+		}
+	}
+}
+
+// resolve is path with its symlinks resolved as far as it exists: what does not exist yet will
+// be made where the part that does leads.
+func resolve(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	return filepath.Join(resolve(parent), filepath.Base(path))
+}
+
+// within reports whether path is dir or inside it, by their names.
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // Mirrors maps each logical repo id to its read-only mirror.
