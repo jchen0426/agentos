@@ -17,12 +17,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite" // database/sql driver "sqlite"
 
 	"github.com/jchen0426/agentos/internal/ledger/db"
 )
 
+// Never change a migration a ledger may have applied, not even a comment: agentd records each
+// file's sha256 and refuses a ledger that applied a different file (migrate.go). Add another.
+//
 //go:embed migrations/*.sql
 var migrations embed.FS
 
@@ -75,18 +77,9 @@ func open(ctx context.Context, path string, fsys fs.FS) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
-	provider, err := goose.NewProvider(goose.DialectSQLite3, sqlDB, fsys)
-	if err != nil {
+	if err := migrate(ctx, sqlDB, path, fsys); err != nil {
 		sqlDB.Close()
 		return nil, err
-	}
-	if err := checkMigrations(ctx, sqlDB, path, fsys, provider.ListSources()); err != nil {
-		sqlDB.Close()
-		return nil, err
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("migrate ledger: %w", err)
 	}
 	return &Ledger{DB: sqlDB, Q: db.New(sqlDB)}, nil
 }

@@ -66,15 +66,19 @@ directory that holds one). All checkouts share `~/.agentos`: run one dev stack a
 another a config with a `data_dir` of its own, also under the home directory. agentd refuses a
 ledger another branch's agentd has migrated: one with migrations this agentd does not have, or
 another file under one of its migration numbers. A migration edited after the ledger applied it
-counts as another file, so leave applied migrations as they are. Run the agentd that migrated
-the ledger, or start a fresh development ledger and keep the old one, with its WAL, aside:
+counts as another file, so leave applied migrations as they are. agentd also refuses a new
+migration it cannot tell from its own: one an agentd built before this check applied, such as
+your own branch's before it merged main (and such an agentd checks nothing). Run the agentd
+that migrated the ledger, or stop agentd, start a fresh development ledger and keep the old
+one, with its WAL, aside where no Worker can read it:
 
 ```bash
 d=~/.agentos/old-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv ~/.agentos/ledger.db* "$d"/
 ```
 
-Runs recorded in the old ledger cannot continue. For a clean slate, stop the dev server and move
-`~/.agentos/temporal.db*` there too.
+Runs recorded in the old ledger cannot continue. If any wrote to GitHub, first settle what
+`bin/agentctl reconcile list` shows, with the agentd that migrated the ledger. For a clean slate,
+stop the dev server and move `~/.agentos/temporal.db*` there too.
 
 In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under
