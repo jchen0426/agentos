@@ -63,13 +63,17 @@ FIXTURE_COMMIT = "01f7b30c0dd024bac65d30d17395693903c759ed"
 # How agentd launches the git tool server in each sandbox mode.
 TOOL_LAUNCHER = {"srt": REPO / "sandbox/macos/run-tool.sh", "bwrap": REPO / "sandbox/linux/run-tool.sh"}
 
-# AGENTOS_MODEL=claude sends the model task to Claude: the real prompt, schema, fallback and
-# prices, with the key from the keychain. It costs money; the tests that make sense with a
-# real model are T1's, which check that crashes never repeat or lose a model call.
+# AGENTOS_MODEL=claude, openai or local sends the model task to a real model: Claude, OpenAI's
+# gpt-6.1-sol, or gpt-oss:20b on the Ollama server on this machine (README), with the real
+# prompt, schema and prices, and the key from the keychain. Claude and OpenAI cost money; the
+# tests that make sense with a real model are T1's, which check that crashes never repeat or
+# lose a model call.
 MODEL = os.environ.get("AGENTOS_MODEL", "fake")
 REAL_MODEL = MODEL != "fake"
-# How long a model call may take: a real one thinks for a while.
-MODEL_TIMEOUT = 240 if REAL_MODEL else 30
+# How long a model call may take: a real one thinks for a while, one on this machine longer.
+MODEL_TIMEOUT = {"fake": 30, "local": 480}.get(MODEL, 240)
+if MODEL in ("openai", "local"):
+    TEST_POLICY = TEST_POLICY.replace("allowed_providers: [fake, anthropic]", f"allowed_providers: [fake, anthropic, {MODEL}]")
 
 if MODEL == "fake":
     TEST_MODELS = f"""
@@ -93,6 +97,47 @@ tasks:
     output_schema: {AUDIT_SCHEMA}
     blobs: [patch]
     fallback: [anthropic/claude-opus-4-8]
+"""
+elif MODEL == "openai":
+    # As config/models.yaml's openai provider, with max_tokens 8000: a request that runs to the
+    # limit costs about $0.08 at gpt-6.1-sol's prices, so a T1 run stays well under $1.
+    TEST_MODELS = f"""
+providers:
+  openai:
+    adapter: openai_compat
+    api: responses
+    base_url: "https://api.openai.com/v1"
+    key: "keyring:agentos-openai-api-key"
+    requests_per_minute: 20
+    efforts: [low, medium, high, xhigh, max]
+tasks:
+  audit_v1:
+    model: openai/gpt-6.1-sol
+    max_tokens: 8000
+    effort: high
+    prompt: {REPO / "config/prompts/audit_v1/claude.md"}
+    output_schema: {AUDIT_SCHEMA}
+    blobs: [patch]
+"""
+elif MODEL == "local":
+    # As config/models.yaml's local provider: free, and its window must be the server's
+    # (OLLAMA_CONTEXT_LENGTH). Effort medium leaves gpt-oss's reasoning room in max_tokens.
+    TEST_MODELS = f"""
+providers:
+  local:
+    adapter: openai_compat
+    api: chat
+    base_url: "http://127.0.0.1:11434/v1"
+    context_tokens: 65536
+    efforts: [low, medium, high]
+tasks:
+  audit_v1:
+    model: local/gpt-oss:20b
+    max_tokens: 8000
+    effort: medium
+    prompt: {REPO / "config/prompts/audit_v1/claude.md"}
+    output_schema: {AUDIT_SCHEMA}
+    blobs: [patch]
 """
 else:
     raise ValueError(f"unknown AGENTOS_MODEL {MODEL!r}")

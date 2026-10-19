@@ -170,15 +170,19 @@ make test-linux  # in the Lima VM, Workers under bubblewrap
 
 `tests/test_temporal_mtls.py` also needs the full Temporal server: `make temporal-server`.
 
-T1 on Claude instead of the fake model (it costs money, a few cents a run; the Worker runs
-under its sandbox because agentd holds a real key), and a free check of the key:
+T1 on a real model instead of the fake one: `AGENTOS_MODEL=claude`, `openai` (gpt-6.1-sol) or
+`local` (gpt-oss:20b on the Ollama server above, which is free). Claude and OpenAI cost money,
+a few cents a run; the Worker runs under its sandbox because agentd holds a real key. Check the
+key, or the Ollama server, first: `-run LiveCountTokens` for Claude, `LiveOpenAI` (a token
+count, at most a fraction of a cent) or `LiveOllama` (its version, the model, and the window it
+runs with).
 
 ```bash
-AGENTOS_MODEL=claude AGENTOS_SANDBOX=srt uv run pytest tests/test_t1_worker_crash.py tests/test_t1_agentd_crash.py
+AGENTOS_LIVE=1 go test ./internal/models -run LiveOpenAI -v
 ```
 
 ```bash
-AGENTOS_LIVE=1 go test ./internal/models -run Live
+AGENTOS_MODEL=openai AGENTOS_SANDBOX=srt uv run pytest tests/test_t1_worker_crash.py tests/test_t1_agentd_crash.py
 ```
 
 T2 once against a real test repository (design doc, section 11), with the fake model. The
