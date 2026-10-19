@@ -39,8 +39,10 @@ type Client struct {
 
 // Options configure a Client.
 type Options struct {
-	Server  string   // the agentos-mcp-git binary
-	Sandbox []string // the launcher and its leading arguments: run-tool.sh; empty runs unsandboxed
+	Server string // the agentos-mcp-git binary
+	// Sandbox is the launcher and its leading arguments: run-tool.sh; empty runs unsandboxed. A
+	// launcher sets the hard CPU time limit above the soft one (see cpuLimited).
+	Sandbox []string
 	// DenyRead lists paths the launcher keeps out of reach on top of its own rules (agentd's
 	// data directory, the other mirrors), passed as AGENTOS_SANDBOX_DENY_READ, a JSON array:
 	// any character may be in a path.
