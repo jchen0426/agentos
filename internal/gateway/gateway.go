@@ -203,10 +203,14 @@ func (g *Gateway) awaitRunID(ctx context.Context, workflowID, runID string) (db.
 	if wait <= 0 {
 		wait = defaultRunIDWait
 	}
-	var remaining time.Duration // none for a run that is gone or unreadable: LookupRun answers
+	// None for a run that is gone or unreadable (LookupRun answers), or recorded after now on the
+	// wall clock, which was set back since: how long it has been starting is unknown.
+	var remaining time.Duration
 	if r, err := g.Ledger.Q.GetRun(ctx, workflowID); err == nil {
 		if created, err := time.Parse(time.RFC3339Nano, r.CreatedAt); err == nil {
-			remaining = min(wait, time.Until(created.Add(wait)))
+			if starting := time.Since(created); starting >= 0 {
+				remaining = wait - starting
+			}
 		}
 	}
 	// From here on this process's monotonic clock: setting the wall clock back stretches nothing.

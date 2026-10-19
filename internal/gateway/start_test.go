@@ -195,6 +195,23 @@ func TestInvokeWaitsNoLongerForARunStartingSinceLongAgo(t *testing.T) {
 	}
 }
 
+func TestInvokeWaitsNotForARunRecordedAfterNowOnTheWallClock(t *testing.T) {
+	t.Parallel()
+	// The wall clock was set back since StartRun recorded the run: how long the run has been
+	// starting is unknown, and every attempt waiting the full bound would be the per-attempt
+	// wait again.
+	g, _ := startingRun(t, time.Now().Add(time.Hour))
+	start := time.Now()
+
+	_, err := invoke(g, noSuchTool)
+	if !stillStarting(err) {
+		t.Fatalf("got %v, want a retryable %q", err, ledger.ErrRunStarting)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("refused after %v: the attempt waited", waited)
+	}
+}
+
 func TestInvokeHeartbeatsWhileItWaits(t *testing.T) {
 	t.Parallel()
 	g, l := startingRun(t, time.Now())
