@@ -123,6 +123,37 @@ M3b 给工具服务器补探针时发现，bwrap 自己建的根目录是可写�
 - `-v` 只管单个进程。Worker 可以 fork 出很多个小进程，每个都比 agentd 小，内存用光时 OOM killer 照样先杀 agentd（评审实测过）。Worker 的地址空间还随 CPU 数增长：glibc 给 SDK 的线程各分一个 malloc arena，4 核时 SDK 运行时约 0.4 GB，设 `MALLOC_ARENA_MAX=1` 只有 0.09 GB。整套测试里 Worker 的地址空间最高 0.78 GB，常驻内存最高 74 MB。
 - `-f` 也管 Worker 的 stdout/stderr。它们常常重定向到普通的日志文件，日志一过上限（或者追加到本来就超过上限的日志），Worker 就被 SIGXFSZ 杀掉。反过来，这个输出是 Worker 唯一能无限写的东西，能写满日志所在的磁盘，该交给管道或 journald，由读的一方限住，不要直接指向普通文件。
 
+## Worker 看得到的目录里不能有 agentd 的数据（2026-10-19）
+
+PR #11 的对抗评审指出过：开发配置把数据目录放在仓库里（`.agentos`），启动脚本把代码目录整个交给 Worker，测试给的代码目录又是仓库根。这次在两个平台上复现了。agentd 用 `config/dev/agentd.yaml` 起，Temporal 开发服务器照 README 把数据库放在 `.agentos/temporal.db`，再像测试那样以仓库根为代码目录起沙箱，里面的探针：
+
+- Linux（bwrap）：用 SQLite 打开了账本（12 张表），在 `ledger.db-wal` 和 `temporal.db` 里都找到了运维者刚起的 run ID，镜像也读得到。它还连上了 Control socket（只读挂载挡不住 `connect()`）：`ListRuns` 列出了那个 run，`ExtendBudget` 把它的预算从 1000 改成 1001 微美元，运维者随后看到的也是 1001。换成 `agentd-claude.yaml`，同一个 Control 接口就能给花真钱的任务加预算、起任务、取消任务、了结核对。虚拟机里没有存 key 的 Secret Service，这个配置在 Linux 上起不来，所以只用假模型演示；两份配置的数据目录是同一行。
+- macOS（srt）：账本、Temporal 数据库和镜像同样读得到。两份配置都试了，`agentd-claude.yaml` 只起 agentd，不起任务。Control socket 连不上：srt 不放行任何按路径的 Unix socket 连接，`socket()` 和 `socketpair()` 能用，`connect()` 得到 EPERM。
+
+改动：
+
+- 两个 Worker 启动脚本启动前检查 Python 环境目录和代码目录，里面有开发数据就拒绝：`ledger.db*`（agentd 的账本，连同它的 WAL 和改名的备份；M3a 加锁文件之前的旧数据目录也有它）、`.agentos` 目录、`temporal.db*`（Temporal 开发服务器的数据库）。FIFO 也拒绝：Linux 上只读挂载挡不住往里写，macOS 上沙箱虽然写不进去，却能从里面读。Linux 上还拒绝 Unix socket，只读挂载挡不住 `connect()`，别的 agentd 的 Control socket、ssh-agent、Docker 的都是出路。macOS 不查 socket：srt 一个都不让连，查了反而会误伤 git fsmonitor 放在 `.git` 里的 socket。用 `find -H`，给的目录本身是符号链接时查它指向的地方，bwrap 挂的也是那里。扫描时有目录被删（比如同一个 worktree 里正在 `npm ci`），`find` 会报错，所以最多试三次，还不行才拒绝。扫一个 worktree，虚拟机里约 0.08 秒，Mac 上 0.03 秒；从主 checkout 跑测试时，里面还有别的 worktree，约 2.6 万个文件，虚拟机经 virtiofs 每次约 0.7 秒。
+- Linux 启动脚本原先检查 Runtime socket 的目录时，`find` 不带 `-H`：目录本身是符号链接时一项都看不到，bwrap 却把它指向的整个目录挂到 `/run/agentos`，账本和 Control socket 一起进了沙箱（评审实测）。现在也带 `-H`。
+- macOS 启动脚本把每个拒读路径连同它的真实路径一起交给 srt，总是拒读 `~/.agentos` 的真实路径，家目录也不只看 `$HOME`，用户数据库里的那个一样拒读（`run-tool.sh` 本来就这样）：`HOME` 指向别处或是相对路径时，原先真正的家目录读得到（评审实测）。Seatbelt 按真实路径匹配，srt 遇到指向别处的符号链接时保留原来的写法，所以原先写成符号链接的拒读条目不起作用，`~/.agentos` 是指向家目录外的符号链接时，里面的数据也读得到（评审实测）。
+- 开发配置不再写 `data_dir`，用默认的 `~/.agentos`，也就是 agentctl 默认找 Control socket 的地方；镜像放在 `~/.agentos/mirror`，README 让 Temporal 的数据库也放进去。macOS 沙箱读不到家目录，Linux 沙箱不挂家目录。为此 agentd 配置里的路径可以用 `~/` 开头。别的 `~` 写法（单独一个 `~`、`~user/`）报错，不再静默地当成配置旁边的目录；取不到家目录、或家目录不是绝对路径，也报错，否则数据目录会相对于 agentd 的当前目录，socket 却在配置旁边。
+- 不写 `data_dir` 是为了旧的 agentd。这次改动之前编译的 agentd 不认识 `~/`，评审用它实测过：配置里写 `data_dir: ~/.agentos`，它会建出 `config/dev/~/.agentos`，账本又回到仓库里，而 `.gitignore` 原先只管根目录的 `.agentos`。不写的话，旧 agentd 也把数据放进 `~/.agentos`，只是找不到镜像。`.gitignore` 现在不论在哪一层，都不提交 `.agentos/`、`ledger.db*`、`temporal.db*`（仓库是公开的）。拉了新代码还是要先 `make build`。
+- README：先建 `~/.agentos`（`mkdir -p -m 700`，Temporal CLI 不会自己建）；agentctl 命令不再带 `--socket`；沙箱 Worker 的代码目录写成 `python`，里面只有任务代码；旧 checkout 自己的 `.agentos` 要挪出仓库；所有 checkout 共用 `~/.agentos`，同一时间只跑一套开发环境。
+
+测试：
+
+- `tests/test_sandbox.py::test_worker_launcher_refuses_agentd_data_in_reach` 起一个真实的 stack，把数据目录放进交给 Worker 的目录，分三种情形：代码目录里有数据目录，Control socket 也在里面；代码目录是指向它的符号链接；Python 环境目录里只有账本，Control socket 在别处，Linux 上必须靠账本认出来。macOS 上这个目录跟家目录一样在拒读列表里，只有交给 Worker 的目录能把它重新放开，原来的漏洞就是这样。改之前三种都失败：探针读到了账本，Linux 上还连上了 socket。只有 macOS 的符号链接那一种例外：srt 不跟随符号链接形式的代码目录，探针跑了起来，但没读到。
+- `test_worker_launcher_refuses_dev_data_by_name`：代码目录里只有 `.agentos/mirror`，或者只有 `temporal.db`。
+- `test_worker_launcher_refuses_a_way_out_in_the_code_dir`：代码目录里有一个在监听的 socket（只在 Linux 上跑），或者一个有人在读的 FIFO。改之前探针连上了 socket，也写进了 FIFO（macOS 上探针跑了起来，但写不进去）。
+- `test_worker_launcher_refuses_a_directory_it_cannot_look_through`：代码目录里有个只能进、不能列的目录（0111），账本在里面。`find` 列不出来，Worker 却能按名字打开它，所以查不完就得拒绝。
+- `test_worker_launcher_refuses_a_runtime_dir_that_holds_more`（只在 Linux 上跑）：Runtime socket 的目录经符号链接给出，里面还有账本。改之前探针在 `/run/agentos` 读到了它。
+- `test_worker_sandbox_denies_data_behind_a_symlink`（只在 macOS 上跑）：`~/.agentos` 是指向别处的符号链接，或者拒读条目写成符号链接，后面的账本都读不到。改之前两种都读到了。
+- `test_worker_sandbox_denies_the_home_directory_whatever_home_says`（只在 macOS 上跑）：`HOME` 指向别处时，真正家目录里的文件也读不到。改之前读到了。
+- 逐条改坏启动脚本，每一处都有对应的用例失败：不查 Python 环境、socket、FIFO、账本、`.agentos` 或 `temporal.db`，扫描不带 `-H`，查不完也放行，Runtime 目录的检查不带 `-H`；macOS 上拒读条目不解析真实路径，不拒读 `~/.agentos`，或只拒读 `$HOME`。
+- `internal/config`：两份开发配置解析出来的数据目录、socket 和镜像都不在仓库里，都在家目录里；`~/` 路径会展开；`~`、`~user/`、取不到的家目录和相对的家目录都报错。
+- 照新 README 在两个平台上各走了一遍：数据在 `~/.agentos`，沙箱 Worker 的代码目录是 `python`，假模型的任务跑到 SUCCEEDED。再把整个仓库当代码目录，沙箱里读不到账本和 Temporal 数据库，也连不上 Control socket：macOS 得到 EPERM，Linux 上这些路径根本没挂进来。
+
+推送前，两个评审代理（安全、对抗）在各自的副本里做了实验，都没找到高危问题。上面 Runtime 目录、FIFO、macOS 符号链接、旧 agentd、`~` 写法、扫描重试这几条都是它们找出来的。它们还发现，macOS 上原来的测试数据放在 `/tmp`，本来就读得到，测不出真正的漏洞；现在测试先把它拒读。改完再请对抗评审复查了一轮：上面那些都修好了；它又找出 macOS 能读 FIFO、`HOME` 不可靠、“查不完就拒绝”没有用例这三处，也都补上了。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
@@ -131,7 +162,13 @@ M3b 给工具服务器补探针时发现，bwrap 自己建的根目录是可写�
 - `Scope` 只约束列出来的参数名。如果工具还接受别的能指定目标的参数（比如 `head_repo`），就能绕过去。M3 接真实工具时，参数要按 schema 校验，未知参数一律拒绝。
 - Linux 沙箱里还有不记在任何进程名下的内存，OOM killer 挑不中 Worker：memfd、SysV 共享内存和消息队列（沙箱里能改 `kernel.msgmnb` 这些 IPC 参数，以前就是这样），以及管道和 Unix socket 的缓冲区。实测在改好的沙箱里 memfd 和 SysV 共享内存各占 128 MiB，宿主机的 Shmem 多了 256 MiB，进程自己的常驻内存只有 10 MB；评审实测 3000 个管道占 83 MiB，200 对 socket 占 91 MiB。匿名内存分散到很多小进程时也一样（见上）。进程数只受这个用户的 `ulimit -u` 限制，和 agentd、Temporal 共用：Worker 把它用光，它们的 Go 运行时建不了线程就会退出。这些都要靠 cgroup v2（`memory.max`、`memory.swap.max`、`pids.max`；评审实测上面这些内存都记在 memcg 上）或者 seccomp，M5 定稿沙箱时一起做。`/dev/pts` 还能占宿主机共用的伪终端。macOS 的 Worker 沙箱则不限私有目录的大小，能写满磁盘。
 - Runtime 代理每条请求最多收 128 MiB，并发流数不限（grpc-go 的默认值），转发前还要把整条请求读进内存检查。被攻破的 Worker 开很多流，就能让 agentd 自己占满内存，OOM killer 杀的就是 agentd。可以加 `grpc.MaxConcurrentStreams`、按方法收紧大小上限、限每个 Worker 的连接数（看代码得出，没实测）。
-- 开发配置 `config/dev/agentd.yaml` 把数据目录放在仓库里（`.agentos`），Linux 的启动脚本又把代码目录整个只读挂进沙箱，而测试用的代码目录就是仓库根。照这样起的 Worker 能读账本、连 Control socket：只读挂载挡不住 `connect()`，Runtime socket 就是这样连的。测试把数据放在仓库外面，所以没测到。要么把开发配置的数据目录挪出仓库，要么只挂 Worker 自己的代码。
+- Worker 启动脚本只在启动时检查一次代码目录和 Python 环境。之后才出现在里面的 socket 或数据目录，比如后起的、数据目录放在里面的 agentd，正在跑的 Worker 照样看得到。M5 改由 agentd 拉起 Worker 时，可以在源头比较代码目录和自己的数据目录、socket。
+- macOS 的 Worker 沙箱按黑名单拦读，家目录以外默认都能读。数据目录和镜像的真实路径不在家目录里时，得列进 `AGENTOS_SANDBOX_DENY_READ`，启动脚本不知道它们在哪：第二套开发环境的数据目录、`~/.agentos` 里指向家目录外的镜像都是这样（评审实测读到了；`~/.agentos` 本身不用列，启动脚本总会拒读它的真实路径，但它只在启动时解析：那时还悬空的符号链接，指向的地方之后才建出来，正在跑的 Worker 就读得到）。agentd 给工具服务器算拒读列表时本来就有这些路径（`toolDenyRead`），可以让启动脚本直接用它，不靠手写的环境变量。Linux 按白名单挂载，没有这个问题。
+- 启动脚本只按名字认开发数据，改了名的副本、硬链接和压缩包都认不出来（评审实测过硬链接和改名的副本）。代码目录给得太大，里面别的东西照样被 Worker 看到：镜像、`.git/config` 里的凭据、别的 worktree。代码目录应该只放任务代码。README 用的是 `python`；测试要加载 `tests.*` 里的工作流，用的还是仓库根，可以改成每个测试会话把 `python/` 和 `tests/` 复制到一个临时目录交给 Worker。
+- git 工具服务器也有同类问题：Linux 的 `run-tool.sh` 把镜像整个挂进去，镜像目录要是包住了 agentd 的数据目录（比如 `repos` 写成家目录），工具服务器就能读账本、连 Control socket。启动脚本每次调用都扫一遍镜像太慢，该由 agentd 加载配置时拒绝：镜像里不能有数据目录、两个 socket 所在的目录，也不能有别的镜像。
+- 开发数据现在由所有 checkout 共用一份 `~/.agentos`：开发用的 agentd 同一时间只能跑一个，第二个会卡在锁上；不同分支轮流用同一个账本。goose 会忽略它不认识的迁移版本，所以旧分支的 agentd 照样在新分支迁移过的账本上跑；两个分支各加一个同号的迁移时，后一个永远不会执行。该让 agentd 拒绝账本里它不认识的最高版本。
+- 虚拟机里的 Linux 启动脚本也会拒绝 Mac 那边留在共享目录里的 socket，比如开了 git fsmonitor 时 `.git` 里的那个，虽然虚拟机根本连不上它（评审实测，连接被拒）。
+- 和这次改动无关、评审顺带发现的 macOS 问题：Worker 启动脚本从不删除自己的状态目录（`/tmp/agentos-sandbox.*`，这台 Mac 上已经积了 910 个），后起的 Worker 都能读到前面那些；srt 默认允许沙箱写 `/tmp/claude`，`run-tool.sh` 禁了，Worker 的启动脚本没禁。
 
 ## 后续（不在 M1 范围）
 

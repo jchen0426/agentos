@@ -4,7 +4,11 @@
 #     so neither the host's Temporal port nor anything else on the network is reachable;
 #   - allowlisted mounts only: /usr read-only, the Python environment and the task code
 #     read-only. The home directory and the host's /run (D-Bus session bus, ssh-agent,
-#     docker.sock) are never mounted;
+#     docker.sock) are never mounted. The Worker sees all of the two directories it is given,
+#     so the launcher refuses either if it holds a way out, a Unix socket or a FIFO (a read-only
+#     mount stops neither connect() nor a write to a FIFO), or dev data: agentd's ledger, and by
+#     default its Control socket, a .agentos directory, Temporal's dev database. It looks when it
+#     starts the Worker; what appears there later, the Worker sees too;
 #   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root and
 #     /dev, tmpfs mounts bwrap makes as large as half the memory, are read-only; /tmp and /run
 #     are only directories in the root. A tmpfs's data, inodes and extended attributes are
@@ -18,7 +22,7 @@
 #     127.0.0.1:7233 to it, because the Temporal SDK only dials host:port. Its directory is
 #     mounted rather than the socket file: agentd re-creates the socket when it restarts,
 #     and a mounted file would keep pointing at the old one. So that directory must hold
-#     nothing but the socket.
+#     nothing but the socket, also when it is reached through a symlink.
 # Unlike run-tool.sh, no ulimit. -v bounds one process, and the Worker can fork; its address
 # space also grows with the CPU count (glibc gives the SDK's threads malloc arenas). -f would
 # kill the Worker once a log file its output goes to grew past the limit. That output is the
@@ -41,8 +45,24 @@ shift 4
 command -v socat >/dev/null || { echo "$0: socat is not installed" >&2; exit 1; }
 runtime_dir=$(dirname "$runtime_sock")
 sock_name=$(basename "$runtime_sock")
-extra=$(find "$runtime_dir" -mindepth 1 -maxdepth 1 ! -name "$sock_name" -print -quit)
+extra=$(find -H "$runtime_dir" -mindepth 1 -maxdepth 1 ! -name "$sock_name" -print -quit)
 [[ -z $extra ]] || { echo "$0: $runtime_dir must hold only the Runtime socket, found $extra" >&2; exit 1; }
+# -H: a directory given as a symlink is looked into, as bwrap mounts what it points to. A scan
+# fails when a directory goes away under it (npm ci in the code directory, say): try again.
+scan() {
+  find -H "$1" \( -type s -o -type p -o -name 'ledger.db*' -o -name 'temporal.db*' -o -name .agentos \) -print -quit
+}
+for dir in "$pyenv" "$code"; do
+  found=$(scan "$dir" 2>/dev/null) || found=$(scan "$dir" 2>/dev/null) || found=$(scan "$dir") ||
+    { echo "$0: cannot look through $dir" >&2; exit 1; }
+  if [[ -S $found || -p $found ]]; then
+    echo "$0: $dir holds $found, a way out of the sandbox that a read-only mount does not close" >&2
+    exit 1
+  elif [[ -n $found ]]; then
+    echo "$0: $dir holds $found, agentd's or Temporal's data, which the Worker could read" >&2
+    exit 1
+  fi
+done
 
 inner_sock=/run/agentos/$sock_name
 args=(
