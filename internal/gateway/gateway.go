@@ -68,6 +68,7 @@ type Gateway struct {
 	// one agentd at a time, so an effect another incarnation claimed has nobody sending it.
 	Incarnation string
 
+	runIDWait  time.Duration      // how long a call waits for its run's ID; 0 is defaultRunIDWait
 	modelCalls singleflight.Group // in-flight model calls, by workflow and activity ID
 	effects    singleflight.Group // in-flight effects and their recoveries, by effect ID
 	executions sync.WaitGroup     // detached executions, drained on shutdown
@@ -116,9 +117,19 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 	// Only executions started through Control: the caller's identity comes from Temporal's
 	// activity info, never from fields the workflow fills in.
 	run, err := g.Ledger.LookupRun(ctx, info.WorkflowExecution.ID, info.WorkflowExecution.RunID)
+	if errors.Is(err, ledger.ErrRunStarting) {
+		// StartRun records the run ID once Temporal has started the run, and a Worker already
+		// polling can send the run's first call before that. Refused, the call would lose one
+		// of its attempts and wait out Temporal's backoff: it waits for the run ID instead.
+		log.Info("invoke waits for the run ID")
+		stop := heartbeat(ctx, false)
+		run, err = g.awaitRunID(ctx, info.WorkflowExecution.ID, info.WorkflowExecution.RunID)
+		stop()
+	}
 	switch {
 	case errors.Is(err, ledger.ErrRunStarting):
-		return nil, err // retried until StartRun has recorded the run ID
+		log.Warn("invoke refused: the run ID is still not recorded")
+		return nil, err // retried: StartRun, or RecoverStarts when agentd starts, may record it yet
 	case errors.Is(err, ledger.ErrUnknownRun):
 		log.Warn("invoke from an unknown run", "run_id", info.WorkflowExecution.RunID)
 		return nil, temporal.NewNonRetryableApplicationError("unknown run", "UnknownRun", err)
@@ -168,6 +179,36 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 	}
 	log.Info("invoke finished", "status", res.GetStatus())
 	return res, nil
+}
+
+// defaultRunIDWait bounds how long a call waits for StartRun to record its run's ID: usually
+// milliseconds, the time it takes StartRun to learn the run ID from Temporal and record it.
+const defaultRunIDWait = 5 * time.Second
+
+// awaitRunID reads the run again, while StartRun has not recorded its run ID, until it has, the
+// run is gone or the wait is over, and answers as LookupRun does: a run ID recorded for another
+// execution is still ErrUnknownRun, and a run still starting is still ErrRunStarting.
+func (g *Gateway) awaitRunID(ctx context.Context, workflowID, runID string) (db.Run, error) {
+	wait := g.runIDWait
+	if wait <= 0 {
+		wait = defaultRunIDWait
+	}
+	deadline := time.Now().Add(wait)
+	for pause := 10 * time.Millisecond; ; pause = min(2*pause, 100*time.Millisecond) {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return db.Run{}, ledger.ErrRunStarting
+		}
+		select {
+		case <-ctx.Done():
+			return db.Run{}, ctx.Err()
+		case <-time.After(min(pause, left)):
+		}
+		run, err := g.Ledger.LookupRun(ctx, workflowID, runID)
+		if !errors.Is(err, ledger.ErrRunStarting) {
+			return run, err
+		}
+	}
 }
 
 // CheckModels reports, at start, a cross-provider fallback the policy would never let a
