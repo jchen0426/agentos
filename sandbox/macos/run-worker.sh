@@ -7,19 +7,35 @@
 #   - network: allowedDomains = ["127.0.0.1:<runtime port>"], allowLocalBinding = false
 #   - files: the home directory (both $HOME and the one the user database names), and any
 #     colon-separated paths in AGENTOS_SANDBOX_DENY_READ, are unreadable except the Python
-#     environment and the task code; writes only to a private temporary directory. Everything
-#     else can be read, so agentd's data directory and mirrors belong under the home directory
-#     or in AGENTOS_SANDBOX_DENY_READ. Seatbelt matches real paths, and srt keeps a symlink's
-#     spelling when it leads elsewhere, so each denied path goes in as given and as its real
-#     path; agentd's default data directory, ~/.agentos, is denied wherever it really is (as
-#     resolved when the Worker starts). The launcher refuses a Python environment or code
-#     directory that holds dev data, which the Worker could read (agentd's ledger, a .agentos
-#     directory, Temporal's dev database), or a FIFO, which it could read from. It looks when
-#     it starts the Worker. Unix sockets there need no such check: srt lets it connect to none
-#   - environment: cleared, except what srt adds (its proxy variables)
+#     environment and the task code. Everything else can be read, so agentd's data directory
+#     and mirrors belong under the home directory or in AGENTOS_SANDBOX_DENY_READ. Seatbelt
+#     matches real paths, and srt keeps a symlink's spelling when it leads elsewhere, so each
+#     denied path goes in as given and as its real path; agentd's default data directory,
+#     ~/.agentos, is denied wherever it really is (as resolved when the Worker starts). The
+#     launcher refuses a Python environment or code directory that holds dev data, which the
+#     Worker could read (agentd's ledger, a .agentos directory, Temporal's dev database), or a
+#     FIFO, which it could read from. It looks when it starts the Worker. Unix sockets there
+#     need no such check: srt lets it connect to none
+#   - writes: only to a private directory, the Worker's HOME and TMPDIR. Not to /tmp/claude,
+#     which srt otherwise always allows and hands out as TMPDIR, to everything it runs
+#   - state: each launch has a directory, /tmp/agentos-sandbox.*, for srt's settings, srt's
+#     own sockets and the Worker's private directory. A Worker can read none of them but its
+#     own private directory. It goes when srt does, however srt ends (kill -9 included), with
+#     one exception: a kill of srt's whole process group (or SIGKILL/SIGSTOP) takes the remover
+#     too, so the directory stays, still out of every Worker's reach, until agentd owns this in
+#     M5. The remover (rm-state.py) walks fd-relative, never following a symlink, so untrusted
+#     task code cannot turn it into a delete of anything outside the state directory
+#   - environment: cleared, except what srt adds (its proxy variables, TMPDIR) and
+#     CLAUDE_CODE_TMPDIR, which srt hands out as TMPDIR
 #
 # Usage: run-worker.sh <runtime-port> <python-env-dir> <code-dir> -- <command> [args...]
 set -euo pipefail
+
+# A caller that started us with stdin, stdout or stderr closed would have bash hand that low
+# descriptor to the control pipe below, and the sandboxed Worker would inherit it. Keep 0-2 open.
+{ : <&0; } 2>/dev/null || exec 0</dev/null
+{ : >&1; } 2>/dev/null || exec 1>/dev/null
+{ : >&2; } 2>/dev/null || exec 2>/dev/null
 
 if [[ $# -lt 5 || $4 != "--" ]]; then
   echo "usage: $0 <runtime-port> <python-env-dir> <code-dir> -- <command> [args...]" >&2
@@ -48,13 +64,34 @@ here=$(cd "$(dirname "$0")" && pwd)
 srt="$here/node_modules/.bin/srt"
 [[ -x $srt ]] || { echo "$0: run 'npm ci' in $here first" >&2; exit 1; }
 node_dir=$(dirname "$(command -v node)")
+# The Python that runs rm-state.py when this launch ends. The pyenv's own python is the
+# Worker's, so it is always present; fall back to one on PATH. rm-state.py needs only os.open
+# with dir_fd and O_NOFOLLOW, which every 3.x has — that is what makes the removal symlink-safe.
+# With neither python the state directory is left in place (read-denied to every Worker) rather
+# than removed unsafely.
+rmstate="$pyenv/bin/python3"
+[[ -x $rmstate ]] || rmstate=$(command -v python3 2>/dev/null || true)
 
 state=$(mktemp -d /tmp/agentos-sandbox.XXXXXX)
+# Until srt is exec'd there is no sandboxed process yet, so a plain rm is safe here; this guards
+# the window before the reader below is in charge (a signal, or a failure building the settings).
+# exec'ing srt replaces this shell, so the trap does not fire once srt is running.
+trap 'rm -rf "$state"' EXIT
+trap 'exit 1' HUP INT QUIT TERM
+# srt holds fd 9 (the write end of a pipe) until it ends, whatever ends it, and hands it to
+# nothing it starts (libuv spawns with POSIX_SPAWN_CLOEXEC_DEFAULT on macOS). The reader runs
+# outside the Worker's process tree (whoever stops a Worker kills that tree) and, at EOF, removes
+# the state directory with rm-state.py (fd-relative, never follows a symlink). It ignores the
+# job-control and terminal signals it can; a kill of its whole process group still takes it.
+exec 9> >( (trap '' INT QUIT TSTP TTIN TTOU TERM HUP USR1 USR2
+  while read -r _; do :; done
+  [[ -n $rmstate ]] && "$rmstate" -I "$here/rm-state.py" "$state") <&0 >/dev/null 2>&1 & )
 mkdir "$state/work"
 # Built with node (which srt needs anyway) so that paths are JSON-escaped.
 node -e '
   const fs = require("fs"), path = require("path");
-  const [port, pyenv, code, home, work, deny] = process.argv.slice(1);
+  const [port, pyenv, code, home, state, deny] = process.argv.slice(1);
+  const work = path.join(state, "work");
   const real = p => {
     try { return fs.realpathSync(p); } catch {
       const dir = path.dirname(p);
@@ -63,16 +100,21 @@ node -e '
   };
   const homes = [home, require("os").userInfo().homedir];
   const denied = [...homes, ...homes.map(h => path.join(h, ".agentos")), ...deny.split(":").filter(Boolean)];
+  // The state of every launch, as mktemp names it, this one included: allowRead wins, so the
+  // Worker reads its own private directory there and nothing else.
+  const launches = path.join(real(path.dirname(state)), "agentos-sandbox.*");
   console.log(JSON.stringify({
     network: { allowedDomains: [`127.0.0.1:${port}`], deniedDomains: [], allowLocalBinding: false },
     filesystem: {
-      denyRead: [...new Set(denied.flatMap(p => [p, real(p)]))],
-      allowRead: [pyenv, code],
+      denyRead: [...new Set(denied.flatMap(p => [p, real(p)])), launches],
+      allowRead: [pyenv, code, work],
       allowWrite: [work],
-      denyWrite: [],
+      denyWrite: ["/tmp/claude", "/private/tmp/claude"],
     },
   }, null, 2));
-' "$port" "$pyenv" "$code" "$HOME" "$state/work" "${AGENTOS_SANDBOX_DENY_READ:-}" > "$state/srt-settings.json"
+' "$port" "$pyenv" "$code" "$HOME" "$state" "${AGENTOS_SANDBOX_DENY_READ:-}" > "$state/srt-settings.json"
 
-exec env -i PATH="/usr/bin:/bin:$node_dir" HOME="$state/work" TMPDIR="$state/work" LANG=en_US.UTF-8 \
-  PYTHONDONTWRITEBYTECODE=1 "$srt" --settings "$state/srt-settings.json" -- "$@"
+# srt keeps its own temporary files (its sockets) in the state directory, out of the Worker's
+# reach, and hands the Worker CLAUDE_CODE_TMPDIR as TMPDIR.
+exec env -i PATH="/usr/bin:/bin:$node_dir" HOME="$state/work" TMPDIR="$state" CLAUDE_CODE_TMPDIR="$state/work" \
+  LANG=en_US.UTF-8 PYTHONDONTWRITEBYTECODE=1 "$srt" --settings "$state/srt-settings.json" -- "$@"
