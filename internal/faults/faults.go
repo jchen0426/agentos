@@ -78,7 +78,12 @@ func Load(path string) (*Script, error) {
 	return &s, nil
 }
 
-// Match is called once per Invoke attempt and returns the merged effect of all matching rules.
+// Match is called once per Invoke attempt that gets past the run lookup and the loop guard
+// (before the policy decides), and returns the merged effect of all matching rules. Attempts
+// are Temporal's, so they count the attempts refused before Match: a call that reaches agentd
+// before StartRun has recorded the run ID is refused ("run registration in progress") and
+// retried. A test that faults one of a run's opening calls by attempt starts the Worker after
+// the run.
 func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 	if s == nil {
 		return Effect{}

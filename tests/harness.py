@@ -408,6 +408,10 @@ class Stack:
         if test_tools:
             self._agentd_args.append("--test-tools")
         if faults:
+            # A rule's "attempt" is Temporal's. A call that reaches agentd before StartRun has
+            # recorded the run ID is refused ("run registration in progress") and retried, so a
+            # test that faults one of a run's opening calls by attempt starts the Worker after
+            # the run.
             (d / "faults.json").write_text(json.dumps({"rules": faults}))
             self._agentd_args += ["--fault-script", d / "faults.json"]
         return self._launch_agentd()
