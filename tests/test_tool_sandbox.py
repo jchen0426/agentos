@@ -11,6 +11,7 @@ Run with AGENTOS_SANDBOX=srt on macOS or AGENTOS_SANDBOX=bwrap on Linux.
 
 import json
 import os
+import pwd
 import secrets
 import shlex
 import shutil
@@ -126,13 +127,13 @@ def in_keychain(service: str) -> bool:
                               env={**probe_env(state, []), "PATH": "/usr/bin:/bin"}).returncode == 0
 
 
-def probe(stack: Stack, args: dict, deny: list[str]) -> dict:
+def probe(mirror: Path, args: dict, deny: list[str], env: dict[str, str] | None = None) -> dict:
     state = tempfile.mkdtemp(prefix="agentos-tool-", dir="/tmp")
     # The probe runs isolated (-I): Python would look for packages in the home directory.
     try:
-        r = subprocess.run([str(TOOL_LAUNCHER[SANDBOX]), str(stack.tmp / "mirror"), "--", "/usr/bin/python3", "-I", "-c",
+        r = subprocess.run([str(TOOL_LAUNCHER[SANDBOX]), str(mirror), "--", "/usr/bin/python3", "-I", "-c",
                             PROBE, json.dumps(args)], capture_output=True, text=True, timeout=120,
-                           env=probe_env(state, deny))
+                           env={**probe_env(state, deny), **(env or {})})
     finally:
         subprocess.run(["rm", "-rf", state], check=False)
     assert r.returncode == 0, r.stderr
@@ -187,7 +188,7 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
         for url in sockets.values():
             connect(url)
         keychain = [s for s in KEYCHAIN_ITEMS if in_keychain(s)]
-        report = probe(stack, {"mirror": str(mirror), "home": str(Path.home()),
+        report = probe(mirror, {"mirror": str(mirror), "home": str(Path.home()),
                                "reads": {k: str(p) for k, p in reads.items()},
                                "writes": {k: str(p) for k, p in writes.items()},
                                "sockets": {**sockets, "internet": "tcp://1.1.1.1:443"},
@@ -218,3 +219,31 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
         if not (SANDBOX == "bwrap" and key in ("shared_tmp", "srt_tmp")):
             assert result.startswith("refused"), (key, result)
     assert "AGENTOS_TEST_CANARY" not in report["env"] and "AGENTOS_SANDBOX_DENY_READ" not in report["env"], report["env"]
+
+
+@pytest.mark.skipif(SANDBOX != "srt", reason="the macOS launcher's deny list")
+def test_the_git_tool_server_cannot_read_a_home_directory_named_through_a_symlink() -> None:
+    """The macOS launcher denies the home directory the user database names. Seatbelt matches real
+    paths, and sandbox-runtime keeps a symlink's spelling when it leads elsewhere, so a home named
+    through one (/Users/x leading to another volume, say) is denied by its real path too. A test
+    cannot change the user database, so it changes the answer where the launcher asks for it,
+    Node's os.userInfo(), through NODE_OPTIONS."""
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    canary = home / f".agentos-canary-{secrets.token_hex(4)}"
+    base = Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/var/tmp"))  # not denied wholesale
+    try:
+        canary.write_text("a file the tool server must not read")
+        (base / "mirror").mkdir()
+        (base / "home").symlink_to(home, target_is_directory=True)
+        user_info = base / "user-info.js"
+        user_info.write_text('const os = require("os"), userInfo = os.userInfo;\n'
+                             'os.userInfo = (...a) => ({...userInfo(...a), homedir: process.env.AGENTOS_TEST_HOMEDIR});\n')
+        report = probe(base / "mirror", {"mirror": str(base / "mirror"), "home": str(home),
+                                         "reads": {"home_canary": str(canary)}, "writes": {}, "sockets": {},
+                                         "keychain": [], "keychain_file": str(LOGIN_KEYCHAIN)}, [],
+                       env={"NODE_OPTIONS": f"--require={user_info}", "AGENTOS_TEST_HOMEDIR": str(base / "home")})
+    finally:
+        canary.unlink(missing_ok=True)
+        shutil.rmtree(base, ignore_errors=True)
+    assert report["reads"]["home_canary"].startswith("refused"), report["reads"]
+    assert report["home_list"].startswith("refused"), report["home_list"]

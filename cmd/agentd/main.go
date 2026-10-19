@@ -56,7 +56,7 @@ const drainTimeout = 30 * time.Second
 
 func main() {
 	configPath := flag.String("config", "agentd.yaml", "path to agentd.yaml")
-	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the tools and the fake model")
+	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the tools, the fake model and run starts")
 	testTools := flag.Bool("test-tools", false, "TESTS ONLY: also offer test.unsafe_write, a write to a local log")
 	insecureDev := flag.Bool("insecure-dev", false, "DEVELOPMENT ONLY: run the git tool server without a sandbox when git_tools.sandbox is unset")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
@@ -273,6 +273,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		Tasks:       registry,
 		TaskQueue:   cfg.TaskQueues.Workflows,
 		CancelGrace: cfg.CancelGrace,
+		Faults:      script,
 		Log:         log.With("component", "control"),
 	}
 	if err := ctl.RecoverStarts(ctx); err != nil {
@@ -428,7 +429,9 @@ func gitServer(cfg *config.Config, insecureDev bool, log *slog.Logger) (*gitmcp.
 
 // toolDenyRead is what the git tool server must not read, whatever its launcher allows:
 // agentd's data, its control socket and Runtime socket, the Temporal client certificate and
-// key, and every mirror (the launcher lets the server read the call's own).
+// key, and every mirror (the launcher lets the server read the call's own). config.Load
+// refuses a mirror that holds any of the rest: the Linux launcher mounts all of the call's
+// mirror.
 func toolDenyRead(cfg *config.Config) []string {
 	deny := []string{cfg.DataDir, filepath.Dir(cfg.ControlSocket)}
 	if p, ok := strings.CutPrefix(cfg.RuntimeListen, "unix://"); ok {

@@ -41,12 +41,13 @@ var requestTypes = map[string]func() proto.Message{
 type Refusal struct {
 	Reason  string
 	Command string // the command type, when a command was refused
+	rule    string // which check refused it: the reason without its values
 }
 
 func (r *Refusal) Error() string { return r.Reason }
 
 func refuse(command, format string, args ...any) *Refusal {
-	return &Refusal{Reason: fmt.Sprintf(format, args...), Command: command}
+	return &Refusal{Reason: fmt.Sprintf(format, args...), Command: command, rule: format}
 }
 
 // Check decodes the raw request of method and returns a *Refusal when it is not allowed.
@@ -102,7 +103,7 @@ func (r Rules) checkPollQueue(tq *taskqueuepb.TaskQueue) error {
 }
 
 func (r Rules) checkCommand(c *commandpb.Command) error {
-	kind := c.GetCommandType().String()
+	kind := commandName(c.GetCommandType())
 	switch c.GetCommandType() {
 	case enumspb.COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK:
 		a := c.GetScheduleActivityTaskCommandAttributes()
@@ -135,9 +136,23 @@ func (r Rules) checkCommand(c *commandpb.Command) error {
 	default:
 		// Signalling or cancelling other workflows, child workflows, continue-as-new,
 		// Nexus operations and anything added later.
+		if kind == unknownCommand {
+			return refuse(kind, "command type %d is not available to workers", c.GetCommandType())
+		}
 		return refuse(kind, "%s is not available to workers", kind)
 	}
 	return nil
+}
+
+const unknownCommand = "COMMAND_TYPE_UNKNOWN"
+
+// commandName is a command's type by name. Every value this version of the API does not name
+// has the same one: the Worker picks the value, and must not make up names in agentd's log.
+func commandName(t enumspb.CommandType) string {
+	if _, ok := enumspb.CommandType_name[int32(t)]; ok {
+		return t.String()
+	}
+	return unknownCommand
 }
 
 // namespaceOf returns the request's namespace field, if it has one.
