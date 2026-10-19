@@ -64,10 +64,10 @@ type Writer interface {
 	Live() bool
 }
 
-// Proceed is asked before each visible request of a write. It fails when the request must
-// not go out (the run was cancelled meanwhile), with an error that wraps ErrNotSent, and it
-// marks the moment the request goes out: a lookup's wait for a request in flight counts from
-// the last one.
+// Proceed is asked before each visible request of a write. It fails with ErrStopped when the
+// request must not go out (the run was cancelled meanwhile), and with another error that wraps
+// ErrNotSent when agentd cannot record the request; and it marks the moment the request goes
+// out: a lookup's wait for a request in flight counts from the last one.
 type Proceed func(ctx context.Context) error
 
 // Finder is a Writer whose effect can be looked up afterwards.
@@ -84,9 +84,9 @@ type Finder interface {
 // happened: sending it again is safe.
 var ErrNotSent = errors.New("request not sent")
 
-// ErrStopped is what Proceed fails with when the run was cancelled, or the effect changed
-// meanwhile (a person settled it, say): nothing more of the write may go out. It is ErrNotSent
-// too. Proceed failing otherwise (agentd could not record the request) may be tried again.
+// ErrStopped is what Proceed fails with when the run was cancelled, or the effect is no longer
+// this sender's to send: nothing more of the write may go out. It is ErrNotSent too. Proceed
+// failing otherwise (agentd could not record the request) may be tried again.
 var ErrStopped = fmt.Errorf("%w: the run was cancelled, or the effect changed", ErrNotSent)
 
 // DeniedError refuses a call as it stands, before anything is sent: for example a patch that

@@ -233,7 +233,8 @@ func (t *OpenDraftPR) commitTree(ctx context.Context, p prPayload, sha string) (
 // pull request.
 func (t *OpenDraftPR) write(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string, proceed tools.Proceed) (map[string]any, error) {
 	gh := t.Client.gh
-	if err := t.branch(ctx, w, p, tip, tipTree, proceed); err != nil {
+	parent, err := t.branch(ctx, w, p, tip, tipTree, proceed)
+	if err != nil {
 		return nil, err
 	}
 	// GitHub has the branch now, pushed by this attempt or an earlier one: part of the pull
@@ -244,6 +245,15 @@ func (t *OpenDraftPR) write(ctx context.Context, w *treeWalk, p prPayload, tip, 
 		return nil, onBranch(p, unseen(err))
 	} else if found {
 		return v, nil
+	}
+	// The pull request pushes nothing, but GitHub merges the branch into the base for it, and
+	// pull_request workflows run on that merge: the base must still hold the branch's parent.
+	if why, err := t.stillHolds(ctx, p, parent); err != nil {
+		return nil, onBranch(p, err)
+	} else if why != "" {
+		return nil, &tools.ConflictError{Reason: fmt.Sprintf(
+			"branch %s exists, on commit %s, which branch %s no longer holds (%s); agentd does not open the pull request on it",
+			p.Branch, parent, p.Base, why)}
 	}
 	if err := proceed(ctx); errors.Is(err, tools.ErrStopped) {
 		return nil, &tools.ConflictError{Reason: "branch " + p.Branch +
@@ -425,10 +435,10 @@ func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, base, commit, whe
 	return "", false, nil
 }
 
-// Bounds on one check of the payload's files on GitHub, which lists every directory on the way
-// to each file once, in the audited commit's tree and in the tip's (a directory the two share
-// is listed once): at most twice patch.MaxFiles times patch.MaxDepth listings (a fix needs a
-// handful). A crafted repository can hold directories of hundreds of thousands of entries,
+// Bounds on one call's checks of the payload's files on GitHub, which list every directory on
+// the way to each file once, in each tree the call checks: the audited commit's, the tip's, and
+// the older tip a branch of the payload's name is on (a directory they share is listed once). At
+// most three times patch.MaxFiles times patch.MaxDepth listings (a fix needs a handful). A crafted repository can hold directories of hundreds of thousands of entries,
 // which GitHub lists whole. And on the comparison of the base branch with the commit: that of
 // a commit in the branch's history lists neither commits nor files, only the two commits, whose
 // messages (twice each when signed) can still be long.
@@ -661,27 +671,29 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 // branch makes sure the branch exists and holds the patch on the base branch: on the tip, as this
-// attempt makes it, or as an earlier attempt made it on the tip it read (checkBranch). A branch
-// of that name that holds anything else is left alone: a person decides.
-func (t *OpenDraftPR) branch(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string, proceed tools.Proceed) error {
+// attempt makes it, or as an earlier attempt made it on the tip it read (checkBranch). It
+// returns the branch commit's parent. A branch of that name that holds anything else is left
+// alone: a person decides.
+func (t *OpenDraftPR) branch(ctx context.Context, w *treeWalk, p prPayload, tip, tipTree string, proceed tools.Proceed) (string, error) {
 	gh := t.Client.gh
 	ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Branch)
 	switch {
 	case err == nil:
-		return onBranch(p, t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree))
+		parent, err := t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree)
+		return parent, onBranch(p, err)
 	case status(resp) != http.StatusNotFound:
-		return unseen(err)
+		return "", unseen(err)
 	}
 	if err := t.atTip(ctx, w, p, tip, tipTree); err != nil {
-		return err
+		return "", err
 	}
 	tree, err := t.patchTree(ctx, p, tipTree)
 	if err != nil {
-		return unseen(err)
+		return "", unseen(err)
 	}
 	date, err := time.Parse(time.RFC3339, p.Author.Date)
 	if err != nil {
-		return fmt.Errorf("%w: author date: %v", tools.ErrNotSent, err)
+		return "", fmt.Errorf("%w: author date: %v", tools.ErrNotSent, err)
 	}
 	who := &github.CommitAuthor{Name: new(p.Author.Name), Email: new(p.Author.Email),
 		Date: &github.Timestamp{Time: date}}
@@ -690,81 +702,86 @@ func (t *OpenDraftPR) branch(ctx context.Context, w *treeWalk, p prPayload, tip,
 		Parents: []*github.Commit{{SHA: new(tip)}}, Author: who, Committer: who,
 	}, nil)
 	if err != nil {
-		return unseen(err)
+		return "", unseen(err)
 	}
-	if err := t.stillHolds(ctx, p, tip); err != nil {
-		return err
+	// Just before the branch goes out: the base branch may have been rewritten while agentd
+	// checked, and a push on a tip it no longer holds would run that tip's workflows again.
+	// Nothing goes out then, and the call is tried again, on the tip there is by then.
+	if why, err := t.stillHolds(ctx, p, tip); err != nil {
+		return "", err
+	} else if why != "" {
+		return "", fmt.Errorf("%w: branch %s moved while agentd checked it: %s", tools.ErrNotSent, p.Base, why)
 	}
 	if err := proceed(ctx); err != nil {
-		return err
+		return "", err
 	}
 	_, resp, err = gh.Git.CreateRef(ctx, p.Owner, p.Repo, github.CreateRef{Ref: "refs/heads/" + p.Branch, SHA: commit.GetSHA()})
 	if err == nil {
-		return nil
+		return tip, nil
 	}
 	if status(resp) != http.StatusUnprocessableEntity {
-		return unseen(err)
+		return "", unseen(err)
 	}
 	// GitHub declined to create it: the branch appeared meanwhile, or for a reason of its own.
 	declined, exists := unseen(err), strings.Contains(err.Error(), "Reference already exists")
 	switch ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Branch); {
 	case err == nil:
-		return onBranch(p, t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree))
+		parent, err := t.checkBranch(ctx, w, p, ref.GetObject().GetSHA(), tip, tipTree)
+		return parent, onBranch(p, err)
 	case status(resp) == http.StatusNotFound && exists:
 		// GitHub's read behind its write (an earlier attempt's, whose answer was lost, say): as
 		// far as agentd can tell, the branch is there.
-		return &tools.ConflictError{Reason: "GitHub refused to create branch " + p.Branch +
-			", which it says exists, and does not show it; so part of the pull request may have gone out"}
+		return "", &tools.ConflictError{Reason: "GitHub refused to create branch " + p.Branch +
+			", which it says exists, and does not show it (or a branch whose name is a directory above it, " +
+			"such as agent, is in the way); so part of the pull request may have gone out"}
 	case status(resp) == http.StatusNotFound:
-		return declined
+		return "", declined
 	default:
-		return unseen(err)
+		return "", unseen(err)
 	}
 }
 
-// stillHolds makes sure, just before the branch goes out, that the base branch still holds the
-// tip it goes on. The branch may have been rewritten while agentd checked (a force push that
-// took the tip out of its history, as in an incident), and a push on that tip would run its
-// workflows again. Then nothing goes out, and the call is tried again, on the tip there is by
-// then. Anything odd in GitHub's answer is tried again too: the next attempt checks the branch
-// from the start.
-func (t *OpenDraftPR) stillHolds(ctx context.Context, p prPayload, tip string) error {
+// stillHolds says why the base branch no longer holds commit, or "" when it does: GitHub's
+// branch is at commit, or ahead of it. agentd asks just before a request that brings commit into
+// the repository (the push of a branch on it, a pull request of such a branch, which GitHub merges
+// into the base): the branch may have been rewritten since agentd read it, by a force push that
+// took commit out of its history, as in an incident. GitHub's answer not being about the branch
+// (no branch, another ref) is err, tried again: the next attempt checks the branch from the start.
+func (t *OpenDraftPR) stillHolds(ctx context.Context, p prPayload, commit string) (string, error) {
 	ref, resp, err := t.Client.gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Base)
 	now := ref.GetObject().GetSHA()
 	switch {
 	case status(resp) == http.StatusNotFound:
-		return fmt.Errorf("%w: GitHub no longer shows branch %s", tools.ErrNotSent, p.Base)
+		return "", fmt.Errorf("%w: GitHub no longer shows branch %s", tools.ErrNotSent, p.Base)
 	case err != nil:
-		return unseen(err)
-	case now == tip:
-		return nil
+		return "", unseen(err)
 	case ref.GetRef() != "refs/heads/"+p.Base || ref.GetObject().GetType() != "commit" || !fullSHA.MatchString(now):
-		return fmt.Errorf("%w: GitHub answered for branch %s with %.100q, a %.20q %.100q", tools.ErrNotSent,
+		return "", fmt.Errorf("%w: GitHub answered for branch %s with %.100q, a %.20q %.100q", tools.ErrNotSent,
 			p.Base, ref.GetRef(), ref.GetObject().GetType(), now)
+	case now == commit:
+		return "", nil
 	}
-	why, _, err := t.behind(ctx, p, now, tip, fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, now))
-	switch {
-	case err != nil:
-		return err
-	case why != "":
-		return fmt.Errorf("%w: branch %s moved while agentd checked it, and %s", tools.ErrNotSent, p.Base, why)
-	}
-	return nil
+	why, _, err := t.behind(ctx, p, now, commit, fmt.Sprintf("branch %s of %s/%s at %s, which it has moved to", p.Base, p.Owner, p.Repo, now))
+	return why, err
 }
 
 // checkBranch compares the commit a branch points at with the one an attempt makes for the
-// payload, and leaves anything else to a person. Not the commit's hash, which would need GitHub
-// to keep the commit object exactly as sent (no signature added, for example).
-func (t *OpenDraftPR) checkBranch(ctx context.Context, w *treeWalk, p prPayload, sha, tip, tipTree string) error {
+// payload, and leaves anything else to a person. It returns the commit's parent. Not the
+// commit's hash, which would need GitHub to keep the commit object exactly as sent (no signature
+// added, for example).
+func (t *OpenDraftPR) checkBranch(ctx context.Context, w *treeWalk, p prPayload, sha, tip, tipTree string) (string, error) {
 	c, _, err := t.Client.gh.Git.GetCommit(ctx, p.Owner, p.Repo, sha)
 	if err != nil {
-		return unseen(err)
+		return "", unseen(err)
 	}
 	why, err := t.notAttempt(ctx, w, p, c, tip, tipTree)
-	if err != nil || why == "" {
-		return err
+	switch {
+	case err != nil:
+		return "", err
+	case why == "":
+		return c.Parents[0].GetSHA(), nil
 	}
-	return &tools.ConflictError{Reason: fmt.Sprintf(
+	return "", &tools.ConflictError{Reason: fmt.Sprintf(
 		"branch %s already exists and points at %s, which is not this patch on branch %s as agentd makes it (%s); agentd does not overwrite it",
 		p.Branch, sha, p.Base, why)}
 }
