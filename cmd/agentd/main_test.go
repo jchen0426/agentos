@@ -78,6 +78,69 @@ func TestNoMirrorIsWhatToolsMustNotRead(t *testing.T) {
 	}
 }
 
+// agentd makes its files where Load looked. The kernel takes a .. after the symlink before it,
+// while Load and filepath.Join take it by name: so Load cleans the paths agentd uses.
+func TestAgentdMakesNothingInAMirror(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "aos-") // short: a socket's path is at most 103 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	mirror := filepath.Join(dir, "mirror")
+	if err := os.MkdirAll(filepath.Join(mirror, "refs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// in leads into the mirror: to the kernel, in/.. is the mirror; by name, it is dir.
+	if err := os.Symlink("mirror/refs", filepath.Join(dir, "in")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(map[string]any{ // JSON is YAML
+		"data_dir":       dir + "/in/../data",
+		"control_socket": dir + "/in/../control.sock",
+		"runtime_listen": "unix://" + dir + "/in/../runtime.sock",
+		"policy_file":    "p", "models_file": "m", "prices_file": "x",
+		"repos": map[string]string{"acme/payments": mirror},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agentd.yaml")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mkdirPrivate(cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range []string{"unix://" + cfg.ControlSocket, cfg.RuntimeListen} {
+		ln, err := listen(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+	}
+	entries, err := os.ReadDir(mirror)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "refs" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("agentd made files in the mirror: %q", names)
+	}
+	// The ledger goes into the data directory agentd made.
+	lock, err := lockDataDir(cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+}
+
 // A provider elsewhere is reached only over https; a key for a Chat Completions server is read
 // only when models.yaml names it.
 func TestModelAdapterKeys(t *testing.T) {

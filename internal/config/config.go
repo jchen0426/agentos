@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -137,8 +138,13 @@ func Load(path string) (*Config, error) {
 			}
 			return filepath.Join(home, rest)
 		}
-		if p == "" || filepath.IsAbs(p) {
+		if p == "" {
 			return p
+		}
+		if filepath.IsAbs(p) {
+			// Clean, as filepath.Join makes the others: agentd names its files by joining onto
+			// these paths, which takes a .. by name, where the kernel takes it after a symlink.
+			return filepath.Clean(p)
 		}
 		return filepath.Join(base, p)
 	}
@@ -197,6 +203,11 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("config %s: repo %s: mirror is required", path, id)
 		}
 		r.Mirror = abs(r.Mirror)
+		// The launchers take the path in shell, where Linux's would drop a trailing newline and
+		// mount another directory than the one checkMirrors looks at.
+		if strings.ContainsFunc(r.Mirror, unicode.IsControl) {
+			return nil, fmt.Errorf("config %s: repo %s: the mirror %q has a control character in its path", path, id, r.Mirror)
+		}
 		if r.GitHub == "" {
 			r.GitHub = id
 		}
@@ -261,63 +272,103 @@ func Load(path string) (*Config, error) {
 // doc, section 8). A mirror may be inside one of them: the dev configs keep theirs in the data
 // directory.
 func (c *Config) checkMirrors() error {
-	type named struct{ repo, what, path string } // repo: whose mirror it is
-	paths := []named{{"", "the data directory", c.DataDir}, {"", "the Control socket's directory", filepath.Dir(c.ControlSocket)}}
+	type named struct {
+		what   string
+		mirror bool   // a repo's mirror
+		repo   string // whose mirror it is
+		place
+	}
+	paths := []named{{what: "the data directory", place: locate(c.DataDir)},
+		{what: "the Control socket's directory", place: locate(filepath.Dir(c.ControlSocket))}}
 	if p, ok := strings.CutPrefix(c.RuntimeListen, "unix://"); ok {
-		paths = append(paths, named{"", "the Runtime socket's directory", filepath.Dir(p)})
+		paths = append(paths, named{what: "the Runtime socket's directory", place: locate(filepath.Dir(p))})
 	}
 	if t := c.Temporal.TLS; t != nil {
-		paths = append(paths, named{"", "the Temporal client certificate", t.CertFile}, named{"", "the Temporal client key", t.KeyFile})
+		paths = append(paths, named{what: "the Temporal client certificate", place: locate(t.CertFile)},
+			named{what: "the Temporal client key", place: locate(t.KeyFile)})
 	}
-	ids := slices.Sorted(maps.Keys(c.Repos))
-	for _, id := range ids {
-		paths = append(paths, named{id, "repo " + id + "'s mirror", c.Repos[id].Mirror})
+	for _, id := range slices.Sorted(maps.Keys(c.Repos)) {
+		paths = append(paths, named{what: "repo " + id + "'s mirror", mirror: true, repo: id, place: locate(c.Repos[id].Mirror)})
 	}
-	for _, id := range ids {
-		mirror := c.Repos[id].Mirror
-		for _, p := range paths {
-			if p.repo != id && p.path != "" && holds(mirror, p.path) {
-				return fmt.Errorf("repo %s: the mirror %s holds %s %s, and the git tool server may read all of its mirror",
-					id, mirror, p.what, p.path)
+	for i, m := range paths {
+		if !m.mirror {
+			continue
+		}
+		for j, p := range paths {
+			if i != j && m.holds(p.place) {
+				via := ""
+				if !within(p.path, m.path) {
+					via = fmt.Sprintf(" (real paths: %s, %s)", m.real, p.real)
+				}
+				return fmt.Errorf("repo %s: the mirror %s holds %s %s%s, and the git tool server may read all of its mirror",
+					m.repo, m.path, p.what, p.path, via)
 			}
 		}
 	}
 	return nil
 }
 
-// holds reports whether the directory dir holds path, or is it: by their names, by their real
-// paths, or because one of the directories path is in is dir by another name, which only the
-// file system knows (on macOS a firmlink or another case, on Linux a bind mount of dir).
-func holds(dir, path string) bool {
-	real := resolve(path)
-	if within(path, dir) || within(real, resolve(dir)) {
-		return true
+// place is a path from the config, and where it is on the file system: each path is looked up
+// once, however many mirrors there are. Only an absolute path is looked up; another (an empty
+// one) names nothing, and holds nothing.
+type place struct {
+	path string
+	real string        // path, its symlinks resolved as far as it exists
+	info os.FileInfo   // path itself, if it exists
+	dirs []os.FileInfo // real and each directory above it, as far as they exist
+}
+
+// locate looks path up on the file system.
+func locate(path string) place {
+	p := place{path: path}
+	if !filepath.IsAbs(path) {
+		return p
 	}
-	d, err := os.Stat(dir)
-	if err != nil {
-		return false
+	p.real = resolve(path)
+	if fi, err := os.Stat(path); err == nil {
+		p.info = fi
 	}
-	for p := real; ; p = filepath.Dir(p) {
-		if fi, err := os.Stat(p); err == nil && os.SameFile(fi, d) {
-			return true
+	for d := p.real; ; d = filepath.Dir(d) {
+		if fi, err := os.Stat(d); err == nil {
+			p.dirs = append(p.dirs, fi)
 		}
-		if p == filepath.Dir(p) {
-			return false
+		if d == filepath.Dir(d) {
+			return p
 		}
 	}
 }
 
+// holds reports whether the directory d holds p, or is it: by their names, by their real paths,
+// or because one of the directories p is in is d by another name, which only the file system
+// knows (on macOS a firmlink or another case; on Linux d may be a bind mount of one of them).
+// A mount inside d, or p mounted from inside d, goes unseen.
+func (d place) holds(p place) bool {
+	return within(p.path, d.path) || within(p.real, d.real) ||
+		d.info != nil && slices.ContainsFunc(p.dirs, func(fi os.FileInfo) bool { return os.SameFile(fi, d.info) })
+}
+
 // resolve is path with its symlinks resolved as far as it exists: what does not exist yet will
-// be made where the part that does leads.
+// be made where the part that does leads, and a symlink to nothing leads where it points.
 func resolve(path string) string {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		return real
+	var walk func(path string, links int) string
+	walk = func(path string, links int) string {
+		if r, err := filepath.EvalSymlinks(path); err == nil {
+			return r
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path
+		}
+		p := filepath.Join(walk(parent, links), filepath.Base(path))
+		if target, err := os.Readlink(p); err == nil && links < 40 { // Linux follows 40 at most
+			if !filepath.IsAbs(target) {
+				target = filepath.Dir(p) + string(filepath.Separator) + target
+			}
+			return walk(target, links+1)
+		}
+		return p
 	}
-	parent := filepath.Dir(path)
-	if parent == path {
-		return path
-	}
-	return filepath.Join(resolve(parent), filepath.Base(path))
+	return walk(path, 0)
 }
 
 // within reports whether path is dir or inside it, by their names.

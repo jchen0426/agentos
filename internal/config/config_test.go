@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -124,13 +125,14 @@ func TestDevConfigsKeepDataOutOfTheRepository(t *testing.T) {
 func TestMirrorsHoldNothingElse(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", filepath.Join(dir, "home"))
-	for _, d := range []string{"home", "real/made"} {
+	for _, d := range []string{"home", "real/made", "up/x"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// link is another name for the mirror real; inner leads into it.
-	for name, target := range map[string]string{"link": "real", "inner": "real/made"} {
+	// link is another name for the mirror real; inner leads into it, away out of it; soon leads
+	// nowhere yet.
+	for name, target := range map[string]string{"link": "real", "inner": "real/made", "away": "up/x", "soon": "up/soon"} {
 		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -166,20 +168,25 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 		"a data directory not made yet":       {"data_dir: inner/data\n" + apart + "repos: {a/b: real}\n", "inner/data"},
 		"a Runtime directory not made yet":    {"data_dir: d\nruntime_listen: unix://inner/runtime/runtime.sock\nrepos: {a/b: real}\n", "inner/runtime"},
 		"a socket's directory through a link": {"data_dir: d\ncontrol_socket: link/control.sock\nrepos: {a/b: real}\n", "link"},
+		// agentd makes up/soon when it makes the data directory: then soon is the mirror around it.
+		"a mirror through a symlink to nothing yet": {"data_dir: up/soon/data\n" + apart + "repos: {a/b: soon}\n", "up/soon/data"},
+		"a repo with an empty id":                   {"data_dir: m/data\n" + apart + "repos: {\"\": {mirror: m, github: o/n}}\n", "m/data"},
+		// The kernel takes away/.. to be up; agentd's ledger goes to the name without the .., inner.
+		"a data directory with .. after a symlink": {"data_dir: " + dir + "/away/../inner\n" + apart + "repos: {a/b: real}\n", "inner"},
 	}
 	// Another name for the same directory, which only the file system knows: on macOS, a
 	// firmlink, or another case. (On Linux a bind mount, which a test cannot make.)
-	real, err := filepath.EvalSymlinks(filepath.Join(dir, "real"))
+	realDir, err := filepath.EvalSymlinks(filepath.Join(dir, "real"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	realInfo, err := os.Stat(real)
+	realInfo, err := os.Stat(realDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, alias := range map[string]string{"firmlink": "/System/Volumes/Data" + real, "case": strings.ToUpper(real)} {
+	for name, alias := range map[string]string{"firmlink": "/System/Volumes/Data" + realDir, "case": strings.ToUpper(realDir)} {
 		if a, err := os.Stat(alias); err != nil || !os.SameFile(a, realInfo) {
-			t.Logf("%s: %s has no such name here", name, real)
+			t.Logf("%s: %s has no such name here", name, realDir)
 			continue
 		}
 		if err := os.Symlink(filepath.Join(alias, "made"), filepath.Join(dir, name)); err != nil {
@@ -189,9 +196,15 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 		// The symlink leads into the mirror by the other name: where the data directory will be
 		// is known only from the real path.
 		refused["a symlink into the mirror by another name: "+name] = refusal{"data_dir: " + name + "/data\n" + apart + "repos: {a/b: real}\n", name + "/data"}
+		refused["the data directory is the mirror by another name: "+name] = refusal{"data_dir: \"" + alias + "\"\n" + apart + "repos: {a/b: real}\n", alias}
 	}
 	for name, c := range refused {
-		if _, err := load(c.body); err == nil || !strings.Contains(err.Error(), filepath.Join(dir, c.held)) {
+		held := c.held
+		if !filepath.IsAbs(held) {
+			held = filepath.Join(dir, held)
+		}
+		// The path itself, not just one inside it.
+		if _, err := load(c.body); err == nil || !regexp.MustCompile(regexp.QuoteMeta(held)+`($|[^/])`).MatchString(err.Error()) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -203,6 +216,12 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 		if _, err := load(body); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// Only absolute paths are compared. A Runtime endpoint without a path names no directory,
+	// whatever directory agentd starts in.
+	t.Chdir(filepath.Join(dir, "real"))
+	if _, err := load("data_dir: d\nruntime_listen: \"unix://\"\nrepos: {a/b: real}\n"); err != nil {
+		t.Errorf("unix:// started in the mirror: %v", err)
 	}
 }
 
@@ -287,6 +306,8 @@ func TestReposAndGitHub(t *testing.T) {
 		"no token for GitHub itself": "github: {api_url: \"https://api.github.com/\"}\n",
 		"github not owner/name":      "repos:\n  a/b: {mirror: m, github: nope}\n",
 		"no mirror":                  "repos:\n  a/b: {github: o/n}\n",
+		// The Linux launcher's shell would drop the newline, and mount m: not what Load checked.
+		"a mirror with a control character": "repos:\n  a/b: \"m\\n\"\n",
 	} {
 		if _, err := write(body); err == nil {
 			t.Errorf("%s: loaded", name)
