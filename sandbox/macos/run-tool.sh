@@ -44,7 +44,7 @@ work=$(cd "$state/work" && pwd -P)
 node -e '
   const fs = require("fs"), path = require("path");
   const [mirror, server, work, deny] = process.argv.slice(1);
-  const denied = JSON.parse(deny || "[]");
+  const denied = [require("os").userInfo().homedir, ...JSON.parse(deny || "[]")];
   const real = p => {
     try { return fs.realpathSync(p); } catch {
       const dir = path.dirname(p);
@@ -54,8 +54,7 @@ node -e '
   console.log(JSON.stringify({
     network: { allowedDomains: [], deniedDomains: [], allowLocalBinding: false },
     filesystem: {
-      denyRead: [...new Set([require("os").userInfo().homedir, "/private/tmp", "/private/var/folders",
-                             ...denied.flatMap(p => [p, real(p)])])],
+      denyRead: [...new Set(["/private/tmp", "/private/var/folders", ...denied.flatMap(p => [p, real(p)])])],
       allowRead: [...new Set([mirror, server, real(server), work])],
       allowWrite: [work],
       denyWrite: ["/tmp/claude", "/private/tmp/claude"],

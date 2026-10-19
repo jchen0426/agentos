@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,6 +35,110 @@ func TestToolDenyRead(t *testing.T) {
 	if slices.Contains(toolDenyRead(cfg), "127.0.0.1:7233") || len(toolDenyRead(cfg)) != len(want)-1 {
 		t.Errorf("a TCP Runtime endpoint: %q", toolDenyRead(cfg))
 	}
+}
+
+// On Linux the launcher mounts all of the call's mirror: whatever else toolDenyRead keeps from the
+// git tool server, a config that makes it a repo's mirror does not load.
+func TestNoMirrorIsWhatToolsMustNotRead(t *testing.T) {
+	dir := t.TempDir()
+	repos := map[string]string{"acme/payments": filepath.Join(dir, "payments"), "acme/ledger": filepath.Join(dir, "ledger")}
+	load := func() (*config.Config, error) {
+		t.Helper()
+		b, err := json.Marshal(map[string]any{ // JSON is YAML
+			"data_dir":       filepath.Join(dir, "data"),
+			"control_socket": filepath.Join(dir, "control", "control.sock"),
+			"runtime_listen": "unix://" + filepath.Join(dir, "runtime", "runtime.sock"),
+			"temporal": map[string]any{"tls": map[string]string{
+				"cert_file": filepath.Join(dir, "tls", "agentd.crt"), "key_file": filepath.Join(dir, "tls", "agentd.key")}},
+			"policy_file": "p", "models_file": "m", "prices_file": "x",
+			"repos": repos,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return config.Load(path)
+	}
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := cfg.Repos["acme/payments"].Mirror
+	for _, p := range toolDenyRead(cfg) {
+		if p == own {
+			continue
+		}
+		repos["acme/payments"] = p
+		if _, err := load(); err == nil {
+			t.Errorf("acme/payments with the mirror %s: loaded", p)
+		}
+	}
+}
+
+// agentd makes its files where Load looked. The kernel takes a .. after the symlink before it,
+// while Load and filepath.Join take it by name: so Load cleans the paths agentd uses.
+func TestAgentdMakesNothingInAMirror(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "aos-") // short: a socket's path is at most 103 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	mirror := filepath.Join(dir, "mirror")
+	if err := os.MkdirAll(filepath.Join(mirror, "refs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// in leads into the mirror: to the kernel, in/.. is the mirror; by name, it is dir.
+	if err := os.Symlink("mirror/refs", filepath.Join(dir, "in")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(map[string]any{ // JSON is YAML
+		"data_dir":       dir + "/in/../data",
+		"control_socket": dir + "/in/../control.sock",
+		"runtime_listen": "unix://" + dir + "/in/../runtime.sock",
+		"policy_file":    "p", "models_file": "m", "prices_file": "x",
+		"repos": map[string]string{"acme/payments": mirror},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agentd.yaml")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mkdirPrivate(cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range []string{"unix://" + cfg.ControlSocket, cfg.RuntimeListen} {
+		ln, err := listen(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+	}
+	entries, err := os.ReadDir(mirror)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "refs" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("agentd made files in the mirror: %q", names)
+	}
+	// The ledger goes into the data directory agentd made.
+	lock, err := lockDataDir(cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
 }
 
 // A provider elsewhere is reached only over https; a key for a Chat Completions server is read
