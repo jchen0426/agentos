@@ -154,6 +154,35 @@ PR #11 的对抗评审指出过：开发配置把数据目录放在仓库里（`
 
 推送前，两个评审代理（安全、对抗）在各自的副本里做了实验，都没找到高危问题。上面 Runtime 目录、FIFO、macOS 符号链接、旧 agentd、`~` 写法、扫描重试这几条都是它们找出来的。它们还发现，macOS 上原来的测试数据放在 `/tmp`，本来就读得到，测不出真正的漏洞；现在测试先把它拒读。改完再请对抗评审复查了一轮：上面那些都修好了；它又找出 macOS 能读 FIFO、`HOME` 不可靠、“查不完就拒绝”没有用例这三处，也都补上了。
 
+## macOS 启动脚本的状态目录和 `/tmp/claude`（2026-10-19）
+
+PR #20 的评审顺带发现的三处 macOS 启动脚本问题（比它早就有），这次一起修了。改之前都复现过：
+
+- srt 默认放行沙箱写 `/tmp/claude`（和 `/private/tmp/claude`），还把沙箱里的 `TMPDIR` 换成它。`run-tool.sh` 禁了，Worker 的启动脚本没禁：Worker 能在那里建文件，`tempfile` 也建在那里。这个目录由第一个用到它的进程建出来，人人可读，本机所有按 srt 默认设置跑的命令共用。启动脚本自己传的 `TMPDIR` 被 srt 盖掉了，从来没生效。
+- 启动脚本每次在 `/tmp/agentos-sandbox.XXXXXX` 建一个状态目录（srt 的设置、srt 自己的 socket、Worker 的私有目录），然后 `exec` srt，没有谁删它：这台 Mac 上已经积了 1300 多个。macOS 沙箱家目录以外默认都能读，所以 Worker 读得到别的 Worker 的私有目录、别的 srt 的设置（里面是整张拒读列表），也读得到留下来的那些。
+- `run-tool.sh` 拒读用户数据库里的家目录，只按原样交给 srt。家目录要是指向别处的符号链接（比如 `/Users/x` 指向另一个卷），srt 保留原写法，Seatbelt 按真实路径匹配，等于没拒读。Worker 的启动脚本在 PR #20 里已经连真实路径一起给了。
+
+改动：
+
+- Worker 启动脚本禁写 `/tmp/claude` 和 `/private/tmp/claude`。两种写法都要：`/tmp/claude` 不存在时，srt 解析不出它的真实路径。srt 把 `CLAUDE_CODE_TMPDIR` 当作沙箱里的 `TMPDIR`，启动脚本把它设成 Worker 的私有目录；srt 自己的 `TMPDIR`（它的 socket 放在那里）原先也是这个私有目录，现在改成状态目录本身，Worker 读写不到。
+- 状态目录跟着 srt 走。启动脚本 `exec` srt 之前开一条管道：写端是 fd 9，srt 一直拿着，不传给它起的进程（macOS 上 libuv 用 `POSIX_SPAWN_CLOEXEC_DEFAULT` 起进程）；读端交给一个不在 Worker 进程树里的进程（fork 两次，父进程成了 launchd）。读到管道关闭（srt 以任何方式结束，内核都会关掉它的 fd）就删掉状态目录。启动脚本照旧 `exec` srt，信号处理和以前完全一样：SIGTERM 发给 srt，srt 转给 Worker，Worker 死于 SIGTERM 时 srt 以 0 退出。没用“不 exec，等 srt 结束再删”：harness 遇到停不下来的 Worker、T1 测试要它崩溃时，都 `kill -9` 整棵进程树，启动脚本自己也在里面。
+- 删除本身不能被 Worker 利用（这是 PR #20 两个评审复查本次改动时发现、我引入的高危回归）：删目录的进程在沙箱外，用非沙箱用户的权限跑；Worker 虽然只能写自己的私有目录，却能在里面放符号链接，`rm -rf` 遍历时要删的目录被换成符号链接就会跟出去，把沙箱外的东西（家目录、账本、仓库）递归删掉。真正利用要靠竞态：Worker 留一个 `setsid` 的子孙进程（不在被杀的进程树和进程组里），在 srt 退出、删除开始时不停地把目录换成符号链接。所以删除交给 `sandbox/macos/rm-state.py`：它不按名字判断，只沿着自己用 `O_RDONLY|O_NOFOLLOW|O_DIRECTORY` 打开的 fd 往下走——符号链接打不开（ELOOP），当成链接本身删掉，绝不跟随；非目录打不开（ENOTDIR），也删掉；只有真目录能打开，递归用那个 fd，不再用名字。检查和下降之间没有窗口。找不到这样的 Python（先用 pyenv 自带的，再找 PATH 上的 `python3`）就不删，把目录留下（仍然拒读），绝不用不安全的方式删。
+- Worker 还能用 `chflags uchg` 钉住自己私有目录里的文件、或把子目录 `chmod 000`，让一次 `rm` 删不掉、状态目录留下来（两个评审都发现了；只影响自己这一个目录，仍然拒读，不泄密，是整洁/占用问题）。`rm-state.py` 删不掉时尽力清一次 flag 和 mode 再重试，失败就只留下那一个条目。整个进程组一起被杀（或 SIGKILL/SIGSTOP）会带走删目录的进程，目录也会留下；这些都等 M5 由 agentd 建、删这个目录来根治。读端只忽略它能忽略的作业控制和终端信号（INT QUIT TSTP TTIN TTOU TERM HUP USR1 USR2）。
+- 启动脚本开头保证 fd 0、1、2 都是开的（关着就接 `/dev/null`）：否则调用者把它们关掉时，bash 会把上面那条管道的写端放到 fd 2 这种低位，沙箱里的 Worker 就继承了管道（评审发现）。
+- 每次启动都拒读所有启动的状态目录（`/private/tmp/agentos-sandbox.*`，按 mktemp 的命名），再放开 Worker 自己的私有目录（allowRead 优先）：别的 Worker 的文件、srt 的设置、留下来的目录都读不到。glob 要写成真实路径：基目录正好是 `/tmp` 的 glob，srt 不会改写成 `/private/tmp`，Seatbelt 就匹配不上。
+- `run-tool.sh` 把用户数据库里的家目录连同真实路径一起拒读，和别的拒读条目一样。
+
+测试（都只在 macOS 上跑）：
+
+- `tests/test_sandbox.py::test_worker_sandbox_writes_only_its_private_directory`：Worker 往 `/tmp/claude`、`/private/tmp/claude`、`/tmp`、`/var/tmp`、家目录、代码目录写都被拒（EPERM），沙箱外也没出现；`tempfile` 能用，文件建在私有目录里。改之前 `/tmp/claude` 下的两个都写进去了。
+- `test_worker_launcher_leaves_no_state_behind`：Worker 自己退出、SIGTERM 发给 srt、SIGTERM 发给整个进程组、Ctrl-C（SIGINT 发给进程组）、SIGHUP 发给进程组（srt 不捕获它，死于它；关终端就是这个信号）、`kill -9` 整棵进程树，六种结束方式之后 10 秒内，srt 的设置所在的目录（从 srt 的命令行取）和 Worker 的私有目录都没了；srt 的退出状态也对（前四种 0，SIGHUP 死于信号，kill -9 死于信号），Worker 的进程也都不在了。改之前都留下了。
+- `test_rm_state_removes_a_tree_without_following_a_symlink_out_of_it`：直接跑 `rm-state.py`，状态目录里放一个指向目录外 canary 的符号链接、一个 `uchg` 文件、一个 `chmod 000` 的子目录；删完目录没了，canary 原封不动（没跟随符号链接）。去掉 `O_NOFOLLOW` 这个用例就失败（符号链接被跟进去，canary 被删）。另外实测了真正的竞态：Worker 留一个 `setsid` 子孙进程不停换符号链接，单杀 srt，canary 10 次都没被删。
+- `test_worker_sandbox_cannot_read_another_launchs_state`：一个 Worker 跑着，另一个去读它私有目录里的文件、它的 srt 设置、一个按启动脚本的命名留下的目录，都被拒；自己私有目录里的文件读得到。沙箱外先确认这些都读得到。改之前三样都读到了。
+- `tests/test_tool_sandbox.py::test_the_git_tool_server_cannot_read_a_home_directory_named_through_a_symlink`：测试改不了用户数据库，就在启动脚本问的地方（Node 的 `os.userInfo()`，经 `NODE_OPTIONS` 预加载一段脚本）把家目录换成指向真正家目录的符号链接。改之前探针读到了家目录里的文件。
+- 逐条改坏：Worker 启动脚本不禁写 `/tmp/claude`、只禁一种写法（`/tmp/claude` 不存在时才测得出）、不设 `CLAUDE_CODE_TMPDIR`、不起删目录的进程、它留在进程树里、它不忽略信号（只有发给进程组的 SIGTERM 测得出：bash 本来就让后台命令忽略 SIGINT 和 SIGQUIT）、不拒读状态目录、glob 写成 `/tmp/...`、不放开自己的私有目录；`rm-state.py` 去掉 `O_NOFOLLOW`、不清 `uchg`、不清 `chmod 000`；`run-tool.sh` 不解析家目录的真实路径——每一处都有用例失败。
+
+原来留在 `/tmp` 的状态目录（连同本次测试留下的）没有删，挪到了家目录的 `~/agentos-backups/2026-10-19-macos-worker-state/`（Worker 读不到）；还有 srt 进程在用的（命令行里点名的）留在原处。别的 checkout 和 worktree 用的还是旧启动脚本，在它们更新之前还会继续留下新的。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
@@ -168,7 +197,8 @@ PR #11 的对抗评审指出过：开发配置把数据目录放在仓库里（`
 - git 工具服务器也有同类问题：Linux 的 `run-tool.sh` 把镜像整个挂进去，镜像目录要是包住了 agentd 的数据目录（比如 `repos` 写成家目录），工具服务器就能读账本、连 Control socket。启动脚本每次调用都扫一遍镜像太慢，该由 agentd 加载配置时拒绝：镜像里不能有数据目录、两个 socket 所在的目录，也不能有别的镜像。
 - 开发数据现在由所有 checkout 共用一份 `~/.agentos`：开发用的 agentd 同一时间只能跑一个，第二个会卡在锁上；不同分支轮流用同一个账本。goose 会忽略它不认识的迁移版本，所以旧分支的 agentd 照样在新分支迁移过的账本上跑；两个分支各加一个同号的迁移时，后一个永远不会执行。该让 agentd 拒绝账本里它不认识的最高版本。
 - 虚拟机里的 Linux 启动脚本也会拒绝 Mac 那边留在共享目录里的 socket，比如开了 git fsmonitor 时 `.git` 里的那个，虽然虚拟机根本连不上它（评审实测，连接被拒）。
-- 和这次改动无关、评审顺带发现的 macOS 问题：Worker 启动脚本从不删除自己的状态目录（`/tmp/agentos-sandbox.*`，这台 Mac 上已经积了 910 个），后起的 Worker 都能读到前面那些；srt 默认允许沙箱写 `/tmp/claude`，`run-tool.sh` 禁了，Worker 的启动脚本没禁。
+- macOS 的 Worker 沙箱家目录以外按黑名单拦读，`/tmp` 和 `/var/folders` 里除了各次启动的状态目录，别的都读得到：工具服务器每次调用的目录（`/tmp/agentos-tools.*`，里面有 srt 的设置，也就是拒读列表）、别的程序的临时文件，比如 Claude Code 自己的 `/tmp/claude-<uid>`（实测读到了，权限 0700 挡不住同一个用户）。可以像 `run-tool.sh` 那样把 `/private/tmp` 和 `/private/var/folders` 整个拒读，只放开 Python 环境、代码目录和私有目录；那样测试里放在 `/tmp` 的数据就要挪到 `/var/tmp`，否则测不出拒读条目本身。
+- macOS 启动脚本删状态目录的进程和 srt 在同一个进程组里。两个一起被杀（比如 `kill -9` 整个进程组）时，状态目录留下来，Worker 读不到，但没人删。M5 改由 agentd 拉起 Worker 时，可以像工具服务器那样由 agentd 建、删这个目录（`AGENTOS_SANDBOX_STATE`）。
 
 ## 后续（不在 M1 范围）
 
