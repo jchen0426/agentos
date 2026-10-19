@@ -125,14 +125,17 @@ func TestDevConfigsKeepDataOutOfTheRepository(t *testing.T) {
 func TestMirrorsHoldNothingElse(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", filepath.Join(dir, "home"))
-	for _, d := range []string{"home", "real/made", "up/x"} {
+	for _, d := range []string{"home", "real/made", "up/x", "elsewhere/a/b"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// link is another name for the mirror real; inner leads into it, away out of it; soon leads
-	// nowhere yet.
-	for name, target := range map[string]string{"link": "real", "inner": "real/made", "away": "up/x", "soon": "up/soon"} {
+	// nowhere yet, and soon2 too, by an absolute path that ends in /. sub leads deep into
+	// elsewhere, and lat through sub/.. to elsewhere/a/later, which is not there yet: the kernel
+	// takes a .. after the symlink before it.
+	for name, target := range map[string]string{"link": "real", "inner": "real/made", "away": "up/x", "soon": "up/soon",
+		"soon2": filepath.Join(dir, "up", "soon2") + "/", "sub": "elsewhere/a/b", "lat": "sub/../later"} {
 		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -169,8 +172,10 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 		"a Runtime directory not made yet":    {"data_dir: d\nruntime_listen: unix://inner/runtime/runtime.sock\nrepos: {a/b: real}\n", "inner/runtime"},
 		"a socket's directory through a link": {"data_dir: d\ncontrol_socket: link/control.sock\nrepos: {a/b: real}\n", "link"},
 		// agentd makes up/soon when it makes the data directory: then soon is the mirror around it.
-		"a mirror through a symlink to nothing yet": {"data_dir: up/soon/data\n" + apart + "repos: {a/b: soon}\n", "up/soon/data"},
-		"a repo with an empty id":                   {"data_dir: m/data\n" + apart + "repos: {\"\": {mirror: m, github: o/n}}\n", "m/data"},
+		"a mirror through a symlink to nothing yet":                        {"data_dir: up/soon/data\n" + apart + "repos: {a/b: soon}\n", "up/soon/data"},
+		"a mirror through a symlink to nothing yet, by a path ending in /": {"data_dir: up/soon2/data\n" + apart + "repos: {a/b: soon2}\n", "up/soon2/data"},
+		"a mirror through a symlink to nothing yet, by .. after a symlink": {"data_dir: elsewhere/a/later/data\n" + apart + "repos: {a/b: lat}\n", "elsewhere/a/later/data"},
+		"a repo with an empty id":                                          {"data_dir: m/data\n" + apart + "repos: {\"\": {mirror: m, github: o/n}}\n", "m/data"},
 		// The kernel takes away/.. to be up; agentd's ledger goes to the name without the .., inner.
 		"a data directory with .. after a symlink": {"data_dir: " + dir + "/away/../inner\n" + apart + "repos: {a/b: real}\n", "inner"},
 	}
@@ -212,6 +217,8 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 	for name, body := range map[string]string{
 		"a mirror in the data directory": "data_dir: d\nrepos: {a/b: d/mirror}\n", // the dev configs' layout
 		"names that share a prefix":      "data_dir: m-data\ncontrol_socket: m-control/control.sock\nrepos: {a/b: m, c/d: m2}\n",
+		// lat leads to elsewhere/a/later, not to later
+		"a link's .. taken after the symlink before it": "data_dir: later/data\n" + apart + "repos: {a/b: lat}\n",
 	} {
 		if _, err := load(body); err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -223,6 +230,42 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 	if _, err := load("data_dir: d\nruntime_listen: \"unix://\"\nrepos: {a/b: real}\n"); err != nil {
 		t.Errorf("unix:// started in the mirror: %v", err)
 	}
+}
+
+// resolve takes a path as the kernel does where it exists, as filepath.EvalSymlinks does, and
+// keeps the names that do not exist yet.
+func TestResolveAsTheKernelDoes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a/b/c"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"rel": "a/b", "abs": filepath.Join(dir, "a"), "chain": "rel", "dots": "a/b/../b/c", "deep": "a/b/c",
+	} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{dir + "/a/b/c", dir + "/rel/c", dir + "/abs/b", dir + "/chain/c", dir + "/dots",
+		dir + "/deep/..", dir + "/rel/../b", "/tmp", "/var"} {
+		want, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := resolve(p); got != want {
+			t.Errorf("resolve(%s) = %s, want %s", p, got, want)
+		}
+		if got := resolve(p + "/not/yet"); got != want+"/not/yet" {
+			t.Errorf("resolve(%s/not/yet) = %s, want %s/not/yet", p, got, want)
+		}
+	}
+	// A loop of symlinks ends: the kernel follows 40 at most.
+	for name, target := range map[string]string{"loop1": "loop2", "loop2": "loop1"} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolve(dir + "/loop1/x")
 }
 
 func TestPathsInTheHomeDirectory(t *testing.T) {
@@ -281,6 +324,13 @@ func TestPathsInTheHomeDirectory(t *testing.T) {
 
 func TestReposAndGitHub(t *testing.T) {
 	dir := t.TempDir()
+	// A directory whose name ends in a newline, reached by a symlink without one.
+	if err := os.Mkdir(filepath.Join(dir, "nl\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nl\n", filepath.Join(dir, "nl-link")); err != nil {
+		t.Fatal(err)
+	}
 	write := func(body string) (*Config, error) {
 		path := filepath.Join(dir, "agentd.yaml")
 		if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\n"+body), 0o600); err != nil {
@@ -308,6 +358,7 @@ func TestReposAndGitHub(t *testing.T) {
 		"no mirror":                  "repos:\n  a/b: {github: o/n}\n",
 		// The Linux launcher's shell would drop the newline, and mount m: not what Load checked.
 		"a mirror with a control character": "repos:\n  a/b: \"m\\n\"\n",
+		"a mirror whose real path has one":  "repos:\n  a/b: nl-link\n",
 	} {
 		if _, err := write(body); err == nil {
 			t.Errorf("%s: loaded", name)

@@ -1,5 +1,6 @@
 // Package config loads agentd.yaml. Relative paths are resolved against the directory of
-// the config file; a path that starts with ~/ is in the home directory.
+// the config file; a path that starts with ~/ is in the home directory. Every path is cleaned
+// (filepath.Clean): a .. drops the name before it, a symlink's too.
 package config
 
 import (
@@ -203,11 +204,6 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("config %s: repo %s: mirror is required", path, id)
 		}
 		r.Mirror = abs(r.Mirror)
-		// The launchers take the path in shell, where Linux's would drop a trailing newline and
-		// mount another directory than the one checkMirrors looks at.
-		if strings.ContainsFunc(r.Mirror, unicode.IsControl) {
-			return nil, fmt.Errorf("config %s: repo %s: the mirror %q has a control character in its path", path, id, r.Mirror)
-		}
 		if r.GitHub == "" {
 			r.GitHub = id
 		}
@@ -294,6 +290,11 @@ func (c *Config) checkMirrors() error {
 		if !m.mirror {
 			continue
 		}
+		// The Linux launcher takes the mirror's real path in shell, which drops a trailing newline:
+		// it would mount another directory than the one checked here.
+		if strings.ContainsFunc(m.real, unicode.IsControl) {
+			return fmt.Errorf("repo %s: the mirror %q has a control character in its real path %q", m.repo, m.path, m.real)
+		}
 		for j, p := range paths {
 			if i != j && m.holds(p.place) {
 				via := ""
@@ -347,28 +348,35 @@ func (d place) holds(p place) bool {
 		d.info != nil && slices.ContainsFunc(p.dirs, func(fi os.FileInfo) bool { return os.SameFile(fi, d.info) })
 }
 
-// resolve is path with its symlinks resolved as far as it exists: what does not exist yet will
-// be made where the part that does leads, and a symlink to nothing leads where it points.
+// resolve is path, an absolute one, with its symlinks resolved a name at a time as the kernel
+// does, as far as the names exist: what does not exist yet will be made under the names given,
+// where the part that does leads, and a symlink to nothing leads where it points.
 func resolve(path string) string {
-	var walk func(path string, links int) string
-	walk = func(path string, links int) string {
-		if r, err := filepath.EvalSymlinks(path); err == nil {
-			return r
+	sep := string(filepath.Separator)
+	dest, names := sep, strings.Split(path, sep)
+	for links := 0; len(names) > 0; {
+		name := names[0]
+		names = names[1:]
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			dest = filepath.Dir(dest) // dest holds no symlink: its parent is the one by name
+			continue
 		}
-		parent := filepath.Dir(path)
-		if parent == path {
-			return path
+		next := filepath.Join(dest, name)
+		target, err := os.Readlink(next)
+		if err != nil || links == 40 { // not a symlink, or not there; Linux follows 40 at most
+			dest = next
+			continue
 		}
-		p := filepath.Join(walk(parent, links), filepath.Base(path))
-		if target, err := os.Readlink(p); err == nil && links < 40 { // Linux follows 40 at most
-			if !filepath.IsAbs(target) {
-				target = filepath.Dir(p) + string(filepath.Separator) + target
-			}
-			return walk(target, links+1)
+		links++
+		if filepath.IsAbs(target) {
+			dest = sep
 		}
-		return p
+		names = append(strings.Split(target, sep), names...)
 	}
-	return walk(path, 0)
+	return dest
 }
 
 // within reports whether path is dir or inside it, by their names.
