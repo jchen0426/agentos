@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -202,6 +203,11 @@ func TestMirrorsHoldNothingElse(t *testing.T) {
 		// is known only from the real path.
 		refused["a symlink into the mirror by another name: "+name] = refusal{"data_dir: " + name + "/data\n" + apart + "repos: {a/b: real}\n", name + "/data"}
 		refused["the data directory is the mirror by another name: "+name] = refusal{"data_dir: \"" + alias + "\"\n" + apart + "repos: {a/b: real}\n", alias}
+		// The mirror is a symlink to the other name: only the directory it leads to is the one.
+		if err := os.Symlink(alias, filepath.Join(dir, name+"-mirror")); err != nil {
+			t.Fatal(err)
+		}
+		refused["a symlink to the mirror by another name: "+name] = refusal{"data_dir: real/data\n" + apart + "repos: {a/b: " + name + "-mirror}\n", "real/data"}
 	}
 	for name, c := range refused {
 		held := c.held
@@ -246,26 +252,86 @@ func TestResolveAsTheKernelDoes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Chains of 32 links, as many as macOS follows (Linux 40): to a place, and to nowhere yet.
+	for i := 1; i <= 32; i++ {
+		to, nowhere := fmt.Sprintf("c%d", i+1), fmt.Sprintf("n%d", i+1)
+		if i == 32 {
+			to, nowhere = "a/b", "a/nowhere"
+		}
+		if err := os.Symlink(to, filepath.Join(dir, fmt.Sprintf("c%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(nowhere, filepath.Join(dir, fmt.Sprintf("n%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, p := range []string{dir + "/a/b/c", dir + "/rel/c", dir + "/abs/b", dir + "/chain/c", dir + "/dots",
-		dir + "/deep/..", dir + "/rel/../b", "/tmp", "/var"} {
+		dir + "/deep/..", dir + "/rel/../b", dir + "/c1/c", "/tmp", "/var"} {
 		want, err := filepath.EvalSymlinks(p)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := resolve(p); got != want {
-			t.Errorf("resolve(%s) = %s, want %s", p, got, want)
+		if got, err := resolve(p); got != want || err != nil {
+			t.Errorf("resolve(%s) = %s, %v; want %s", p, got, err, want)
 		}
-		if got := resolve(p + "/not/yet"); got != want+"/not/yet" {
-			t.Errorf("resolve(%s/not/yet) = %s, want %s/not/yet", p, got, want)
+		if got, err := resolve(p + "/not/yet"); got != want+"/not/yet" || err != nil {
+			t.Errorf("resolve(%s/not/yet) = %s, %v; want %s/not/yet", p, got, err, want)
 		}
 	}
-	// A loop of symlinks ends: the kernel follows 40 at most.
+	a, err := filepath.EvalSymlinks(dir + "/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolve(dir + "/n1/c"); got != a+"/nowhere/c" || err != nil {
+		t.Errorf("resolve(n1/c) = %s, %v; want %s/nowhere/c", got, err, a)
+	}
+	// A loop of symlinks ends, with nowhere to tell of: the kernel cannot take it either.
 	for name, target := range map[string]string{"loop1": "loop2", "loop2": "loop1"} {
 		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	resolve(dir + "/loop1/x")
+	if got, err := resolve(dir + "/loop1/x"); err == nil {
+		t.Errorf("resolve(loop1/x) = %s", got)
+	}
+}
+
+// Where resolve cannot follow a path, Load refuses it rather than guess. Here the real path of
+// the data directory is longer than the system takes, though the kernel reaches it by a short
+// one through symlinks: it would make the data directory inside the mirror.
+func TestLoadRefusesWhatItCannotFollow(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "mirror"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Each s leads 500 bytes deeper. They are made from inside: no name of the deepest
+	// directory is short enough to make it from outside.
+	t.Chdir(dir)
+	short, long := dir, strings.Repeat("D", 250)
+	for i := range 10 {
+		step := fmt.Sprintf("%s%da/%s%db", long, i, long, i)
+		if err := os.MkdirAll(step, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(step, "s"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir("s"); err != nil {
+			t.Fatal(err)
+		}
+		short += "/s"
+	}
+	if err := os.Symlink(filepath.Join(dir, "mirror"), "x"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agentd.yaml")
+	if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\ndata_dir: "+short+"/x/data\n"+
+		"control_socket: c/control.sock\nruntime_listen: tcp://127.0.0.1:7244\nrepos: {a/b: mirror}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(path); err == nil {
+		t.Errorf("loaded, data_dir %s", c.DataDir)
+	}
 }
 
 func TestPathsInTheHomeDirectory(t *testing.T) {

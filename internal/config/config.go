@@ -5,7 +5,9 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -286,6 +289,11 @@ func (c *Config) checkMirrors() error {
 	for _, id := range slices.Sorted(maps.Keys(c.Repos)) {
 		paths = append(paths, named{what: "repo " + id + "'s mirror", mirror: true, repo: id, place: locate(c.Repos[id].Mirror)})
 	}
+	for _, p := range paths {
+		if p.err != nil && len(c.Repos) > 0 {
+			return fmt.Errorf("cannot tell where %s %s leads, to check it against the mirrors: %w", p.what, p.path, p.err)
+		}
+	}
 	for i, m := range paths {
 		if !m.mirror {
 			continue
@@ -315,6 +323,7 @@ func (c *Config) checkMirrors() error {
 type place struct {
 	path string
 	real string        // path, its symlinks resolved as far as it exists
+	err  error         // why real could not be told
 	info os.FileInfo   // path itself, if it exists
 	dirs []os.FileInfo // real and each directory above it, as far as they exist
 }
@@ -325,7 +334,9 @@ func locate(path string) place {
 	if !filepath.IsAbs(path) {
 		return p
 	}
-	p.real = resolve(path)
+	if p.real, p.err = resolve(path); p.err != nil {
+		return p
+	}
 	if fi, err := os.Stat(path); err == nil {
 		p.info = fi
 	}
@@ -350,8 +361,9 @@ func (d place) holds(p place) bool {
 
 // resolve is path, an absolute one, with its symlinks resolved a name at a time as the kernel
 // does, as far as the names exist: what does not exist yet will be made under the names given,
-// where the part that does leads, and a symlink to nothing leads where it points.
-func resolve(path string) string {
+// where the part that does leads, and a symlink to nothing leads where it points. Where it
+// cannot tell (a name it cannot look at, a real path longer than the system takes), it fails.
+func resolve(path string) (string, error) {
 	sep := string(filepath.Separator)
 	dest, names := sep, strings.Split(path, sep)
 	for links := 0; len(names) > 0; {
@@ -366,6 +378,9 @@ func resolve(path string) string {
 		}
 		next := filepath.Join(dest, name)
 		target, err := os.Readlink(next)
+		if err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+			return "", err
+		}
 		if err != nil || links == 40 { // not a symlink, or not there; Linux follows 40 at most
 			dest = next
 			continue
@@ -376,7 +391,7 @@ func resolve(path string) string {
 		}
 		names = append(strings.Split(target, sep), names...)
 	}
-	return dest
+	return dest, nil
 }
 
 // within reports whether path is dir or inside it, by their names.
