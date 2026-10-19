@@ -577,7 +577,10 @@ func (e *cpuLimitError) Error() string { return "git " + e.cmd + ": killed at it
 // cpuLimited reports whether a process died at its CPU time limit: of SIGXCPU at the soft
 // limit, or of SIGKILL having used as much CPU as the limit (Linux sends SIGKILL, not SIGXCPU,
 // at a hard limit equal to the soft one). The server has the same limits as git: they are
-// the launcher's.
+// the launcher's. Only SIGXCPU is certain: Linux kills on a CPU clock it samples at each tick,
+// which can run a tenth or more ahead of the CPU time wait reports when other processes wake
+// for short spells on the same CPU, so a launcher keeps the hard limit above the soft one, as
+// run-tool.sh does.
 func cpuLimited(st *os.ProcessState) bool {
 	ws, ok := st.Sys().(syscall.WaitStatus)
 	if !ok || !ws.Signaled() {

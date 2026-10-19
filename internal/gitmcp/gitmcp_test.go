@@ -1132,8 +1132,12 @@ func TestClientLimits(t *testing.T) {
 	r.commit("old")
 	r.write("lines.txt", new.String())
 	slow := r.commit("new")
-	// Soft and hard limit alike: SIGXCPU on macOS, SIGKILL on Linux.
-	launcher := []string{"/bin/sh", "-c", `ulimit -t 1; shift 2; exec "$@"`, "sh"} // <mirror> -- <server> ...
+	// The soft limit below the hard one, as run-tool.sh sets them, so that git dies of SIGXCPU
+	// on Linux as on macOS. With the two equal, Linux sends SIGKILL instead, on a CPU clock it
+	// samples at each tick: with other processes waking for short spells on the same CPU, that
+	// clock ran a tenth or more ahead of the CPU time wait reports, and the server took git's
+	// death for a failure.
+	launcher := []string{"/bin/sh", "-c", `ulimit -S -t 1 && ulimit -H -t 2 && shift 2 && exec "$@"`, "sh"} // <mirror> -- <server> ...
 	c, err := NewClient(Options{Server: bin, Sandbox: launcher, Timeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
