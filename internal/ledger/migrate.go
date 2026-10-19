@@ -34,9 +34,9 @@ const createMigrationFiles = `CREATE TABLE IF NOT EXISTS migration_files (
 
 type migrationFile struct{ name, sha256 string }
 
-// migrationRecord is a row of migration_files. It vouches for its migration only while goose's
-// row for that version is the one that applied it: goose's down deletes the row, not the record,
-// and the version's next row has a new id (the table is AUTOINCREMENT).
+// migrationRecord is a row of migration_files. After 7 it vouches for its migration only while
+// goose's row for that version is the one that applied it: goose's down deletes the row, not the
+// record, and the version's next row has a new id (goose's table is AUTOINCREMENT).
 type migrationRecord struct {
 	migrationFile
 	gooseID int64
@@ -160,9 +160,9 @@ func checkMigrations(ctx context.Context, sqlDB *sql.DB, path string, store data
 			name, name, name, filepath.Dir(path))
 	}
 	for v, id := range applied {
-		if r, ok := recorded[v]; !ok || r.gooseID != id { // up to 7: the check refuses any later one
-			if _, err := tx.ExecContext(ctx, "INSERT OR REPLACE INTO migration_files (version, goose_id, name, sha256) "+
-				"VALUES (?, ?, ?, ?)", v, id, files[v].name, files[v].sha256); err != nil {
+		if _, ok := recorded[v]; !ok { // up to 7: the check refuses any later one
+			if _, err := tx.ExecContext(ctx, "INSERT INTO migration_files (version, goose_id, name, sha256) VALUES (?, ?, ?, ?)",
+				v, id, files[v].name, files[v].sha256); err != nil {
 				return err
 			}
 		}
@@ -180,20 +180,24 @@ func mismatches(applied map[int64]int64, recorded map[int64]migrationRecord, fil
 	for _, v := range slices.Sorted(maps.Keys(applied)) {
 		last = v
 		f, ok := files[v]
-		r, isRecorded := recorded[v]
-		if isRecorded = isRecorded && r.gooseID == applied[v]; isRecorded {
+		r, hasRecord := recorded[v]
+		current := hasRecord && r.gooseID == applied[v] // a record of the version's row
+		if current {
 			names[v] = r.name
 		}
+		// Up to 7, even a record of a row since rolled back counts: those versions are taken as
+		// this agentd's file only when nothing says otherwise.
+		differs := hasRecord && r.sha256 != f.sha256 && (current || v <= lastUnrecordedMigration)
 		switch {
 		case !ok:
 			unknown = append(unknown, v)
-		case isRecorded && r.sha256 != f.sha256 && r.name == f.name: // edited since, or another branch's namesake
+		case differs && r.name == f.name: // edited since, or another branch's namesake
 			other = append(other, fmt.Sprintf("its migration %d was another %s (sha256 %.12s), not this agentd's (sha256 %.12s)",
 				v, f.name, r.sha256, f.sha256))
-		case isRecorded && r.sha256 != f.sha256:
+		case differs:
 			other = append(other, fmt.Sprintf("its migration %d was %s (sha256 %.12s), this agentd's is %s (sha256 %.12s)",
 				v, r.name, r.sha256, f.name, f.sha256))
-		case !isRecorded && v > lastUnrecordedMigration:
+		case !current && v > lastUnrecordedMigration:
 			unrecorded = append(unrecorded, v)
 		}
 	}

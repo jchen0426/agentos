@@ -354,8 +354,8 @@ func TestOpenRefusesAMigrationAppliedAfterGooseRolledItsOwnBack(t *testing.T) {
 	wantRefused(t, openAs(t, path, ours), path, fmt.Sprint(v))
 }
 
-// goose alone rolled back and reapplied migration 7, one of those taken on first use: the
-// ledger's record moves to the new row, and holds the file to this agentd's from then on.
+// goose alone rolled back and reapplied migration 7, one of those taken on first use, with this
+// agentd's file: still this agentd's, and an edited 00007 is still refused.
 func TestOpenTakesAMigrationUpTo7ReappliedByGooseAsItsOwnAgain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	this := thisAgentd(t)
@@ -376,6 +376,28 @@ func TestOpenTakesAMigrationUpTo7ReappliedByGooseAsItsOwnAgain(t *testing.T) {
 	edited := maps.Clone(this)
 	edited[seventh] = &fstest.MapFile{Data: append(slices.Clone(this[seventh].Data), "-- edited\n"...)}
 	wantRefused(t, openAs(t, path, edited), path, seventh)
+}
+
+// An agentd with an edited 00007 migrated the ledger, then goose alone rolled 7 back and applied
+// that file again, leaving the record of the first time. Up to 7, a version is taken as this
+// agentd's file only when nothing says otherwise: here the record does.
+func TestOpenRefusesAMigrationUpTo7ReappliedByGooseAfterAnotherFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	this := thisAgentd(t)
+	const seventh = "00007_effect_claims.sql"
+	edited := upTo(t, this, 7)
+	edited[seventh] = &fstest.MapFile{Data: append(slices.Clone(this[seventh].Data), "-- edited\n"...)}
+	if err := openAs(t, path, edited); err != nil {
+		t.Fatal(err)
+	}
+	p := gooseAlone(t, path, edited)
+	if _, err := p.Down(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Up(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	wantRefused(t, openAs(t, path, this), path, seventh)
 }
 
 // A migration outside a transaction (NO TRANSACTION) still gets its version row and its record
