@@ -12,6 +12,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -49,8 +50,8 @@ type Server struct {
 	LogPath    string // one JSON line per request
 	FaultsPath string // read on every write and tree listing; may be absent
 	// Repos holds, for "owner/name", a local copy of the repository on GitHub: GitHub has its
-	// commits and trees, and no others. A repository not listed has any 40-hex SHA as a
-	// commit, whose tree nobody can list.
+	// commits, trees and branches, and no other commits. A repository not listed has any
+	// 40-hex SHA as a commit, whose tree nobody can list, and no branches but those set.
 	Repos map[string]string
 
 	mu       sync.Mutex
@@ -64,6 +65,7 @@ type Server struct {
 type commit struct {
 	Tree    string
 	Parents []string
+	Message string // as GitHub shows it: without git's last newline
 }
 
 type pull struct {
@@ -97,10 +99,12 @@ var (
 	reCommits  = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/commits$`)
 	reTree     = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/trees/([0-9a-f]{40})$`)
 	reTrees    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/trees$`)
-	reRef      = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/ref/(heads/.+)$`)
+	reRef      = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/ref/heads/(.+)$`)
 	reRefs     = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/git/refs$`)
 	rePulls    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/pulls$`)
 	reComments = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/commits/([0-9a-f]{40})/comments$`)
+	reCompare  = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/compare/(.+)$`)
+	reSHA      = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -135,7 +139,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.createCommit(w, r, body)
 	case r.Method == http.MethodGet && m(reRef) != nil:
 		g := m(reRef)
-		s.getRef(w, r, g[1]+"/"+g[2]+" "+g[3])
+		s.getRef(w, r, g[1]+"/"+g[2], g[3])
+	case r.Method == http.MethodGet && m(reCompare) != nil:
+		g := m(reCompare)
+		s.compare(w, r, g[1]+"/"+g[2], g[3])
 	case r.Method == http.MethodPost && m(reRefs) != nil:
 		g := m(reRefs)
 		s.createRef(w, r, g[1]+"/"+g[2], body)
@@ -186,7 +193,8 @@ func (s *Server) getCommit(w http.ResponseWriter, r *http.Request, repo, sha str
 	for _, p := range c.Parents {
 		parents = append(parents, map[string]any{"sha": p})
 	}
-	s.answer(w, r, "get_commit", http.StatusOK, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.Tree}, "parents": parents}, nil)
+	s.answer(w, r, "get_commit", http.StatusOK, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.Tree}, "parents": parents,
+		"message": c.Message}, nil)
 }
 
 // readCommit reads a commit's tree and parents from the repository's copy.
@@ -198,8 +206,8 @@ func readCommit(dir, sha string) (commit, bool) {
 	if err != nil {
 		return commit{}, false
 	}
-	var c commit
-	headers, _, _ := bytes.Cut(raw, []byte("\n\n"))
+	headers, message, _ := bytes.Cut(raw, []byte("\n\n"))
+	c := commit{Message: strings.TrimSuffix(string(message), "\n")}
 	for line := range strings.Lines(string(headers)) {
 		switch k, v, _ := strings.Cut(strings.TrimSuffix(line, "\n"), " "); k {
 		case "tree":
@@ -275,6 +283,7 @@ func gitIn(dir string, args ...string) ([]byte, error) {
 func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[string]any) {
 	sha := hash(body)
 	tree, _ := body["tree"].(string)
+	message, _ := body["message"].(string)
 	var parents []string
 	for _, p := range anySlice(body["parents"]) {
 		if ps, ok := p.(string); ok {
@@ -282,31 +291,130 @@ func (s *Server) createCommit(w http.ResponseWriter, r *http.Request, body map[s
 		}
 	}
 	s.mu.Lock()
-	s.commits[sha] = commit{Tree: tree, Parents: parents}
+	s.commits[sha] = commit{Tree: tree, Parents: parents, Message: message}
 	s.mu.Unlock()
 	s.answer(w, r, "create_commit", http.StatusCreated, map[string]any{"sha": sha, "tree": map[string]any{"sha": tree}}, nil)
 }
 
-func (s *Server) getRef(w http.ResponseWriter, r *http.Request, key string) {
-	s.mu.Lock()
-	sha, ok := s.refs[key]
-	s.mu.Unlock()
+func (s *Server) getRef(w http.ResponseWriter, r *http.Request, repo, branch string) {
+	// GitHub finds "a//b" as a/b, and answers under the name it was asked for; one that ends in
+	// "/" it does not find (checked on github.com).
+	sha, ok := "", false
+	if !strings.HasSuffix(branch, "/") {
+		sha, ok = s.branch(repo, strings.Join(strings.FieldsFunc(branch, func(c rune) bool { return c == '/' }), "/"))
+	}
 	if !ok {
 		s.answer(w, r, "get_ref", http.StatusNotFound, map[string]any{"message": "Not Found"}, nil)
 		return
 	}
-	_, branch, _ := strings.Cut(key, " ")
-	ref := "refs/" + branch
-	s.answer(w, r, "get_ref", http.StatusOK, map[string]any{"ref": ref, "object": map[string]any{"sha": sha, "type": "commit"}}, nil)
+	s.answer(w, r, "get_ref", http.StatusOK, map[string]any{"ref": "refs/heads/" + branch,
+		"object": map[string]any{"sha": sha, "type": "commit"}}, nil)
+}
+
+// branch is the commit a branch points at: one the API created or a test set, or else the
+// repository copy's own.
+func (s *Server) branch(repo, name string) (string, bool) {
+	s.mu.Lock()
+	sha, ok := s.refs[repo+" heads/"+name]
+	s.mu.Unlock()
+	if dir, local := s.Repos[repo]; !ok && local {
+		out, err := gitIn(dir, "show-ref", "--verify", "-s", "refs/heads/"+name)
+		sha, ok = string(bytes.TrimSpace(out)), err == nil
+	}
+	return sha, ok
+}
+
+// compare compares two commits of the repository's copy as GitHub's compare API does: base and
+// head are each a branch or a full SHA, and the answer says whether head is in base's history
+// (behind, identical) or has commits of its own (ahead, diverged). It lists those commits,
+// oldest first, and the files they change since the merge base. Like GitHub, it compares a
+// commit no branch holds; it does not compare commits the API created.
+func (s *Server) compare(w http.ResponseWriter, r *http.Request, repo, basehead string) {
+	dir, local := s.Repos[repo]
+	baseName, headName, _ := strings.Cut(basehead, "...")
+	base, baseFound := s.commitNamed(repo, dir, baseName)
+	head, headFound := s.commitNamed(repo, dir, headName)
+	if !local || !baseFound || !headFound {
+		s.answer(w, r, "compare", http.StatusNotFound, map[string]any{"message": "Not Found"}, nil)
+		return
+	}
+	out, err := gitIn(dir, "merge-base", base, head)
+	if err != nil {
+		s.answer(w, r, "compare", http.StatusNotFound,
+			map[string]any{"message": fmt.Sprintf("No common ancestor between %s and %s.", baseName, headName)}, nil)
+		return
+	}
+	mergeBase := string(bytes.TrimSpace(out))
+	own, err := revList(dir, base+".."+head)
+	theirs, err2 := revList(dir, head+".."+base)
+	diff, err3 := gitIn(dir, "diff", "--name-status", "-z", "--no-renames", mergeBase, head, "--")
+	if err := errors.Join(err, err2, err3); err != nil {
+		s.answer(w, r, "compare", http.StatusInternalServerError, map[string]any{"message": "git: " + err.Error()}, nil)
+		return
+	}
+	status := map[[2]bool]string{{true, true}: "identical", {false, true}: "ahead", {true, false}: "behind",
+		{false, false}: "diverged"}[[2]bool{len(own) == 0, len(theirs) == 0}]
+	commits := []map[string]any{}
+	for i, sha := range own {
+		if n, _ := strconv.Atoi(r.URL.Query().Get("per_page")); n > 0 && i == n {
+			break // the first page
+		}
+		commits = append(commits, commitObject(dir, sha))
+	}
+	files := []map[string]any{}
+	fields := strings.Split(strings.TrimSuffix(string(diff), "\x00"), "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		files = append(files, map[string]any{"filename": fields[i+1],
+			"status": map[string]string{"A": "added", "D": "removed", "M": "modified", "T": "changed"}[fields[i]]})
+	}
+	s.answer(w, r, "compare", http.StatusOK, map[string]any{
+		"url":      fmt.Sprintf("https://github.example/api/repos/%s/compare/%s", repo, basehead),
+		"html_url": fmt.Sprintf("https://github.example/%s/compare/%s", repo, basehead),
+		"status":   status, "ahead_by": len(own), "behind_by": len(theirs), "total_commits": len(own),
+		"base_commit": commitObject(dir, base), "merge_base_commit": commitObject(dir, mergeBase),
+		"commits": commits, "files": files,
+	}, nil)
+}
+
+// commitNamed finds a commit of the repository's copy by its full SHA or a branch's name.
+func (s *Server) commitNamed(repo, dir, name string) (string, bool) {
+	sha, ok := name, reSHA.MatchString(name)
+	if !ok {
+		sha, ok = s.branch(repo, name)
+	}
+	if ok && dir != "" {
+		_, ok = readCommit(dir, sha)
+	}
+	return sha, ok && dir != ""
+}
+
+// revList is the commits of a range of the repository's copy, oldest first.
+func revList(dir, rng string) ([]string, error) {
+	out, err := gitIn(dir, "rev-list", "--reverse", "--topo-order", rng, "--")
+	return strings.Fields(string(out)), err
+}
+
+// commitObject is a commit as GitHub's compare API shows it: the parts the tools use, and its
+// message, which most of such an answer's size is.
+func commitObject(dir, sha string) map[string]any {
+	c, _ := readCommit(dir, sha)
+	parents := []map[string]any{}
+	for _, p := range c.Parents {
+		parents = append(parents, map[string]any{"sha": p})
+	}
+	return map[string]any{"sha": sha, "commit": map[string]any{"tree": map[string]any{"sha": c.Tree}, "message": c.Message},
+		"parents": parents}
 }
 
 func (s *Server) createRef(w http.ResponseWriter, r *http.Request, repo string, body map[string]any) {
 	ref, _ := body["ref"].(string)
 	sha, _ := body["sha"].(string)
 	key := repo + " " + strings.TrimPrefix(ref, "refs/")
+	_, exists := s.branch(repo, strings.TrimPrefix(ref, "refs/heads/")) // the repository's own, too
 	s.mu.Lock()
-	_, exists := s.refs[key]
-	if !exists {
+	if _, ok := s.refs[key]; ok || exists {
+		exists = true
+	} else {
 		s.refs[key] = sha
 	}
 	s.mu.Unlock()
@@ -337,6 +445,12 @@ func (s *Server) listPulls(w http.ResponseWriter, r *http.Request, repo string) 
 func (s *Server) createPull(w http.ResponseWriter, r *http.Request, owner, name string, body map[string]any) {
 	repo := owner + "/" + name
 	head, _ := body["head"].(string)
+	base, _ := body["base"].(string)
+	if _, ok := s.branch(repo, base); !ok {
+		s.answer(w, r, "create_pull", http.StatusUnprocessableEntity, map[string]any{"message": "Validation Failed",
+			"errors": []any{map[string]any{"resource": "PullRequest", "field": "base", "code": "invalid"}}}, nil)
+		return
+	}
 	s.mu.Lock()
 	if _, ok := s.refs[repo+" heads/"+head]; !ok {
 		s.mu.Unlock()

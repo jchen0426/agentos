@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -169,6 +170,26 @@ const (
 	CommitPattern = `^[0-9a-f]{40}$`
 	BlobPattern   = `^sha256:[0-9a-f]{64}$`
 )
+
+var branchRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`)
+
+// ValidBranch says whether name is a branch name agentd takes: git's rule for one (git
+// check-ref-format --branch) within a few plain characters. No "..", no part that is empty or
+// begins with a dot or ends in ".lock", no dot at the end, not "HEAD". GitHub reads a branch by
+// its exact name, but go-github resolves dot segments in the paths it asks for ("a/./b" is
+// a/b), and GitHub answers for "a//b" with a/b's commit under the name it was asked for: with
+// such a name, open_draft_pr would check one branch and open the pull request against another.
+func ValidBranch(name string) bool {
+	if !branchRe.MatchString(name) || name == "HEAD" || strings.Contains(name, "..") || strings.HasSuffix(name, ".") {
+		return false
+	}
+	for part := range strings.SplitSeq(name, "/") {
+		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
 
 // String returns args[key] when it is a string.
 func String(args map[string]any, key string) string {

@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"strings"
 
 	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/policy"
+	"github.com/jchen0426/agentos/internal/tools"
 )
 
 type Task struct {
@@ -43,10 +43,7 @@ type AuditInput struct {
 	BaseBranch string `json:"base_branch"` // target branch of the draft PR
 }
 
-var (
-	commitRe = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
-	branchRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`)
-)
+var commitRe = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
 // SecurityAudit is the first task (design doc, section 3). repos maps logical repo ids to
 // read-only mirrors; arbitrary paths are never accepted. git is the git tool server, which
@@ -74,7 +71,7 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Calle
 			if !commitRe.MatchString(commit) {
 				return nil, nil, errors.New("commit must match ^[0-9a-f]{7,40}$")
 			}
-			if !branchRe.MatchString(base) || strings.Contains(base, "..") {
+			if !tools.ValidBranch(base) {
 				return nil, nil, fmt.Errorf("bad base branch %q", base)
 			}
 			full, err := resolveCommit(ctx, git, mirror, commit)
