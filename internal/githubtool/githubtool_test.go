@@ -1912,7 +1912,8 @@ func (f *fixture) commitWith(t *testing.T, p prPayload, tree, parent string, cha
 }
 
 // A commit on an older parent that differs from agentd's commit for the payload in one of the
-// fields every attempt gives it (its message, its author's name, email or date) is not an attempt's.
+// fields every attempt gives it (its message, its author's name, email or date) is not an
+// attempt's.
 func TestOpenDraftPRTakesABranchOnAnOlderTipOnlyAsAgentdMakesIt(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -2164,5 +2165,97 @@ func TestOpenDraftPRDoesNotTakeAPullRequestOnABranchItCannotTell(t *testing.T) {
 	var conflict *tools.ConflictError
 	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch) {
 		t.Fatalf("got %v, want a conflict", err)
+	}
+}
+
+// moveAfterPush serves GitHub's API with sim, and points main at to right after GitHub created the
+// payload's branch: main moves between the push and the pull request.
+type moveAfterPush struct {
+	sim  *githubsim.Server
+	to   string
+	done atomic.Bool
+}
+
+func (h *moveAfterPush) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.sim.ServeHTTP(w, r)
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/refs") && h.done.CompareAndSwap(false, true) {
+		h.sim.SetRef("acme/payments", "main", h.to)
+	}
+}
+
+// Main moving on between the push and the pull request, by a commit or by a merge whose second
+// parent is the tip the branch is on, still holds the branch's parent: the pull request is opened.
+func TestOpenDraftPROpensThePullRequestWhenTheBaseMovesOnAfterThePush(t *testing.T) {
+	for _, merge := range []bool{false, true} {
+		t.Run(fmt.Sprintf("merge %v", merge), func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			tip := base.commit
+			next := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+			if merge {
+				side := gitIn(t, dir, "commit-tree", "-p", base.parentOf(t, tip), "-m", "side", base.treeOf(t, tip))
+				next = gitIn(t, dir, "commit-tree", "-p", side, "-p", tip, "-m", "merge", base.treeOf(t, next))
+			}
+			base.sim.SetRef("acme/payments", "main", tip)
+			f := newFixture(t, base.sim, &moveAfterPush{sim: base.sim, to: next}, dir, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || f.log(t, "create_pull") != 1 {
+				t.Fatalf("got %v %v, %d pull requests", v, err, f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// Main forced back between agentd's own push and the pull request, taking out the tip the branch
+// is on: no pull request; a person settles it (the branch is there).
+func TestOpenDraftPRDoesNotOpenThePullRequestWhenTheBaseDropsTheTipAfterThePush(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+	base.sim.SetRef("acme/payments", "main", tip)
+	f := newFixture(t, base.sim, &moveAfterPush{sim: base.sim, to: audited}, dir, audited)
+	tool, payload := f.prepare(t, f.git, fix)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || f.log(t, "create_ref") != 1 || f.log(t, "create_pull") != 0 {
+		t.Fatalf("got %v; %d branches, %d pull requests", err, f.log(t, "create_ref"), f.log(t, "create_pull"))
+	}
+}
+
+// A resend takes an earlier attempt's branch on an older tip T1; during the resend main is forced
+// back to T1 itself (the later tip T2 taken out, T1 kept). The base still holds the branch's
+// parent, and the pull request is opened: it is the parent that is checked, not the tip.
+func TestOpenDraftPROpensThePullRequestWhenTheBaseIsForcedBackToTheBranchsParent(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	t1 := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+	failing := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls") {
+			return http.StatusBadGateway
+		}
+		return 0
+	}}, dir, audited)
+	tool, payload := failing.prepare(t, failing.git, fix)
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err == nil {
+		t.Fatal("the earlier attempt opened the pull request")
+	}
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	if c := failing.branchCommit(t, p.Branch); c.Parents[0].GetSHA() != t1 {
+		t.Fatalf("the earlier attempt's branch is on %s, want %s", c.Parents[0].GetSHA(), t1)
+	}
+	commitFiles(t, dir, map[string]string{"docs/later2.md": "y\n"}) // main moves on to T2
+	var forced atomic.Bool
+	f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.sim.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", t1) // T2 forced out, T1 kept
+		}
+	}), dir, audited)
+	tool = &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: failing.blobs, Git: f.git}
+	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || f.log(t, "create_pull") != 1 {
+		t.Fatalf("got %v %v, %d pull requests", v, err, f.log(t, "create_pull"))
 	}
 }

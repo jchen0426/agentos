@@ -438,8 +438,9 @@ func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, base, commit, whe
 // Bounds on one call's checks of the payload's files on GitHub, which list every directory on
 // the way to each file once, in each tree the call checks: the audited commit's, the tip's, and
 // the older tip a branch of the payload's name is on (a directory they share is listed once). At
-// most three times patch.MaxFiles times patch.MaxDepth listings (a fix needs a handful). A crafted repository can hold directories of hundreds of thousands of entries,
-// which GitHub lists whole. And on the comparison of the base branch with the commit: that of
+// most three times patch.MaxFiles times patch.MaxDepth listings (a fix needs a handful). A
+// crafted repository can hold directories of hundreds of thousands of entries, which GitHub
+// lists whole. And on the comparison of the base branch with the commit: that of
 // a commit in the branch's history lists neither commits nor files, only the two commits, whose
 // messages (twice each when signed) can still be long.
 const (
