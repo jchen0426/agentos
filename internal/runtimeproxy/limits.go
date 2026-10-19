@@ -198,15 +198,17 @@ func (c *conn) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Write follows what agentd writes: the responses, as they reach the socket.
+// Write follows what agentd writes: the responses, as they reach the socket. They are
+// counted before they are written: once written, the Worker can read them and reset the call
+// before this goroutine counts them, and a reset stream's later bytes are not counted. A
+// write that fails, even in part, ends the connection.
 func (c *conn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
 	c.mu.Lock()
-	if c.flow.wrote(p[:n]) {
+	if c.flow.wrote(p) {
 		c.signal()
 	}
 	c.mu.Unlock()
-	return n, err
+	return c.Conn.Write(p)
 }
 
 // signal wakes those waiting for the Worker to read; c.mu is held.

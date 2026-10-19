@@ -1052,3 +1052,48 @@ func TestTheRefusalLogKeepsFewKinds(t *testing.T) {
 		t.Errorf("%d refusals held back, want the %d beyond the first %d kinds", r.held, 9*maxKinds, maxKinds)
 	}
 }
+
+// scriptedConn is the socket under a conn: what the Worker sends comes from reads, and a write
+// blocks until released, as one does while its bytes are on their way.
+type scriptedConn struct {
+	net.Conn
+	reads   chan []byte
+	writing chan struct{} // closed when a write has begun
+	release chan struct{}
+}
+
+func (s *scriptedConn) Read(p []byte) (int, error) { return copy(p, <-s.reads), nil }
+
+func (s *scriptedConn) Write(p []byte) (int, error) {
+	close(s.writing)
+	<-s.release
+	return len(p), nil
+}
+
+func TestAResponseIsCountedAsWrittenBeforeItLeaves(t *testing.T) {
+	sc := &scriptedConn{reads: make(chan []byte, 2), writing: make(chan struct{}), release: make(chan struct{})}
+	c := &conn{Conn: sc, changed: make(chan struct{})}
+	msg := frame(make([]byte, 1000), 1000)
+	c.queue(int64(len(msg)))
+	var in bytes.Buffer
+	in.WriteString(http2.ClientPreface)
+	http2.NewFramer(&in, nil).WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte("call"), EndHeaders: true})
+	sc.reads <- in.Bytes()
+	c.Read(make([]byte, 1024)) // the Worker opens the call
+	// agentd writes the start of the response; while those bytes are on their way, the Worker
+	// gets them and resets the call, and agentd reads the reset.
+	var out bytes.Buffer
+	http2.NewFramer(&out, nil).WriteData(1, false, msg[:100])
+	wrote := make(chan struct{})
+	go func() { c.Write(out.Bytes()); close(wrote) }()
+	<-sc.writing
+	var rst bytes.Buffer
+	http2.NewFramer(&rst, nil).WriteRSTStream(1, http2.ErrCodeCancel)
+	sc.reads <- rst.Bytes()
+	c.Read(make([]byte, 1024))
+	close(sc.release)
+	<-wrote
+	if got := c.flow.unread(); got != 0 {
+		t.Errorf("unread %d after the Worker reset a call whose response was on its way, want 0", got)
+	}
+}
