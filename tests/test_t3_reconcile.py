@@ -20,13 +20,8 @@ def crash_after(stack: Stack, fault: str) -> tuple[dict, Path]:
     hold = stack.tmp / "hold"
     hold.touch()
     stack.start_agentd(policy=POLICY, test_tools=True, faults=[{"name": TOOL, "attempt": 1, fault: str(hold)}])
-    # The write is the run's first call. A Worker already running could send it before agentd
-    # has recorded the run ID: the gateway refuses that attempt ("run registration in
-    # progress"), and attempt 2, which nothing holds, writes. StartRun answers once the run ID
-    # is recorded, so the Worker starts after it.
-    run = stack.start_run()
     stack.start_worker(workflows=WORKFLOWS)
-    return run, hold
+    return stack.start_run(), hold
 
 
 def waiting_for_a_person(stack: Stack, run: dict) -> dict:

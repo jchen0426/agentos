@@ -379,7 +379,9 @@ class Stack:
 
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
-                     test_tools: bool = False) -> Proc:
+                     test_tools: bool = False, run_id_delay: str | None = None) -> Proc:
+        """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
+        duration) makes StartRun record each run's ID that much later."""
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -407,12 +409,13 @@ class Stack:
             self._agentd_args.append("--insecure-dev")  # the git tool server runs unsandboxed too
         if test_tools:
             self._agentd_args.append("--test-tools")
-        if faults:
-            # A rule's "attempt" is Temporal's. A call that reaches agentd before StartRun has
-            # recorded the run ID is refused ("run registration in progress") and retried, so a
-            # test that faults one of a run's opening calls by attempt starts the Worker after
-            # the run.
-            (d / "faults.json").write_text(json.dumps({"rules": faults}))
+        if faults or run_id_delay:
+            # A rule's "attempt" is Temporal's: it counts attempts the gateway refused before
+            # the rules were consulted. A run's opening call that reaches agentd before StartRun
+            # has recorded the run ID waits for it (up to 5 s) rather than being refused, so it
+            # keeps attempt 1 even with a Worker that is already polling.
+            script = {"rules": faults or [], **({"run_id_delay": run_id_delay} if run_id_delay else {})}
+            (d / "faults.json").write_text(json.dumps(script))
             self._agentd_args += ["--fault-script", d / "faults.json"]
         return self._launch_agentd()
 
