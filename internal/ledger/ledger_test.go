@@ -1,7 +1,6 @@
 package ledger
 
 import (
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -89,20 +88,25 @@ func openAs(t *testing.T, path string, m fs.FS) error {
 	return err
 }
 
-// migrateUnrecorded migrates the ledger at path with m as agentd did before it recorded its
-// migrations: goose alone.
-func migrateUnrecorded(t *testing.T, path string, m fs.FS) {
+// gooseAlone returns goose on the ledger at path with the migrations m, recording no files: as
+// agentd ran it before it recorded its migrations, and as goose's command line does.
+func gooseAlone(t *testing.T, path string, m fs.FS) *goose.Provider {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sqlDB.Close()
+	t.Cleanup(func() { sqlDB.Close() })
 	p, err := goose.NewProvider(goose.DialectSQLite3, sqlDB, m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Up(t.Context()); err != nil {
+	return p
+}
+
+func migrateUnrecorded(t *testing.T, path string, m fs.FS) {
+	t.Helper()
+	if _, err := gooseAlone(t, path, m).Up(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -332,25 +336,71 @@ func TestOpenRefusesAMigrationAnotherAgentdAppliedAfterItsOwnFailed(t *testing.T
 	wantRefused(t, err, path, fmt.Sprint(v))
 }
 
-// A record of a migration the ledger has not applied (goose's down leaves one behind) vouches for
-// nothing, even when it names this agentd's file: the next agentd to start drops it.
-func TestOpenDropsTheRecordOfAMigrationTheLedgerHasNotApplied(t *testing.T) {
+// goose alone (its command line, say) rolled this agentd's migration back, which leaves its record
+// behind, and then applied another branch's migration under that number. The record is of the
+// migration rolled back: it vouches for nothing applied since.
+func TestOpenRefusesAMigrationAppliedAfterGooseRolledItsOwnBack(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	this := thisAgentd(t)
 	v := next(t, this)
 	ours := with(this, file(v, "ours"), "ours")
-	if err := openAs(t, path, this); err != nil {
+	if err := openAs(t, path, ours); err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256(ours[file(v, "ours")].Data)
-	execSQL(t, path, fmt.Sprintf("INSERT INTO migration_files (version, name, sha256) VALUES (%d, '%s', '%x')",
-		v, file(v, "ours"), sum))
-	if err := openAs(t, path, this); err != nil {
+	if _, err := gooseAlone(t, path, ours).Down(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	migrateUnrecorded(t, path, with(this, file(v, "theirs"), "theirs"))
-	err := openAs(t, path, ours)
-	wantRefused(t, err, path, fmt.Sprint(v))
+	wantRefused(t, openAs(t, path, ours), path, fmt.Sprint(v))
+}
+
+// goose alone rolled back and reapplied migration 7, one of those taken on first use: the
+// ledger's record moves to the new row, and holds the file to this agentd's from then on.
+func TestOpenTakesAMigrationUpTo7ReappliedByGooseAsItsOwnAgain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	this := thisAgentd(t)
+	if err := openAs(t, path, upTo(t, this, 7)); err != nil {
+		t.Fatal(err)
+	}
+	p := gooseAlone(t, path, upTo(t, this, 7))
+	if _, err := p.Down(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Up(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := openAs(t, path, this); err != nil {
+		t.Fatalf("after goose reapplied migration 7: %v", err)
+	}
+	const seventh = "00007_effect_claims.sql"
+	edited := maps.Clone(this)
+	edited[seventh] = &fstest.MapFile{Data: append(slices.Clone(this[seventh].Data), "-- edited\n"...)}
+	wantRefused(t, openAs(t, path, edited), path, seventh)
+}
+
+// A migration outside a transaction (NO TRANSACTION) still gets its version row and its record
+// together: here the record cannot be written, so goose's row is not either.
+func TestOpenRecordsAMigrationOutsideATransactionWithItsRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	this := thisAgentd(t)
+	v := next(t, this)
+	m := maps.Clone(this)
+	m[file(v, "loose")] = &fstest.MapFile{Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nDROP TABLE migration_files;\n")}
+	if err := openAs(t, path, m); err == nil {
+		t.Fatal("applied a migration whose record could not be written")
+	}
+	var n int
+	sqlDB, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.QueryRowContext(t.Context(), "SELECT count(*) FROM goose_db_version WHERE version_id = ?", v).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("goose recorded migration %d as applied without its record", v)
+	}
 }
 
 // SQLite finds goose's version table whatever the case of its name, and a view by that name too.

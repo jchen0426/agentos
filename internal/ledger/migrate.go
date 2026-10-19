@@ -27,11 +27,20 @@ const lastUnrecordedMigration = 7
 // cannot come from a migration: it has to be there first.
 const createMigrationFiles = `CREATE TABLE IF NOT EXISTS migration_files (
   version INTEGER PRIMARY KEY,
+  goose_id INTEGER NOT NULL,  -- the goose_db_version row that applied it
   name TEXT NOT NULL,
-  sha256 TEXT NOT NULL      -- of the file, hex
+  sha256 TEXT NOT NULL        -- of the file, hex
 )`
 
 type migrationFile struct{ name, sha256 string }
+
+// migrationRecord is a row of migration_files. It vouches for its migration only while goose's
+// row for that version is the one that applied it: goose's down deletes the row, not the record,
+// and the version's next row has a new id (the table is AUTOINCREMENT).
+type migrationRecord struct {
+	migrationFile
+	gooseID int64
+}
 
 // migrate refuses a ledger another agentd migrated (checkMigrations), then applies this agentd's
 // pending migrations, recording which file each one was.
@@ -83,15 +92,37 @@ type recordingStore struct {
 }
 
 func (s *recordingStore) Insert(ctx context.Context, db database.DBTxConn, req database.InsertRequest) error {
-	if err := s.Store.Insert(ctx, db, req); err != nil || req.Version == 0 { // 0: goose's starting row
-		return err
+	if req.Version == 0 { // goose's starting row
+		return s.Store.Insert(ctx, db, req)
 	}
 	f, ok := s.files[req.Version]
 	if !ok {
 		return fmt.Errorf("no file for migration %d", req.Version)
 	}
-	_, err := db.ExecContext(ctx, "INSERT OR REPLACE INTO migration_files (version, name, sha256) VALUES (?, ?, ?)",
-		req.Version, f.name, f.sha256)
+	// A migration outside a transaction (NO TRANSACTION) still gets its row and its record in one.
+	c, ok := db.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return s.insert(ctx, db, req.Version, f)
+	}
+	tx, err := c.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := s.insert(ctx, tx, req.Version, f); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *recordingStore) insert(ctx context.Context, db database.DBTxConn, version int64, f migrationFile) error {
+	if err := s.Store.Insert(ctx, db, database.InsertRequest{Version: version}); err != nil {
+		return err
+	}
+	_, err := db.ExecContext(ctx, "INSERT OR REPLACE INTO migration_files (version, goose_id, name, sha256) "+
+		"SELECT ?, max(id), ?, ? FROM "+s.Tablename()+" WHERE version_id = ?", version, f.name, f.sha256, version)
 	return err
 }
 
@@ -99,8 +130,7 @@ func (s *recordingStore) Insert(ctx context.Context, db database.DBTxConn, req d
 // only version numbers, and ignores applied versions it has no file for: an older agentd would
 // run on a schema it was not written for, and of two branches' migrations with the same number,
 // the second would never run. A ledger that passes has this agentd's files recorded for its
-// migrations up to 7 that have no record, and loses the records of migrations it has not applied
-// (goose's down leaves them behind).
+// migrations up to 7 that have no record.
 func checkMigrations(ctx context.Context, sqlDB *sql.DB, path string, store database.Store, files map[int64]migrationFile) error {
 	// One IMMEDIATE transaction: what the check reads cannot change before it writes. A refusal
 	// rolls it all back, the table included.
@@ -129,17 +159,10 @@ func checkMigrations(ctx context.Context, sqlDB *sql.DB, path string, store data
 			slices.Max(slices.Collect(maps.Keys(files))), strings.Join(problems, "; "),
 			name, name, name, filepath.Dir(path))
 	}
-	for v := range recorded {
-		if !applied[v] {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM migration_files WHERE version = ?", v); err != nil {
-				return err
-			}
-		}
-	}
-	for v := range applied {
-		if _, ok := recorded[v]; !ok { // up to 7: the check refuses any later one
-			if _, err := tx.ExecContext(ctx, "INSERT INTO migration_files (version, name, sha256) VALUES (?, ?, ?)",
-				v, files[v].name, files[v].sha256); err != nil {
+	for v, id := range applied {
+		if r, ok := recorded[v]; !ok || r.gooseID != id { // up to 7: the check refuses any later one
+			if _, err := tx.ExecContext(ctx, "INSERT OR REPLACE INTO migration_files (version, goose_id, name, sha256) "+
+				"VALUES (?, ?, ?, ?)", v, id, files[v].name, files[v].sha256); err != nil {
 				return err
 			}
 		}
@@ -147,21 +170,26 @@ func checkMigrations(ctx context.Context, sqlDB *sql.DB, path string, store data
 	return tx.Commit()
 }
 
-// mismatches says how the migrations the ledger applied differ from this agentd's files.
-func mismatches(applied map[int64]bool, recorded, files map[int64]migrationFile) []string {
+// mismatches says how the migrations the ledger applied (version to goose's row id) differ from
+// this agentd's files.
+func mismatches(applied map[int64]int64, recorded map[int64]migrationRecord, files map[int64]migrationFile) []string {
 	var unknown, unrecorded, skipped []int64
 	var other []string
 	var last int64
+	names := map[int64]string{}
 	for _, v := range slices.Sorted(maps.Keys(applied)) {
 		last = v
 		f, ok := files[v]
 		r, isRecorded := recorded[v]
+		if isRecorded = isRecorded && r.gooseID == applied[v]; isRecorded {
+			names[v] = r.name
+		}
 		switch {
 		case !ok:
 			unknown = append(unknown, v)
-		case isRecorded && r.sha256 != f.sha256 && r.name == f.name:
-			other = append(other, fmt.Sprintf("its migration %d, %s, has changed since the ledger applied it "+
-				"(sha256 %.12s then, %.12s now)", v, f.name, r.sha256, f.sha256))
+		case isRecorded && r.sha256 != f.sha256 && r.name == f.name: // edited since, or another branch's namesake
+			other = append(other, fmt.Sprintf("its migration %d was another %s (sha256 %.12s), not this agentd's (sha256 %.12s)",
+				v, f.name, r.sha256, f.sha256))
 		case isRecorded && r.sha256 != f.sha256:
 			other = append(other, fmt.Sprintf("its migration %d was %s (sha256 %.12s), this agentd's is %s (sha256 %.12s)",
 				v, r.name, r.sha256, f.name, f.sha256))
@@ -170,13 +198,13 @@ func mismatches(applied map[int64]bool, recorded, files map[int64]migrationFile)
 		}
 	}
 	for _, v := range slices.Sorted(maps.Keys(files)) {
-		if v < last && !applied[v] {
+		if _, ok := applied[v]; v < last && !ok {
 			skipped = append(skipped, v)
 		}
 	}
 	var problems []string
 	if len(unknown) > 0 {
-		problems = append(problems, fmt.Sprintf("it applied %s, which this agentd does not have", versionList(unknown, recorded)))
+		problems = append(problems, fmt.Sprintf("it applied %s, which this agentd does not have", versionList(unknown, names)))
 	}
 	problems = append(problems, other...)
 	if len(unrecorded) > 0 {
@@ -190,13 +218,13 @@ func mismatches(applied map[int64]bool, recorded, files map[int64]migrationFile)
 	return problems
 }
 
-// versionList says "migration 8" or "migrations 8, 9", with the file recorded for each, if any.
-func versionList(vs []int64, recorded map[int64]migrationFile) string {
+// versionList says "migration 8" or "migrations 8, 9", with the file named for each, if any.
+func versionList(vs []int64, names map[int64]string) string {
 	s := make([]string, len(vs))
 	for i, v := range vs {
 		s[i] = strconv.FormatInt(v, 10)
-		if r, ok := recorded[v]; ok {
-			s[i] += " (" + r.name + ")"
+		if name, ok := names[v]; ok {
+			s[i] += " (" + name + ")"
 		}
 	}
 	if len(s) == 1 {
@@ -205,42 +233,46 @@ func versionList(vs []int64, recorded map[int64]migrationFile) string {
 	return "migrations " + strings.Join(s, ", ")
 }
 
-// appliedVersions returns the migrations goose has applied: every version in its table but its
-// starting 0, as goose's provider reads the table.
-func appliedVersions(ctx context.Context, tx *sql.Tx, store database.Store) (map[int64]bool, error) {
-	applied := map[int64]bool{}
+// appliedVersions returns the migrations goose has applied, each with the id of its latest row in
+// goose's table: every version there but its starting 0, as goose's provider reads the table.
+func appliedVersions(ctx context.Context, tx *sql.Tx, store database.Store) (map[int64]int64, error) {
+	applied := map[int64]int64{}
 	// Looked up as SQLite finds a table: in any case, and a view too.
 	var n int
 	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'view') "+
 		"AND name = ? COLLATE NOCASE", store.Tablename()).Scan(&n); err != nil || n == 0 {
 		return applied, err
 	}
-	rows, err := store.ListMigrations(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range rows {
-		if r.Version != 0 {
-			applied[r.Version] = true
-		}
-	}
-	return applied, nil
-}
-
-func recordedFiles(ctx context.Context, tx *sql.Tx) (map[int64]migrationFile, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT version, name, sha256 FROM migration_files")
+	rows, err := tx.QueryContext(ctx, "SELECT version_id, max(id) FROM "+store.Tablename()+
+		" WHERE version_id != 0 GROUP BY version_id")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	recorded := map[int64]migrationFile{}
 	for rows.Next() {
-		var v int64
-		var f migrationFile
-		if err := rows.Scan(&v, &f.name, &f.sha256); err != nil {
+		var v, id int64
+		if err := rows.Scan(&v, &id); err != nil {
 			return nil, err
 		}
-		recorded[v] = f
+		applied[v] = id
+	}
+	return applied, rows.Err()
+}
+
+func recordedFiles(ctx context.Context, tx *sql.Tx) (map[int64]migrationRecord, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT version, goose_id, name, sha256 FROM migration_files")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	recorded := map[int64]migrationRecord{}
+	for rows.Next() {
+		var v int64
+		var r migrationRecord
+		if err := rows.Scan(&v, &r.gooseID, &r.name, &r.sha256); err != nil {
+			return nil, err
+		}
+		recorded[v] = r
 	}
 	return recorded, rows.Err()
 }
