@@ -22,6 +22,7 @@ import (
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/budget"
+	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gateway"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
@@ -46,8 +47,9 @@ type Server struct {
 	Effects     Reconciler
 	Temporal    client.Client
 	Tasks       tasks.Registry
-	TaskQueue   string        // where the Python Worker polls
-	CancelGrace time.Duration // how long a cancelled run may keep running before it is terminated
+	TaskQueue   string         // where the Python Worker polls
+	CancelGrace time.Duration  // how long a cancelled run may keep running before it is terminated
+	Faults      *faults.Script // nil unless agentd runs with --fault-script
 	Log         *slog.Logger
 }
 
@@ -110,6 +112,7 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 	}
 	// The run exists in Temporal now: finish the bookkeeping even if agentctl goes away.
 	ctx = context.WithoutCancel(ctx)
+	s.Faults.DelayRunID()
 	if _, err := s.Ledger.Q.SetRunID(ctx, db.SetRunIDParams{
 		RunID: sql.NullString{String: we.GetRunID(), Valid: true}, WorkflowID: workflowID,
 	}); err != nil {

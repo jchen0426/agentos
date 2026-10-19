@@ -66,8 +66,22 @@ Without `--db-filename` the dev server keeps everything in memory and loses ever
 it exits. The dev configs keep agentd's data in `~/.agentos` too, out of the repository; move a
 checkout's own `.agentos` from before out of it as well (the Worker launchers refuse a code
 directory that holds one). All checkouts share `~/.agentos`: run one dev stack at a time, or give
-another a config with a `data_dir` of its own, also under the home directory. A ledger a newer
-branch has migrated is not for an older agentd.
+another a config with a `data_dir` of its own, also under the home directory. agentd refuses a
+ledger another branch's agentd has migrated: one with migrations this agentd does not have, or
+another file under one of its migration numbers. A migration edited after the ledger applied it
+counts as another file, so leave applied migrations as they are. agentd also refuses a new
+migration it cannot tell from its own: one an agentd built before this check applied, such as
+your own branch's before it merged main (and such an agentd checks nothing). Run the agentd
+that migrated the ledger, or stop agentd, start a fresh development ledger and keep the old
+one, with its WAL, aside where no Worker can read it:
+
+```bash
+d=~/.agentos/old-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv ~/.agentos/ledger.db* "$d"/
+```
+
+Runs recorded in the old ledger cannot continue. If any wrote to GitHub, first settle what
+`bin/agentctl reconcile list` shows, with the agentd that migrated the ledger. For a clean slate,
+stop the dev server and move `~/.agentos/temporal.db*` there too.
 
 In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under
