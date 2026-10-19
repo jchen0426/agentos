@@ -541,30 +541,64 @@ func TestOpenDraftPRDoesNotDenyWhatMayHaveGoneOut(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		noCommit bool                      // GitHub does not have the payload's commit
+		outside  bool                      // the commit is not in the base branch's history
 		answer   func(r *http.Request) int // GitHub's answers, after the payload was rendered
 		branch   bool                      // an earlier attempt created the branch
 		want     string                    // in the conflict; "" for not sent
 	}{
-		{"the files differ", false, gone, true, "GitHub has nothing there"},
-		{"no such commit", true, gone, true, "no commit"},
-		{"the token can no longer see the repository", false, func(r *http.Request) int {
+		{"the files differ", false, false, gone, true, "GitHub has nothing there"},
+		{"no such commit", true, false, gone, true, "no commit"},
+		// The base branch was forced back after an earlier attempt, say.
+		{"the commit is not in the base branch", false, true, gone, true, "not in the history of branch main"},
+		{"the token can no longer see the repository", false, false, func(r *http.Request) int {
 			if strings.HasPrefix(r.URL.Path, "/repos/acme/payments") {
 				return http.StatusNotFound
 			}
 			return 0
 		}, true, "cannot see acme/payments"},
-		{"the branch cannot be read", false, func(r *http.Request) int {
-			if strings.Contains(r.URL.Path, "/git/ref/") {
+		{"the branch cannot be read", false, false, func(r *http.Request) int {
+			if strings.Contains(r.URL.Path, "/git/ref/heads/agent/") {
 				return http.StatusForbidden
 			}
 			return 0
 		}, false, "cannot tell whether branch"},
-		{"GitHub fails", false, func(r *http.Request) int {
-			if strings.Contains(r.URL.Path, "/git/ref/") {
+		{"GitHub fails", false, false, func(r *http.Request) int {
+			if strings.Contains(r.URL.Path, "/git/ref/heads/agent/") {
 				return http.StatusBadGateway
 			}
 			return 0
 		}, false, ""},
+		// The commit was found, and then the token lost sight of the repository: the base
+		// branch, or the comparison, is not there either.
+		{"the token can no longer see the base branch", false, false, func(r *http.Request) int {
+			if strings.HasPrefix(r.URL.Path, "/repos/acme/payments") && !strings.Contains(r.URL.Path, "/git/commits/") {
+				return http.StatusNotFound
+			}
+			return 0
+		}, false, "cannot see acme/payments"},
+		{"the token can no longer see the comparison", false, false, func(r *http.Request) int {
+			if r.URL.Path == "/repos/acme/payments" || strings.Contains(r.URL.Path, "/compare/") {
+				return http.StatusNotFound
+			}
+			return 0
+		}, false, "cannot see acme/payments"},
+		{"the token can no longer see a listing", false, false, func() func(r *http.Request) int {
+			lost := false
+			return func(r *http.Request) int {
+				lost = lost || strings.Contains(r.URL.Path, "/git/trees/")
+				if lost && strings.HasPrefix(r.URL.Path, "/repos/acme/payments") {
+					return http.StatusNotFound
+				}
+				return 0
+			}
+		}(), true, "cannot see acme/payments"},
+		// A first attempt, too: agentd cannot tell it from a resend.
+		{"GitHub refuses the token", false, false, func(r *http.Request) int {
+			if strings.HasPrefix(r.URL.Path, "/repos/acme/payments") {
+				return http.StatusUnauthorized
+			}
+			return 0
+		}, false, "cannot tell whether branch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := setup(t)
@@ -574,6 +608,10 @@ func TestOpenDraftPRDoesNotDenyWhatMayHaveGoneOut(t *testing.T) {
 			_ = json.Unmarshal(payload, &p)
 			if tc.noCommit {
 				p.Parent = strings.Repeat("1", 40)
+				payload, _ = json.Marshal(p)
+			}
+			if tc.outside {
+				p.Parent = forkCommit(t, base)
 				payload, _ = json.Marshal(p)
 			}
 			if tc.branch {
@@ -593,25 +631,27 @@ func TestOpenDraftPRDoesNotDenyWhatMayHaveGoneOut(t *testing.T) {
 	}
 }
 
-// rewrite changes GitHub's answers to tree listings.
+// rewrite changes GitHub's answers to the GET requests whose path holds path: tree listings
+// ("/git/trees/"), comparisons ("/compare/").
 type rewrite struct {
-	sim *githubsim.Server
-	fn  func(tree map[string]any) (status int)
+	sim  *githubsim.Server
+	path string
+	fn   func(answer map[string]any) (status int)
 }
 
 func (rw rewrite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/git/trees/") {
+	if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, rw.path) {
 		rw.sim.ServeHTTP(w, r)
 		return
 	}
 	rec := httptest.NewRecorder()
 	rw.sim.ServeHTTP(rec, r)
-	var tree map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &tree)
-	code := rw.fn(tree)
+	var answer map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &answer)
+	code := rw.fn(answer)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(tree)
+	_ = json.NewEncoder(w).Encode(answer)
 }
 
 // A listing agentd cannot read whole is a refusal: a tree on GitHub does not change. GitHub
@@ -632,7 +672,7 @@ func TestOpenDraftPRListsTreesWhole(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := setup(t)
-			f := newFixture(t, base.sim, rewrite{sim: base.sim, fn: tc.fn}, base.repos["acme/payments"].Mirror, base.commit)
+			f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: tc.fn}, base.repos["acme/payments"].Mirror, base.commit)
 			tool, payload := f.prepare(t, f.git, fix)
 			_, err := tool.Execute(context.Background(), payload, "key", proceed)
 			var denied *tools.DeniedError
@@ -666,7 +706,7 @@ func pad(n int) func(map[string]any) int {
 // entries the check keeps only those the payload's paths name.
 func TestOpenDraftPRReadsListingsWithinALimit(t *testing.T) {
 	base := setup(t)
-	f := newFixture(t, base.sim, rewrite{sim: base.sim, fn: pad(maxListingBytes / 100)}, base.repos["acme/payments"].Mirror, base.commit)
+	f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: pad(maxListingBytes / 100)}, base.repos["acme/payments"].Mirror, base.commit)
 	tool, payload := f.prepare(t, f.git, fix)
 	_, err := tool.Execute(context.Background(), payload, "key", proceed)
 	var denied *tools.DeniedError
@@ -674,7 +714,7 @@ func TestOpenDraftPRReadsListingsWithinALimit(t *testing.T) {
 		t.Fatalf("got %v, %d writes", err, f.wrote(t))
 	}
 
-	f = newFixture(t, base.sim, rewrite{sim: base.sim, fn: pad(1000)}, base.repos["acme/payments"].Mirror, base.commit)
+	f = newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: pad(1000)}, base.repos["acme/payments"].Mirror, base.commit)
 	var p prPayload
 	_, payload = f.prepare(t, f.git, fix)
 	_ = json.Unmarshal(payload, &p)
@@ -739,7 +779,7 @@ func TestOpenDraftPRBoundsWhatOneCheckReads(t *testing.T) {
 	deep := strings.Repeat("d/", 20) + "f.txt"
 	commit := commitFiles(t, dir, map[string]string{deep: "x\n"})
 	// Each listing about half of what one may be: the twentieth would be over the limit.
-	f := newFixture(t, base.sim, rewrite{sim: base.sim, fn: pad(maxListingBytes / 2 / 110)}, dir, commit)
+	f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: pad(maxListingBytes / 2 / 110)}, dir, commit)
 	tool, payload := f.prepare(t, f.git, deleteFile(deep))
 	_, err := tool.Execute(context.Background(), payload, "key", proceed)
 	var denied *tools.DeniedError
@@ -771,4 +811,294 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// forkCommit is a commit of the fixture's repository that no branch holds, with main's files on
+// main's first commit: GitHub serves a fork's commits through the parent repository like this.
+func forkCommit(t *testing.T, f *fixture) string {
+	t.Helper()
+	return gitIn(t, f.repos["acme/payments"].Mirror, "commit-tree", "-p", f.commit+"^", "-m", "a fork's", f.commit+"^{tree}")
+}
+
+// GitHub serves any commit of the repository's network, a fork's too: a branch on one that is
+// not in the base branch's history would put its commits into the repository, and a push runs
+// their CI workflows with the repository's secrets. Each of these holds the files the patch
+// was made for, and the check of the files would pass; the commit is refused before it, and
+// nothing is written.
+func TestOpenDraftPRDeniesACommitOutsideTheBaseBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		commit func(t *testing.T, f *fixture) string
+		base   string
+		want   string
+	}{
+		{"a commit of another branch", func(t *testing.T, f *fixture) string {
+			dir := f.repos["acme/payments"].Mirror
+			c := gitIn(t, dir, "commit-tree", "-p", f.commit, "-m", "a feature", f.commit+"^{tree}")
+			gitIn(t, dir, "update-ref", "refs/heads/feature", c)
+			return c
+		}, "main", "not in the history of branch main of acme/payments"},
+		{"a fork's commit", forkCommit, "main", "not in the history of branch main of acme/payments"},
+		{"a history of its own", func(t *testing.T, f *fixture) string {
+			return gitIn(t, f.repos["acme/payments"].Mirror, "commit-tree", "-m", "an orphan", f.commit+"^{tree}")
+		}, "main", "no history in common with branch main of acme/payments"},
+		{"a base branch GitHub does not have", func(t *testing.T, f *fixture) string { return f.commit },
+			"release", "GitHub has no branch release in acme/payments"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			f := newFixture(t, base.sim, base.sim, base.repos["acme/payments"].Mirror, tc.commit(t, base))
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			p.Base = tc.base
+			payload, _ = json.Marshal(p)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var denied *tools.DeniedError
+			if !errors.As(err, &denied) || !strings.Contains(denied.Reason, tc.want) {
+				t.Fatalf("got %v, want denied: ...%s...", err, tc.want)
+			}
+			if f.wrote(t) != 0 || f.listings(t) != 0 {
+				t.Fatalf("%d writes, %d listings", f.wrote(t), f.listings(t))
+			}
+		})
+	}
+}
+
+// A commit the base branch has moved on from is in its history: the pull request holds the
+// patch on it, and nothing else.
+func TestOpenDraftPRTakesAnOlderCommitOfTheBaseBranch(t *testing.T) {
+	base := setup(t)
+	f := newFixture(t, base.sim, base.sim, base.repos["acme/payments"].Mirror, gitIn(t, base.repos["acme/payments"].Mirror, "rev-parse", "main^"))
+	tool, payload := f.prepare(t, f.git, fix)
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+		t.Fatal(err)
+	}
+	if f.log(t, "create_pull") != 1 {
+		t.Fatalf("%d pull requests", f.log(t, "create_pull"))
+	}
+}
+
+// agentd takes the commit only when GitHub's comparison says both that the commit is the merge
+// base and that the branch is at it or ahead of it; an answer over the limit is a refusal too
+// (one of a commit in the branch's history lists no commits and no files, and its two commits
+// fit, long messages and all). GitHub failing is tried again.
+func TestOpenDraftPRTakesOnlyWhatTheComparisonShowsInTheBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fn     func(map[string]any) int
+		denied string // "" for not sent
+		opens  bool
+	}{
+		{"a long commit message", func(c map[string]any) int {
+			c["base_commit"].(map[string]any)["commit"] = map[string]any{"message": strings.Repeat("m", 2<<20)}
+			return http.StatusOK
+		}, "", true},
+		{"another merge base", func(c map[string]any) int {
+			c["merge_base_commit"] = map[string]any{"sha": strings.Repeat("2", 40)}
+			return http.StatusOK
+		}, "not in the history", false},
+		{"ahead", func(c map[string]any) int { c["status"], c["ahead_by"] = "ahead", 1; return http.StatusOK }, "not in the history", false},
+		{"over the limit", func(c map[string]any) int {
+			files := []any{}
+			for i := range maxCompareBytes / 1000 {
+				files = append(files, map[string]any{"filename": fmt.Sprintf("pad%07d.txt", i), "status": "added",
+					"patch": strings.Repeat("x", 1000)})
+			}
+			c["files"] = files
+			return http.StatusOK
+		}, "over the limit", false},
+		{"GitHub fails", func(map[string]any) int { return http.StatusBadGateway }, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/compare/", fn: tc.fn}, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var denied *tools.DeniedError
+			switch {
+			case tc.opens && (err != nil || f.log(t, "create_pull") != 1):
+				t.Fatalf("got %v, %d pull requests", err, f.log(t, "create_pull"))
+			case tc.opens:
+			case tc.denied != "" && (!errors.As(err, &denied) || !strings.Contains(denied.Reason, tc.denied)):
+				t.Fatalf("got %v, want denied: ...%s...", err, tc.denied)
+			case tc.denied == "" && (errors.As(err, &denied) || !errors.Is(err, tools.ErrNotSent)):
+				t.Fatalf("got %v, want not sent", err)
+			case f.wrote(t) != 0:
+				t.Fatalf("%d writes reached GitHub", f.wrote(t))
+			}
+		})
+	}
+}
+
+// open_draft_pr compares the commit with the branch the pull request is for, and nothing else.
+// A base that is not a name git makes is refused, also in a payload recorded before agentd
+// checked: go-github asks for "release/./1.0" as release/1.0, and GitHub answers for
+// "release//1.0" with release/1.0's commit, under the name it was asked for. So is GitHub
+// answering about another ref or object. Nothing is written.
+func TestOpenDraftPRReadsTheBaseBranchItNames(t *testing.T) {
+	for _, tc := range []struct {
+		name, base string
+		fn         func(map[string]any) int
+		want       string
+	}{
+		{"a name with a dot segment", "release/./1.0", nil, "not a branch name"},
+		{"a name with a double slash", "release//1.0", nil, "not a branch name"},
+		{"another branch", "main", func(ref map[string]any) int { ref["ref"] = "refs/heads/other"; return http.StatusOK }, "cannot compare"},
+		{"not a commit", "main", func(ref map[string]any) int { ref["object"].(map[string]any)["type"] = "tag"; return http.StatusOK },
+			"cannot compare"},
+		{"no commit", "main", func(ref map[string]any) int { ref["object"].(map[string]any)["sha"] = ""; return http.StatusOK },
+			"cannot compare"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			gitIn(t, base.repos["acme/payments"].Mirror, "branch", "release/1.0", base.commit)
+			var h http.Handler = base.sim
+			if tc.fn != nil {
+				h = rewrite{sim: base.sim, path: "/git/ref/heads/main", fn: tc.fn}
+			}
+			f := newFixture(t, base.sim, h, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			p.Base = tc.base
+			payload, _ = json.Marshal(p)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var denied *tools.DeniedError
+			if !errors.As(err, &denied) || !strings.Contains(denied.Reason, tc.want) || f.wrote(t) != 0 {
+				t.Fatalf("got %v, %d writes; want denied: ...%s...", err, f.wrote(t), tc.want)
+			}
+		})
+	}
+	f := setup(t)
+	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
+	tool := &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: f.blobs, Git: f.git}
+	_, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
+		"repo": "acme/payments", "commit": f.commit, "base_branch": "release//1.0", "patch_ref": ref}))
+	var denied *tools.DeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("Prepare: got %v, want denied", err)
+	}
+}
+
+// GitHub declining a read before the first write (a 403, or a 422, that is not a rate limit) is
+// a refusal only when nothing of the payload went out: with the payload's branch there, an
+// earlier attempt may have sent part of it, and a person decides.
+func TestOpenDraftPRRefusedReadsStandOnlyWithoutTheBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		code       int
+	}{
+		{"the commit", "/git/commits/", http.StatusForbidden},
+		{"the base branch", "/git/ref/heads/main", http.StatusForbidden},
+		{"the comparison", "/compare/", http.StatusUnprocessableEntity},
+		{"a listing", "/git/trees/", http.StatusForbidden},
+	} {
+		for _, branch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, branch %v", tc.name, branch), func(t *testing.T) {
+				base := setup(t)
+				f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+					if strings.Contains(r.URL.Path, tc.path) {
+						return tc.code
+					}
+					return 0
+				}}, base.repos["acme/payments"].Mirror, base.commit)
+				tool, payload := f.prepare(t, f.git, fix)
+				var p prPayload
+				_ = json.Unmarshal(payload, &p)
+				if branch {
+					f.sim.SetRef("acme/payments", p.Branch, f.commit)
+				}
+				_, err := tool.Execute(context.Background(), payload, "key", proceed)
+				var conflict *tools.ConflictError
+				var refused *tools.RefusedError
+				switch {
+				case branch && (!errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch+" exists")):
+					t.Fatalf("got %v, want a conflict", err)
+				case !branch && (!errors.As(err, &refused) || refused.Retryable):
+					t.Fatalf("got %v, want GitHub's refusal", err)
+				case f.wrote(t) != 0:
+					t.Fatalf("%d writes", f.wrote(t))
+				}
+			})
+		}
+	}
+}
+
+// Once the checks pass, agentd writes. GitHub declining a request from then on (a token that may
+// push the branch but not open pull requests, say) is GitHub refusing and nothing done only
+// while the payload's branch is not there: otherwise this attempt or an earlier one made it, and
+// a person decides.
+func TestOpenDraftPRRefusalsAfterTheChecksLeaveTheBranchToAPerson(t *testing.T) {
+	refuse := func(method, path string, code int) func(r *http.Request) int {
+		return func(r *http.Request) int {
+			if r.Method == method && strings.HasSuffix(r.URL.Path, path) {
+				return code
+			}
+			return 0
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		answer func(f *fixture) func(r *http.Request) int
+		branch func(f *fixture) string // where the payload's branch points beforehand; "" for nowhere
+		want   bool                    // a conflict, not GitHub's refusal
+	}{
+		{"listing the pull requests is refused", func(*fixture) func(*http.Request) int {
+			return refuse(http.MethodGet, "/pulls", http.StatusForbidden)
+		}, nil, true},
+		{"the pull request is refused", func(*fixture) func(*http.Request) int {
+			return refuse(http.MethodPost, "/pulls", http.StatusForbidden)
+		}, nil, true},
+		{"the tree is refused", func(*fixture) func(*http.Request) int {
+			return refuse(http.MethodPost, "/git/trees", http.StatusUnprocessableEntity)
+		}, nil, false},
+		{"the tree is refused on a resend", func(*fixture) func(*http.Request) int {
+			return refuse(http.MethodPost, "/git/trees", http.StatusUnprocessableEntity)
+		}, func(f *fixture) string { return f.commit }, true},
+		{"the branch's commit cannot be read", func(f *fixture) func(*http.Request) int {
+			return refuse(http.MethodGet, "/git/commits/"+gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", f.commit+"^"),
+				http.StatusForbidden)
+		}, func(f *fixture) string { return gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", f.commit+"^") }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			f := newFixture(t, base.sim, answering{sim: base.sim, answer: tc.answer(base)}, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			if tc.branch != nil {
+				f.sim.SetRef("acme/payments", p.Branch, tc.branch(f))
+			}
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			var refused *tools.RefusedError
+			switch {
+			case tc.want && (!errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch+" exists")):
+				t.Fatalf("got %v, want a conflict", err)
+			case !tc.want && (!errors.As(err, &refused) || refused.Retryable || f.log(t, "create_ref") != 0):
+				t.Fatalf("got %v, %d branches; want GitHub's refusal", err, f.log(t, "create_ref"))
+			}
+		})
+	}
+}
+
+// A rate limit on a read is tried again, whatever is on GitHub: it is no refusal.
+func TestOpenDraftPRRetriesARateLimitedRead(t *testing.T) {
+	base := setup(t)
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if strings.Contains(r.URL.Path, "/compare/") {
+			return http.StatusTooManyRequests
+		}
+		return 0
+	}}, base.repos["acme/payments"].Mirror, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	f.sim.SetRef("acme/payments", p.Branch, f.commit)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var refused *tools.RefusedError
+	if !errors.As(err, &refused) || !refused.Retryable {
+		t.Fatalf("got %v, want a refusal to try again", err)
+	}
 }

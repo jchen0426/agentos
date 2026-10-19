@@ -115,3 +115,28 @@ func TestSecurityAuditResolve(t *testing.T) {
 		}
 	}
 }
+
+// The base branch is a name git itself would make (`git check-ref-format --branch` sorts these
+// lists): GitHub reads a branch by its exact name, while go-github resolves dot segments in the
+// path it asks for, so with "a/./b" open_draft_pr would check a/b and open the pull request
+// against "a/./b".
+func TestSecurityAuditTakesOnlyBranchNamesGitMakes(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	git(t, dir, "commit", "-q", "--allow-empty", "-m", "init")
+	head := git(t, dir, "rev-parse", "HEAD")
+	task := SecurityAudit(&policy.Policy{Repos: []string{"acme/payments"}}, map[string]string{"acme/payments": dir}, server(t))
+	ctx := context.Background()
+	for _, base := range []string{"a/./b", "main/.", "main/", "stable//3.5", "a/.hidden", "main.lock", "a/b.lock", "x.lock/y",
+		"main.", "a..b", "release/../main", "HEAD"} {
+		if _, _, err := task.Resolve(ctx, map[string]string{"repo": "acme/payments", "commit": head[:7], "base": base}); err == nil {
+			t.Errorf("%q: taken", base)
+		}
+	}
+	for _, base := range []string{"main", "release/1.0", "feature/x-y_z", "v1.2.3", "a.lock.b", "a/-b"} {
+		if _, params, err := task.Resolve(ctx, map[string]string{"repo": "acme/payments", "commit": head[:7], "base": base}); err != nil ||
+			params["base"] != base {
+			t.Errorf("%q: %v %v", base, params, err)
+		}
+	}
+}

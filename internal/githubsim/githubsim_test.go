@@ -3,10 +3,12 @@ package githubsim
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -161,5 +163,142 @@ func TestRepositoriesCanBeSeen(t *testing.T) {
 	gh := client(t, &Server{})
 	if r, _, err := gh.Repositories.Get(context.Background(), "acme", "payments"); err != nil || r.GetFullName() != "acme/payments" {
 		t.Fatalf("%+v %v", r, err)
+	}
+}
+
+// GitHub has the repository's own branches, as the local copy holds them. A branch the API
+// created, or a test set, comes first: the copy is what the repository held to begin with.
+func TestBranchesComeFromTheRepository(t *testing.T) {
+	dir, head := repo(t)
+	first := git(t, dir, "rev-parse", head+"^")
+	git(t, dir, "branch", "release/1.0", first)
+	s := &Server{Repos: map[string]string{"acme/payments": dir}}
+	gh := client(t, s)
+	ctx := context.Background()
+	for branch, want := range map[string]string{"main": head, "release/1.0": first} {
+		ref, _, err := gh.Git.GetRef(ctx, "acme", "payments", "heads/"+branch)
+		if err != nil || ref.GetRef() != "refs/heads/"+branch || ref.GetObject().GetSHA() != want ||
+			ref.GetObject().GetType() != "commit" {
+			t.Errorf("%s: %+v %v", branch, ref, err)
+		}
+	}
+	if _, resp, err := gh.Git.GetRef(ctx, "acme", "payments", "heads/nosuch"); resp.StatusCode != 404 {
+		t.Errorf("a branch the repository does not have: %v", err)
+	}
+	// GitHub finds "release//1.0" as release/1.0, and answers under the name it was asked for;
+	// a name that ends in "/" it does not find (checked on github.com, octocat/Hello-World).
+	if ref, _, err := gh.Git.GetRef(ctx, "acme", "payments", "heads/release//1.0"); err != nil ||
+		ref.GetRef() != "refs/heads/release//1.0" || ref.GetObject().GetSHA() != first {
+		t.Errorf("release//1.0: %+v %v", ref, err)
+	}
+	if _, resp, err := gh.Git.GetRef(ctx, "acme", "payments", "heads/main/"); resp.StatusCode != 404 {
+		t.Errorf("main/: %v", err)
+	}
+	s.SetRef("acme/payments", "main", first) // someone moved the branch
+	if ref, _, err := gh.Git.GetRef(ctx, "acme", "payments", "heads/main"); err != nil || ref.GetObject().GetSHA() != first {
+		t.Errorf("main after it moved: %+v %v", ref, err)
+	}
+}
+
+// GitHub compares two commits of the repository as its compare API does: whether the second
+// is in the first's history (behind, identical) or has commits of its own (ahead, diverged).
+// Like GitHub, it compares a commit no branch holds, as a fork's commit is (GitHub serves those
+// through the parent repository). The answers follow github.com's (checked 2026-10-19 on
+// jchen0426/agentos-audit-target, octocat/Spoon-Knife and select2/select2): commits lists the
+// second's own commits, oldest first, and files what they change; anything not there, or
+// something other than a commit, is a 404, and so are two commits with no history in common.
+func TestCompareLikeGitHub(t *testing.T) {
+	dir, head := repo(t)
+	first := git(t, dir, "rev-parse", head+"^")
+	git(t, dir, "checkout", "-q", "-b", "feature")
+	write(t, filepath.Join(dir, "app", "db.py"), "y\n", 0o644)
+	git(t, dir, "add", "app/db.py") // not -a: the submodule has no directory here, and would go
+	git(t, dir, "commit", "-q", "-m", "feature")
+	feature := git(t, dir, "rev-parse", "HEAD")
+	git(t, dir, "checkout", "-q", "main")
+	fork := git(t, dir, "commit-tree", "-p", first, "-m", "fork", head+"^{tree}") // adds vendor, as head does
+	orphan := git(t, dir, "commit-tree", "-m", "orphan", head+"^{tree}")
+	gh := client(t, &Server{Repos: map[string]string{"acme/payments": dir}})
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		base, head            string
+		status                string
+		ahead, behind         int
+		baseCommit, mergeBase string
+		commits               []string
+		files                 []string // "status filename"
+	}{
+		{"main", head, "identical", 0, 0, head, head, nil, nil},
+		{"main", first, "behind", 0, 1, head, first, nil, nil},
+		{head, first, "behind", 0, 1, head, first, nil, nil},
+		{"main", feature, "ahead", 1, 0, head, head, []string{feature}, []string{"modified app/db.py"}},
+		{"main", fork, "diverged", 1, 1, head, first, []string{fork}, []string{"added vendor"}},
+		{"feature", "main", "behind", 0, 1, feature, head, nil, nil},
+	} {
+		c, _, err := gh.Repositories.CompareCommits(ctx, "acme", "payments", tc.base, tc.head, nil)
+		if err != nil {
+			t.Errorf("%s...%s: %v", tc.base, tc.head, err)
+			continue
+		}
+		var commits, files []string
+		for _, rc := range c.Commits {
+			commits = append(commits, rc.GetSHA())
+		}
+		for _, f := range c.Files {
+			files = append(files, f.GetStatus()+" "+f.GetFilename())
+		}
+		if c.GetStatus() != tc.status || c.GetAheadBy() != tc.ahead || c.GetBehindBy() != tc.behind ||
+			c.GetTotalCommits() != tc.ahead || c.GetBaseCommit().GetSHA() != tc.baseCommit ||
+			c.GetMergeBaseCommit().GetSHA() != tc.mergeBase || !slices.Equal(commits, tc.commits) || !slices.Equal(files, tc.files) {
+			t.Errorf("%s...%s: %s, ahead %d, behind %d, total %d, base %s, merge base %s, commits %v, files %v",
+				tc.base, tc.head, c.GetStatus(), c.GetAheadBy(), c.GetBehindBy(), c.GetTotalCommits(),
+				c.GetBaseCommit().GetSHA(), c.GetMergeBaseCommit().GetSHA(), commits, files)
+		}
+	}
+
+	// Its commits carry their messages, as GitHub's do (without git's last newline); per_page
+	// cuts the list of commits, not the counts.
+	c, _, err := gh.Repositories.CompareCommits(ctx, "acme", "payments", first, "feature", &github.ListOptions{PerPage: 1})
+	if err != nil || c.GetAheadBy() != 2 || len(c.Commits) != 1 || c.Commits[0].GetSHA() != head ||
+		c.Commits[0].GetCommit().GetMessage() != "two" || c.GetBaseCommit().GetCommit().GetMessage() != "one" {
+		t.Errorf("%s...feature, one per page: %+v %v", first, c, err)
+	}
+
+	tree, blob := git(t, dir, "rev-parse", head+"^{tree}"), git(t, dir, "rev-parse", head+":run.sh")
+	for _, tc := range []struct{ repo, base, head, message string }{
+		{"payments", "main", strings.Repeat("1", 40), "Not Found"},
+		{"payments", "nosuch", head, "Not Found"},
+		{"payments", strings.Repeat("1", 40), head, "Not Found"},
+		{"payments", "main", tree, "Not Found"},
+		{"payments", "main", blob, "Not Found"},
+		{"payments", "main", orphan, "No common ancestor between main and " + orphan + "."},
+		{"other", "main", head, "Not Found"}, // a repository the simulator was not given
+	} {
+		_, resp, err := gh.Repositories.CompareCommits(ctx, "acme", tc.repo, tc.base, tc.head, nil)
+		var answer *github.ErrorResponse
+		if resp == nil || resp.StatusCode != 404 || !errors.As(err, &answer) || answer.Message != tc.message {
+			t.Errorf("%s: %s...%s: %v", tc.repo, tc.base, tc.head, err)
+		}
+	}
+}
+
+// The repository's own branches are there for the writes too: GitHub refuses to create one
+// that exists (422), and a pull request onto a branch it does not have.
+func TestWritesSeeTheRepositorysBranches(t *testing.T) {
+	dir, head := repo(t)
+	gh := client(t, &Server{Repos: map[string]string{"acme/payments": dir}})
+	ctx := context.Background()
+	if _, resp, err := gh.Git.CreateRef(ctx, "acme", "payments", github.CreateRef{Ref: "refs/heads/main", SHA: head}); resp.StatusCode != 422 {
+		t.Errorf("create main: %v", err)
+	}
+	if _, _, err := gh.Git.CreateRef(ctx, "acme", "payments", github.CreateRef{Ref: "refs/heads/fix", SHA: head}); err != nil {
+		t.Fatal(err)
+	}
+	for base, want := range map[string]int{"release": 422, "main": 201} {
+		_, resp, err := gh.PullRequests.Create(ctx, "acme", "payments", github.CreatePullRequest{Title: new("x"), Head: "fix", Base: base})
+		if resp == nil || resp.StatusCode != want {
+			t.Errorf("a pull request onto %s: %v, want %d", base, err, want)
+		}
 	}
 }

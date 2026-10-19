@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -23,8 +24,9 @@ import (
 // OpenDraftPR is github.open_draft_pr. Two steps (section 6): a branch with the patch on the
 // audited commit, created under a name derived from the commit, the run and the patch, so a
 // retry recreates the same thing (idempotent); then a draft pull request, which is looked up
-// by its head branch before it is opened (lookup). Before either, it checks the files the
-// patch touches against the commit on GitHub (checkFiles).
+// by its head branch before it is opened (lookup). Before either, it checks on GitHub that the
+// commit is in the base branch's history (inBase) and that the files the patch touches are
+// what the patch was made for (checkFiles).
 type OpenDraftPR struct {
 	Client    *Client
 	Repos     map[string]Repo
@@ -104,6 +106,9 @@ func (t *OpenDraftPR) Prepare(ctx context.Context, req tools.Request) (json.RawM
 		return nil, &tools.DeniedError{Reason: "no GitHub repository is configured for " + tools.String(req.Args, "repo")}
 	}
 	commit, ref := tools.String(req.Args, "commit"), tools.String(req.Args, "patch_ref")
+	if base := tools.String(req.Args, "base_branch"); !tools.ValidBranch(base) {
+		return nil, &tools.DeniedError{Reason: fmt.Sprintf("%.100q is not a branch name agentd takes", base)}
+	}
 	changes, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, append(slices.Clone(ProtectedPaths), t.DenyPaths...), repo.Mirror, commit)
 	if err != nil {
 		return nil, err
@@ -144,8 +149,9 @@ func (t *OpenDraftPR) author() Author {
 }
 
 // DryRun is the pull request the payload would open. A dry run sends nothing to GitHub and
-// reads nothing from it either, so nothing checks the payload's files there (Execute does):
-// the files are as the git tool server read them.
+// reads nothing from it either, so nothing checks the payload's commit or files there (Execute
+// does): a commit outside the base branch dry-runs a pull request too, and the files are as the
+// git tool server read them.
 func (t *OpenDraftPR) DryRun(payload json.RawMessage) map[string]any {
 	var p prPayload
 	_ = json.Unmarshal(payload, &p)
@@ -161,6 +167,9 @@ func (t *OpenDraftPR) Execute(ctx context.Context, raw json.RawMessage, _ string
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, fmt.Errorf("%w: %v", tools.ErrNotSent, err)
 	}
+	if !tools.ValidBranch(p.Base) { // a payload recorded before agentd checked the name
+		return nil, t.refused(ctx, p, false, &tools.DeniedError{Reason: fmt.Sprintf("%.100q is not a branch name agentd takes", p.Base)})
+	}
 	gh := t.Client.gh
 	parent, resp, err := gh.Git.GetCommit(ctx, p.Owner, p.Repo, p.Parent)
 	switch {
@@ -170,20 +179,36 @@ func (t *OpenDraftPR) Execute(ctx context.Context, raw json.RawMessage, _ string
 		return nil, t.refused(ctx, p, false, &tools.DeniedError{Reason: fmt.Sprintf(
 			"GitHub has no commit %s in %s/%s (or the token cannot see the repository)", p.Parent, p.Owner, p.Repo)})
 	case err != nil:
-		return nil, unseen(err)
+		return nil, t.refused(ctx, p, false, unseen(err))
 	case parent.GetSHA() != p.Parent:
 		return nil, fmt.Errorf("%w: GitHub answered for commit %s with %.100q", tools.ErrNotSent, p.Parent, parent.GetSHA())
 	}
-	// Before anything is written: the tree is made on top of the commit's own tree.
+	// Before anything is written: the pull request holds the patch alone, and its tree is made
+	// on top of the commit's own tree.
+	if err := t.inBase(ctx, p); err != nil {
+		return nil, err
+	}
 	if err := t.checkFiles(ctx, p, parent.GetTree().GetSHA()); err != nil {
 		return nil, t.refused(ctx, p, true, err)
 	}
+	// From here on agentd writes. GitHub declining a request leaves the branch on GitHub when
+	// this attempt or an earlier one made it.
+	v, err := t.write(ctx, p, parent.GetTree().GetSHA(), proceed)
+	if err != nil {
+		return nil, t.refused(ctx, p, true, err)
+	}
+	return v, nil
+}
+
+// write makes the patch's tree on top of the commit's (base), the branch and the pull request.
+func (t *OpenDraftPR) write(ctx context.Context, p prPayload, base string, proceed tools.Proceed) (map[string]any, error) {
+	gh := t.Client.gh
 	entries := make([]*github.TreeEntry, 0, len(p.Files))
 	for _, f := range p.Files {
 		entries = append(entries, &github.TreeEntry{Path: new(f.Path), Mode: new("100644"),
 			Type: new("blob"), Content: f.Content})
 	}
-	tree, _, err := gh.Git.CreateTree(ctx, p.Owner, p.Repo, parent.GetTree().GetSHA(), entries)
+	tree, _, err := gh.Git.CreateTree(ctx, p.Owner, p.Repo, base, entries)
 	if err != nil {
 		return nil, unseen(err)
 	}
@@ -218,19 +243,28 @@ func (t *OpenDraftPR) Execute(ctx context.Context, raw json.RawMessage, _ string
 	return prValue(pr, p.Branch), nil
 }
 
-// refused passes err on, unless it refuses the payload: a refusal is only for a payload nothing
-// of which went out, and GitHub must show no branch of its name. When the branch exists, an
-// earlier attempt may have sent part of it (this one is a resend after recovery, say), and a
-// person settles the effect; so too when agentd cannot tell. GitHub answers 404 for anything in
-// a repository the token cannot see, a branch too: unless the repository was seen (seen), it is
-// looked at first. GitHub failing to say is tried again.
+// refused passes err on, unless it refuses the payload: agentd's own refusal (a DeniedError), or
+// GitHub declining a request (a RefusedError that is not to be tried again). A refusal is only
+// for a payload nothing of which went out, and GitHub must show no branch of its name. When the
+// branch exists, this attempt or an earlier one sent part of the pull request (this one is a
+// resend after recovery, say), and a person settles the effect; so too when agentd cannot tell.
+// GitHub answers 404 for anything in a repository the token cannot see, a branch too: unless
+// the repository was seen (seen), it is looked at first, and always after GitHub declined a
+// request, which may be the token losing sight of it. GitHub failing to say is tried again.
 func (t *OpenDraftPR) refused(ctx context.Context, p prPayload, seen bool, err error) error {
 	var denied *tools.DeniedError
-	if !errors.As(err, &denied) {
+	var declined *tools.RefusedError
+	var reason string
+	switch {
+	case errors.As(err, &denied):
+		reason = denied.Reason
+	case errors.As(err, &declined) && !declined.Retryable:
+		reason, seen = "GitHub refused: "+declined.Reason, false
+	default:
 		return err
 	}
 	unsure := func(why string) error {
-		return &tools.ConflictError{Reason: denied.Reason + "; and " + why + ", so an earlier attempt may have sent part of the pull request"}
+		return &tools.ConflictError{Reason: reason + "; and " + why + ", so part of the pull request may have gone out"}
 	}
 	// failed is GitHub's failure to answer: tried again, unless it refused to.
 	failed := func(rerr error) error {
@@ -259,14 +293,86 @@ func (t *OpenDraftPR) refused(ctx context.Context, p prPayload, seen bool, err e
 	}
 }
 
+// inBase makes sure the audited commit is in the history of the base branch on GitHub. GitHub
+// serves any commit of the repository's network of forks through the repository, a fork's own
+// too, so finding the commit there (Git.GetCommit) does not say the repository holds it. A
+// branch on a commit outside the base branch would put the commits it holds of its own into the
+// repository, made by anyone who can open a fork: a push runs their CI workflows with the
+// repository's secrets, and the pull request would carry them. So agentd opens one only on a
+// commit the branch holds: GitHub's comparison of the branch with the commit has the commit
+// as the merge base, and the branch at it or ahead of it. A refusal goes through refused.
+func (t *OpenDraftPR) inBase(ctx context.Context, p prPayload) error {
+	gh := t.Client.gh
+	where := fmt.Sprintf("branch %s of %s/%s", p.Base, p.Owner, p.Repo)
+	// The branch's own commit: a name in the comparison could be a tag's as well.
+	ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Base)
+	switch {
+	case status(resp) == http.StatusNotFound:
+		return t.refused(ctx, p, false, &tools.DeniedError{Reason: fmt.Sprintf(
+			"GitHub has no branch %s in %s/%s (or the token cannot see the repository)", p.Base, p.Owner, p.Repo)})
+	case err != nil:
+		return t.refused(ctx, p, false, unseen(err))
+	}
+	// The answer must be about the branch the pull request names (the name was checked, but GitHub
+	// answers for "a//b" with a/b's commit), and that branch a commit.
+	tip := ref.GetObject().GetSHA()
+	if ref.GetRef() != "refs/heads/"+p.Base || ref.GetObject().GetType() != "commit" || !fullSHA.MatchString(tip) {
+		return t.refused(ctx, p, true, &tools.DeniedError{Reason: fmt.Sprintf(
+			"GitHub answered for branch %s of %s/%s with %.100q, a %.20q %.100q: agentd cannot compare the commit with it",
+			p.Base, p.Owner, p.Repo, ref.GetRef(), ref.GetObject().GetType(), tip)})
+	}
+	where += " at " + tip
+	// Only the first of the commit's own commits: the answer stays small when it has many.
+	req, err := gh.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%v/%v/compare/%v...%v?per_page=1", p.Owner, p.Repo, tip, p.Parent), nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", tools.ErrNotSent, err)
+	}
+	body := &cappedBuffer{max: maxCompareBytes}
+	resp, err = gh.Do(req, body)
+	switch {
+	case status(resp) == http.StatusNotFound:
+		// GitHub has both (the commit was just found): they have no history in common. Or the
+		// token lost sight of the repository meanwhile.
+		return t.refused(ctx, p, false, &tools.DeniedError{Reason: fmt.Sprintf(
+			"commit %s has no history in common with %s (or the token cannot see the repository)", p.Parent, where)})
+	case errors.Is(err, errOverLimit):
+		return t.refused(ctx, p, true, &tools.DeniedError{Reason: fmt.Sprintf(
+			"GitHub's comparison of commit %s with %s is over the limit of %d bytes (that of a commit in the branch's history lists no commits and no files)",
+			p.Parent, where, maxCompareBytes)})
+	case err != nil:
+		return t.refused(ctx, p, false, unseen(err))
+	}
+	var cmp struct {
+		Status    string `json:"status"`
+		AheadBy   int    `json:"ahead_by"`
+		MergeBase struct {
+			SHA string `json:"sha"`
+		} `json:"merge_base_commit"`
+	}
+	if err := json.Unmarshal(body.buf.Bytes(), &cmp); err != nil {
+		return fmt.Errorf("%w: GitHub's comparison of commit %s with %s: %v", tools.ErrNotSent, p.Parent, where, err)
+	}
+	if cmp.MergeBase.SHA != p.Parent || cmp.Status != "behind" && cmp.Status != "identical" {
+		return t.refused(ctx, p, true, &tools.DeniedError{Reason: fmt.Sprintf(
+			"commit %s is not in the history of %s: GitHub compares it as %.20q, with %d commits of its own, which a pull request on it would bring in",
+			p.Parent, where, cmp.Status, cmp.AheadBy)})
+	}
+	return nil
+}
+
 // Bounds on one check of the payload's files on GitHub, which lists every directory on the way
 // to each file once: at most patch.MaxFiles times patch.MaxDepth listings (a fix needs a
 // handful). A crafted repository can hold directories of hundreds of thousands of entries,
-// which GitHub lists whole.
+// which GitHub lists whole. And on the comparison of the base branch with the commit: that of
+// a commit in the branch's history lists neither commits nor files, only the two commits, whose
+// messages (twice each when signed) can still be long.
 const (
 	maxListingBytes = 8 << 20  // one listing, as GitHub sends it: some 40,000 entries
 	maxCheckBytes   = 64 << 20 // all of them
+	maxCompareBytes = 8 << 20
 )
+
+var fullSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // checkFiles makes sure each file the payload touches is, at the audited commit on GitHub,
 // what the git tool server read from the mirror: a file the patch changes or deletes is a
