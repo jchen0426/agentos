@@ -165,9 +165,24 @@ def wait_for(predicate: Callable[[], T], what: str, timeout: float = 30, interva
 
 
 def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A port that no other process asking the OS for a port gets for a while; the server meant
+    to have it must bind it with SO_REUSEADDR, as Go does. Linux may give a port just let go to
+    the next process that asks, and the Temporal dev server asks for its own services' ports
+    after it has checked the one it was given: its worker service took the frontend's port, and
+    the server answered, then died. Like Temporal's own port picker, leave a connection to the
+    port in TIME_WAIT: until that ends (60 s), Linux gives the port to nobody who binds port 0
+    or connects out, while a bind by number with SO_REUSEADDR still succeeds. macOS hands out
+    ports in turn, so a port let go does not come back soon there anyway."""
+    with socket.socket() as listener:
+        # The connection inherits SO_REUSEADDR; without it, Linux refuses even the server's
+        # SO_REUSEADDR bind while the connection waits.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port)):
+            listener.accept()[0].close()  # this end closes first, so its side waits in TIME_WAIT
+    return port
 
 
 def descendants(pid: int) -> list[int]:
@@ -286,8 +301,8 @@ class Stack:
     # --- processes ---------------------------------------------------------------------------
 
     def _start_temporal(self) -> None:
-        # free_port() hands out a port that is free now; another process can take it before the
-        # server binds it (an outgoing connection's ephemeral port, say). Then try another.
+        # free_port() keeps the port from processes that ask the OS for any port, not from one
+        # that binds it by number before the server does. Then try another.
         for attempt in range(3):
             port = self.temporal_address.rsplit(":", 1)[1]
             p = Proc("temporal", ["temporal", "server", "start-dev", "--ip", "127.0.0.1", "--port", port,

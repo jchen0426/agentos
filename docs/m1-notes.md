@@ -310,6 +310,24 @@ PR #20 的评审顺带发现的三处 macOS 启动脚本问题（比它早就有
 
 原来留在 `/tmp` 的状态目录（连同本次测试留下的）没有删，挪到了家目录的 `~/agentos-backups/2026-10-19-macos-worker-state/`（Worker 读不到）；还有 srt 进程在用的（命令行里点名的）留在原处。别的 checkout 和 worktree 用的还是旧启动脚本，在它们更新之前还会继续留下新的。
 
+## 测试里的 Temporal 开发服务器答应之后又退出（2026-10-19）
+
+CI 偶尔在测试一开头失败：Temporal 开发服务器答应了测试框架的就绪检查，不到一秒又退出，agentd 连不上它（"connection refused"），`_launch_agentd` 的断言失败。见过两次，在两个 PR、两种模式下：run 39191441167（PR #23，none，`tests/test_cancel.py` 的第一个测试）和 run 39181890891（PR #21 的分支，bwrap，`tests/test_write_limits.py::test_a_run_posts_one_report`）。两次 Temporal 的日志都是 worker 服务的 gRPC 监听失败（`bind: address already in use`），端口正是框架给前端选的那个，随后进程 panic。框架只在服务器答应之前就退出时才换端口重试，这种漏了过去。CI 到现在的 96 次运行（共 99 次尝试，算上重跑前失败的那几次）里，只有这两次是这个原因。
+
+原因（看的是 Temporal CLI 1.9.1 的源码：`internal/temporalcli/commands.server.go`、`internal/devserver/server.go`、`internal/devserver/freeport.go`；1.9.1 也是现在最新的版本）：
+
+- 框架的 `free_port()` 绑端口 0，读出端口号就放手。`temporal server start-dev --port P` 先试绑 P（绑上就放），再向系统要 5 个端口：metrics、HTTP API，和 history、matching、worker 三个内部服务的 gRPC 端口，每个都是绑端口 0。内部服务的端口没有参数可以指定，`--port 0` 直接报 `missing frontend port`：既不能固定内部端口，也不能让 Temporal 自己选前端端口再读出来。
+- Linux 随机分配端口 0，刚放手的端口下一次就可能分出去。在虚拟机里（内核 6.8，默认范围 32768–60999）各绑 4000 次：不设 SO_REUSEADDR 时（框架原来的 `free_port()`）在整个范围的奇数端口里挑，设了时（Go 默认设）只在下半段（32768–46883）的奇数端口里挑。CI 上那两个端口 37977、33757 都是下半段的奇数。粗算每个测试栈约有 1/2800 的机会让 Temporal 的 5 个端口之一落在 P 上，落在 worker 上约 1/14000；现在每次 CI 约 110 个栈，不到 1% 的 CI 会因此失败。
+- 落在谁身上结果不同：另外 4 个端口拿到 P 时，前端绑不上或者 HTTP API 起不来（下面的复现里都是这样），服务器在答应之前就退出，框架换端口重试；worker 在前端之后才绑，这时前端已经能答应了，于是漏过去。
+- Temporal 自己选的端口防了这一点：在 Linux 上它连一次刚选的端口，从监听那一侧先关，这一侧的连接在 TIME_WAIT 里留 60 秒。这期间 Linux 不把这个端口分给绑端口 0 的 socket 或往外连的连接，按端口号带 SO_REUSEADDR 绑定的仍然可以。macOS 按顺序分配端口（这台 Mac 上实测也是），刚放手的端口要轮完一圈才会再分出去，它在 macOS 上就不做这一步，本机的测试也就几乎碰不上这个问题。框架给的端口没有这样留住。
+- 同一个原因也可能让 Temporal 拿走 agentd 的 Runtime 端口（none 模式，栈起来时就选好，agentd 后起），或者让几次 `free_port()` 给出同一个端口（复现里常见），或者让 mTLS 测试给完整服务器的 9 个端口有重复。CI 上没见过。
+
+复现：在虚拟机里，每次用一个新的网络命名空间，临时端口范围设成 40000–40199，奇数端口除了下半段的 5 个都保留（`ip_local_reserved_ports`），Temporal 要的 5 个端口就一定把框架给前端的那个也拿走。原来的框架 25 次里 6 次失败，和 CI 一样（worker 绑不上前端的端口，Temporal 只起了一次，agentd "connection refused"）；另外 19 次都是 Temporal 在答应之前就退出，靠重试才过。
+
+修复（`tests/harness.py`）：`free_port()` 像 Temporal 那样留住端口：设 SO_REUSEADDR 监听端口 0，连一次，从监听那一侧先关。SO_REUSEADDR 不能少：留在 TIME_WAIT 里的连接继承这个选项，没有它，Linux 连服务器按端口号的绑定也拒绝（实测）。Linux 上留 60 秒，够用：Temporal 一起来就绑上前端端口，它自己的 5 个端口也在那一两秒里要完；Runtime 端口在测试启动 agentd 时才绑，通常也就几秒。只有 mTLS 测试先等完整服务器起来（最多 90 秒）再启动 agentd，慢的机器上可能过了 60 秒，那以后 Runtime 端口回到原来的情形，不过那时已经没有 Temporal 在要端口了（完整服务器的端口都由测试给定）。macOS 上 TIME_WAIT 是 30 秒，那里本来就按顺序分配。同样的复现跑了两轮，每轮 25 次全过，Temporal 每次只起一次，日志里没有监听错误。`_start_temporal` 的重试留着，防的只剩按端口号绑定的进程。新测试 `tests/test_harness.py` 检查这个约定：拿到的端口先被占着（不带 SO_REUSEADDR 的绑定被拒），带 SO_REUSEADDR 的绑定拿得到。改之前它失败；监听不设 SO_REUSEADDR 时它在 Linux 上失败，在 macOS 上照过（macOS 只看新绑定的那个 socket 有没有这个选项）。
+
+没采用的：答应之后再观察一段时间，进程还在、日志里没有监听错误才往下走。每个栈都要多等，等多久才够也说不准，而且是出了事再补救，原因还在。
+
 ## 还没解决的风险
 
 - macOS 上 Runtime 入口是回环 TCP 端口，本机任何进程（包括同一台 Mac 上的其他用户）都能连上去冒充 Worker。v0.1 的信任模型不防同一用户，但多用户的 Mac 要注意；Linux 上是 0700 目录里的 Unix socket，没有这个问题。
