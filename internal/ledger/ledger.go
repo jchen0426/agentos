@@ -33,6 +33,9 @@ var (
 	ErrRunStarting = errors.New("run registration in progress")
 	// ErrNotFound is returned for missing blobs and records.
 	ErrNotFound = errors.New("not found")
+	// ErrMigrationMismatch means another agentd migrated the ledger: one with migrations this
+	// one does not have, or with another file under one of its migration numbers.
+	ErrMigrationMismatch = errors.New("migrated by another agentd")
 )
 
 // Ledger is agentd's SQLite store. Writers serialize on SQLite's write lock: every
@@ -42,8 +45,19 @@ type Ledger struct {
 	Q  *db.Queries
 }
 
-// Open opens (creating if needed) the ledger at path and applies pending migrations.
+// Open opens (creating if needed) the ledger at path and applies pending migrations. It refuses
+// a ledger another agentd migrated (ErrMigrationMismatch): all checkouts' development stacks
+// share one, and goose ignores applied migrations it has no file for.
 func Open(ctx context.Context, path string) (*Ledger, error) {
+	sub, err := fs.Sub(migrations, "migrations")
+	if err != nil {
+		return nil, err
+	}
+	return open(ctx, path, sub)
+}
+
+// open is Open with the migrations in fsys: tests give it other branches' migrations.
+func open(ctx context.Context, path string, fsys fs.FS) (*Ledger, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create ledger: %w", err)
@@ -61,12 +75,12 @@ func Open(ctx context.Context, path string) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
-	sub, err := fs.Sub(migrations, "migrations")
+	provider, err := goose.NewProvider(goose.DialectSQLite3, sqlDB, fsys)
 	if err != nil {
+		sqlDB.Close()
 		return nil, err
 	}
-	provider, err := goose.NewProvider(goose.DialectSQLite3, sqlDB, sub)
-	if err != nil {
+	if err := checkMigrations(ctx, sqlDB, path, fsys, provider.ListSources()); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}
