@@ -117,18 +117,24 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 	// Only executions started through Control: the caller's identity comes from Temporal's
 	// activity info, never from fields the workflow fills in.
 	run, err := g.Ledger.LookupRun(ctx, info.WorkflowExecution.ID, info.WorkflowExecution.RunID)
+	var waited time.Duration
 	if errors.Is(err, ledger.ErrRunStarting) {
 		// StartRun records the run ID once Temporal has started the run, and a Worker already
 		// polling can send the run's first call before that. Refused, the call would lose one
 		// of its attempts and wait out Temporal's backoff: it waits for the run ID instead.
-		log.Info("invoke waits for the run ID")
+		start := time.Now()
 		stop := heartbeat(ctx, false)
 		run, err = g.awaitRunID(ctx, info.WorkflowExecution.ID, info.WorkflowExecution.RunID)
 		stop()
+		waited = time.Since(start)
+		if err == nil {
+			log.Info("invoke waited for the run ID", "waited_ms", waited.Milliseconds())
+		}
 	}
 	switch {
 	case errors.Is(err, ledger.ErrRunStarting):
-		log.Warn("invoke refused: the run ID is still not recorded")
+		log.Warn("invoke refused: the run ID is still not recorded", "run_id", info.WorkflowExecution.RunID,
+			"waited_ms", waited.Milliseconds())
 		return nil, err // retried: StartRun, or RecoverStarts when agentd starts, may record it yet
 	case errors.Is(err, ledger.ErrUnknownRun):
 		log.Warn("invoke from an unknown run", "run_id", info.WorkflowExecution.RunID)
@@ -181,32 +187,43 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 	return res, nil
 }
 
-// defaultRunIDWait bounds how long a call waits for StartRun to record its run's ID: usually
+// defaultRunIDWait bounds how long a run's calls wait for StartRun to record its run ID: usually
 // milliseconds, the time it takes StartRun to learn the run ID from Temporal and record it.
 const defaultRunIDWait = 5 * time.Second
 
 // awaitRunID reads the run again, while StartRun has not recorded its run ID, until it has, the
 // run is gone or the wait is over, and answers as LookupRun does: a run ID recorded for another
 // execution is still ErrUnknownRun, and a run still starting is still ErrRunStarting.
+//
+// The wait counts from when StartRun recorded the run, not from this attempt: the calls of a run
+// that keeps no run ID (StartRun could neither record nor stop it, or the execution under its
+// workflow ID is not the one agentd started) are refused at once, attempt after attempt.
 func (g *Gateway) awaitRunID(ctx context.Context, workflowID, runID string) (db.Run, error) {
 	wait := g.runIDWait
 	if wait <= 0 {
 		wait = defaultRunIDWait
 	}
-	deadline := time.Now().Add(wait)
+	var remaining time.Duration // none for a run that is gone or unreadable: LookupRun answers
+	if r, err := g.Ledger.Q.GetRun(ctx, workflowID); err == nil {
+		if created, err := time.Parse(time.RFC3339Nano, r.CreatedAt); err == nil {
+			remaining = min(wait, time.Until(created.Add(wait)))
+		}
+	}
+	// From here on this process's monotonic clock: setting the wall clock back stretches nothing.
+	deadline := time.Now().Add(remaining)
 	for pause := 10 * time.Millisecond; ; pause = min(2*pause, 100*time.Millisecond) {
+		run, err := g.Ledger.LookupRun(ctx, workflowID, runID)
+		if !errors.Is(err, ledger.ErrRunStarting) {
+			return run, err
+		}
 		left := time.Until(deadline)
 		if left <= 0 {
-			return db.Run{}, ledger.ErrRunStarting
+			return db.Run{}, err
 		}
 		select {
 		case <-ctx.Done():
 			return db.Run{}, ctx.Err()
 		case <-time.After(min(pause, left)):
-		}
-		run, err := g.Ledger.LookupRun(ctx, workflowID, runID)
-		if !errors.Is(err, ledger.ErrRunStarting) {
-			return run, err
 		}
 	}
 }
@@ -1025,15 +1042,17 @@ func heartbeat(ctx context.Context, skip bool) (stop func()) {
 	if skip || timeout <= 0 {
 		return func() {}
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	done, cancel := context.WithCancel(ctx)
 	go func() {
 		t := time.NewTicker(heartbeatInterval(timeout))
 		defer t.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-done.Done():
 				return
 			case <-t.C:
+				// With the attempt's own context: Temporal's SDK sends a heartbeat it held back
+				// later with the context it came with, and done ends with stop, maybe before.
 				activity.RecordHeartbeat(ctx)
 			}
 		}

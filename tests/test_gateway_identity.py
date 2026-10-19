@@ -47,7 +47,7 @@ def test_a_runs_first_call_waits_for_the_run_id(stack: Stack) -> None:
         return [e for e in stack.agentd_log() if e["msg"] == msg and e.get("workflow_id") == run["run_id"]]
     [started] = wait_for(lambda: logged("invoke started"), "the run's first call to start")
     assert (started["name"], started["attempt"]) == ("git.show_diff", 1), started
-    assert [e["attempt"] for e in logged("invoke waits for the run ID")] == [1], \
+    assert [e["attempt"] for e in logged("invoke waited for the run ID")] == [1], \
         "the first call came after the run ID was recorded: nothing raced"
     assert stack.get_run(run)["state"] == "RUNNING"
 
