@@ -9,15 +9,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/go-github/v92/github"
 
 	"github.com/jchen0426/agentos/internal/githubsim"
 	"github.com/jchen0426/agentos/internal/gitmcp"
@@ -130,20 +135,41 @@ func (f *fixture) request(t *testing.T, args map[string]any) tools.Request {
 
 func (f *fixture) log(t *testing.T, action string) int {
 	t.Helper()
+	return len(f.logged(t, action))
+}
+
+// logged is GitHub's log of the writes of an action that took effect.
+func (f *fixture) logged(t *testing.T, action string) []map[string]any {
+	t.Helper()
 	b, err := os.ReadFile(f.sim.LogPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0 // GitHub answered nothing
+		return nil // GitHub answered nothing
 	} else if err != nil {
 		t.Fatal(err)
 	}
-	n := 0
+	var entries []map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
 		var e map[string]any
 		if json.Unmarshal([]byte(line), &e) == nil && e["action"] == action && e["status"] == float64(201) {
-			n++
+			entries = append(entries, e)
 		}
 	}
-	return n
+	return entries
+}
+
+// branchCommit is the commit a branch points at on GitHub.
+func (f *fixture) branchCommit(t *testing.T, branch string) *github.Commit {
+	t.Helper()
+	ctx := context.Background()
+	ref, _, err := f.client.gh.Git.GetRef(ctx, "acme", "payments", "heads/"+branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := f.client.gh.Git.GetCommit(ctx, "acme", "payments", ref.GetObject().GetSHA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 func (f *fixture) allCarriedTheToken(t *testing.T) bool {
@@ -316,10 +342,11 @@ func TestACancelStopsThePullRequest(t *testing.T) {
 	asked := 0
 	cancelled := func(context.Context) error {
 		asked++
-		return fmt.Errorf("%w: cancelled", tools.ErrNotSent)
+		return tools.ErrStopped
 	}
-	if _, err := tool.Execute(context.Background(), payload, "key", cancelled); !errors.Is(err, tools.ErrNotSent) {
-		t.Fatalf("got %v", err)
+	var conflict *tools.ConflictError
+	if _, err := tool.Execute(context.Background(), payload, "key", cancelled); !errors.Is(err, tools.ErrNotSent) || errors.As(err, &conflict) {
+		t.Fatalf("got %v, want not sent", err)
 	}
 	if asked != 1 || f.log(t, "create_ref") != 0 || f.log(t, "create_pull") != 0 {
 		t.Fatalf("asked %d, refs %d, pulls %d", asked, f.log(t, "create_ref"), f.log(t, "create_pull"))
@@ -458,11 +485,11 @@ func TestOpenDraftPRDeniesACommitGitHubDoesNotHave(t *testing.T) {
 	tool, payload := f.prepare(t, f.git, fix)
 	var p prPayload
 	_ = json.Unmarshal(payload, &p)
-	p.Parent = strings.Repeat("1", 40)
+	p.Commit = strings.Repeat("1", 40)
 	payload, _ = json.Marshal(p)
 	_, err := tool.Execute(context.Background(), payload, "key", proceed)
 	var denied *tools.DeniedError
-	if !errors.As(err, &denied) || !strings.Contains(denied.Reason, "no commit "+p.Parent) || f.wrote(t) != 0 {
+	if !errors.As(err, &denied) || !strings.Contains(denied.Reason, "no commit "+p.Commit) || f.wrote(t) != 0 {
 		t.Fatalf("got %v, %d writes", err, f.wrote(t))
 	}
 }
@@ -607,11 +634,11 @@ func TestOpenDraftPRDoesNotDenyWhatMayHaveGoneOut(t *testing.T) {
 			var p prPayload
 			_ = json.Unmarshal(payload, &p)
 			if tc.noCommit {
-				p.Parent = strings.Repeat("1", 40)
+				p.Commit = strings.Repeat("1", 40)
 				payload, _ = json.Marshal(p)
 			}
 			if tc.outside {
-				p.Parent = forkCommit(t, base)
+				p.Commit = forkCommit(t, base)
 				payload, _ = json.Marshal(p)
 			}
 			if tc.branch {
@@ -1055,7 +1082,7 @@ func TestOpenDraftPRRefusalsAfterTheChecksLeaveTheBranchToAPerson(t *testing.T) 
 		}, nil, false},
 		{"the tree is refused on a resend", func(*fixture) func(*http.Request) int {
 			return refuse(http.MethodPost, "/git/trees", http.StatusUnprocessableEntity)
-		}, func(f *fixture) string { return f.commit }, true},
+		}, nil, true},
 		{"the branch's commit cannot be read", func(f *fixture) func(*http.Request) int {
 			return refuse(http.MethodGet, "/git/commits/"+gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", f.commit+"^"),
 				http.StatusForbidden)
@@ -1067,8 +1094,12 @@ func TestOpenDraftPRRefusalsAfterTheChecksLeaveTheBranchToAPerson(t *testing.T) 
 			tool, payload := f.prepare(t, f.git, fix)
 			var p prPayload
 			_ = json.Unmarshal(payload, &p)
-			if tc.branch != nil {
+			switch {
+			case tc.branch != nil:
 				f.sim.SetRef("acme/payments", p.Branch, tc.branch(f))
+			case tc.name == "the tree is refused on a resend":
+				// An earlier attempt's branch, made before GitHub began to refuse trees.
+				f.sim.SetRef("acme/payments", p.Branch, base.commitAs(t, p, base.patched(t, p, base.treeOf(t, base.commit)), base.commit))
 			}
 			_, err := tool.Execute(context.Background(), payload, "key", proceed)
 			var conflict *tools.ConflictError
@@ -1100,5 +1131,1158 @@ func TestOpenDraftPRRetriesARateLimitedRead(t *testing.T) {
 	var refused *tools.RefusedError
 	if !errors.As(err, &refused) || !refused.Retryable {
 		t.Fatalf("got %v, want a refusal to try again", err)
+	}
+}
+
+// patched makes, on GitHub, the tree of base with the payload's files, as agentd makes the
+// tree of a pull request's commit, and returns it.
+func (f *fixture) patched(t *testing.T, p prPayload, base string) string {
+	t.Helper()
+	entries := make([]*github.TreeEntry, 0, len(p.Files))
+	for _, pf := range p.Files {
+		entries = append(entries, &github.TreeEntry{Path: new(pf.Path), Mode: new("100644"), Type: new("blob"), Content: pf.Content})
+	}
+	tree, _, err := f.client.gh.Git.CreateTree(context.Background(), p.Owner, p.Repo, base, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tree.GetSHA()
+}
+
+// commitAs makes, on GitHub, a commit of tree on parents as agentd makes the payload's: its
+// message, and its author and committer at the run's creation time. It returns the commit.
+func (f *fixture) commitAs(t *testing.T, p prPayload, tree string, parents ...string) string {
+	t.Helper()
+	date, err := time.Parse(time.RFC3339, p.Author.Date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	who := &github.CommitAuthor{Name: new(p.Author.Name), Email: new(p.Author.Email), Date: &github.Timestamp{Time: date}}
+	var ps []*github.Commit
+	for _, sha := range parents {
+		ps = append(ps, &github.Commit{SHA: new(sha)})
+	}
+	c, _, err := f.client.gh.Git.CreateCommit(context.Background(), "acme", "payments",
+		github.Commit{Message: new(p.Message), Tree: &github.Tree{SHA: new(tree)}, Parents: ps, Author: who, Committer: who}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.GetSHA()
+}
+
+// commitOn makes, on GitHub, a commit of tree on parents, and returns it.
+func (f *fixture) commitOn(t *testing.T, tree string, parents ...string) string {
+	t.Helper()
+	var ps []*github.Commit
+	for _, p := range parents {
+		ps = append(ps, &github.Commit{SHA: new(p)})
+	}
+	c, _, err := f.client.gh.Git.CreateCommit(context.Background(), "acme", "payments",
+		github.Commit{Message: new("m"), Tree: &github.Tree{SHA: new(tree)}, Parents: ps}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.GetSHA()
+}
+
+// The pull request's commit is the patch on the tip of the base branch, whichever commit of its
+// history was audited: its tree is the tip's tree with the patched files. A commit the branch
+// has moved on from can hold files nobody reviewed as a whole: here a fork's pull request,
+// merged with its own commits, added a workflow in one commit and took it out in the next, and
+// the audited commit is the first. A branch on it would run that workflow when pushed.
+func TestOpenDraftPRBuildsOnTheTipOfTheBaseBranch(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	planted := commitFiles(t, dir, map[string]string{".github/workflows/evil.yml": "on: push\n"})
+	gitIn(t, dir, "rm", "-q", ".github/workflows/evil.yml")
+	gitIn(t, dir, "commit", "-q", "-m", "take it out")
+	tip := gitIn(t, dir, "rev-parse", "HEAD")
+	f := newFixture(t, base.sim, base.sim, dir, planted)
+	tool, payload := f.prepare(t, f.git, fix)
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+		t.Fatal(err)
+	}
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	c := f.branchCommit(t, p.Branch)
+	trees := f.logged(t, "create_tree")
+	if len(c.Parents) != 1 || c.Parents[0].GetSHA() != tip || len(trees) != 1 ||
+		trees[0]["base_tree"] != gitIn(t, dir, "rev-parse", tip+"^{tree}") || trees[0]["sha"] != c.GetTree().GetSHA() {
+		t.Fatalf("the branch's commit %+v, its tree made as %v; want the patch on %s", c, trees, tip)
+	}
+	if f.log(t, "create_pull") != 1 {
+		t.Fatalf("%d pull requests", f.log(t, "create_pull"))
+	}
+}
+
+// The patch was made for the files of the audited commit, and goes onto the tip. Where the base
+// branch has since changed a file the patch touches, or put something in the way of one it
+// creates, the patch is not what was checked: a refusal, before anything is written. So too
+// where the git tool server's answer about the audited commit is false, even when the tip
+// makes it true: the server read the audited commit for the patch.
+func TestOpenDraftPRDeniesAPatchTheBaseBranchHasChangedUnder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		patch  string
+		tip    map[string]string // files the tip adds or changes
+		remove []string          // files the tip removes
+		lies   map[string]gitmcp.File
+		want   string
+	}{
+		{"the file changed", fix, map[string]string{"app/db.py": vulnerable + "# later\n"}, nil, nil,
+			"app/db.py: the patch was made for the regular file 40f0c5d58706e66e4df57ca3877eb3fe9c77a649"},
+		{"the file taken out", fix, nil, []string{"app/db.py"}, nil, "GitHub has nothing there"},
+		{"a file where the patch creates one", newFile("app/new.py"), map[string]string{"app/new.py": "y\n"}, nil, nil,
+			"app/new.py: the patch creates it"},
+		{"a name that differs only in case", newFile("app/new.py"), map[string]string{"app/NEW.py": "y\n"}, nil, nil,
+			"only in case"},
+		{"a file above a new one", newFile("docs/new/SECURITY.md"), map[string]string{"docs/new": "y\n"}, nil, nil,
+			"docs/new, above it"},
+		{"a lie the tip makes true", fix, map[string]string{"app/db.py": vulnerable + "# later\n"}, nil,
+			map[string]gitmcp.File{"app/db.py": regular("app/db.py", vulnerable+"# later\n")},
+			"app/db.py: the git tool server read the regular file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			for _, path := range tc.remove {
+				gitIn(t, dir, "rm", "-q", path)
+			}
+			tip := commitFiles(t, dir, tc.tip)
+			f := newFixture(t, base.sim, base.sim, dir, base.commit)
+			tool, payload := f.prepare(t, liar{real: f.git, lies: tc.lies}, tc.patch)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var denied *tools.DeniedError
+			if !errors.As(err, &denied) || !strings.Contains(denied.Reason, tc.want) {
+				t.Fatalf("got %v, want denied: ...%s...", err, tc.want)
+			}
+			if tc.lies == nil && !strings.Contains(denied.Reason, tip) {
+				t.Fatalf("%q does not name the tip %s", denied.Reason, tip)
+			}
+			if f.wrote(t) != 0 {
+				t.Fatalf("%d writes reached GitHub", f.wrote(t))
+			}
+		})
+	}
+}
+
+// A resend finds the branch an earlier attempt pushed on the tip it read, the base branch
+// having moved on since: one parent, in the branch's history, and that parent's tree with the
+// patch. The pull request is found on it, or opened; no second branch is made. So too a branch
+// an older agentd made on the audited commit itself.
+func TestOpenDraftPRTakesTheBranchOfAnEarlierAttemptOnAnOlderTip(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		earlier func(t *testing.T, f *fixture, p prPayload, tool *OpenDraftPR, payload json.RawMessage)
+		pulls   int // the pull requests the earlier attempt opened
+	}{
+		{"the pull request was opened", func(t *testing.T, f *fixture, _ prPayload, tool *OpenDraftPR, payload json.RawMessage) {
+			if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+				t.Fatal(err)
+			}
+		}, 1},
+		{"the pull request was not", func(t *testing.T, f *fixture, _ prPayload, _ *OpenDraftPR, payload json.RawMessage) {
+			// GitHub fails to open it: the branch stays.
+			g := newFixture(t, f.sim, answering{sim: f.sim, answer: func(r *http.Request) int {
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls") {
+					return http.StatusBadGateway
+				}
+				return 0
+			}}, f.repos["acme/payments"].Mirror, f.commit)
+			tool := &OpenDraftPR{Client: g.client, Repos: g.repos, Blobs: f.blobs, Git: g.git}
+			if _, err := tool.Execute(context.Background(), payload, "key", proceed); err == nil {
+				t.Fatal("the pull request opened")
+			}
+		}, 0},
+		{"an older agentd's, on the audited commit", func(t *testing.T, f *fixture, p prPayload, _ *OpenDraftPR, _ json.RawMessage) {
+			f.sim.SetRef("acme/payments", p.Branch, f.commitAs(t, p, f.patched(t, p, gitIn(t, f.repos["acme/payments"].Mirror,
+				"rev-parse", f.commit+"^{tree}")), f.commit))
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			tc.earlier(t, f, p, tool, payload)
+			before := f.branchCommit(t, p.Branch)
+			if len(before.Parents) != 1 || before.Parents[0].GetSHA() != f.commit {
+				t.Fatalf("the earlier attempt's branch %+v", before)
+			}
+			commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"docs/later.md": "x\n"}) // main moves on
+			refs := f.log(t, "create_ref")
+			v, err := tool.Execute(context.Background(), payload, "key", proceed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f.log(t, "create_ref") != refs || f.log(t, "create_pull") != 1 || f.branchCommit(t, p.Branch).GetSHA() != before.GetSHA() ||
+				v["branch"] != p.Branch {
+				t.Fatalf("got %v; %d branches made, %d pull requests (%d before)", v, f.log(t, "create_ref")-refs,
+					f.log(t, "create_pull"), tc.pulls)
+			}
+		})
+	}
+}
+
+// A branch of the payload's name that is not the patch on the base branch, as an attempt makes it,
+// is left to a person, however close it comes. Main has moved on from the audited commit A, so
+// a branch can be on an older commit of its history. Each branch but one is made as agentd
+// makes a commit, and breaks one condition only.
+func TestOpenDraftPRLeavesABranchThatIsNotThePatchAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		commit func(t *testing.T, f *fixture, p prPayload) string
+	}{
+		{"two parents", func(t *testing.T, f *fixture, p prPayload) string {
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, f.commit)), f.commit, f.parentOf(t, f.commit))
+		}},
+		{"a fork's parent", func(t *testing.T, f *fixture, p prPayload) string {
+			fork := forkCommit(t, f)
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, fork)), fork)
+		}},
+		{"a parent on another branch", func(t *testing.T, f *fixture, p prPayload) string {
+			// A's child that main does not hold: only its place outside the branch is wrong.
+			other := gitIn(t, f.repos["acme/payments"].Mirror, "commit-tree", "-p", f.commit, "-m", "elsewhere", f.treeOf(t, f.commit))
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, other)), other)
+		}},
+		{"a parent older than the audited commit", func(t *testing.T, f *fixture, p prPayload) string {
+			older := f.parentOf(t, f.commit) // app/db.py as at A: only its place in the history is wrong
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, older)), older)
+		}},
+		{"a parent where the file is another", func(t *testing.T, f *fixture, p prPayload) string {
+			changed := commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"app/db.py": vulnerable + "# later\n"})
+			commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"docs/later.md": "y\n"}) // the tip is past it
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, changed)), changed)
+		}},
+		{"another tree on an older commit", func(t *testing.T, f *fixture, p prPayload) string {
+			q := p
+			q.Files = append(slices.Clone(p.Files), prFile{Path: "app/extra.py", Content: new("x\n")})
+			return f.commitAs(t, p, f.patched(t, q, f.treeOf(t, f.commit)), f.commit)
+		}},
+		{"someone else's commit on an older commit", func(t *testing.T, f *fixture, p prPayload) string {
+			return f.commitOn(t, f.patched(t, p, f.treeOf(t, f.commit)), f.commit)
+		}},
+		{"another tree on the tip", func(t *testing.T, f *fixture, p prPayload) string {
+			tip := gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", "main")
+			return f.commitAs(t, p, f.treeOf(t, tip), tip)
+		}},
+		{"the patch on a tip where the file is another", func(t *testing.T, f *fixture, p prPayload) string {
+			tip := commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"app/db.py": vulnerable + "# later\n"})
+			return f.commitAs(t, p, f.patched(t, p, f.treeOf(t, tip)), tip)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"docs/later.md": "x\n"}) // main moves on from A
+			f.sim.SetRef("acme/payments", p.Branch, tc.commit(t, f, p))
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch) {
+				t.Fatalf("got %v, want a conflict", err)
+			}
+			if f.log(t, "create_pull") != 0 || f.log(t, "create_ref") != 0 {
+				t.Fatalf("%d pull requests, %d branches", f.log(t, "create_pull"), f.log(t, "create_ref"))
+			}
+		})
+	}
+}
+
+// treeOf is a commit's tree, as the fixture's repository has it.
+func (f *fixture) treeOf(t *testing.T, commit string) string {
+	t.Helper()
+	return gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", commit+"^{tree}")
+}
+
+// parentOf is a commit's first parent, as the fixture's repository has it.
+func (f *fixture) parentOf(t *testing.T, commit string) string {
+	t.Helper()
+	return gitIn(t, f.repos["acme/payments"].Mirror, "rev-parse", commit+"^")
+}
+
+// Once the branch is pushed, a cancel does not end the effect as never sent: the push has run
+// the repository's workflows, and the branch stays on GitHub. A person settles it. agentd
+// failing to record the request is not a cancel: tried again, the next attempt finds the branch.
+func TestACancelAfterTheBranchWasPushedGoesToAPerson(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stop     error
+		conflict bool
+	}{
+		{"cancelled", tools.ErrStopped, true},
+		{"the request not recorded", fmt.Errorf("%w: database is locked", tools.ErrNotSent), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			asked := 0
+			stopped := func(context.Context) error {
+				if asked++; asked > 1 {
+					return tc.stop
+				}
+				return nil
+			}
+			_, err := tool.Execute(context.Background(), payload, "key", stopped)
+			var conflict *tools.ConflictError
+			switch {
+			case tc.conflict && (!errors.As(err, &conflict) || errors.Is(err, tools.ErrNotSent) ||
+				!strings.Contains(conflict.Reason, "branch "+p.Branch) || strings.Contains(conflict.Reason, tools.ErrNotSent.Error())):
+				t.Fatalf("got %v, want a conflict", err)
+			case !tc.conflict && (errors.As(err, &conflict) || !errors.Is(err, tools.ErrNotSent)):
+				t.Fatalf("got %v, want not sent", err)
+			case asked != 2 || f.log(t, "create_ref") != 1 || f.log(t, "create_pull") != 0:
+				t.Fatalf("asked %d, branches %d, pulls %d", asked, f.log(t, "create_ref"), f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// Once agentd has seen the payload's branch on GitHub, GitHub declining a request goes to a
+// person as it is: agentd does not ask GitHub again whether the branch exists. Someone may have
+// deleted it meanwhile (then GitHub refuses the pull request, and finds no branch), or GitHub
+// may fail to say. So after the branch was pushed, and after a branch that was there already.
+func TestOpenDraftPRDoesNotAskAgainAboutTheBranchItHas(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		earlier bool // the branch is there already, on a commit GitHub declines to show
+		code    int  // GitHub's answers about the branch, once it has declined a request
+	}{
+		{"pushed, then deleted", false, http.StatusNotFound},
+		{"pushed, then GitHub fails", false, http.StatusBadGateway},
+		{"there already, then deleted", true, http.StatusNotFound},
+		{"pushed, the lookup declined, then deleted", false, http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			older := gitIn(t, base.repos["acme/payments"].Mirror, "rev-parse", base.commit+"^")
+			var declined atomic.Bool
+			var asked atomic.Int32
+			f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+				switch {
+				case strings.HasSuffix(tc.name, "lookup declined, then deleted") && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pulls"):
+					declined.Store(true)
+					return http.StatusForbidden
+				case !tc.earlier && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls"):
+					declined.Store(true)
+					return http.StatusUnprocessableEntity
+				case tc.earlier && strings.HasSuffix(r.URL.Path, "/git/commits/"+older):
+					declined.Store(true)
+					return http.StatusForbidden
+				case declined.Load() && strings.Contains(r.URL.Path, "/git/ref/heads/agent/"):
+					asked.Add(1)
+					return tc.code
+				}
+				return 0
+			}}, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			if tc.earlier {
+				f.sim.SetRef("acme/payments", p.Branch, older)
+			}
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch+" exists") {
+				t.Fatalf("got %v, want a conflict", err)
+			}
+			if asked.Load() != 0 {
+				t.Fatalf("asked about the branch %d times after GitHub declined", asked.Load())
+			}
+		})
+	}
+}
+
+// GitHub refusing to create the branch (422) for a reason other than its being there already
+// is GitHub's refusal, with GitHub's reason: not that of the look at the branch that follows.
+func TestOpenDraftPRKeepsGitHubsReasonForRefusingTheBranch(t *testing.T) {
+	base := setup(t)
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/refs") {
+			return http.StatusUnprocessableEntity
+		}
+		return 0
+	}}, base.repos["acme/payments"].Mirror, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var refused *tools.RefusedError
+	if !errors.As(err, &refused) || refused.Retryable || !strings.Contains(refused.Reason, "/git/refs: 422") {
+		t.Fatalf("got %v, want GitHub's refusal of the branch", err)
+	}
+}
+
+// GitHub declining to show the tip's commit, whose tree the pull request's is made on, is as
+// GitHub declining any read before the first write: a refusal only while the payload's branch
+// is not there.
+func TestOpenDraftPRRefusedTipStandsOnlyWithoutTheBranch(t *testing.T) {
+	for _, branch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("branch %v", branch), func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+			f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+				if strings.HasSuffix(r.URL.Path, "/git/commits/"+tip) {
+					return http.StatusForbidden
+				}
+				return 0
+			}}, dir, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			if branch {
+				f.sim.SetRef("acme/payments", p.Branch, f.commit)
+			}
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			var refused *tools.RefusedError
+			switch {
+			case branch && (!errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch+" exists")):
+				t.Fatalf("got %v, want a conflict", err)
+			case !branch && (!errors.As(err, &refused) || refused.Retryable || !strings.Contains(refused.Reason, tip)):
+				t.Fatalf("got %v, want GitHub's refusal", err)
+			case f.wrote(t) != 0 || f.listings(t) != 0:
+				t.Fatalf("%d writes, %d listings", f.wrote(t), f.listings(t))
+			}
+		})
+	}
+}
+
+// Telling whether a branch on an older tip is an earlier attempt's takes GitHub's answers about
+// that tip: the comparisons, its commit, its tree with the patch made again. GitHub failing to
+// give one is tried again; GitHub declining goes to a person, the branch being there.
+func TestOpenDraftPRTellsAnEarlierAttemptsBranchByGitHubsAnswers(t *testing.T) {
+	for _, request := range []string{"the comparison with the tip", "the comparison with the audited commit", "the commit", "the tree"} {
+		for _, tc := range []struct {
+			name     string
+			code     int
+			conflict bool
+		}{{"GitHub fails", http.StatusBadGateway, false}, {"GitHub declines", http.StatusForbidden, true}} {
+			t.Run(request+", "+tc.name, func(t *testing.T) {
+				base := setup(t)
+				dir := base.repos["acme/payments"].Mirror
+				older := base.parentOf(t, base.commit) // audited; the earlier attempt's tip is main
+				f := newFixture(t, base.sim, base.sim, dir, older)
+				tool, payload := f.prepare(t, f.git, fix)
+				if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+					t.Fatal(err)
+				}
+				earlier := base.commit
+				tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // main moves on
+				g := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var hit bool
+					switch request {
+					case "the comparison with the tip":
+						hit = strings.HasSuffix(r.URL.Path, "/compare/"+tip+"..."+earlier)
+					case "the comparison with the audited commit":
+						hit = strings.HasSuffix(r.URL.Path, "/compare/"+earlier+"..."+older)
+					case "the commit":
+						hit = strings.HasSuffix(r.URL.Path, "/git/commits/"+earlier)
+					case "the tree":
+						if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/trees") {
+							b, _ := io.ReadAll(r.Body)
+							r.Body = io.NopCloser(bytes.NewReader(b))
+							hit = strings.Contains(string(b), base.treeOf(t, earlier))
+						}
+					}
+					if hit {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(tc.code)
+						_, _ = w.Write([]byte(`{"message": "an answer of the test's"}`))
+						return
+					}
+					base.sim.ServeHTTP(w, r)
+				}), dir, older)
+				tool = &OpenDraftPR{Client: g.client, Repos: g.repos, Blobs: f.blobs, Git: g.git}
+				_, err := tool.Execute(context.Background(), payload, "key", proceed)
+				var conflict *tools.ConflictError
+				switch {
+				case tc.conflict && !errors.As(err, &conflict):
+					t.Fatalf("got %v, want a conflict", err)
+				case !tc.conflict && (errors.As(err, &conflict) || !errors.Is(err, tools.ErrNotSent)):
+					t.Fatalf("got %v, want not sent", err)
+				}
+			})
+		}
+	}
+}
+
+// A resend finds the branch an earlier attempt pushed on a tip other than the audited commit,
+// for a patch that changes a file, deletes one and creates one in a new directory: checked on
+// that tip, the files are what the patch was made for, and the tree is the tip's with the patch.
+func TestOpenDraftPRTakesTheBranchOfAnEarlierAttemptOnAnotherTip(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	older := base.parentOf(t, base.commit) // audited; the earlier attempt's tip is main
+	f := newFixture(t, base.sim, base.sim, dir, older)
+	tool, payload := f.prepare(t, f.git, fix+deleteFile("app/old.py")+newFile("docs/new/SECURITY.md"))
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+		t.Fatal(err)
+	}
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	if c := f.branchCommit(t, p.Branch); len(c.Parents) != 1 || c.Parents[0].GetSHA() != base.commit {
+		t.Fatalf("the earlier attempt's branch %+v, want it on %s", c, base.commit)
+	}
+	commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // main moves on
+	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || f.log(t, "create_ref") != 1 ||
+		f.log(t, "create_pull") != 1 || v["branch"] != p.Branch {
+		t.Fatalf("got %v %v; %d branches, %d pull requests", v, err, f.log(t, "create_ref"), f.log(t, "create_pull"))
+	}
+}
+
+// The base branch changing a file the patch touches stops a new branch, not one an earlier
+// attempt pushed: a resend finds that branch, checked on the tip it was made on, and its pull
+// request, or opens one on it. Opening it pushes nothing.
+func TestOpenDraftPRResendsAfterTheBaseChangedAFile(t *testing.T) {
+	for _, opened := range []bool{true, false} {
+		t.Run(fmt.Sprintf("pull request opened %v", opened), func(t *testing.T) {
+			f := setup(t)
+			dir := f.repos["acme/payments"].Mirror
+			tool, payload := f.prepare(t, f.git, fix)
+			first := tool
+			if !opened { // GitHub fails to open it
+				g := newFixture(t, f.sim, answering{sim: f.sim, answer: func(r *http.Request) int {
+					if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls") {
+						return http.StatusBadGateway
+					}
+					return 0
+				}}, dir, f.commit)
+				first = &OpenDraftPR{Client: g.client, Repos: g.repos, Blobs: f.blobs, Git: g.git}
+			}
+			if _, err := first.Execute(context.Background(), payload, "key", proceed); (err == nil) != opened {
+				t.Fatalf("the earlier attempt: %v", err)
+			}
+			commitFiles(t, dir, map[string]string{"app/db.py": vulnerable + "# later\n"}) // main changes the patched file
+			v, err := tool.Execute(context.Background(), payload, "key", proceed)
+			if err != nil || f.log(t, "create_ref") != 1 || f.log(t, "create_pull") != 1 || v["url"] == nil {
+				t.Fatalf("got %v %v; %d branches, %d pull requests", v, err, f.log(t, "create_ref"), f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// The base branch rewritten while agentd checks, so that the tip it read is no longer in the
+// branch's history (a force push that takes a commit out, say): nothing is pushed on that tip.
+// The call is tried again, and the retry builds on the tip the branch has now.
+func TestOpenDraftPRDoesNotPushOnATipTheBaseDropped(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	dropped := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // main's tip as agentd reads it
+	var forced atomic.Bool
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if strings.Contains(r.URL.Path, "/git/trees/") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", audited) // forced back during the check
+		}
+		return 0
+	}}, dir, audited)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if errors.As(err, &conflict) || !errors.Is(err, tools.ErrNotSent) || f.log(t, "create_ref") != 0 {
+		t.Fatalf("got %v, %d branches; want not sent, and no branch on %s", err, f.log(t, "create_ref"), dropped)
+	}
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+		t.Fatal(err)
+	}
+	if c := f.branchCommit(t, p.Branch); len(c.Parents) != 1 || c.Parents[0].GetSHA() != audited {
+		t.Fatalf("the branch's commit %+v, want it on %s", c, audited)
+	}
+}
+
+// GitHub refusing to create the branch because it exists, and then not showing it (a read that
+// lags a write: an earlier attempt's, which landed after its answer was lost): the branch is
+// there for all agentd can tell, and a person settles it.
+func TestOpenDraftPRLeavesABranchGitHubSaysExistsToAPerson(t *testing.T) {
+	base := setup(t)
+	f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/refs") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message": "Reference already exists"}`))
+			return
+		}
+		base.sim.ServeHTTP(w, r)
+	}), base.repos["acme/payments"].Mirror, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch) {
+		t.Fatalf("got %v, want a conflict", err)
+	}
+}
+
+// GitHub declining to create the branch, and then failing to show it: tried again, whatever
+// GitHub says about the branch afterwards.
+func TestOpenDraftPRTriesAgainWhenGitHubFailsToShowTheBranch(t *testing.T) {
+	base := setup(t)
+	var declined, failed atomic.Bool
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/refs"):
+			declined.Store(true)
+			return http.StatusUnprocessableEntity
+		case declined.Load() && strings.Contains(r.URL.Path, "/git/ref/heads/agent/") && !failed.Swap(true):
+			return http.StatusBadGateway
+		}
+		return 0
+	}}, base.repos["acme/payments"].Mirror, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var refused *tools.RefusedError
+	if errors.As(err, &refused) || !errors.Is(err, tools.ErrNotSent) {
+		t.Fatalf("got %v, want not sent", err)
+	}
+}
+
+// After the push, GitHub failing to list the pull requests is tried again, and so is a rate
+// limit on opening the pull request: neither goes to a person.
+func TestOpenDraftPRTriesFailuresAfterThePushAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		code         int
+	}{{"the lookup fails", http.MethodGet, http.StatusBadGateway}, {"a rate limit", http.MethodPost, http.StatusTooManyRequests}} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+				if r.Method == tc.method && strings.HasSuffix(r.URL.Path, "/pulls") {
+					return tc.code
+				}
+				return 0
+			}}, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			var refused *tools.RefusedError
+			if errors.As(err, &conflict) || !errors.Is(err, tools.ErrNotSent) && !(errors.As(err, &refused) && refused.Retryable) ||
+				f.log(t, "create_ref") != 1 {
+				t.Fatalf("got %v, %d branches; want it tried again", err, f.log(t, "create_ref"))
+			}
+		})
+	}
+}
+
+// GitHub declining to create the branch because it appeared meanwhile (an earlier attempt's),
+// then declining to show the commit it points at: a person settles it, and agentd does not ask
+// GitHub about the branch again (which may answer 404 by then).
+func TestOpenDraftPRDoesNotAskAgainAboutABranchThatAppearedMeanwhile(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	var earlier atomic.Value
+	earlier.Store("")
+	var reads, asked atomic.Int32
+	var declined atomic.Bool
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/agent/"):
+			if declined.Load() {
+				asked.Add(1)
+				return http.StatusNotFound
+			}
+			if reads.Add(1) == 1 {
+				return http.StatusNotFound // not there yet when first read
+			}
+		case earlier.Load().(string) != "" && strings.HasSuffix(r.URL.Path, "/git/commits/"+earlier.Load().(string)):
+			declined.Store(true)
+			return http.StatusForbidden
+		}
+		return 0
+	}}, dir, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	c := base.commitAs(t, p, base.patched(t, p, base.treeOf(t, base.commit)), base.commit)
+	earlier.Store(c)
+	f.sim.SetRef("acme/payments", p.Branch, c)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || asked.Load() != 0 {
+		t.Fatalf("got %v; asked about the branch %d times after GitHub declined", err, asked.Load())
+	}
+}
+
+// The listings of both trees, the audited commit's and the tip's, count against one limit:
+// each tree's on the way to the file fit within maxCheckBytes, both together do not.
+func TestOpenDraftPRReadsBothTreesWithinOneLimit(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	deep := strings.Repeat("d/", 9) + "f.txt" // ten listings on the way, in each tree
+	audited := commitFiles(t, dir, map[string]string{deep: "x\n"})
+	commitFiles(t, dir, map[string]string{strings.Repeat("d/", 9) + "g.txt": "y\n"}) // every tree on the way differs at the tip
+	// Each listing some 4.6 MiB: ten of them fit in 64 MiB, twenty do not.
+	f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: pad(maxListingBytes * 9 / 16 / 110)}, dir, audited)
+	tool, payload := f.prepare(t, f.git, deleteFile(deep))
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var denied *tools.DeniedError
+	if !errors.As(err, &denied) || !strings.Contains(denied.Reason, "in all") || f.wrote(t) != 0 {
+		t.Fatalf("got %v, %d writes; want the check over its limit", err, f.wrote(t))
+	}
+}
+
+// GitHub naming a commit's tree with something other than an object's name is GitHub failing:
+// tried again, and nothing is written (go-github leaves an empty base tree out of the request,
+// and the tree would hold the patch's files alone).
+func TestOpenDraftPRTakesOnlyATreeGitHubNames(t *testing.T) {
+	for _, which := range []string{"audited", "tip"} {
+		t.Run(which, func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			audited, tip := base.commit, base.commit
+			if which == "tip" {
+				tip = commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+			}
+			sha := map[string]string{"audited": audited, "tip": tip}[which]
+			f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/commits/" + sha, fn: func(c map[string]any) int {
+				c["tree"] = map[string]any{"sha": ""}
+				return http.StatusOK
+			}}, dir, audited)
+			tool, payload := f.prepare(t, f.git, fix)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			if !errors.Is(err, tools.ErrNotSent) || f.wrote(t) != 0 {
+				t.Fatalf("got %v, %d writes; want not sent", err, f.wrote(t))
+			}
+		})
+	}
+}
+
+// Opening the pull request on a branch that is there already pushes nothing, but GitHub's merge
+// of the pull request brings in what the branch holds, and pull_request workflows run on it:
+// agentd opens it only while the base branch still holds the branch's parent. Here an earlier
+// attempt pushed the branch on main's tip M and failed to open the pull request; during the
+// resend, after agentd read main, M is forced out of main (an incident, say). A person settles it.
+func TestOpenDraftPRDoesNotOpenAPullRequestOnATipTheBaseDropped(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	m := commitFiles(t, dir, map[string]string{".github/workflows/evil.yml": "on: pull_request\n"})
+	failing := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls") {
+			return http.StatusBadGateway
+		}
+		return 0
+	}}, dir, audited)
+	tool, payload := failing.prepare(t, failing.git, fix)
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err == nil {
+		t.Fatal("the earlier attempt opened the pull request")
+	}
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	if c := failing.branchCommit(t, p.Branch); c.Parents[0].GetSHA() != m {
+		t.Fatalf("the earlier attempt's branch is on %s, want %s", c.Parents[0].GetSHA(), m)
+	}
+	var forced atomic.Bool
+	f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.sim.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", audited) // M forced out right after agentd read main
+		}
+	}), dir, audited)
+	tool = &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: failing.blobs, Git: f.git}
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch) || f.log(t, "create_pull") != 0 {
+		t.Fatalf("got %v, %d pull requests; want a conflict, and none", err, f.log(t, "create_pull"))
+	}
+}
+
+// commitWith makes, on GitHub, the commit agentd makes for the payload on parent (its message,
+// its author and committer at the run's creation time), changed by change first.
+func (f *fixture) commitWith(t *testing.T, p prPayload, tree, parent string, change func(*github.Commit)) string {
+	t.Helper()
+	date, err := time.Parse(time.RFC3339, p.Author.Date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	who := &github.CommitAuthor{Name: new(p.Author.Name), Email: new(p.Author.Email), Date: &github.Timestamp{Time: date}}
+	c := github.Commit{Message: new(p.Message), Tree: &github.Tree{SHA: new(tree)}, Parents: []*github.Commit{{SHA: new(parent)}},
+		Author: who, Committer: who}
+	change(&c)
+	made, _, err := f.client.gh.Git.CreateCommit(context.Background(), "acme", "payments", c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return made.GetSHA()
+}
+
+// A commit on an older parent that differs from agentd's commit for the payload in one of the
+// fields every attempt gives it (its message, its author's name, email or date) is not an
+// attempt's.
+func TestOpenDraftPRTakesABranchOnAnOlderTipOnlyAsAgentdMakesIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*github.Commit)
+	}{
+		{"another date", func(c *github.Commit) {
+			at := c.Author.Date.Add(time.Hour)
+			c.Author = &github.CommitAuthor{Name: c.Author.Name, Email: c.Author.Email, Date: &github.Timestamp{Time: at}}
+		}},
+		{"another email", func(c *github.Commit) {
+			c.Author = &github.CommitAuthor{Name: c.Author.Name, Email: new("mallory@example.com"), Date: c.Author.Date}
+		}},
+		{"another message", func(c *github.Commit) { c.Message = new(*c.Message + "\n\n(and more)") }},
+		{"another name", func(c *github.Commit) {
+			c.Author = &github.CommitAuthor{Name: new("mallory"), Email: c.Author.Email, Date: c.Author.Date}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"docs/later.md": "x\n"}) // main moves on from A
+			f.sim.SetRef("acme/payments", p.Branch, f.commitWith(t, p, f.patched(t, p, f.treeOf(t, f.commit)), f.commit, tc.change))
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			if !errors.As(err, &conflict) || f.log(t, "create_pull") != 0 {
+				t.Fatalf("got %v, %d pulls; want a conflict", err, f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// faultOnSecondBaseRead serves GitHub's API with sim, but answers the second read of main (the one
+// just before the branch goes out) with answer.
+func faultOnSecondBaseRead(f *fixture, answer func(w http.ResponseWriter)) http.Handler {
+	var reads atomic.Int32
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && reads.Add(1) == 2 {
+			answer(w)
+			return
+		}
+		f.sim.ServeHTTP(w, r)
+	})
+}
+
+// When GitHub does not show the base branch just before the push (no branch, GitHub failing, an
+// answer about another ref), nothing goes out: tried again.
+func TestOpenDraftPRPushesNothingWhenTheBaseCannotBeReadAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer func(w http.ResponseWriter, tip string)
+	}{
+		{"no such branch", func(w http.ResponseWriter, _ string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message": "Not Found"}`))
+		}},
+		{"GitHub fails", func(w http.ResponseWriter, _ string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"message": "Server Error"}`))
+		}},
+		{"another ref", func(w http.ResponseWriter, tip string) {
+			// On the tip agentd read: only the ref's name gives it away.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ref": "refs/heads/other", "object": {"sha": "` + tip + `", "type": "commit"}}`))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // the tip is not the audited commit
+			f := newFixture(t, base.sim, faultOnSecondBaseRead(base, func(w http.ResponseWriter) { tc.answer(w, tip) }), dir, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			if !errors.Is(err, tools.ErrNotSent) || f.log(t, "create_ref") != 0 {
+				t.Fatalf("got %v, %d branches; want not sent, and no branch", err, f.log(t, "create_ref"))
+			}
+		})
+	}
+}
+
+// Main moving on while agentd checks, with the tip agentd read still in its history, does not
+// stop the push: the branch goes out on that tip. A new commit on it, or a merge of another
+// branch into it.
+func TestOpenDraftPRPushesWhenTheBaseMovesOnDuringTheCheck(t *testing.T) {
+	for _, merge := range []bool{false, true} {
+		t.Run(fmt.Sprintf("merge %v", merge), func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+			next := commitFiles(t, dir, map[string]string{"docs/later2.md": "y\n"})
+			if merge { // next is a merge of tip and a side branch
+				side := gitIn(t, dir, "commit-tree", "-p", base.commit, "-m", "side", base.treeOf(t, base.commit))
+				next = gitIn(t, dir, "commit-tree", "-p", tip, "-p", side, "-m", "merge", base.treeOf(t, next))
+			}
+			base.sim.SetRef("acme/payments", "main", tip)
+			var moved atomic.Bool
+			f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.Contains(r.URL.Path, "/git/trees/") && !moved.Swap(true) {
+					base.sim.SetRef("acme/payments", "main", next)
+				}
+				base.sim.ServeHTTP(w, r)
+			}), dir, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			var p prPayload
+			_ = json.Unmarshal(payload, &p)
+			if _, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil {
+				t.Fatalf("got %v", err)
+			}
+			if c := f.branchCommit(t, p.Branch); c.Parents[0].GetSHA() != tip || f.log(t, "create_pull") != 1 {
+				t.Fatalf("parent %s, want %s; %d pull requests", c.Parents[0].GetSHA(), tip, f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// GitHub failing to compare the base branch, moved on during the check, with the tip agentd read:
+// nothing goes out, tried again.
+func TestOpenDraftPRPushesNothingWhenGitHubFailsToCompareTheMovedBase(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+	next := commitFiles(t, dir, map[string]string{"docs/later2.md": "y\n"})
+	base.sim.SetRef("acme/payments", "main", tip)
+	var moved atomic.Bool
+	f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/git/trees/") && !moved.Swap(true):
+			base.sim.SetRef("acme/payments", "main", next)
+		case strings.HasSuffix(r.URL.Path, "/compare/"+next+"..."+tip):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"message": "Server Error"}`))
+			return
+		}
+		base.sim.ServeHTTP(w, r)
+	}), dir, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	if !errors.Is(err, tools.ErrNotSent) || f.log(t, "create_ref") != 0 {
+		t.Fatalf("got %v, %d branches; want not sent, and no branch", err, f.log(t, "create_ref"))
+	}
+}
+
+// The read of the base branch before the pull request is opened: GitHub failing is tried again,
+// GitHub declining goes to a person (the branch is there), without asking about the branch
+// again (it may be gone by then). No pull request is opened.
+func TestOpenDraftPRReadsTheBaseAgainBeforeThePullRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		code     int
+		conflict bool
+	}{{"GitHub fails", http.StatusBadGateway, false}, {"GitHub declines", http.StatusForbidden, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := setup(t)
+			var reads, asked atomic.Int32
+			f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+				switch {
+				// inBase's, the one before the push, and the one before the pull request
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && reads.Add(1) == 3:
+					return tc.code
+				case reads.Load() >= 3 && strings.Contains(r.URL.Path, "/git/ref/heads/agent/"):
+					asked.Add(1)
+					return http.StatusNotFound
+				}
+				return 0
+			}}, base.repos["acme/payments"].Mirror, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			_, err := tool.Execute(context.Background(), payload, "key", proceed)
+			var conflict *tools.ConflictError
+			switch {
+			case tc.conflict && !errors.As(err, &conflict):
+				t.Fatalf("got %v, want a conflict", err)
+			case !tc.conflict && (errors.As(err, &conflict) || !errors.Is(err, tools.ErrNotSent)):
+				t.Fatalf("got %v, want not sent", err)
+			case f.log(t, "create_ref") != 1 || f.log(t, "create_pull") != 0 || asked.Load() != 0:
+				t.Fatalf("%d branches, %d pull requests; asked about the branch %d times after", f.log(t, "create_ref"),
+					f.log(t, "create_pull"), asked.Load())
+			}
+		})
+	}
+}
+
+// A branch on the tip whose touched file the base has changed is not an attempt's: a person
+// settles it, and agentd does not ask GitHub about the branch again (it may be gone by then).
+func TestOpenDraftPRLeavesABranchOnAChangedTipToAPerson(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	var asked, reads atomic.Int32
+	f := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/git/ref/heads/agent/") && reads.Add(1) > 1 {
+			asked.Add(1)
+			return http.StatusNotFound
+		}
+		return 0
+	}}, dir, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	tip := commitFiles(t, dir, map[string]string{"app/db.py": vulnerable + "# later\n"})
+	f.sim.SetRef("acme/payments", p.Branch, base.commitAs(t, p, base.patched(t, p, base.treeOf(t, tip)), tip))
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, tip) || asked.Load() != 0 {
+		t.Fatalf("got %v; asked about the branch %d times more", err, asked.Load())
+	}
+}
+
+// Telling an earlier attempt's branch on an older tip reads that tip's listings within the same
+// limit as the audited commit's: each fits, both together do not, and the branch, being there,
+// goes to a person.
+func TestOpenDraftPRReadsAnOlderTipsTreeWithinTheSameLimit(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	deep := strings.Repeat("d/", 9) + "f.txt" // ten listings on the way, in each tree
+	audited := commitFiles(t, dir, map[string]string{deep: "x\n"})
+	earlierTip := commitFiles(t, dir, map[string]string{strings.Repeat("d/", 9) + "g.txt": "y\n"}) // every tree on the way differs
+	f := newFixture(t, base.sim, rewrite{sim: base.sim, path: "/git/trees/", fn: pad(maxListingBytes * 9 / 16 / 110)}, dir, audited)
+	tool, payload := f.prepare(t, f.git, deleteFile(deep))
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	f.sim.SetRef("acme/payments", p.Branch, f.commitAs(t, p, f.patched(t, p, f.treeOf(t, earlierTip)), earlierTip))
+	commitFiles(t, dir, map[string]string{"docs/later.md": "z\n"}) // main moves on: the branch is on an older tip
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "in all") || f.log(t, "create_pull") != 0 {
+		t.Fatalf("got %v, %d pulls; want a conflict over the limit", err, f.log(t, "create_pull"))
+	}
+}
+
+// A pull request on a branch agentd cannot tell for an attempt's is not taken for the effect: the
+// branch is checked before the pull request is looked up. Here the branch is made as agentd makes
+// its commit, on a commit main does not hold, and a pull request is open on it.
+func TestOpenDraftPRDoesNotTakeAPullRequestOnABranchItCannotTell(t *testing.T) {
+	f := setup(t)
+	tool, payload := f.prepare(t, f.git, fix)
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	commitFiles(t, f.repos["acme/payments"].Mirror, map[string]string{"docs/later.md": "x\n"}) // main moves on from A
+	other := gitIn(t, f.repos["acme/payments"].Mirror, "commit-tree", "-p", f.commit, "-m", "elsewhere", f.treeOf(t, f.commit))
+	f.sim.SetRef("acme/payments", p.Branch, f.commitAs(t, p, f.patched(t, p, f.treeOf(t, other)), other))
+	if _, _, err := f.client.gh.PullRequests.Create(context.Background(), "acme", "payments", github.CreatePullRequest{
+		Title: new("not agentd's"), Head: p.Branch, Base: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || !strings.Contains(conflict.Reason, "branch "+p.Branch) {
+		t.Fatalf("got %v, want a conflict", err)
+	}
+}
+
+// moveAfterPush serves GitHub's API with sim, and points main at to right after GitHub created the
+// payload's branch: main moves between the push and the pull request.
+type moveAfterPush struct {
+	sim  *githubsim.Server
+	to   string
+	done atomic.Bool
+}
+
+func (h *moveAfterPush) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.sim.ServeHTTP(w, r)
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git/refs") && h.done.CompareAndSwap(false, true) {
+		h.sim.SetRef("acme/payments", "main", h.to)
+	}
+}
+
+// Main moving on between the push and the pull request, by a commit or by a merge whose second
+// parent is the tip the branch is on, still holds the branch's parent: the pull request is opened.
+func TestOpenDraftPROpensThePullRequestWhenTheBaseMovesOnAfterThePush(t *testing.T) {
+	for _, merge := range []bool{false, true} {
+		t.Run(fmt.Sprintf("merge %v", merge), func(t *testing.T) {
+			base := setup(t)
+			dir := base.repos["acme/payments"].Mirror
+			tip := base.commit
+			next := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+			if merge {
+				side := gitIn(t, dir, "commit-tree", "-p", base.parentOf(t, tip), "-m", "side", base.treeOf(t, tip))
+				next = gitIn(t, dir, "commit-tree", "-p", side, "-p", tip, "-m", "merge", base.treeOf(t, next))
+			}
+			base.sim.SetRef("acme/payments", "main", tip)
+			f := newFixture(t, base.sim, &moveAfterPush{sim: base.sim, to: next}, dir, base.commit)
+			tool, payload := f.prepare(t, f.git, fix)
+			if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || f.log(t, "create_pull") != 1 {
+				t.Fatalf("got %v %v, %d pull requests", v, err, f.log(t, "create_pull"))
+			}
+		})
+	}
+}
+
+// Main forced back between agentd's own push and the pull request, taking out the tip the branch
+// is on: no pull request; a person settles it (the branch is there).
+func TestOpenDraftPRDoesNotOpenThePullRequestWhenTheBaseDropsTheTipAfterThePush(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	tip := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+	base.sim.SetRef("acme/payments", "main", tip)
+	f := newFixture(t, base.sim, &moveAfterPush{sim: base.sim, to: audited}, dir, audited)
+	tool, payload := f.prepare(t, f.git, fix)
+	_, err := tool.Execute(context.Background(), payload, "key", proceed)
+	var conflict *tools.ConflictError
+	if !errors.As(err, &conflict) || f.log(t, "create_ref") != 1 || f.log(t, "create_pull") != 0 {
+		t.Fatalf("got %v; %d branches, %d pull requests", err, f.log(t, "create_ref"), f.log(t, "create_pull"))
+	}
+}
+
+// A resend takes an earlier attempt's branch on an older tip T1; during the resend main is forced
+// back to T1 itself (the later tip T2 taken out, T1 kept). The base still holds the branch's
+// parent, and the pull request is opened: it is the parent that is checked, not the tip.
+func TestOpenDraftPROpensThePullRequestWhenTheBaseIsForcedBackToTheBranchsParent(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	audited := base.commit
+	t1 := commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"})
+	failing := newFixture(t, base.sim, answering{sim: base.sim, answer: func(r *http.Request) int {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/pulls") {
+			return http.StatusBadGateway
+		}
+		return 0
+	}}, dir, audited)
+	tool, payload := failing.prepare(t, failing.git, fix)
+	if _, err := tool.Execute(context.Background(), payload, "key", proceed); err == nil {
+		t.Fatal("the earlier attempt opened the pull request")
+	}
+	var p prPayload
+	_ = json.Unmarshal(payload, &p)
+	if c := failing.branchCommit(t, p.Branch); c.Parents[0].GetSHA() != t1 {
+		t.Fatalf("the earlier attempt's branch is on %s, want %s", c.Parents[0].GetSHA(), t1)
+	}
+	commitFiles(t, dir, map[string]string{"docs/later2.md": "y\n"}) // main moves on to T2
+	var forced atomic.Bool
+	f := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.sim.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", t1) // T2 forced out, T1 kept
+		}
+	}), dir, audited)
+	tool = &OpenDraftPR{Client: f.client, Repos: f.repos, Blobs: failing.blobs, Git: f.git}
+	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || f.log(t, "create_pull") != 1 {
+		t.Fatalf("got %v %v, %d pull requests", v, err, f.log(t, "create_pull"))
+	}
+}
+
+// A resend finds the pull request an earlier attempt opened, and returns it, even when main drops
+// the branch's parent after agentd read main: the check of the base before a pull request is
+// opened comes after the lookup, and no pull request is opened.
+func TestOpenDraftPRReturnsAPullRequestItFindsAfterTheBaseDropsTheParent(t *testing.T) {
+	base := setup(t)
+	dir := base.repos["acme/payments"].Mirror
+	commitFiles(t, dir, map[string]string{"docs/later.md": "x\n"}) // the tip the branch goes on
+	f := newFixture(t, base.sim, base.sim, dir, base.commit)
+	tool, payload := f.prepare(t, f.git, fix)
+	first, err := tool.Execute(context.Background(), payload, "key", proceed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forced atomic.Bool
+	g := newFixture(t, base.sim, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		base.sim.ServeHTTP(w, r)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/git/ref/heads/main") && !forced.Swap(true) {
+			base.sim.SetRef("acme/payments", "main", base.commit) // the branch's parent dropped after agentd read main
+		}
+	}), dir, base.commit)
+	tool = &OpenDraftPR{Client: g.client, Repos: g.repos, Blobs: f.blobs, Git: g.git}
+	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || v["number"] != first["number"] ||
+		f.log(t, "create_pull") != 1 {
+		t.Fatalf("got %v %v, %d pull requests; want the first, #%v", v, err, f.log(t, "create_pull"), first["number"])
 	}
 }

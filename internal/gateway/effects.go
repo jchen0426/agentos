@@ -284,7 +284,7 @@ func (g *Gateway) proceed(e db.Effect) tools.Proceed {
 		case err != nil:
 			return fmt.Errorf("%w: %v", tools.ErrNotSent, err)
 		case n == 0:
-			return fmt.Errorf("%w: the run was cancelled, or the effect changed", tools.ErrNotSent)
+			return tools.ErrStopped
 		}
 		return nil
 	}
