@@ -1,6 +1,7 @@
 // Package faults is agentd's test-only fault injection, enabled with --fault-script. It
 // lets black-box tests make a gateway call hold, hang, skip heartbeats or return a
-// scripted status, to reproduce the failure scenarios of the design doc's section 11.
+// scripted status, to reproduce the failure scenarios of the design doc's section 11, and
+// make StartRun slow to record a run's ID.
 package faults
 
 import (
@@ -60,6 +61,9 @@ type Effect struct {
 // Script is a loaded fault script. A nil *Script injects nothing.
 type Script struct {
 	Rules []Rule `json:"rules"`
+	// RunIDDelay holds StartRun this long after Temporal has started a run, before it records
+	// the run ID: the window in which the run's first calls reach the gateway early.
+	RunIDDelay Duration `json:"run_id_delay"`
 
 	mu     sync.Mutex
 	counts map[string]int // workflow ID + name -> Invokes seen
@@ -78,7 +82,19 @@ func Load(path string) (*Script, error) {
 	return &s, nil
 }
 
-// Match is called once per Invoke attempt and returns the merged effect of all matching rules.
+// DelayRunID holds StartRun before it records a run's ID, for the script's RunIDDelay.
+func (s *Script) DelayRunID() {
+	if s != nil && s.RunIDDelay > 0 {
+		time.Sleep(time.Duration(s.RunIDDelay))
+	}
+}
+
+// Match is called once per Invoke attempt that gets past the run lookup and the loop guard
+// (before the policy decides), and returns the merged effect of all matching rules. Attempts
+// are Temporal's, so they count the attempts refused before Match. A call that reaches agentd
+// before StartRun has recorded the run ID waits for it rather than being refused (up to 5 s,
+// see gateway.Invoke), so a run's opening call keeps its first attempt even with a Worker
+// that is already polling.
 func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 	if s == nil {
 		return Effect{}

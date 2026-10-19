@@ -45,3 +45,35 @@ class ManyReports(SecurityAudit):
     @workflow.signal
     def doorbell(self) -> None:
         super().doorbell()
+
+
+@workflow.defn(name="security-audit")
+class OversizedCompletion(SecurityAudit):
+    """Schedules three gateway calls at once, each with 1.5 MiB of arguments: every payload is
+    under Temporal's 2 MiB limit, which the SDK checks itself, but the workflow task's completion
+    is over the 4 MiB Temporal takes in a request, so it can never be delivered."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        await asyncio.gather(*(invoke(f"{i}:test.big", "tool", "test.big", padding="x" * (3 << 19))
+                               for i in range(1, 4)))
+        return {}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+
+@workflow.defn(name="security-audit")
+class ManyCalls(SecurityAudit):
+    """Schedules 5,000 gateway calls at once: well under 4 MiB, but over 100,000 values in the
+    workflow task's completion, more than the Runtime proxy decodes."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        await asyncio.gather(*(invoke(f"{i}:test.x", "tool", "test.x") for i in range(1, 5001)))
+        return {}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
