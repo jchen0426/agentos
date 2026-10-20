@@ -163,6 +163,125 @@ func (t *OpenDraftPR) DryRun(payload json.RawMessage) map[string]any {
 		"branch": p.Branch, "dry_run": true}
 }
 
+// EditArg is what a reviewer's edit replaces: the patch (tools.Editable).
+func (*OpenDraftPR) EditArg() string { return "patch_ref" }
+
+// Describe is what the reviewer of a pull request sees besides its payload (design doc, section
+// 10, tools.Describer): the patch as it was written, the files it changes, git's own check of it,
+// and where the base branch stands on GitHub now, with the checks Execute makes on GitHub before
+// it writes, made now (they only read). Each part says what agentd could not find out. Things
+// change before the write is sent; Execute checks again.
+func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.RawMessage) map[string]any {
+	var p prPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return map[string]any{"error": "the payload: " + err.Error()}
+	}
+	files := make([]map[string]any, 0, len(p.Files))
+	paths := make([]string, 0, len(p.Files))
+	for _, f := range p.Files {
+		change := "modify"
+		switch {
+		case f.New:
+			change = "create"
+		case f.Content == nil:
+			change = "delete"
+		}
+		files = append(files, map[string]any{"path": f.Path, "change": change})
+		paths = append(paths, f.Path)
+	}
+	out := map[string]any{
+		"repository": p.Owner + "/" + p.Repo, "base_branch": p.Base, "branch": p.Branch, "commit": p.Commit,
+		"title": p.Title, "files": files,
+		"notes": []string{
+			"The pull request's commit is made on the tip of " + p.Base + " when the write is sent, not on the audited commit. " +
+				"If the files the patch touches have changed on the tip by then, agentd pushes no branch and opens no pull request.",
+			"Pushing branch " + p.Branch + " runs the repository's workflows that start on a push or on a new branch.",
+		},
+	}
+	if b, err := t.Blobs.GetRunBlob(ctx, req.WorkflowID, tools.String(req.Args, "patch_ref")); err != nil {
+		out["patch_error"] = err.Error()
+	} else {
+		out["patch"] = string(b)
+		out["apply_check"] = t.applyCheck(ctx, tools.String(req.Args, "repo"), p.Commit, b, paths)
+	}
+	out["github"] = t.onGitHub(ctx, p)
+	return out
+}
+
+// applyCheck is git's own check of the patch (git apply --check), for the reviewer.
+func (t *OpenDraftPR) applyCheck(ctx context.Context, repo, commit string, patch []byte, paths []string) map[string]any {
+	r, ok := t.Repos[repo]
+	if !ok || t.Git == nil {
+		return map[string]any{"error": "no git tool server for " + repo}
+	}
+	err := tools.GitApplyCheck(ctx, t.Git, r.Mirror, commit, patch, paths)
+	var denied *tools.DeniedError
+	switch {
+	case err == nil:
+		return map[string]any{"applies": true}
+	case errors.As(err, &denied):
+		return map[string]any{"applies": false, "reason": denied.Reason}
+	}
+	return map[string]any{"error": err.Error()}
+}
+
+// onGitHub is where the base branch stands on GitHub now: its tip, how the audited commit
+// compares with it, and the checks of the patch's files Execute makes before it writes.
+func (t *OpenDraftPR) onGitHub(ctx context.Context, p prPayload) map[string]any {
+	if !t.Live() {
+		return map[string]any{"error": "GitHub is not configured"}
+	}
+	gh := t.Client.gh
+	ref, resp, err := gh.Git.GetRef(ctx, p.Owner, p.Repo, "heads/"+p.Base)
+	tip := ref.GetObject().GetSHA()
+	switch {
+	case status(resp) == http.StatusNotFound:
+		return map[string]any{"error": fmt.Sprintf("GitHub has no branch %s in %s/%s (or the token cannot see the repository)", p.Base, p.Owner, p.Repo)}
+	case err != nil:
+		return map[string]any{"error": unseen(err).Error()}
+	case ref.GetRef() != "refs/heads/"+p.Base || ref.GetObject().GetType() != "commit" || !fullSHA.MatchString(tip):
+		return map[string]any{"error": fmt.Sprintf("GitHub answered for branch %s with %.100q, a %.20q %.100q",
+			p.Base, ref.GetRef(), ref.GetObject().GetType(), tip)}
+	}
+	out := map[string]any{"base_tip": tip}
+	where := fmt.Sprintf("branch %s of %s/%s at %s", p.Base, p.Owner, p.Repo, tip)
+	switch cmp, why, _, err := t.compare(ctx, p, tip, p.Commit, where); {
+	case err != nil:
+		out["audited_commit_error"] = err.Error()
+	case why != "":
+		out["audited_commit_error"] = why
+	default:
+		out["audited_commit"] = map[string]any{"status": cmp.Status, "behind_by": cmp.BehindBy, "ahead_by": cmp.AheadBy,
+			"in_base_branch": cmp.holds(p.Commit)}
+	}
+	verdict := func(err error) string {
+		var denied *tools.DeniedError
+		switch {
+		case err == nil:
+			return "ok"
+		case errors.As(err, &denied):
+			return "refused: " + denied.Reason
+		}
+		return "unknown: " + err.Error()
+	}
+	audited, _, err := gh.Git.GetCommit(ctx, p.Owner, p.Repo, p.Commit)
+	if err != nil {
+		out["files_at_commit"] = verdict(unseen(err))
+		return out
+	}
+	w := newTreeWalk(gh, p)
+	out["files_at_commit"] = verdict(t.checkFiles(ctx, w, p, audited.GetTree().GetSHA()))
+	tipTree := audited.GetTree().GetSHA()
+	if tip != p.Commit {
+		if tipTree, err = t.commitTree(ctx, p, tip); err != nil {
+			out["files_at_tip"] = verdict(err)
+			return out
+		}
+	}
+	out["files_at_tip"] = verdict(t.atTip(ctx, w, p, tip, tipTree))
+	return out
+}
+
 func (t *OpenDraftPR) Execute(ctx context.Context, raw json.RawMessage, _ string, proceed tools.Proceed) (map[string]any, error) {
 	if !t.Live() {
 		return nil, fmt.Errorf("%w: GitHub is not configured", tools.ErrNotSent)
@@ -401,38 +520,56 @@ func (t *OpenDraftPR) inBase(ctx context.Context, p prPayload) (string, error) {
 // where naming base; missing, when GitHub has no comparison of the two, which have no history in
 // common (both are on GitHub), or the token lost sight of the repository. GitHub failing is err.
 func (t *OpenDraftPR) behind(ctx context.Context, p prPayload, base, commit, where string) (why string, missing bool, err error) {
+	cmp, why, missing, err := t.compare(ctx, p, base, commit, where)
+	if why != "" || err != nil {
+		return why, missing, err
+	}
+	if !cmp.holds(commit) {
+		return fmt.Sprintf("commit %s is not in the history of %s: GitHub compares it as %.20q, with %d commits of its own",
+			commit, where, cmp.Status, cmp.AheadBy), false, nil
+	}
+	return "", false, nil
+}
+
+// comparison is GitHub's comparison of a commit with a base.
+type comparison struct {
+	Status    string `json:"status"`
+	AheadBy   int    `json:"ahead_by"`  // the commit's own commits
+	BehindBy  int    `json:"behind_by"` // the base's commits the commit does not have
+	MergeBase struct {
+		SHA string `json:"sha"`
+	} `json:"merge_base_commit"`
+}
+
+// holds says whether the base holds commit: commit is the merge base, and the base at it or ahead.
+func (c comparison) holds(commit string) bool {
+	return c.MergeBase.SHA == commit && (c.Status == "behind" || c.Status == "identical")
+}
+
+// compare is GitHub's comparison of commit with base (base...commit). When GitHub has no
+// comparison, why says so (missing: see behind), as when it is over the limit. GitHub failing is err.
+func (t *OpenDraftPR) compare(ctx context.Context, p prPayload, base, commit, where string) (cmp comparison, why string, missing bool, err error) {
 	gh := t.Client.gh
 	// Only the first of the commit's own commits: the answer stays small when it has many.
 	req, err := gh.NewRequest(ctx, http.MethodGet, fmt.Sprintf("repos/%v/%v/compare/%v...%v?per_page=1", p.Owner, p.Repo, base, commit), nil)
 	if err != nil {
-		return "", false, fmt.Errorf("%w: %v", tools.ErrNotSent, err)
+		return cmp, "", false, fmt.Errorf("%w: %v", tools.ErrNotSent, err)
 	}
 	body := &cappedBuffer{max: maxCompareBytes}
 	resp, err := gh.Do(req, body)
 	switch {
 	case status(resp) == http.StatusNotFound:
-		return fmt.Sprintf("commit %s has no history in common with %s (or the token cannot see the repository)", commit, where), true, nil
+		return cmp, fmt.Sprintf("commit %s has no history in common with %s (or the token cannot see the repository)", commit, where), true, nil
 	case errors.Is(err, errOverLimit):
-		return fmt.Sprintf("GitHub's comparison of commit %s with %s is over the limit of %d bytes (that of a commit in the branch's history lists no commits and no files)",
+		return cmp, fmt.Sprintf("GitHub's comparison of commit %s with %s is over the limit of %d bytes (that of a commit in the branch's history lists no commits and no files)",
 			commit, where, maxCompareBytes), false, nil
 	case err != nil:
-		return "", false, unseen(err)
-	}
-	var cmp struct {
-		Status    string `json:"status"`
-		AheadBy   int    `json:"ahead_by"`
-		MergeBase struct {
-			SHA string `json:"sha"`
-		} `json:"merge_base_commit"`
+		return cmp, "", false, unseen(err)
 	}
 	if err := json.Unmarshal(body.buf.Bytes(), &cmp); err != nil {
-		return "", false, fmt.Errorf("%w: GitHub's comparison of commit %s with %s: %v", tools.ErrNotSent, commit, where, err)
+		return cmp, "", false, fmt.Errorf("%w: GitHub's comparison of commit %s with %s: %v", tools.ErrNotSent, commit, where, err)
 	}
-	if cmp.MergeBase.SHA != commit || cmp.Status != "behind" && cmp.Status != "identical" {
-		return fmt.Sprintf("commit %s is not in the history of %s: GitHub compares it as %.20q, with %d commits of its own",
-			commit, where, cmp.Status, cmp.AheadBy), false, nil
-	}
-	return "", false, nil
+	return cmp, "", false, nil
 }
 
 // Bounds on one call's checks of the payload's files on GitHub, which list every directory on

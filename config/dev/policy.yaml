@@ -1,11 +1,13 @@
-# Development policy: like config/policy.yaml, but nothing waits for approval (M4) and the
-# fake model, and Claude under agentd-claude.yaml, may receive the task's data. The patch
-# checks stay: they matter most where nobody approves.
+# Development policy: like config/policy.yaml, but the fake model, and Claude under
+# agentd-claude.yaml, may receive the task's data. As there, a person approves each pull request
+# before it is opened (agentctl approvals); the dev configs leave GitHub out, and a dry run asks
+# for no approval: it sends nothing.
 repos: [acme/payments]
 tools:
   git.show_diff:         {decision: allow, effect: none}
   git.apply_check:       {decision: allow, effect: none, deny_paths: [".github/**", "Makefile", "GNUmakefile", "scripts/**"]}
-  github.open_draft_pr:  {decision: allow, effect: lookup, deny_paths: [".github/**", "Makefile", "GNUmakefile", "scripts/**"]}
+  github.open_draft_pr:  {decision: require_approval, effect: lookup, approval_ttl: 24h,
+                          deny_paths: [".github/**", "Makefile", "GNUmakefile", "scripts/**"]}
   github.comment_commit: {decision: allow, effect: lookup}
 models:
   audit_v1: {allowed_providers: [fake, anthropic]}   # anthropic for agentd-claude.yaml

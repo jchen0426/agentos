@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadDesignDocPolicy(t *testing.T) {
@@ -96,6 +97,46 @@ func TestToolCallsStayInTheRunsScope(t *testing.T) {
 	for _, c := range cases {
 		if got := p.EvaluateTool("github.comment_commit", c.args, scope).Decision; got != c.want {
 			t.Errorf("%v: got %v, want %v", c.args, got, c.want)
+		}
+	}
+}
+
+// approval_ttl bounds an approval (design doc, section 10): 24 hours unless the policy says, a
+// positive duration, and only on a tool that asks for approval.
+func TestApprovalTTL(t *testing.T) {
+	p, err := Load("../../config/policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.EvaluateTool("github.open_draft_pr", map[string]any{"repo": "acme/payments"}, nil).ApprovalTTL; got != 24*time.Hour {
+		t.Errorf("open_draft_pr: ttl %v, want 24h", got)
+	}
+	write := func(body string) string {
+		path := filepath.Join(t.TempDir(), "policy.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	p, err = Load(write("tools:\n  x: {decision: require_approval, approval_ttl: 90s}\n  y: {decision: require_approval}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.EvaluateTool("x", nil, nil).ApprovalTTL; got != 90*time.Second {
+		t.Errorf("x: ttl %v, want 90s", got)
+	}
+	if got := p.EvaluateTool("y", nil, nil).ApprovalTTL; got != DefaultApprovalTTL {
+		t.Errorf("y: ttl %v, want the default", got)
+	}
+	for name, body := range map[string]string{
+		"not a duration": "tools:\n  x: {decision: require_approval, approval_ttl: tomorrow}\n",
+		"zero":           "tools:\n  x: {decision: require_approval, approval_ttl: 0s}\n",
+		"negative":       "tools:\n  x: {decision: require_approval, approval_ttl: -1h}\n",
+		"too long":       "tools:\n  x: {decision: require_approval, approval_ttl: 721h}\n",
+		"no approval":    "tools:\n  x: {decision: allow, approval_ttl: 1h}\n",
+	} {
+		if _, err := Load(write(body)); err == nil {
+			t.Errorf("%s: loaded without error", name)
 		}
 	}
 }

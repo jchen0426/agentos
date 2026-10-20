@@ -9,14 +9,25 @@ import (
 )
 
 type Approval struct {
-	ApprovalID      string
-	EffectID        string
-	PayloadSha256   string
-	Status          string
-	ExpiresAt       string
-	DecidedBy       sql.NullString
-	Reason          sql.NullString
-	EditedPatchBlob sql.NullString
+	ApprovalID       string
+	EffectID         string
+	WorkflowID       string
+	Tool             string
+	ArgsJson         string
+	PayloadSha256    string
+	ContextBlob      string
+	Status           string
+	CreatedAt        string
+	ExpiresAt        string
+	DecidedBy        sql.NullString
+	DecidedAt        sql.NullString
+	DecisionKey      sql.NullString
+	Reason           sql.NullString
+	EditedPatchBlob  sql.NullString
+	EditedArgsSha256 sql.NullString
+	Supersedes       sql.NullString
+	SupersededBy     sql.NullString
+	UsedAt           sql.NullString
 }
 
 type AuditLog struct {
@@ -81,6 +92,8 @@ type Effect struct {
 	ClaimedAt      sql.NullString
 	Version        int64
 	Reason         sql.NullString
+	MaybeSent      int64
+	LastRequestAt  sql.NullString
 }
 
 type EffectResolution struct {
@@ -106,6 +119,18 @@ type ModelCall struct {
 	UsageJson     sql.NullString
 	StartedAt     string
 	FinishedAt    sql.NullString
+}
+
+type Outbox struct {
+	Seq           int64
+	WorkflowID    string
+	Kind          string
+	Why           string
+	CreatedAt     string
+	Attempts      int64
+	NextAttemptAt string
+	DeliveredAt   sql.NullString
+	Outcome       sql.NullString
 }
 
 type Run struct {

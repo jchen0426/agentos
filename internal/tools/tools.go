@@ -64,6 +64,24 @@ type Writer interface {
 	Live() bool
 }
 
+// Describer is a write whose reviewer needs to see more than its payload: what agentd can find
+// out about the write before a person approves it (design doc, section 10), such as whether the
+// patch applies and where the target stands now. It is best-effort: what it cannot find out, it
+// says in its answer rather than failing the call.
+type Describer interface {
+	Writer
+	Describe(ctx context.Context, req Request, payload json.RawMessage) map[string]any
+}
+
+// Editable is a write a reviewer may edit before approving it. An edit replaces the value of one
+// argument, EditArg, with a blob of the run: for github.open_draft_pr, the patch. The workflow
+// gets the new value, checks it again, and calls again with it; that call needs an approval of
+// its own.
+type Editable interface {
+	Writer
+	EditArg() string
+}
+
 // Proceed is asked before each visible request of a write. It fails with ErrStopped when the
 // request must not go out (the run was cancelled meanwhile), and with another error that wraps
 // ErrNotSent when agentd cannot record the request; and it marks the moment the request goes

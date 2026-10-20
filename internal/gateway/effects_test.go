@@ -27,6 +27,10 @@ type writer struct {
 	release chan struct{} // when set, Execute waits for it before it asks to proceed
 	err     error         // what Execute returns, once sent
 	deny    string        // when set, Execute refuses the payload before it sends anything
+	unsent  bool          // when set, Execute fails before it sends anything (ErrNotSent)
+	// When set, Execute asks to proceed and then fails with it, making nothing: a write of several
+	// requests whose first went out, and whose next did nothing (a retryable refusal).
+	after error
 }
 
 var noArgs = tools.MustSchema(`{"type": "object"}`)
@@ -50,8 +54,14 @@ func (w *writer) Execute(ctx context.Context, _ json.RawMessage, _ string, proce
 	if w.deny != "" {
 		return nil, &tools.DeniedError{Reason: w.deny}
 	}
+	if w.unsent {
+		return nil, tools.ErrNotSent
+	}
 	if err := proceed(ctx); err != nil {
 		return nil, err
+	}
+	if w.after != nil {
+		return nil, w.after
 	}
 	w.sent.Add(1)
 	if w.err != nil {
@@ -108,7 +118,7 @@ func (f *fixture) req() tools.Request {
 
 func (f *fixture) do(t *testing.T, w tools.Writer) (string, error) {
 	t.Helper()
-	res, err := f.g.effect(context.Background(), f.run, w, w.Class(), 1, f.req(), faults.Effect{})
+	res, err := f.g.effect(context.Background(), f.run, w, w.Class(), 1, nil, f.req(), nil, faults.Effect{})
 	return res.GetStatus(), err
 }
 
@@ -178,7 +188,7 @@ func TestClaimIsCompareAndSwap(t *testing.T) {
 	w := &writer{class: policy.EffectUnsafe}
 	if _, err := f.g.Ledger.Q.InsertEffect(context.Background(), db.InsertEffectParams{
 		EffectID: f.req().EffectID, WorkflowID: "wf", Tool: w.Name(), EffectClass: w.class, PayloadSha256: "x",
-		IdempotencyKey: "k", CreatedAt: ledger.Now(), UpdatedAt: ledger.Now(),
+		IdempotencyKey: "k", Status: effectPending, CreatedAt: ledger.Now(), UpdatedAt: ledger.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +223,7 @@ func TestProceedStopsOnceTheRunIsCancelled(t *testing.T) {
 	f := newFixture(t, false)
 	ctx := context.Background()
 	w := &writer{class: policy.EffectUnsafe}
-	if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, f.req()); res != nil || err != nil {
+	if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil); res != nil || err != nil {
 		t.Fatalf("record: %v %v", res, err)
 	}
 	e, ok, err := f.g.claim(ctx, f.status(t))
@@ -238,21 +248,21 @@ func TestAToolsDenialEndsTheEffect(t *testing.T) {
 	for _, class := range []string{policy.EffectUnsafe, policy.EffectLookup} {
 		f := newFixture(t, false)
 		w := &finder{writer: writer{class: class, deny: "app/db.py is not what the mirror has"}}
-		res, err := f.g.effect(context.Background(), f.run, w, class, 1, f.req(), faults.Effect{})
+		res, err := f.g.effect(context.Background(), f.run, w, class, 1, nil, f.req(), nil, faults.Effect{})
 		e := f.status(t)
 		if err != nil || res.GetStatus() != StatusDenied || !strings.Contains(res.GetValueJson(), w.deny) ||
 			e.Status != effectDenied || e.Reason.String != w.deny || w.sent.Load() != 0 {
 			t.Fatalf("%s: result %v, err %v, effect %s %q, sent %d", class, res, err, e.Status, e.Reason.String, w.sent.Load())
 		}
 		// The same call again gets the same answer, and nothing is sent.
-		if res, err := f.g.effect(context.Background(), f.run, w, class, 1, f.req(), faults.Effect{}); err != nil ||
+		if res, err := f.g.effect(context.Background(), f.run, w, class, 1, nil, f.req(), nil, faults.Effect{}); err != nil ||
 			res.GetStatus() != StatusDenied || w.sent.Load() != 0 {
 			t.Fatalf("%s: again: %v %v", class, res, err)
 		}
 		// Another payload of the same tool is one write too many.
 		other := f.req()
 		other.EffectID, other.Args = strings.Repeat("f", 64), map[string]any{"n": 2}
-		res, err = f.g.effect(context.Background(), f.run, &writer{class: class}, class, 1, other, faults.Effect{})
+		res, err = f.g.effect(context.Background(), f.run, &writer{class: class}, class, 1, nil, other, nil, faults.Effect{})
 		if err != nil || res.GetStatus() != StatusDenied || !strings.Contains(res.GetValueJson(), "already has 1") {
 			t.Fatalf("%s: another payload: %v %v", class, res, err)
 		}
@@ -279,7 +289,7 @@ func (f *fixture) claimElsewhere(t *testing.T, w tools.Writer) {
 	}
 	if _, err := f.g.Ledger.Q.InsertEffect(ctx, db.InsertEffectParams{
 		EffectID: f.req().EffectID, WorkflowID: "wf", Tool: w.Name(), EffectClass: w.Class(), PayloadSha256: sha256Hex(payload),
-		PayloadBlob: valid(ref), IdempotencyKey: "k", CreatedAt: ledger.Now(), UpdatedAt: ledger.Now(),
+		PayloadBlob: valid(ref), IdempotencyKey: "k", Status: effectPending, CreatedAt: ledger.Now(), UpdatedAt: ledger.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +426,7 @@ func TestReconcile(t *testing.T) {
 		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "c"}); !errors.Is(err, ErrNotUnknown) {
 			t.Fatalf("a second, different resolution: %v", err)
 		}
-		res, err := f.g.effect(ctx, f.run, w, w.class, 1, f.req(), faults.Effect{})
+		res, err := f.g.effect(ctx, f.run, w, w.class, 1, nil, f.req(), nil, faults.Effect{})
 		if err != nil || res.GetValueJson() != `{"id":3}` || w.sent.Load() != 0 {
 			t.Fatalf("the call after: %v %v, sent %d", res, err, w.sent.Load())
 		}
@@ -473,7 +483,7 @@ func TestOneWritePerRunByDefault(t *testing.T) {
 		t.Fatalf("first: %s %v", status, err)
 	}
 	other := tools.Request{WorkflowID: "wf", EffectID: strings.Repeat("f", 64), Args: map[string]any{"n": 2}}
-	res, err := f.g.effect(context.Background(), f.run, w, w.class, 1, other, faults.Effect{})
+	res, err := f.g.effect(context.Background(), f.run, w, w.class, 1, nil, other, nil, faults.Effect{})
 	if err != nil || res.GetStatus() != StatusDenied || w.sent.Load() != 1 {
 		t.Fatalf("a second write: %v %v, sent %d", res, err, w.sent.Load())
 	}
@@ -481,7 +491,7 @@ func TestOneWritePerRunByDefault(t *testing.T) {
 	if status, err := f.do(t, w); err != nil || status != StatusOK || w.sent.Load() != 1 {
 		t.Fatalf("the first again: %s %v, sent %d", status, err, w.sent.Load())
 	}
-	if res, err := f.g.effect(context.Background(), f.run, w, w.class, 2, other, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
+	if res, err := f.g.effect(context.Background(), f.run, w, w.class, 2, nil, other, nil, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
 		t.Fatalf("allowed two: %v %v", res, err)
 	}
 }

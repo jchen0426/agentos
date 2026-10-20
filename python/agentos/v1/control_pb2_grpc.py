@@ -61,6 +61,11 @@ class ControlStub:
                 request_serializer=agentos_dot_v1_dot_control__pb2.ListPendingRequest.SerializeToString,
                 response_deserializer=agentos_dot_v1_dot_control__pb2.ListPendingResponse.FromString,
                 _registered_method=True)
+        self.GetApproval = channel.unary_unary(
+                '/agentos.v1.Control/GetApproval',
+                request_serializer=agentos_dot_v1_dot_control__pb2.GetApprovalRequest.SerializeToString,
+                response_deserializer=agentos_dot_v1_dot_control__pb2.Approval.FromString,
+                _registered_method=True)
         self.ResolveApproval = channel.unary_unary(
                 '/agentos.v1.Control/ResolveApproval',
                 request_serializer=agentos_dot_v1_dot_control__pb2.ResolveApprovalRequest.SerializeToString,
@@ -115,6 +120,13 @@ class ControlServicer:
 
     def ListPending(self, request, context):
         """approvals and reconciliations (M3, M4)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetApproval(self, request, context):
+        """M4: the approval card, decided or not
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -175,6 +187,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.ListPending,
                     request_deserializer=agentos_dot_v1_dot_control__pb2.ListPendingRequest.FromString,
                     response_serializer=agentos_dot_v1_dot_control__pb2.ListPendingResponse.SerializeToString,
+            ),
+            'GetApproval': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetApproval,
+                    request_deserializer=agentos_dot_v1_dot_control__pb2.GetApprovalRequest.FromString,
+                    response_serializer=agentos_dot_v1_dot_control__pb2.Approval.SerializeToString,
             ),
             'ResolveApproval': grpc.unary_unary_rpc_method_handler(
                     servicer.ResolveApproval,
@@ -334,6 +351,33 @@ class Control:
             '/agentos.v1.Control/ListPending',
             agentos_dot_v1_dot_control__pb2.ListPendingRequest.SerializeToString,
             agentos_dot_v1_dot_control__pb2.ListPendingResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetApproval(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/agentos.v1.Control/GetApproval',
+            agentos_dot_v1_dot_control__pb2.GetApprovalRequest.SerializeToString,
+            agentos_dot_v1_dot_control__pb2.Approval.FromString,
             options,
             channel_credentials,
             insecure,

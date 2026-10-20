@@ -60,7 +60,10 @@ func (b blobs) GetRunBlob(_ context.Context, workflowID, ref string) ([]byte, er
 	return v, nil
 }
 
-type effects struct{ pr int64 }
+type effects struct {
+	pr        int64
+	approvals []Approval
+}
 
 func (e effects) LatestEffectResult(context.Context, string, string) (map[string]any, bool, error) {
 	if e.pr == 0 {
@@ -68,6 +71,8 @@ func (e effects) LatestEffectResult(context.Context, string, string) (map[string
 	}
 	return map[string]any{"number": json.Number(strconv.FormatInt(e.pr, 10))}, true, nil
 }
+
+func (e effects) RunApprovals(context.Context, string) ([]Approval, error) { return e.approvals, nil }
 
 func proceed(context.Context) error { return nil }
 
@@ -321,7 +326,7 @@ func TestCommentCommit(t *testing.T) {
 
 func TestRenderKeepsWithinGitHubsLimit(t *testing.T) {
 	body := render(strings.Repeat("a", 40), strings.Repeat("`", 30000)+strings.Repeat("x", 1990),
-		&report{Summary: strings.Repeat("`", 30000)}, 0, marker(strings.Repeat("ab", 32)))
+		&report{Summary: strings.Repeat("`", 30000)}, 0, nil, marker(strings.Repeat("ab", 32)))
 	if len(body) > 65536 || strings.Contains(body, strings.Repeat("`", maxBackticks+2)) {
 		t.Fatalf("%d characters, longest backtick run %d", len(body), longestRun(body, '`'))
 	}
@@ -2284,5 +2289,81 @@ func TestOpenDraftPRReturnsAPullRequestItFindsAfterTheBaseDropsTheParent(t *test
 	if v, err := tool.Execute(context.Background(), payload, "key", proceed); err != nil || v["number"] != first["number"] ||
 		f.log(t, "create_pull") != 1 {
 		t.Fatalf("got %v %v, %d pull requests; want the first, #%v", v, err, f.log(t, "create_pull"), first["number"])
+	}
+}
+
+// The reviewer of a pull request sees what agentd observed (design doc, section 10): the patch,
+// the files it changes, git's own check, where the base branch stands on GitHub and how the
+// checks Execute makes would go, made now. Describe writes nothing.
+func TestDescribeShowsWhatAgentdObserved(t *testing.T) {
+	f := setup(t)
+	dir := f.repos["acme/payments"].Mirror
+	tool, payload := f.prepare(t, f.git, fix)
+	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
+	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
+	d := tool.Describe(context.Background(), req, payload)
+	files, _ := json.Marshal(d["files"])
+	if d["patch"] != fix || string(files) != `[{"change":"modify","path":"app/db.py"}]` || d["commit"] != f.commit {
+		t.Fatalf("described %v", d)
+	}
+	if got, _ := json.Marshal(d["apply_check"]); string(got) != `{"applies":true}` {
+		t.Fatalf("apply_check %s", got)
+	}
+	gh, _ := json.Marshal(d["github"])
+	want := `{"audited_commit":{"ahead_by":0,"behind_by":0,"in_base_branch":true,"status":"identical"},"base_tip":"` + f.commit +
+		`","files_at_commit":"ok","files_at_tip":"ok"}`
+	if string(gh) != want {
+		t.Fatalf("github:\n got %s\nwant %s", gh, want)
+	}
+
+	// The base branch moves on, and changes the file the patch touches: the reviewer is told.
+	tip := commitFiles(t, dir, map[string]string{"app/db.py": vulnerable + "# later\n"})
+	f.sim.SetRef("acme/payments", "main", tip)
+	g := tool.Describe(context.Background(), req, payload)["github"].(map[string]any)
+	audited, _ := json.Marshal(g["audited_commit"])
+	if g["base_tip"] != tip || string(audited) != `{"ahead_by":0,"behind_by":1,"in_base_branch":true,"status":"behind"}` ||
+		g["files_at_commit"] != "ok" || !strings.HasPrefix(g["files_at_tip"].(string), "refused: app/db.py") {
+		t.Fatalf("after the base moved: %v", g)
+	}
+	if f.wrote(t) != 0 {
+		t.Fatal("Describe wrote to GitHub")
+	}
+}
+
+// The report shows how each approval of the run ended: the status, which agentd records itself,
+// outside the fence; who decided, and a rejection's reason, inside it, where links and mentions
+// do nothing.
+func TestTheReportShowsTheApprovals(t *testing.T) {
+	f := setup(t)
+	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{approvals: []Approval{
+		{ID: "a1", Tool: "github.open_draft_pr", Status: "SUPERSEDED", DecidedBy: "carol", DecidedAt: "2026-10-20T09:00:00Z"},
+		{ID: "a2", Tool: "github.open_draft_pr", Status: "REJECTED", DecidedBy: "bob @mallory", DecidedAt: "2026-10-20T10:00:00Z",
+			Reason: "see https://evil.example and ``` this"},
+		{ID: "a3", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "dave", DecidedAt: "2026-10-20T11:00:00Z",
+			Write: "not sent", WriteReason: "the run was cancelled before the approved write was sent"},
+		{ID: "a4", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "erin", DecidedAt: "2026-10-20T12:00:00Z",
+			Write: "failed", WriteReason: "GitHub refused: 403"},
+	}}}
+	payload, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
+		"repo": "acme/payments", "commit": f.commit, "outcome": "rejected"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p commentPayload
+	_ = json.Unmarshal(payload, &p)
+	i := strings.Index(p.Body, "```")
+	head, fenced := p.Body[:i], p.Body[i:]
+	if !strings.Contains(head, "Approval of github.open_draft_pr: superseded\n") ||
+		!strings.Contains(head, "Approval of github.open_draft_pr: approved, not sent\n") ||
+		!strings.Contains(head, "Approval of github.open_draft_pr: approved, failed\n") ||
+		!strings.Contains(head, "Approval of github.open_draft_pr: rejected\n") ||
+		strings.Contains(head, "evil") || strings.Contains(head, "@") {
+		t.Fatalf("head:\n%s", head)
+	}
+	if !strings.Contains(fenced, "- github.open_draft_pr, approval a2: REJECTED by bob @mallory at 2026-10-20T10:00:00Z. Reason: see https://evil.example") ||
+		!strings.Contains(fenced, "approval a1: SUPERSEDED (edited by carol at 2026-10-20T09:00:00Z)") ||
+		!strings.Contains(fenced, "approval a3: APPROVED by dave at 2026-10-20T11:00:00Z; not sent: the run was cancelled") ||
+		!strings.HasPrefix(fenced, "````text\n") {
+		t.Fatalf("fenced:\n%s", fenced)
 	}
 }

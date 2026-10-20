@@ -64,6 +64,9 @@ type Script struct {
 	// RunIDDelay holds StartRun this long after Temporal has started a run, before it records
 	// the run ID: the window in which the run's first calls reach the gateway early.
 	RunIDDelay Duration `json:"run_id_delay"`
+	// HoldDoorbellsWhileExists keeps the outbox from delivering any doorbell while this file
+	// exists: they wait in the ledger, as when agentd stops before it signals (T14).
+	HoldDoorbellsWhileExists string `json:"hold_doorbells_while_exists"`
 
 	mu     sync.Mutex
 	counts map[string]int // workflow ID + name -> Invokes seen
@@ -87,6 +90,15 @@ func (s *Script) DelayRunID() {
 	if s != nil && s.RunIDDelay > 0 {
 		time.Sleep(time.Duration(s.RunIDDelay))
 	}
+}
+
+// HoldDoorbells reports whether the outbox must deliver nothing for now.
+func (s *Script) HoldDoorbells() bool {
+	if s == nil || s.HoldDoorbellsWhileExists == "" {
+		return false
+	}
+	_, err := os.Stat(s.HoldDoorbellsWhileExists)
+	return err == nil
 }
 
 // Match is called once per Invoke attempt that gets past the run lookup and the loop guard

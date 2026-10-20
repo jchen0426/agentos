@@ -140,3 +140,36 @@ func TestSecurityAuditTakesOnlyBranchNamesGitMakes(t *testing.T) {
 		}
 	}
 }
+
+// answers is a run's accepted audits, newest first.
+type answers []map[string]any
+
+func (a answers) ModelOutputs(context.Context, string) ([]map[string]any, error) { return a, nil }
+
+// The reviewer of a patch sees the findings of the audit that proposed it: a workflow can ask for
+// several audits and send one's patch with another's findings. A patch no audit proposed (a
+// reviewer's edit) gets the latest audit's, and the card says so.
+func TestApprovalContextShowsTheFindingsOfThePatchsAudit(t *testing.T) {
+	audit := func(patch, cwe string) map[string]any {
+		return map[string]any{"patch_ref": patch, "summary": "audit with " + patch,
+			"findings": []any{map[string]any{"severity": "high", "cwe": cwe, "file": "app/db.py", "line": 2, "title": "t", "explanation": "e"}}}
+	}
+	run := answers{audit("sha256:new", "CWE-79"), audit("sha256:old", "CWE-89")}
+	for patch, want := range map[string]struct {
+		cwe      string
+		proposed bool
+	}{
+		"sha256:old":    {"CWE-89", true},
+		"sha256:new":    {"CWE-79", true},
+		"sha256:edited": {"CWE-79", false},
+	} {
+		c := auditFindings(context.Background(), run, map[string]any{"patch_ref": patch})
+		findings := c["findings"].([]any)
+		if got := findings[0].(map[string]any)["cwe"]; got != want.cwe || c["patch_from_this_audit"] != want.proposed || c["audits"] != 2 {
+			t.Errorf("%s: %v", patch, c)
+		}
+		if _, ok := findings[0].(map[string]any)["explanation"]; ok {
+			t.Errorf("%s: the card carries the model's explanation: %v", patch, findings[0])
+		}
+	}
+}

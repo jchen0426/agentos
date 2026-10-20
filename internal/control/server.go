@@ -4,7 +4,9 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +47,8 @@ type Server struct {
 	Ledger      *ledger.Ledger
 	Budget      *budget.Budget
 	Effects     Reconciler
+	Approvals   Approver
+	Doorbells   interface{ Poke() } // the outbox: rings the doorbells the server's changes wrote
 	Temporal    client.Client
 	Tasks       tasks.Registry
 	TaskQueue   string         // where the Python Worker polls
@@ -57,6 +61,11 @@ type Server struct {
 // gateway, which knows the tools.
 type Reconciler interface {
 	Reconcile(ctx context.Context, r gateway.Resolution) (status, workflowID string, err error)
+}
+
+// Approver records a person's decision on an approval: the gateway, which knows the tools.
+type Approver interface {
+	Decide(ctx context.Context, d gateway.Decision) (db.Approval, error)
 }
 
 func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (*agentosv1.Run, error) {
@@ -280,15 +289,29 @@ func closed(state string) bool {
 	return false
 }
 
-// ListPending lists what waits for a person. M3 has reconciliations: effects whose outcome
-// nobody knows. Approvals arrive in M4. What the external system was to receive and the
-// reason come from tools and the outside world: neither leaves with raw control characters.
+// ListPending lists what waits for a person: approvals nobody has decided yet (but those of
+// cancelled runs, whose writes never go out), and reconciliations, effects whose outcome nobody
+// knows. What the external system was to receive and the reason come from tools and the outside
+// world: neither leaves with raw control characters.
 func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingRequest) (*agentosv1.ListPendingResponse, error) {
+	resp := &agentosv1.ListPendingResponse{}
+	approvals, err := s.Ledger.Q.ListPendingApprovals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range approvals {
+		if at, err := time.Parse(time.RFC3339Nano, a.ExpiresAt); err == nil && !time.Now().Before(at) {
+			continue // expired: agentd records it as such any moment
+		}
+		// Without the payload, which GetApproval shows and checks: a pull request's runs to 20 files
+		// of 1 MiB, and one large approval would make the whole list too large to receive.
+		resp.Items = append(resp.Items, &agentosv1.PendingItem{Kind: "approval", Id: a.ApprovalID, RunId: a.WorkflowID,
+			ExpiresAt: a.ExpiresAt, Tool: a.Tool, Since: a.CreatedAt, PayloadSha256: a.PayloadSha256})
+	}
 	rows, err := s.Ledger.Q.ListEffectsByStatus(ctx, "UNKNOWN")
 	if err != nil {
 		return nil, err
 	}
-	resp := &agentosv1.ListPendingResponse{}
 	for _, e := range rows {
 		item := &agentosv1.PendingItem{Kind: "reconciliation", Id: e.EffectID, RunId: e.WorkflowID, Tool: e.Tool,
 			Reason: safetext.Line(e.Reason.String), Since: e.UpdatedAt}
@@ -304,13 +327,122 @@ func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingReques
 	return resp, nil
 }
 
-func (s *Server) ResolveApproval(context.Context, *agentosv1.ResolveApprovalRequest) (*agentosv1.ResolveApprovalResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "approvals arrive in M4")
+// errPayloadChanged: the payload recorded for an approval no longer hashes to the one it holds.
+var errPayloadChanged = errors.New("changed since it was recorded")
+
+// approvalPayload is the payload an approval holds the hash of: its effect's, as recorded.
+func (s *Server) approvalPayload(ctx context.Context, a db.Approval) ([]byte, error) {
+	e, err := s.Ledger.Q.GetEffect(ctx, a.EffectID)
+	if err != nil {
+		return nil, err
+	}
+	b, err := s.Ledger.GetBlob(ctx, e.PayloadBlob.String)
+	if err != nil {
+		return nil, err
+	}
+	if sum := sha256.Sum256(b); hex.EncodeToString(sum[:]) != a.PayloadSha256 {
+		return nil, fmt.Errorf("the payload recorded for approval %s does not hash to %s: it %w; do not approve it",
+			a.ApprovalID, a.PayloadSha256, errPayloadChanged)
+	}
+	return b, nil
+}
+
+// GetApproval shows one approval (design doc, section 10): exactly what will be sent and its hash,
+// what agentd observed when it made the approval, how it was decided, and what the run has spent.
+func (s *Server) GetApproval(ctx context.Context, req *agentosv1.GetApprovalRequest) (*agentosv1.Approval, error) {
+	a, err := s.Ledger.Q.GetApproval(ctx, req.GetApprovalId())
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, status.Errorf(codes.NotFound, "no approval %q", req.GetApprovalId())
+	}
+	if err != nil {
+		return nil, err
+	}
+	payload, err := s.approvalPayload(ctx, a)
+	switch {
+	case errors.Is(err, errPayloadChanged):
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	case err != nil:
+		return nil, err
+	}
+	card, err := s.Ledger.GetBlob(ctx, a.ContextBlob)
+	if err != nil {
+		return nil, err
+	}
+	out := &agentosv1.Approval{
+		ApprovalId: a.ApprovalID, RunId: a.WorkflowID, Tool: a.Tool, Status: a.Status, CreatedAt: a.CreatedAt,
+		ExpiresAt: a.ExpiresAt, PayloadSha256: a.PayloadSha256, PayloadJson: string(safetext.JSON(payload)),
+		ContextJson: string(safetext.JSON(card)), DecidedBy: safetext.Line(a.DecidedBy.String),
+		DecidedAt: a.DecidedAt.String, Reason: safetext.Text(a.Reason.String), Supersedes: a.Supersedes.String,
+		SupersededBy: a.SupersededBy.String,
+	}
+	if a.EditedPatchBlob.Valid {
+		b, err := s.Ledger.GetBlob(ctx, a.EditedPatchBlob.String)
+		if err != nil {
+			return nil, err
+		}
+		out.EditedPatch = safetext.Text(string(b))
+	}
+	t, err := s.Budget.Totals(ctx, a.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	out.BudgetSpentMicros, out.BudgetReservedMicros, out.BudgetLimitMicros = t.Spent, t.Held, t.Limit
+	return out, nil
+}
+
+// ResolveApproval records a person's decision on an approval (design doc, section 10): approve,
+// approve with edits, or reject with a reason. The first valid decision wins; one that comes
+// after another is told who decided what, and when. The decision and the run's doorbell are
+// written together, and the outbox rings it.
+func (s *Server) ResolveApproval(ctx context.Context, req *agentosv1.ResolveApprovalRequest) (*agentosv1.ResolveApprovalResponse, error) {
+	d := gateway.Decision{ApprovalID: req.GetApprovalId(), PayloadSHA256: req.GetPayloadSha256(),
+		Key: req.GetIdempotencyKey(), By: req.GetDecidedBy()}
+	switch x := req.GetDecision().(type) {
+	case *agentosv1.ResolveApprovalRequest_Approve:
+		d.Kind = gateway.DecisionApprove
+	case *agentosv1.ResolveApprovalRequest_Reject:
+		d.Kind, d.Reason = gateway.DecisionReject, x.Reject.GetReason()
+	case *agentosv1.ResolveApprovalRequest_ApproveWithEdits:
+		d.Kind, d.Patch = gateway.DecisionEdit, []byte(x.ApproveWithEdits.GetEditedPatch())
+	default:
+		return nil, status.Error(codes.InvalidArgument, "a decision is required: approve, approve_with_edits or reject")
+	}
+	a, err := s.Ledger.Q.GetApproval(ctx, d.ApprovalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, status.Errorf(codes.NotFound, "no approval %q", d.ApprovalID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r, err := s.lookup(ctx, a.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	// Once the run has ended, nothing acts on a decision: it is refused rather than recorded.
+	current, err := s.describe(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	d.RunClosed = closed(current.GetState())
+	got, err := s.Approvals.Decide(context.WithoutCancel(ctx), d)
+	var decided *gateway.DecidedError
+	switch {
+	case errors.Is(err, gateway.ErrNoSuchApproval):
+		return nil, status.Errorf(codes.NotFound, "no approval %q", d.ApprovalID)
+	case errors.Is(err, gateway.ErrBadDecision):
+		return nil, status.Error(codes.InvalidArgument, safetext.Line(err.Error()))
+	case errors.As(err, &decided), errors.Is(err, gateway.ErrStaleView), errors.Is(err, gateway.ErrRunOver):
+		return nil, status.Error(codes.FailedPrecondition, safetext.Line(err.Error()))
+	case err != nil:
+		return nil, err
+	}
+	return &agentosv1.ResolveApprovalResponse{Status: got.Status, DecidedBy: safetext.Line(got.DecidedBy.String),
+		DecidedAt: got.DecidedAt.String}, nil
 }
 
 // ResolveReconciliation records a person's finding about an effect whose outcome nobody knew
-// (design doc, section 6), then rings the run's doorbell: its call waiting in
-// WAITING_RECONCILE asks again and gets the result, or sends the effect again.
+// (design doc, section 6), with the run's doorbell: its call waiting in WAITING_RECONCILE asks
+// again and gets the result, or sends the effect again.
 func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.ResolveReconciliationRequest) (*agentosv1.ResolveReconciliationResponse, error) {
 	if req.GetIdempotencyKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key is required")
@@ -334,7 +466,7 @@ func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.Resol
 	if err != nil {
 		return nil, err
 	}
-	ctx = context.WithoutCancel(ctx) // once recorded, the doorbell must ring
+	ctx = context.WithoutCancel(ctx) // the finding and its doorbell are written together
 	st, _, err := s.Effects.Reconcile(ctx, gateway.Resolution{
 		EffectID: req.GetEffectId(), Executed: req.GetExecuted(), ResultJSON: req.GetResultJson(),
 		Lookup: req.GetLookup(), Key: req.GetIdempotencyKey(), RunClosed: closed(current.GetState()),
@@ -349,17 +481,11 @@ func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.Resol
 	case err != nil:
 		return nil, err
 	}
-	// Rung for a repeated request too: its first doorbell may have been lost.
-	if r.RunID.Valid {
-		if err := s.Temporal.SignalWorkflow(ctx, r.WorkflowID, r.RunID.String, "doorbell", nil); err != nil {
-			s.Log.Warn("doorbell failed; the waiting call rechecks within the hour", "workflow_id", r.WorkflowID, "error", err)
-		}
-	}
 	return &agentosv1.ResolveReconciliationResponse{Status: st}, nil
 }
 
-// ExtendBudget raises a run's budget and rings its doorbell: calls paused in PAUSED_BUDGET
-// ask again. A lost doorbell only delays them, since a paused call rechecks within the hour.
+// ExtendBudget raises a run's budget, with its doorbell: calls paused in PAUSED_BUDGET ask again.
+// The outbox rings it until Temporal has it.
 func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRequest) (*agentosv1.Run, error) {
 	if req.GetAmountMicros() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "amount must be positive")
@@ -381,17 +507,16 @@ func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRe
 	if closed(current.GetState()) {
 		return nil, status.Errorf(codes.FailedPrecondition, "the run has already ended: %s", current.GetState())
 	}
-	ctx = context.WithoutCancel(ctx) // once recorded, the doorbell must ring
+	ctx = context.WithoutCancel(ctx) // the extension and its doorbell are written together
 	added, err := s.Budget.Extend(ctx, r.WorkflowID, req.GetAmountMicros(), req.GetIdempotencyKey())
 	if err != nil {
 		return nil, err
 	}
 	if added {
 		s.Log.Info("budget extended", "workflow_id", r.WorkflowID, "amount_micros", req.GetAmountMicros())
-	}
-	// Rung for a repeated request too: its first doorbell may have been lost.
-	if err := s.Temporal.SignalWorkflow(ctx, r.WorkflowID, r.RunID.String, "doorbell", nil); err != nil {
-		s.Log.Warn("doorbell failed; the paused calls recheck within the hour", "workflow_id", r.WorkflowID, "error", err)
+		if s.Doorbells != nil {
+			s.Doorbells.Poke()
+		}
 	}
 	return s.getRun(ctx, r.WorkflowID)
 }

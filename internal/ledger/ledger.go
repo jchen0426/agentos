@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -102,6 +103,14 @@ func (l *Ledger) Tx(ctx context.Context, fn func(q *db.Queries) error) error {
 
 // Now is the ledger's timestamp format: RFC 3339 in UTC with nanoseconds.
 func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// stampLayout is RFC 3339 in UTC with all nine digits of the fraction. Now drops trailing zeros,
+// so its times do not sort as text; these do, and SQL compares them as text.
+const stampLayout = "2006-01-02T15:04:05.000000000Z"
+
+// Stamp is t in the fixed-width format of the times SQL compares (an approval's expiry, when a
+// doorbell is due).
+func Stamp(t time.Time) string { return t.UTC().Format(stampLayout) }
 
 // LookupRun returns the run only when both the workflow ID and the run ID match the
 // execution agentd started. Checking the run ID matters: Temporal lets a new execution
@@ -194,6 +203,52 @@ func (l *Ledger) LatestEffectResult(ctx context.Context, workflowID, tool string
 	}
 	v, err := DecodeObject(b)
 	return v, err == nil, err
+}
+
+// ModelOutputs returns what the workflow got from each of the run's accepted answers of a model
+// task, newest first: the gateway's value (report_ref, the blob fields' refs, the other fields
+// inline). Refusals and answers that broke the task's output schema are not answers.
+func (l *Ledger) ModelOutputs(ctx context.Context, workflowID, task string) ([]map[string]any, error) {
+	rows, err := l.Q.ListModelAnswers(ctx, db.ListModelAnswersParams{WorkflowID: workflowID, Task: task})
+	if err != nil {
+		return nil, err
+	}
+	type answer struct {
+		at    time.Time
+		value map[string]any
+	}
+	var answers []answer
+	for _, r := range rows {
+		finished, err := time.Parse(time.RFC3339Nano, r.FinishedAt.String)
+		if err != nil || r.StopReason.String == "invalid_output" {
+			continue
+		}
+		b, err := l.GetBlob(ctx, r.ResponseBlob.String)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Status string          `json:"status"`
+			Value  json.RawMessage `json:"value"`
+		}
+		if err := json.Unmarshal(b, &resp); err != nil || resp.Status != "ok" {
+			continue
+		}
+		if v, err := DecodeObject(resp.Value); err == nil {
+			answers = append(answers, answer{finished, v})
+		}
+	}
+	slices.SortStableFunc(answers, func(a, b answer) int { return b.at.Compare(a.at) })
+	out := make([]map[string]any, 0, len(answers))
+	for _, a := range answers {
+		out = append(out, a.value)
+	}
+	return out, nil
+}
+
+// RunApprovals lists a run's approvals, oldest first.
+func (l *Ledger) RunApprovals(ctx context.Context, workflowID string) ([]db.Approval, error) {
+	return l.Q.ListRunApprovals(ctx, workflowID)
 }
 
 // DecodeObject decodes a JSON object, keeping numbers exact.

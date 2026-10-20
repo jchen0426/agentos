@@ -25,6 +25,17 @@ type Task struct {
 	// Scope maps tool arguments to the resolved parameter they must equal: a run acts only
 	// on what it was started for, not on everything the policy allows.
 	Scope map[string]string
+	// ApprovalContext is what the task shows the reviewer of a call of one of its runs' writes,
+	// beyond what the write itself describes, from what agentd recorded of the run and the call's
+	// arguments (design doc, section 10). Best-effort: what it cannot read, it says.
+	ApprovalContext func(ctx context.Context, run RunOutputs, args map[string]any) map[string]any
+}
+
+// RunOutputs reads what agentd recorded of one run.
+type RunOutputs interface {
+	// ModelOutputs is what the workflow got from each of the run's accepted answers of a model
+	// task, newest first.
+	ModelOutputs(ctx context.Context, task string) ([]map[string]any, error)
 }
 
 type Registry map[string]Task
@@ -50,10 +61,11 @@ var commitRe = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 // resolves the commit in its sandbox.
 func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Caller) Task {
 	return Task{
-		Name:          "security-audit",
-		WorkflowType:  "security-audit",
-		DefaultBudget: 5_000_000,
-		Scope:         map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
+		Name:            "security-audit",
+		WorkflowType:    "security-audit",
+		DefaultBudget:   5_000_000,
+		Scope:           map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
+		ApprovalContext: auditFindings,
 		Resolve: func(ctx context.Context, params map[string]string) (any, map[string]string, error) {
 			for k := range params {
 				if !slices.Contains([]string{"repo", "commit", "base"}, k) {
@@ -82,6 +94,40 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Calle
 				map[string]string{"repo": repo, "commit": full, "base": base}, nil
 		},
 	}
+}
+
+// auditFindings is the security audit's context for a reviewer: the summary and the findings
+// (severity, CWE, where, what), as the model reported them, of the audit that proposed the patch
+// under review. A patch no audit of the run proposed (a reviewer's edit) gets the latest audit's,
+// and says so: a workflow can ask for several audits, and show one's patch with another's findings.
+func auditFindings(ctx context.Context, run RunOutputs, args map[string]any) map[string]any {
+	answers, err := run.ModelOutputs(ctx, "audit_v1")
+	switch {
+	case err != nil:
+		return map[string]any{"findings_error": "agentd could not read the run's audits: " + err.Error()}
+	case len(answers) == 0:
+		return map[string]any{"findings_error": "the run has no accepted audit"}
+	}
+	v, proposed := answers[0], false
+	for _, a := range answers {
+		if ref, ok := a["patch_ref"].(string); ok && ref != "" && ref == args["patch_ref"] {
+			v, proposed = a, true
+			break
+		}
+	}
+	var findings []any
+	list, _ := v["findings"].([]any)
+	for _, f := range list {
+		m, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		findings = append(findings, map[string]any{
+			"severity": m["severity"], "cwe": m["cwe"], "file": m["file"], "line": m["line"], "title": m["title"],
+		})
+	}
+	return map[string]any{"summary": v["summary"], "findings": findings, "audits": len(answers),
+		"patch_from_this_audit": proposed}
 }
 
 // resolveCommit turns an abbreviated commit into the full SHA, using the mirror only: the git

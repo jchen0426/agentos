@@ -24,6 +24,7 @@ const (
 	Control_ListRuns_FullMethodName              = "/agentos.v1.Control/ListRuns"
 	Control_CancelRun_FullMethodName             = "/agentos.v1.Control/CancelRun"
 	Control_ListPending_FullMethodName           = "/agentos.v1.Control/ListPending"
+	Control_GetApproval_FullMethodName           = "/agentos.v1.Control/GetApproval"
 	Control_ResolveApproval_FullMethodName       = "/agentos.v1.Control/ResolveApproval"
 	Control_ResolveReconciliation_FullMethodName = "/agentos.v1.Control/ResolveReconciliation"
 	Control_ExtendBudget_FullMethodName          = "/agentos.v1.Control/ExtendBudget"
@@ -42,6 +43,7 @@ type ControlClient interface {
 	ListRuns(ctx context.Context, in *ListRunsRequest, opts ...grpc.CallOption) (*ListRunsResponse, error)
 	CancelRun(ctx context.Context, in *CancelRunRequest, opts ...grpc.CallOption) (*Run, error)
 	ListPending(ctx context.Context, in *ListPendingRequest, opts ...grpc.CallOption) (*ListPendingResponse, error)
+	GetApproval(ctx context.Context, in *GetApprovalRequest, opts ...grpc.CallOption) (*Approval, error)
 	ResolveApproval(ctx context.Context, in *ResolveApprovalRequest, opts ...grpc.CallOption) (*ResolveApprovalResponse, error)
 	ResolveReconciliation(ctx context.Context, in *ResolveReconciliationRequest, opts ...grpc.CallOption) (*ResolveReconciliationResponse, error)
 	ExtendBudget(ctx context.Context, in *ExtendBudgetRequest, opts ...grpc.CallOption) (*Run, error)
@@ -106,6 +108,16 @@ func (c *controlClient) ListPending(ctx context.Context, in *ListPendingRequest,
 	return out, nil
 }
 
+func (c *controlClient) GetApproval(ctx context.Context, in *GetApprovalRequest, opts ...grpc.CallOption) (*Approval, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Approval)
+	err := c.cc.Invoke(ctx, Control_GetApproval_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlClient) ResolveApproval(ctx context.Context, in *ResolveApprovalRequest, opts ...grpc.CallOption) (*ResolveApprovalResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ResolveApprovalResponse)
@@ -158,6 +170,7 @@ type ControlServer interface {
 	ListRuns(context.Context, *ListRunsRequest) (*ListRunsResponse, error)
 	CancelRun(context.Context, *CancelRunRequest) (*Run, error)
 	ListPending(context.Context, *ListPendingRequest) (*ListPendingResponse, error)
+	GetApproval(context.Context, *GetApprovalRequest) (*Approval, error)
 	ResolveApproval(context.Context, *ResolveApprovalRequest) (*ResolveApprovalResponse, error)
 	ResolveReconciliation(context.Context, *ResolveReconciliationRequest) (*ResolveReconciliationResponse, error)
 	ExtendBudget(context.Context, *ExtendBudgetRequest) (*Run, error)
@@ -186,6 +199,9 @@ func (UnimplementedControlServer) CancelRun(context.Context, *CancelRunRequest) 
 }
 func (UnimplementedControlServer) ListPending(context.Context, *ListPendingRequest) (*ListPendingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPending not implemented")
+}
+func (UnimplementedControlServer) GetApproval(context.Context, *GetApprovalRequest) (*Approval, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetApproval not implemented")
 }
 func (UnimplementedControlServer) ResolveApproval(context.Context, *ResolveApprovalRequest) (*ResolveApprovalResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResolveApproval not implemented")
@@ -310,6 +326,24 @@ func _Control_ListPending_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_GetApproval_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetApprovalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetApproval(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetApproval_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetApproval(ctx, req.(*GetApprovalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Control_ResolveApproval_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ResolveApprovalRequest)
 	if err := dec(in); err != nil {
@@ -408,6 +442,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPending",
 			Handler:    _Control_ListPending_Handler,
+		},
+		{
+			MethodName: "GetApproval",
+			Handler:    _Control_GetApproval_Handler,
 		},
 		{
 			MethodName: "ResolveApproval",

@@ -4,7 +4,7 @@ for an agentd without GitHub configured."""
 
 import json
 
-from tests.harness import TERMINAL, Stack
+from tests.harness import TERMINAL, Stack, approval_policy
 
 WRITES = ("github.open_draft_pr", "github.comment_commit")
 
@@ -35,3 +35,11 @@ def test_without_github_configured_nothing_is_sent(stack: Stack) -> None:
     stack.start_agentd(extra={"github": None})
     stack.start_worker()
     assert_dry(stack, stack.start_run())
+
+
+def test_a_dry_run_asks_for_no_approval(stack: Stack) -> None:
+    """Nothing a dry run writes goes out, so nothing in it waits for a person (section 10)."""
+    stack.start_agentd(policy=approval_policy())
+    stack.start_worker()
+    assert_dry(stack, stack.start_run(dry_run=True))
+    assert stack.ledger("SELECT * FROM approvals") == []

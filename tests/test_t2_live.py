@@ -3,8 +3,8 @@ PR is open on GitHub and agentd is killed before it records the result. When age
 again it finds the PR by its head branch and records it; GitHub ends up with one PR, and one
 report on the commit.
 
-Run it by hand, with the fake model (a real model must not open real PRs before approvals,
-M4) and the Worker in its sandbox (agentd holds a real token). The token for the test
+Run it by hand, with the fake model (the test policy opens the PR without approval, which only
+the fake model may do) and the Worker in its sandbox (agentd holds a real token). The token for the test
 repository lives in its own keychain item, agentos-github-test-token:
   AGENTOS_GITHUB=live AGENTOS_GITHUB_REPO=<owner>/<name> AGENTOS_SANDBOX=srt uv run pytest tests/test_t2_live.py -s
 It leaves the PR open on the test repository, for a look.
@@ -19,7 +19,7 @@ PR = "github.open_draft_pr"
 
 def test_t2_live_the_pr_was_opened_before_the_result_was_recorded(live_stack: Stack) -> None:
     stack = live_stack
-    assert not REAL_MODEL, "a real model must not open real PRs before approvals (M4)"
+    assert not REAL_MODEL, "a real model must not open real PRs without approval, as the test policy does"
     assert SANDBOX != "none", "agentd holds a real token: run the Worker in its sandbox (AGENTOS_SANDBOX=srt)"
     hold = stack.tmp / "hold"
     hold.touch()

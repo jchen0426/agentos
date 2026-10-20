@@ -42,6 +42,7 @@ import (
 	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/outbox"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/pricing"
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
@@ -221,6 +222,13 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	if err := gw.RecoverEffects(ctx); err != nil {
 		return fmt.Errorf("recover effects: %w", err)
 	}
+	// Doorbells wake the runs waiting for a person or for budget: those the last agentd process
+	// wrote and never delivered go out now, and every new one as it is written. Approvals nobody
+	// decided in time expire, as rejections, from now on.
+	doorbells := &outbox.Outbox{Ledger: led, Temporal: tc, Hold: script.HoldDoorbells, Log: log.With("component", "outbox")}
+	gw.Doorbells = doorbells
+	go doorbells.Run(ctx)
+	go gw.ExpireApprovals(ctx)
 	// On shutdown, wait for running Invokes, then for the executions they started to record
 	// their results: an effect left PENDING needs a person to reconcile it.
 	defer func() {
@@ -269,6 +277,8 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		Ledger:      led,
 		Budget:      bud,
 		Effects:     gw,
+		Approvals:   gw,
+		Doorbells:   doorbells,
 		Temporal:    tc,
 		Tasks:       registry,
 		TaskQueue:   cfg.TaskQueues.Workflows,
@@ -389,12 +399,42 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 		pol.Tools["github.open_draft_pr"].DenyPaths)
 	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
 	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
-	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: led})
+	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: runRecords{led}})
 	if testTools {
 		log.Warn("TEST TOOLS ENABLED: never run this outside tests")
 		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})
 	}
 	return reg, nil
+}
+
+// runRecords is what github.comment_commit reads of agentd's own record of a run: its effects'
+// results, and its approvals.
+type runRecords struct{ *ledger.Ledger }
+
+func (r runRecords) RunApprovals(ctx context.Context, workflowID string) ([]githubtool.Approval, error) {
+	rows, err := r.Ledger.RunApprovals(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]githubtool.Approval, 0, len(rows))
+	for _, a := range rows {
+		ga := githubtool.Approval{ID: a.ApprovalID, Tool: a.Tool, Status: a.Status, DecidedBy: a.DecidedBy.String,
+			DecidedAt: a.DecidedAt.String, Reason: a.Reason.String, ExpiresAt: a.ExpiresAt}
+		if a.Status == "APPROVED" {
+			// Approved, and refused or lost after: the report must not read as if it went out.
+			e, err := r.Ledger.Q.GetEffect(ctx, a.EffectID)
+			if err != nil {
+				return nil, err
+			}
+			ga.Write = map[string]string{"ABANDONED": "not sent", "DENIED": "not sent", "FAILED": "failed",
+				"UNKNOWN": "outcome unknown"}[e.Status]
+			if ga.Write != "" {
+				ga.WriteReason = e.Reason.String
+			}
+		}
+		out = append(out, ga)
+	}
+	return out, nil
 }
 
 // gitServer is how agentd runs the read-only git MCP server. Its sandbox launcher is required:

@@ -46,7 +46,7 @@ func main() {
 	budget.AddCommand(extendCmd(g))
 	reconcile := &cobra.Command{Use: "reconcile", Short: "Settle external writes whose outcome nobody knows"}
 	reconcile.AddCommand(reconcileListCmd(g), reconcileShowCmd(g), reconcileResolveCmd(g))
-	root.AddCommand(runs, budget, reconcile)
+	root.AddCommand(runs, budget, reconcile, approvalsCmd(g))
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))
@@ -317,7 +317,8 @@ func reconcileResolveCmd(g *globals) *cobra.Command {
 		Short: "Say whether an external write happened; the run then carries on",
 		Long: "--executed records the write as done, with what it produced (--result), or with what\n" +
 			"agentd finds when it looks (--lookup, for tools that can look). --not-executed has the\n" +
-			"run send it again under its original idempotency key, or drop it if the run was cancelled.",
+			"run send it again under its original idempotency key; it is dropped instead if the run was\n" +
+			"cancelled or has ended, or if the write's approval has run out by then.",
 		Example: "  agentctl reconcile resolve 3c1f... --executed --result '{\"written\": true}'\n" +
 			"  agentctl reconcile resolve 3c1f... --not-executed",
 		Args: cobra.ExactArgs(1),
@@ -375,7 +376,7 @@ func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) er
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("control socket %s: %w (is agentd running?)", path, err)
 	}
-	conn, err := grpc.NewClient("unix://"+path, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("unix://"+path, dialOptions()...)
 	if err != nil {
 		return err
 	}
@@ -383,6 +384,16 @@ func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) er
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return fn(ctx, agentosv1.NewControlClient(conn))
+}
+
+// maxReceive is what agentctl takes in one answer: an approval card holds the whole payload, a
+// pull request's up to 20 files of 1 MiB, larger still once its text is escaped. gRPC's default
+// of 4 MiB would leave such an approval impossible to read, and so to decide.
+const maxReceive = 512 << 20
+
+func dialOptions() []grpc.DialOption {
+	return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxReceive))}
 }
 
 func printRun(g *globals, r *agentosv1.Run) error {

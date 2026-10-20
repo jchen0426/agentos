@@ -3,28 +3,28 @@ a workflow cannot get out of a cancel by ignoring it (section 6)."""
 
 from temporalio.api.enums.v1 import EventType
 
-from tests.harness import TERMINAL, TEST_POLICY, Stack, wait_for
-
-# The design doc's own rule for opening the PR: approval required. M1 has no approvals
-# table, so the run waits in WAITING_APPROVAL until someone cancels it.
-APPROVAL_POLICY = TEST_POLICY.replace(
-    "github.open_draft_pr:  {decision: allow,",
-    "github.open_draft_pr:  {decision: require_approval,",
-)
+from tests.harness import TERMINAL, Stack, approval_policy, wait_for
 
 
 def test_cancel_while_waiting_for_approval_posts_no_report(stack: Stack) -> None:
-    assert APPROVAL_POLICY != TEST_POLICY
-    stack.start_agentd(policy=APPROVAL_POLICY)
+    # The design doc's own rule for opening the PR: approval required. Nobody decides, and
+    # someone cancels the run instead.
+    stack.start_agentd(policy=approval_policy())
     stack.start_worker()
     run = stack.start_run()
     stack.wait_state(run, {"WAITING_APPROVAL"})
+    item = stack.wait_approval(run)
     assert stack.external(run, "github.open_draft_pr") == []  # nothing was opened
 
     cancelled = stack.agentctl("runs", "cancel", run["run_id"])
     assert cancelled["run_id"] == run["run_id"]
     assert stack.wait_state(run, {"CANCELLED", "SUCCEEDED", "FAILED"})["state"] == "CANCELLED"
     assert stack.external(run, "github.comment_commit") == []
+    # Nothing a cancelled run asks for goes out: its approval waits for nobody, and takes no decision.
+    assert stack.approvals() == []
+    late = stack.agentctl_run("approvals", "approve", item["id"], "--payload-sha256", item["payload_sha256"])
+    assert late.returncode != 0 and "cancelled" in late.stderr, late.stderr
+    assert stack.external(run, "github.open_draft_pr") == []
 
 
 def test_cancel_is_enforced_when_the_workflow_ignores_it(stack: Stack) -> None:
