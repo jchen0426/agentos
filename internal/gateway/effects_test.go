@@ -28,6 +28,9 @@ type writer struct {
 	err     error         // what Execute returns, once sent
 	deny    string        // when set, Execute refuses the payload before it sends anything
 	unsent  bool          // when set, Execute fails before it sends anything (ErrNotSent)
+	// When set, Execute asks to proceed and then fails with it, making nothing: a write of several
+	// requests whose first went out, and whose next did nothing (a retryable refusal).
+	after error
 }
 
 var noArgs = tools.MustSchema(`{"type": "object"}`)
@@ -56,6 +59,9 @@ func (w *writer) Execute(ctx context.Context, _ json.RawMessage, _ string, proce
 	}
 	if err := proceed(ctx); err != nil {
 		return nil, err
+	}
+	if w.after != nil {
+		return nil, w.after
 	}
 	w.sent.Add(1)
 	if w.err != nil {

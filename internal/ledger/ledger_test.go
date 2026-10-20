@@ -263,6 +263,48 @@ func TestOpenTakesTheMigrationsOfAnOlderLedgerAsItsOwn(t *testing.T) {
 	wantRefused(t, err, path, seventh)
 }
 
+// An earlier agentd gave back an idempotent effect without a lookup, as it could do no other: it
+// may have taken effect, and migration 8 says so. A lookup write it gave back had been found never
+// to have taken effect, and one never claimed never went out.
+func TestMigration8MarksAnIdempotentEffectGivenBackAsMaybeSent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	this := thisAgentd(t)
+	migrateUnrecorded(t, path, upTo(t, this, 7))
+	effect := func(id, class, status, claimedBy string, version int) string {
+		return fmt.Sprintf(`INSERT INTO effects (effect_id, workflow_id, tool, effect_class, payload_sha256,
+			idempotency_key, status, created_at, updated_at, claimed_by, version)
+			VALUES ('%s', 'wf', 'test.write', '%s', 'x', 'k', '%s', 'now', 'now', %s, %d)`, id, class, status, claimedBy, version)
+	}
+	execSQL(t, path,
+		effect("given-back", "idempotent", "PENDING", "NULL", 2),
+		effect("never-claimed", "idempotent", "PENDING", "NULL", 0),
+		effect("looked-up", "lookup", "PENDING", "NULL", 2),
+		effect("claimed", "idempotent", "PENDING", "'gone'", 1),
+		effect("done", "idempotent", "SUCCEEDED", "NULL", 2),
+	)
+	l, err := open(t.Context(), path, this)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	rows, err := l.DB.QueryContext(t.Context(), `SELECT effect_id FROM effects WHERE maybe_sent = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var marked []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		marked = append(marked, id)
+	}
+	if err := rows.Err(); err != nil || !slices.Equal(marked, []string{"given-back"}) {
+		t.Fatalf("maybe sent: %v %v", marked, err)
+	}
+}
+
 // An agentd from before agentd recorded its migrations applied a migration 8 of its own. Nothing
 // says which file that was, so this agentd cannot tell it from its own 8. Migrations up to 7 are
 // all there were before the records: 8 is the first that must have one, whatever this agentd has.

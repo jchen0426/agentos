@@ -68,13 +68,14 @@ SELECT CAST(COUNT(*) AS INTEGER) FROM effects
 WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED');
 
 -- name: ReleaseEffect :execrows
--- Returns a claimed effect whose request never took effect, or an idempotent one that may have, for
--- a later attempt to send (under its key). maybe_sent stays: what went out went out.
+-- Returns a claimed effect for a later attempt to send under its key, as it was: one an attempt
+-- may have made (maybe_sent) stays in flight.
 UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING';
 
 -- name: ReleaseUnsentEffect :execrows
--- Returns a claimed effect a lookup found never took effect: as far as it goes, nothing went out.
+-- Returns a claimed effect that never took effect, as far as agentd knows: a lookup found nothing,
+-- or the only attempt that could have made it did nothing.
 UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = 0, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING';
 
@@ -211,7 +212,7 @@ WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NUL
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
 -- name: AbandonUnclaimedEffect :execrows
--- A PENDING effect nothing of which went out is never sent: its approval's time ran out first.
+-- A PENDING effect that never took effect is never sent: its approval's time ran out first.
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0;
 
@@ -265,7 +266,8 @@ UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, 
 WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL;
 
 -- name: ExpireUsedApproval :execrows
--- An approval whose write had not gone out when its time was up: void too, as nothing is in flight.
+-- An approval whose write had not taken effect when its time was up: void too, as nothing is in
+-- flight.
 UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
 WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NOT NULL;
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.temporal.io/sdk/temporal"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/faults"
@@ -753,11 +754,12 @@ func TestTheRecordingLockIsTheRunsAlone(t *testing.T) {
 	}
 }
 
-// An approval holds until its write goes out, not only until the run acts on it: an approved
-// write nothing of which went out when the approval's time runs out (agentd stopped right after
-// it moved the write to PENDING, or the tool sent nothing) is not sent, as a rejection. One that
-// may have gone out is in flight, and is sent again under its key whatever the time.
-func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
+// An approval holds until its write takes effect, not only until the run acts on it: an approved
+// write that had not when the approval's time runs out (agentd stopped right after it moved the
+// write to PENDING, or the tool sent nothing, or made one request of several and then nothing) is
+// not sent, as a rejection. One that may have taken effect is in flight, and is sent again under
+// its key whatever the time.
+func TestAnApprovedWriteThatHadNotTakenEffectExpires(t *testing.T) {
 	approve := func(f *fixture, w tools.Writer, args map[string]any) db.Approval {
 		t.Helper()
 		if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
@@ -783,7 +785,7 @@ func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 	if a = f.one(t); a.Status != approvalExpired || !strings.Contains(a.Reason.String, "approved by bob") ||
-		!strings.Contains(a.Reason.String, "had not gone out") {
+		!strings.Contains(a.Reason.String, "had not taken effect") {
 		t.Fatalf("approval %+v", a)
 	}
 	if e := effectOf(t, f, a); e.Status != effectAbandoned {
@@ -803,8 +805,23 @@ func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 		t.Fatalf("given back unsent: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 
-	// A write that may have gone out (the tool said a request went out, then it was given back, as
-	// a retry or a recovery does): in flight, sent again under its key after the approval's time.
+	// The tool made one request of several (a branch), and the next did nothing (GitHub refused the
+	// pull request for now): the write never took effect, and is not sent past its approval's time.
+	p := newFixture(t, false)
+	w = &writer{class: policy.EffectLookup, after: &tools.RefusedError{Reason: "rate limited", Retryable: true}}
+	approve(p, w, args)
+	if _, err := p.ask(t, w, args, 1, time.Hour); err == nil {
+		t.Fatal("the refused write did not fail the call")
+	}
+	w.after = nil
+	time.Sleep(400 * time.Millisecond)
+	if res, err := p.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+		t.Fatalf("one request of several: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+
+	// A write that may have taken effect (the tool said a request went out, then it was given back,
+	// as a recovery of an idempotent write does): in flight, sent again under its key after the
+	// approval's time.
 	h := newFixture(t, false)
 	iw := &writer{class: policy.EffectIdempotent}
 	a = approve(h, iw, args)
@@ -904,48 +921,124 @@ func TestACancelledRunsWriteIsNotHeld(t *testing.T) {
 	}
 }
 
+// approvedThenClaimedElsewhere records the fixture's call of w, which rule wants approved; has a
+// reviewer approve it, and the next call move it to PENDING; and has an agentd that is gone claim
+// it and send a request: what recovery finds. It returns the call.
+func (f *fixture) approvedThenClaimedElsewhere(t *testing.T, w tools.Writer, rule *approvalRule) func() (*agentosv1.Result, error) {
+	t.Helper()
+	req := f.req()
+	canon, _ := encodeCanonical(req.Args)
+	ask := func() (*agentosv1.Result, error) {
+		return f.g.effect(context.Background(), f.run, w, w.Class(), 1, rule, req, canon, faults.Effect{})
+	}
+	if _, err := ask(); err != nil {
+		t.Fatal(err)
+	}
+	a := f.one(t)
+	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
+		t.Fatalf("approved: %v %v", res, err)
+	}
+	if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = 'gone', claimed_at = ?, maybe_sent = 1,
+		version = version + 1 WHERE effect_id = ?`, ledger.Now(), req.EffectID); err != nil {
+		t.Fatal(err)
+	}
+	return ask
+}
+
 // An approved write claimed by an agentd that is gone, which may have gone out: recovery sends a
 // lookup write again only within its approval's time (a lookup that finds nothing makes the resend
-// a new send), and an idempotent one whatever the time (it cannot be looked up: it is in flight).
+// a new request), and an idempotent one whatever the time (it cannot be looked up: it is in flight).
 func TestRecoveryOfAnApprovedWriteAfterItsApprovalExpired(t *testing.T) {
-	for class, want := range map[string]string{policy.EffectLookup: StatusExpired, policy.EffectIdempotent: StatusOK} {
+	t.Run("lookup", func(t *testing.T) {
+		f := newFixture(t, false)
+		w := &finder{writer: writer{class: policy.EffectLookup}}
+		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+		time.Sleep(400 * time.Millisecond)
+		// The lookup finds nothing: the effect goes back, and the next call voids the approval.
+		if _, err := ask(); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
+			t.Fatalf("recovery: %v, sent %d", err, w.sent.Load())
+		}
+		if res, err := ask(); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+			t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+		}
+	})
+	t.Run("idempotent", func(t *testing.T) {
+		f := newFixture(t, false)
+		w := &finder{writer: writer{class: policy.EffectIdempotent}}
+		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+		time.Sleep(400 * time.Millisecond)
+		// In flight: recovery sends it again under its key, there and then.
+		if res, err := ask(); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+			t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+		}
+	})
+}
+
+// A resend that does nothing leaves the write as it was before it: an idempotent one, which an
+// earlier attempt may have made, stays in flight and goes out again under its key past its
+// approval's time; a lookup one, which recovery found never took effect before it sent it again,
+// never took effect, and expires.
+func TestAResendThatDoesNothing(t *testing.T) {
+	for class, want := range map[string]string{policy.EffectIdempotent: StatusOK, policy.EffectLookup: StatusExpired} {
 		t.Run(class, func(t *testing.T) {
 			f := newFixture(t, false)
-			w := &finder{writer: writer{class: class}}
-			req := f.req()
-			canon, _ := encodeCanonical(req.Args)
-			rule := &approvalRule{ttl: 300 * time.Millisecond}
-			ask := func() (*agentosv1.Result, error) {
-				return f.g.effect(context.Background(), f.run, w, w.Class(), 1, rule, req, canon, faults.Effect{})
+			w := &finder{writer: writer{class: class, unsent: true}}
+			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+			if _, err := ask(); err == nil || errors.Is(err, errEffectReleased) {
+				t.Fatalf("the resend that did nothing: %v", err)
 			}
-			if _, err := ask(); err != nil {
-				t.Fatal(err)
-			}
-			a := f.one(t)
-			if _, err := f.decide(t, a, Decision{Kind: DecisionApprove}); err != nil {
-				t.Fatal(err)
-			}
-			if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
-				t.Fatalf("approved: %v %v", res, err)
-			}
-			// An agentd that is gone claimed it and sent a request.
-			if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = 'gone', claimed_at = ?, maybe_sent = 1,
-				version = version + 1 WHERE effect_id = ?`, ledger.Now(), req.EffectID); err != nil {
-				t.Fatal(err)
-			}
+			w.unsent = false
 			time.Sleep(400 * time.Millisecond)
-			var res *agentosv1.Result
-			var err error
-			for range 3 { // recovery gives it back first, as the next attempt would find it
-				if res, err = ask(); !errors.Is(err, errEffectReleased) {
-					break
-				}
-			}
-			if err != nil || res.GetStatus() != want {
+			res, err := ask()
+			if err != nil || res.GetStatus() != want || (want == StatusOK) != (w.sent.Load() == 1) {
 				t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 			}
-			if sent := w.sent.Load(); (want == StatusOK) != (sent == 1) {
-				t.Fatalf("sent %d", sent)
+		})
+	}
+}
+
+// Recovery sends a write a lookup found nothing of again only once the old request can no longer
+// take effect. An approval whose time ran out during that wait does not allow the new request:
+// the effect goes back, and the next call voids the approval.
+func TestAnApprovalThatRunsOutWhileRecoveryWaits(t *testing.T) {
+	f := newFixture(t, false)
+	w := &finder{writer: writer{class: policy.EffectLookup}, settle: time.Second}
+	ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 500 * time.Millisecond})
+	if _, err := ask(); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
+		t.Fatalf("recovery past the approval's time: %v, sent %d", err, w.sent.Load())
+	}
+	if res, err := ask(); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+}
+
+// A PENDING effect whose approval is anything but approved and used cannot be: the approval moves
+// it to PENDING. Should a ledger hold one, nothing sends it, neither a call nor a recovery: the
+// call fails for good.
+func TestAnEffectWithABadApprovalIsNotSent(t *testing.T) {
+	for _, claimed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("claimed %v", claimed), func(t *testing.T) {
+			f := newFixture(t, false)
+			w := &finder{writer: writer{class: policy.EffectIdempotent}}
+			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: time.Hour})
+			if _, err := f.g.Ledger.DB.Exec(`UPDATE approvals SET status = 'REJECTED', reason = 'no'`); err != nil {
+				t.Fatal(err)
+			}
+			if !claimed {
+				if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = NULL, claimed_at = NULL`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var app *temporal.ApplicationError
+			res, err := ask()
+			if claimed && errors.Is(err, errEffectReleased) { // recovery only gives it back
+				res, err = ask()
+			}
+			if !errors.As(err, &app) || app.Type() != "BadApproval" || !app.NonRetryable() || w.sent.Load() != 0 {
+				t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 			}
 		})
 	}

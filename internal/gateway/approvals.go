@@ -21,7 +21,6 @@ import (
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/outbox"
 	"github.com/jchen0426/agentos/internal/patch"
-	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
 )
 
@@ -302,15 +301,16 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 
 // gate decides whether a PENDING effect nobody has claimed, of a write the policy wants approved,
 // may go out now. It returns no result when it may.
-//   - A request of it may have gone out (the tool said one went out, and it was given back without
-//     a lookup that found nothing: a retry, an idempotent recovery): it is in flight. With its
-//     approval it goes on, sent again under its key, whatever the approval's time. Without one (sent
-//     before the policy asked), sending it again could make a write nobody approved, and asking for
-//     an approval could "reject" a write that happened: a person settles it (UNKNOWN).
-//   - Nothing of it went out, and its approval is approved and used (it moved the effect to
-//     PENDING): it goes, unless the approval's time ran out first; then the approval is void, as a
-//     rejection.
-//   - Nothing of it went out, and it has no approval: recorded before the policy asked (a policy
+//   - It may have taken effect (maybe_sent): it is in flight. Only an idempotent write is given back
+//     so, which recovery could not look up; anything else is given back only once a lookup found it
+//     never took effect, or an attempt with none before it did nothing. With its approval it goes
+//     on, sent again under its key, whatever the approval's time. Without one (sent before the
+//     policy asked), sending it again could make a write nobody approved, and asking for an approval
+//     could "reject" a write that happened: a person settles it (UNKNOWN).
+//   - It never took effect, and its approval is approved and used (it moved the effect to PENDING):
+//     it goes, unless the approval's time ran out first; then the approval is void, as a rejection.
+//     A write of several requests may have made some (a branch, for a pull request never opened).
+//   - It never took effect, and it has no approval: recorded before the policy asked (a policy
 //     changed across a restart), or while its tool could only dry-run. It waits for one, made now,
 //     in one transaction with its move back to AWAITING_APPROVAL; the call answers needs_approval.
 func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, rule *approvalRule,
@@ -364,11 +364,11 @@ func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 	return result(StatusNeedsApproval, map[string]any{"approval_id": na.ApprovalID, "expires_at": na.ExpiresAt})
 }
 
-// expireUnsent voids the used approval of an effect that never went out before the approval's time
-// ran out, and abandons the effect, in one transaction.
+// expireUnsent voids the used approval of an effect that had not taken effect when the approval's
+// time ran out, and abandons the effect, in one transaction.
 func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) (*agentosv1.Result, error) {
-	reason := fmt.Sprintf("approved by %s at %s, but the write had not gone out when the approval expired at %s",
-		a.DecidedBy.String, a.DecidedAt.String, a.ExpiresAt)
+	reason := fmt.Sprintf("approved by %s at %s, but the write had not taken effect when the approval expired at %s; "+
+		"agentd sends no more of it", a.DecidedBy.String, a.DecidedAt.String, a.ExpiresAt)
 	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
 		now := ledger.Now()
 		if n, err := q.ExpireUsedApproval(ctx, db.ExpireUsedApprovalParams{
@@ -395,9 +395,10 @@ func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) 
 // mayResend says whether recovery may send a claimed effect again, which may never have gone out:
 // always, unless the policy wants it approved. Then only with its approval, approved and used: an
 // idempotent write, which cannot be looked up, is in flight whatever the approval's time; one a
-// lookup finds never took effect is a new send, and needs the approval in its time. Otherwise
-// recovery only looks, and an effect it gives back meets gate on the next call: one found never to
-// have taken effect, an expired approval or none; an idempotent one that may be out, a person.
+// lookup finds never took effect is a new request, sent only in the approval's time (recoverEffect
+// looks at it then). Otherwise recovery only looks, and an effect it gives back meets gate on the
+// next call: one found never to have taken effect, an expired approval or none; an idempotent one
+// that may be out, a person.
 func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule) (bool, error) {
 	if rule == nil {
 		return true, nil
@@ -409,7 +410,19 @@ func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule
 	case err != nil:
 		return false, err
 	}
-	return a.Status == approvalApproved && a.UsedAt.Valid && (e.EffectClass == policy.EffectIdempotent || !expired(a)), nil
+	return a.Status == approvalApproved && a.UsedAt.Valid, nil
+}
+
+// lapsed reports whether an effect has an approval, and its time is up.
+func (g *Gateway) lapsed(ctx context.Context, effectID string) (bool, error) {
+	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, effectID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return expired(a), nil
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the

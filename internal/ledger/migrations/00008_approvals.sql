@@ -33,12 +33,18 @@ CREATE TABLE approvals (
 );
 CREATE INDEX approvals_pending ON approvals (expires_at) WHERE status = 'PENDING';
 CREATE INDEX approvals_by_run ON approvals (workflow_id, tool);
--- Whether a request of an effect may have reached the outside world: set when the tool says a
--- visible request goes out (proceed); cleared when a lookup found the write never took effect, or a
--- person found it never happened. An approval's time, and an approval it never had, matter only
--- while it is clear: a write that may be out is in flight, recovered by its class, or settled by a
--- person.
+-- Whether an effect may have taken effect: set when the tool says a visible request goes out
+-- (proceed); cleared when that is known not to be so: a lookup found nothing, the only attempt that
+-- could have made it did nothing, or a person found it never happened. An approval's time, and an
+-- approval it never had, matter only while it is clear: a write that may have taken effect is in
+-- flight, recovered by its class, or settled by a person. A write of several requests may have
+-- made some of them without taking effect (a branch, for a pull request never opened).
 ALTER TABLE effects ADD COLUMN maybe_sent INTEGER NOT NULL DEFAULT 0;
+-- An earlier agentd gave back an idempotent effect it could not look up, unsettled: one claimed
+-- before (its version moved on) and unclaimed now may have taken effect. Anything else it gave
+-- back had been found never to have.
+UPDATE effects SET maybe_sent = 1
+WHERE status = 'PENDING' AND claimed_by IS NULL AND effect_class = 'idempotent' AND version > 0;
 
 -- Doorbells to deliver (design doc, section 10): each written in the same transaction as the
 -- change that should wake the run, and signalled until Temporal has it, or the run has ended.

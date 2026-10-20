@@ -317,7 +317,8 @@ func reconcileResolveCmd(g *globals) *cobra.Command {
 		Short: "Say whether an external write happened; the run then carries on",
 		Long: "--executed records the write as done, with what it produced (--result), or with what\n" +
 			"agentd finds when it looks (--lookup, for tools that can look). --not-executed has the\n" +
-			"run send it again under its original idempotency key, or drop it if the run was cancelled.",
+			"run send it again under its original idempotency key; it is dropped instead if the run was\n" +
+			"cancelled or has ended, or if the write's approval has run out by then.",
 		Example: "  agentctl reconcile resolve 3c1f... --executed --result '{\"written\": true}'\n" +
 			"  agentctl reconcile resolve 3c1f... --not-executed",
 		Args: cobra.ExactArgs(1),

@@ -156,8 +156,10 @@ bin/agentctl reconcile list
 bin/agentctl reconcile resolve <effect-id> --not-executed
 ```
 
-`--executed --result '{...}'` records what the write produced instead, and `--executed --lookup`
-lets agentd look it up for tools that can.
+`--not-executed` has the run send the write again under its original idempotency key, unless the
+run has ended or the write's approval has run out by then. `--executed --result '{...}'` records
+what the write produced instead, and `--executed --lookup` lets agentd look it up for tools that
+can.
 
 To send the audit to Claude instead of the fake model, store an API key in the login keychain
 (the command asks for it, so it stays out of your shell history), then start agentd with

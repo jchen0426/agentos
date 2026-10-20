@@ -396,14 +396,13 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 		// The tool refused the recorded payload before sending anything: it never will be.
 		return g.settle(ctx, e, effectDenied, nil, denied.Reason)
 	case errors.Is(err, tools.ErrNotSent) || errors.As(err, &refused) && refused.Retryable:
-		// Nothing happened outside. A cancelled run's effect is done with; anyone else's goes
-		// back for a later attempt.
+		// This attempt did nothing outside. A cancelled run's effect is done with; anyone else's goes
+		// back for a later attempt: as one that never took effect, unless an earlier attempt may
+		// have (e is as it was when this one began).
 		if cancelled, cerr := g.runCancelled(ctx, run.WorkflowID); cerr == nil && cancelled {
 			return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
 		}
-		if _, rerr := g.Ledger.Q.ReleaseEffect(ctx, db.ReleaseEffectParams{
-			UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
-		}); rerr != nil {
+		if _, rerr := g.giveBack(ctx, e, e.MaybeSent == 0); rerr != nil {
 			g.Log.Error("could not release an unsent effect", "effect_id", e.EffectID, "error", rerr)
 		}
 		return nil, temporal.NewApplicationError(fmt.Sprintf("tool %s: %v", t.Name(), err), "ToolNotSent")
@@ -416,8 +415,8 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 	return g.recoverEffect(ctx, run, t, e, payload, err.Error(), true)
 }
 
-// errEffectReleased is retryable: the effect never went out, and the next attempt sends it.
-var errEffectReleased = temporal.NewApplicationError("the effect never went out; the next attempt sends it", "EffectReleased")
+// errEffectReleased is retryable: the effect was given back, and the run's next call takes it up.
+var errEffectReleased = temporal.NewApplicationError("the effect was given back for the run's next call", "EffectReleased")
 
 // recoverEffect settles an effect whose request may have gone out, by the class it was
 // recorded under (section 6): an idempotent tool sends again under the same key; a lookup
@@ -479,27 +478,44 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	case !mayResend:
 		return g.release(ctx, e, true)
 	}
+	// Sent again, it is a new request, which an approval allows only in its time: past it, the
+	// effect goes back to gate, which voids the approval.
+	if lapsed, err := g.lapsed(ctx, e.EffectID); err != nil {
+		return nil, err
+	} else if lapsed {
+		return g.release(ctx, e, true)
+	}
+	e.MaybeSent = 0 // no earlier request took effect: only the next one can
 	return g.resend(ctx, run, t, e, payload)
 }
 
 // release gives back a claimed effect for the run's next call: one a lookup found never took
-// effect (unsent), or an idempotent one that may have, which the next call sends again under its key.
+// effect (unsent), or an idempotent one that may have, which the next call sends again under its
+// key, or a person settles.
 func (g *Gateway) release(ctx context.Context, e db.Effect, unsent bool) (*agentosv1.Result, error) {
-	release := g.Ledger.Q.ReleaseEffect
-	if unsent {
-		release = func(ctx context.Context, p db.ReleaseEffectParams) (int64, error) {
-			return g.Ledger.Q.ReleaseUnsentEffect(ctx, db.ReleaseUnsentEffectParams(p))
-		}
-	}
-	n, err := release(ctx, db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version})
+	n, err := g.giveBack(ctx, e, unsent)
 	if err != nil {
 		return nil, err
 	}
 	if n == 0 {
 		return nil, errEffectBusy
 	}
-	g.Log.Info("the request never took effect; the run's next call sends it", "workflow_id", e.WorkflowID, "effect_id", e.EffectID)
+	if unsent {
+		g.Log.Info("the request never took effect; the run's next call sends it", "workflow_id", e.WorkflowID, "effect_id", e.EffectID)
+	} else {
+		g.Log.Info("the request may have taken effect; the run's next call takes it up", "workflow_id", e.WorkflowID, "effect_id", e.EffectID)
+	}
 	return nil, errEffectReleased
+}
+
+// giveBack releases a claimed effect. Unsent, it is one that never took effect, as far as agentd
+// knows: no attempt so far did. Otherwise an attempt may have, and the effect stays in flight.
+func (g *Gateway) giveBack(ctx context.Context, e db.Effect, unsent bool) (int64, error) {
+	p := db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version}
+	if unsent {
+		return g.Ledger.Q.ReleaseUnsentEffect(ctx, db.ReleaseUnsentEffectParams(p))
+	}
+	return g.Ledger.Q.ReleaseEffect(ctx, p)
 }
 
 // resend claims e again and sends it under its original key.

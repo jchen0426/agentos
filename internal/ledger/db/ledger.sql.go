@@ -42,7 +42,7 @@ type AbandonUnclaimedEffectParams struct {
 	Version   int64
 }
 
-// A PENDING effect nothing of which went out is never sent: its approval's time ran out first.
+// A PENDING effect that never took effect is never sent: its approval's time ran out first.
 func (q *Queries) AbandonUnclaimedEffect(ctx context.Context, arg AbandonUnclaimedEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, abandonUnclaimedEffect,
 		arg.Reason,
@@ -254,7 +254,8 @@ type ExpireUsedApprovalParams struct {
 	ApprovalID string
 }
 
-// An approval whose write had not gone out when its time was up: void too, as nothing is in flight.
+// An approval whose write had not taken effect when its time was up: void too, as nothing is in
+// flight.
 func (q *Queries) ExpireUsedApproval(ctx context.Context, arg ExpireUsedApprovalParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, expireUsedApproval, arg.DecidedAt, arg.Reason, arg.ApprovalID)
 	if err != nil {
@@ -1577,8 +1578,8 @@ type ReleaseEffectParams struct {
 	Version   int64
 }
 
-// Returns a claimed effect whose request never took effect, or an idempotent one that may have, for
-// a later attempt to send (under its key). maybe_sent stays: what went out went out.
+// Returns a claimed effect for a later attempt to send under its key, as it was: one an attempt
+// may have made (maybe_sent) stays in flight.
 func (q *Queries) ReleaseEffect(ctx context.Context, arg ReleaseEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, releaseEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
 	if err != nil {
@@ -1598,7 +1599,8 @@ type ReleaseUnsentEffectParams struct {
 	Version   int64
 }
 
-// Returns a claimed effect a lookup found never took effect: as far as it goes, nothing went out.
+// Returns a claimed effect that never took effect, as far as agentd knows: a lookup found nothing,
+// or the only attempt that could have made it did nothing.
 func (q *Queries) ReleaseUnsentEffect(ctx context.Context, arg ReleaseUnsentEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, releaseUnsentEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
 	if err != nil {
