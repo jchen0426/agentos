@@ -556,6 +556,27 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 	return i, err
 }
 
+const holdForApproval = `-- name: HoldForApproval :execrows
+UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+`
+
+type HoldForApprovalParams struct {
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// A PENDING effect nobody claimed, recorded before the policy asked for approval: it waits for
+// a person now.
+func (q *Queries) HoldForApproval(ctx context.Context, arg HoldForApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, holdForApproval, arg.UpdatedAt, arg.EffectID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const insertApproval = `-- name: InsertApproval :exec
 INSERT INTO approvals (
   approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status,

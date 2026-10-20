@@ -80,3 +80,29 @@ func TestText(t *testing.T) {
 		}
 	}
 }
+
+// Printable runes that show as nothing: a model could name a parameter with one, and a reviewer
+// would see a space. They are escaped like the rest.
+func TestBlankRunesAreEscaped(t *testing.T) {
+	for _, r := range []rune{0x3164, 0x115f, 0x1160, 0xffa0, 0x2800, 0xfe0f, 0x034f, 0xe0100} {
+		in := "def f(conn, name, " + string(r) + "=None):"
+		if got := Line(in); strings.ContainsRune(got, r) {
+			t.Errorf("Line kept %U: %q", r, got)
+		}
+		if got := Text(in + "\n"); strings.ContainsRune(got, r) || !strings.HasSuffix(got, "\n") {
+			t.Errorf("Text kept %U: %q", r, got)
+		}
+		b, _ := json.Marshal(map[string]string{"x": in})
+		out := JSON(b)
+		if strings.ContainsRune(string(out), r) {
+			t.Errorf("JSON kept %U: %s", r, out)
+		}
+		var back map[string]string
+		if err := json.Unmarshal(out, &back); err != nil || back["x"] != in {
+			t.Errorf("JSON changed the value: %s", out)
+		}
+	}
+	if got := Line("中文 ✅ é"); got != "中文 ✅ é" {
+		t.Errorf("Line(%q) = %q", "中文 ✅ é", got)
+	}
+}

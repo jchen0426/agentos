@@ -44,7 +44,14 @@ type Approval struct {
 	DecidedAt string
 	Reason    string // a rejection's reason, or why it expired
 	ExpiresAt string
+	// Unsent says why agentd did not send an approved write (the payload changed, the run was
+	// cancelled): its effect was abandoned. Empty otherwise.
+	Unsent string
 }
+
+// maxApprovalLines bounds the approvals the report names outside its fence: GitHub takes 65,536
+// characters, and the fenced text has its own bound.
+const maxApprovalLines = 20
 
 var commentArgs = tools.MustSchema(`{
   "type": "object", "additionalProperties": false, "required": ["repo", "commit", "outcome"],
@@ -173,8 +180,16 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 	if pr > 0 {
 		fmt.Fprintf(&b, "A draft pull request proposes a fix: #%d\n\n", pr)
 	}
-	for _, a := range approvals {
-		fmt.Fprintf(&b, "Approval of %s: %s\n\n", a.Tool, strings.ToLower(a.Status))
+	for i, a := range approvals {
+		if i == maxApprovalLines {
+			fmt.Fprintf(&b, "And %d approvals more\n\n", len(approvals)-i)
+			break
+		}
+		status := strings.ToLower(a.Status)
+		if a.Unsent != "" {
+			status += ", not sent"
+		}
+		fmt.Fprintf(&b, "Approval of %s: %s\n\n", a.Tool, status)
 	}
 	// The workflow's outcome may carry a long error: cut it rather than refuse the report.
 	if len(outcome) > maxOutcome {
@@ -197,6 +212,9 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 				fmt.Fprintf(&text, " (edited by %s at %s)", a.DecidedBy, a.DecidedAt)
 			default:
 				fmt.Fprintf(&text, " by %s at %s", a.DecidedBy, a.DecidedAt)
+			}
+			if a.Unsent != "" {
+				fmt.Fprintf(&text, "; not sent: %s", a.Unsent)
 			}
 		}
 	}

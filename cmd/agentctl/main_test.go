@@ -2,13 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/budget"
+	"github.com/jchen0426/agentos/internal/control"
+	"github.com/jchen0426/agentos/internal/ledger"
+	"github.com/jchen0426/agentos/internal/ledger/db"
 )
 
 // A failed run whose failure message the Worker wrote to rewrite the screen and forge a line.
@@ -111,5 +123,66 @@ func TestApprovalCardShowsTheirTextInert(t *testing.T) {
 	}
 	if statuses != 1 || !strings.Contains(out, "      +++ b/x\n") || !strings.Contains(out, "agentctl approvals approve a1 --payload-sha256 "+a.PayloadSha256) {
 		t.Fatalf("card:\n%s", out)
+	}
+}
+
+// One approval's payload can be far larger than gRPC's default of 4 MiB (a pull request's runs to
+// 20 files of 1 MiB, more once escaped). It must neither keep the queue from being listed nor
+// keep its own card from being read: without the card, nobody can decide it.
+func TestALargeApprovalStaysReadable(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("/tmp", "agentctl-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	led, err := ledger.Open(ctx, filepath.Join(dir, "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { led.Close() })
+	if err := led.Q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "wf", Task: "t", ParamsJson: "{}", BudgetLimitMicros: 1,
+		CreatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"content": strings.Repeat("\x00", 1<<20)}) // 6 MiB once escaped
+	ref, err := led.PutBlob(ctx, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := strings.TrimPrefix(ref, "sha256:")
+	card, _ := led.PutBlob(ctx, []byte(`{}`))
+	if _, err := led.Q.InsertEffect(ctx, db.InsertEffectParams{EffectID: "e", WorkflowID: "wf", Tool: "github.open_draft_pr",
+		EffectClass: "lookup", PayloadSha256: sum, PayloadBlob: sql.NullString{String: ref, Valid: true}, IdempotencyKey: "k",
+		Status: "AWAITING_APPROVAL", CreatedAt: ledger.Now(), UpdatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := led.Q.InsertApproval(ctx, db.InsertApprovalParams{ApprovalID: "a", EffectID: "e", WorkflowID: "wf",
+		Tool: "github.open_draft_pr", ArgsJson: "{}", PayloadSha256: sum, ContextBlob: card, CreatedAt: ledger.Stamp(time.Now()),
+		ExpiresAt: ledger.Stamp(time.Now().Add(time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "c.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	agentosv1.RegisterControlServer(srv, &control.Server{Ledger: led, Budget: &budget.Budget{Ledger: led}})
+	go srv.Serve(ln)
+	t.Cleanup(srv.Stop)
+	conn, err := grpc.NewClient("unix://"+sock, dialOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	c := agentosv1.NewControlClient(conn)
+	list, err := c.ListPending(ctx, &agentosv1.ListPendingRequest{})
+	if err != nil || len(list.GetItems()) != 1 || list.GetItems()[0].GetPayloadSha256() != sum {
+		t.Fatalf("list: %v %v", list, err)
+	}
+	a, err := c.GetApproval(ctx, &agentosv1.GetApprovalRequest{ApprovalId: "a"})
+	if err != nil || len(a.GetPayloadJson()) < 6<<20 {
+		t.Fatalf("show: %d bytes, %v", len(a.GetPayloadJson()), err)
 	}
 }

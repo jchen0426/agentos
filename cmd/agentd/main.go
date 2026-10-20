@@ -418,8 +418,19 @@ func (r runRecords) RunApprovals(ctx context.Context, workflowID string) ([]gith
 	}
 	out := make([]githubtool.Approval, 0, len(rows))
 	for _, a := range rows {
-		out = append(out, githubtool.Approval{ID: a.ApprovalID, Tool: a.Tool, Status: a.Status, DecidedBy: a.DecidedBy.String,
-			DecidedAt: a.DecidedAt.String, Reason: a.Reason.String, ExpiresAt: a.ExpiresAt})
+		ga := githubtool.Approval{ID: a.ApprovalID, Tool: a.Tool, Status: a.Status, DecidedBy: a.DecidedBy.String,
+			DecidedAt: a.DecidedAt.String, Reason: a.Reason.String, ExpiresAt: a.ExpiresAt}
+		if a.Status == "APPROVED" {
+			// Approved, and refused at the last moment: the report must not read as if it went out.
+			e, err := r.Ledger.Q.GetEffect(ctx, a.EffectID)
+			if err != nil {
+				return nil, err
+			}
+			if e.Status == "ABANDONED" {
+				ga.Unsent = e.Reason.String
+			}
+		}
+		out = append(out, ga)
 	}
 	return out, nil
 }

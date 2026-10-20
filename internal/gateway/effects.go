@@ -170,6 +170,13 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 			if run.DryRun != 0 || !t.Live() {
 				return g.settle(ctx, e, effectDryRun, t.DryRun(payload), "")
 			}
+			// Recorded before the policy asked for approval, or while the tool could only dry-run:
+			// it waits for a person now, unless one approved it.
+			if rule != nil {
+				if res, err := g.holdUnapproved(ctx, run, t, e, rule, req, canon, payload); res != nil || err != nil {
+					return res, err
+				}
+			}
 			claimed, ok, err := g.claimToSend(ctx, e)
 			if err != nil {
 				return nil, err
@@ -219,8 +226,13 @@ func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class 
 	status := effectPending
 	var approval *db.InsertApprovalParams
 	if rule != nil {
-		// Before what the reviewer is shown is gathered (requests to GitHub among it): a call the
-		// run has no room for is denied below anyway, and must not cost those.
+		// What the reviewer is shown is gathered (requests to GitHub among it) only for a call the
+		// run has room for, which the transaction below counts again. One at a time for the run
+		// and tool, from that count to the record: calls with other arguments at once would each
+		// gather it first.
+		l := g.recordingLock(run.WorkflowID, t.Name())
+		l.Lock()
+		defer l.Unlock()
 		if n, err := g.writesBefore(ctx, run, t, req.EffectID, canon); err != nil {
 			return nil, err
 		} else if maxPerRun > 0 && n >= int64(maxPerRun) {

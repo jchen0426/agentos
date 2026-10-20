@@ -73,8 +73,8 @@ message PendingItem {
   string tool = 5;                  // the tool whose effect it is
   string reason = 6;                // why it waits: for a reconciliation, what is unknown
   string since = 7;                 // RFC 3339: when it started waiting
-  string payload_json = 8;          // exactly what the external system was to receive
-  string payload_sha256 = 9;        // approvals: of payload_json, which a decision names
+  string payload_json = 8;          // reconciliations: exactly what the external system was to receive
+  string payload_sha256 = 9;        // approvals: of the payload GetApproval shows, which a decision names
 }
 
 message GetApprovalRequest {

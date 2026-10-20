@@ -16,15 +16,16 @@ import (
 
 // Line returns s as one line of printable text. Every rune unicode.IsPrint rejects (controls,
 // newlines and tabs, format characters such as bidi overrides, spaces other than the ASCII
-// space) is written as a Go escape: \x1b, \n, \u202e. Invalid UTF-8 becomes U+FFFD.
+// space), and every blank one, is written as a Go escape: \x1b, \n, \u202e, \u3164. Invalid
+// UTF-8 becomes U+FFFD.
 func Line(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsPrint(r) {
+		if visible(r) {
 			b.WriteRune(r)
 			continue
 		}
-		q := strconv.QuoteRune(r)
+		q := strconv.QuoteRuneToASCII(r) // a blank rune is printable to strconv: it must be escaped all the same
 		b.WriteString(q[1 : len(q)-1])
 	}
 	return b.String()
@@ -35,11 +36,11 @@ func Line(s string) string {
 func Text(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsPrint(r) || r == '\n' || r == '\t' {
+		if visible(r) || r == '\n' || r == '\t' {
 			b.WriteRune(r)
 			continue
 		}
-		q := strconv.QuoteRune(r)
+		q := strconv.QuoteRuneToASCII(r) // a blank rune is printable to strconv: it must be escaped all the same
 		b.WriteString(q[1 : len(q)-1])
 	}
 	return b.String()
@@ -59,7 +60,7 @@ func JSON(b []byte) []byte {
 			out = append(out, byte(r))
 		case r == utf8.RuneError && n == 1:
 			out = append(out, `\ufffd`...)
-		case unicode.IsPrint(r):
+		case visible(r):
 			out = append(out, b[:n]...)
 		default:
 			out = appendEscape(out, r)
@@ -67,6 +68,20 @@ func JSON(b []byte) []byte {
 		b = b[n:]
 	}
 	return out
+}
+
+// visible reports whether r shows on a terminal as itself: printable (unicode.IsPrint), and not
+// one of the printable runes that show as nothing or as a blank, which could hide a name in a
+// model's patch (a parameter called U+3164 looks like a space): the Hangul fillers, the Braille
+// blank, a blank musical symbol, and the marks that draw nothing (variation selectors, the
+// combining grapheme joiner, Khmer inherent vowels, Mongolian free variation selectors).
+func visible(r rune) bool {
+	switch {
+	case r == 0x034f, r == 0x115f, r == 0x1160, r == 0x17b4, r == 0x17b5, r >= 0x180b && r <= 0x180d, r == 0x180f,
+		r == 0x2800, r == 0x3164, r >= 0xfe00 && r <= 0xfe0f, r == 0xffa0, r == 0x1d159, r >= 0xe0100 && r <= 0xe01ef:
+		return false
+	}
+	return unicode.IsPrint(r)
 }
 
 func appendEscape(out []byte, r rune) []byte {

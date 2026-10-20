@@ -488,8 +488,8 @@ type PendingItem struct {
 	Tool          string                 `protobuf:"bytes,5,opt,name=tool,proto3" json:"tool,omitempty"`                                        // the tool whose effect it is
 	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`                                    // why it waits: for a reconciliation, what is unknown
 	Since         string                 `protobuf:"bytes,7,opt,name=since,proto3" json:"since,omitempty"`                                      // RFC 3339: when it started waiting
-	PayloadJson   string                 `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`       // exactly what the external system was to receive
-	PayloadSha256 string                 `protobuf:"bytes,9,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"` // approvals: of payload_json, which a decision names
+	PayloadJson   string                 `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`       // reconciliations: exactly what the external system was to receive
+	PayloadSha256 string                 `protobuf:"bytes,9,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"` // approvals: of the payload GetApproval shows, which a decision names
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

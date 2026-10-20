@@ -197,6 +197,12 @@ UPDATE effects SET status = 'PENDING', version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'AWAITING_APPROVAL'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
+-- name: HoldForApproval :execrows
+-- A PENDING effect nobody claimed, recorded before the policy asked for approval: it waits for
+-- a person now.
+UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL;
+
 -- name: AbandonAwaitingEffect :execrows
 -- An effect whose approval was rejected, expired or replaced is never sent.
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?

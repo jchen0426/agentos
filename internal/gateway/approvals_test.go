@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -521,5 +522,151 @@ func TestOnlyWritesAskForApproval(t *testing.T) {
 	write := &policy.Policy{Tools: map[string]policy.Tool{"test.write": {Decision: "require_approval"}}}
 	if err := CheckTools(write, reg); err != nil {
 		t.Fatalf("a write that asks for approval: %v", err)
+	}
+}
+
+// A write the policy wants approved is never sent unapproved, whenever it was recorded: one
+// recorded PENDING before the policy asked (a policy changed across a restart, or a tool that
+// could only dry-run then), never claimed or given back unsent, waits for a person like any other.
+func TestAWriteRecordedWithoutAnApprovalWaitsForOne(t *testing.T) {
+	for name, prepare := range map[string]func(*fixture, *writer, tools.Request, []byte){
+		"recorded, then agentd stopped": func(f *fixture, w *writer, req tools.Request, canon []byte) {
+			if res, err := f.g.record(context.Background(), f.run, w, w.Class(), 1, nil, req, canon); res != nil || err != nil {
+				t.Fatalf("record: %v %v", res, err)
+			}
+		},
+		"given back unsent": func(f *fixture, w *writer, req tools.Request, canon []byte) {
+			w.err = tools.ErrNotSent
+			if _, err := f.g.effect(context.Background(), f.run, w, w.Class(), 1, nil, req, canon, faults.Effect{}); err == nil {
+				t.Fatal("an unsent write did not fail the call")
+			}
+			w.err = nil
+			w.sent.Store(0)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, false)
+			w := &writer{class: policy.EffectLookup}
+			args := map[string]any{"n": 1}
+			req, canon := call(t, w, args)
+			prepare(f, w, req, canon)
+			res, err := f.ask(t, w, args, 1, time.Hour)
+			if err != nil || res.GetStatus() != StatusNeedsApproval || w.sent.Load() != 0 {
+				t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+			}
+			a := f.one(t)
+			if e := effectOf(t, f, a); e.Status != effectAwaitingApproval || a.Status != approvalPending {
+				t.Fatalf("effect %s, approval %s", e.Status, a.Status)
+			}
+			if _, err := f.decide(t, a, Decision{Kind: DecisionApprove}); err != nil {
+				t.Fatal(err)
+			}
+			if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+				t.Fatalf("approved: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+			}
+		})
+	}
+}
+
+// describer counts the cards it describes.
+type describer struct {
+	writer
+	described atomic.Int64
+}
+
+func (d *describer) Describe(context.Context, tools.Request, json.RawMessage) map[string]any {
+	d.described.Add(1)
+	time.Sleep(20 * time.Millisecond) // as GitHub's answers would take
+	return map[string]any{}
+}
+
+// What a reviewer is shown is gathered only for a call the run has room for, even for calls that
+// come at once, each with other arguments: one card, not one per call.
+func TestCallsAtOnceGatherOneCard(t *testing.T) {
+	f := newFixture(t, false)
+	w := &describer{writer: writer{class: policy.EffectLookup}}
+	var wg sync.WaitGroup
+	statuses := make([]string, 10)
+	for i := range statuses {
+		wg.Go(func() {
+			res, err := f.ask(t, w, map[string]any{"n": i}, 1, time.Hour)
+			if err != nil {
+				t.Error(err)
+			}
+			statuses[i] = res.GetStatus()
+		})
+	}
+	wg.Wait()
+	waiting := 0
+	for _, s := range statuses {
+		if s == StatusNeedsApproval {
+			waiting++
+		}
+	}
+	if waiting != 1 || w.described.Load() != 1 {
+		t.Fatalf("%d calls wait for approval, %d cards gathered: %v", waiting, w.described.Load(), statuses)
+	}
+}
+
+// An edit back to a patch the run asked for already would send the workflow round between two
+// edited approvals: it is refused. So is an edit that came too late, and its patch is not kept
+// for the run.
+func TestAnEditBackToAnEarlierPatchIsRefused(t *testing.T) {
+	f := newFixture(t, false)
+	w := &editable{writer{class: policy.EffectLookup}}
+	f.g.Tools = tools.Registry{w.Name(): w}
+	first := "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+	firstRef := "sha256:" + sha256Hex([]byte(first))
+	if _, err := f.ask(t, w, map[string]any{"patch_ref": firstRef}, 1, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	a := f.one(t)
+	if _, err := f.decide(t, a, Decision{Kind: DecisionEdit, Patch: []byte(editedPatch)}); err != nil {
+		t.Fatal(err)
+	}
+	editedRef := "sha256:" + sha256Hex([]byte(editedPatch))
+	if res, err := f.ask(t, w, map[string]any{"patch_ref": editedRef}, 1, time.Hour); err != nil || res.GetStatus() != StatusNeedsApproval {
+		t.Fatalf("%v %v", res.GetStatus(), err)
+	}
+	var second db.Approval
+	for _, x := range f.approvals(t) {
+		if x.ApprovalID != a.ApprovalID {
+			second = x
+		}
+	}
+	if _, err := f.decide(t, second, Decision{Kind: DecisionEdit, Patch: []byte(first)}); !errors.Is(err, ErrBadDecision) {
+		t.Fatalf("an edit back to the first patch: %v", err)
+	}
+	// Too late: the first approval was decided. The patch it carried is not the run's.
+	late := "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+c\n"
+	var decided *DecidedError
+	if _, err := f.decide(t, a, Decision{Kind: DecisionEdit, Patch: []byte(late)}); !errors.As(err, &decided) {
+		t.Fatalf("an edit of a decided approval: %v", err)
+	}
+	if _, err := f.g.Ledger.GetRunBlob(context.Background(), "wf", "sha256:"+sha256Hex([]byte(late))); err == nil {
+		t.Fatal("a refused edit's patch was kept as the run's")
+	}
+}
+
+// An approval approved and then void (the run did not act on it in time) does not stand: the same
+// decision sent again is told so, and the expiry keeps who approved it in its reason.
+func TestAReplayedApprovalThatExpiredIsTold(t *testing.T) {
+	f := newFixture(t, false)
+	w := &writer{class: policy.EffectLookup}
+	if _, err := f.ask(t, w, map[string]any{"n": 1}, 1, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	a := f.one(t)
+	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove, By: "bob", Key: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if res, err := f.ask(t, w, map[string]any{"n": 1}, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired {
+		t.Fatalf("%v %v", res.GetStatus(), err)
+	}
+	var decided *DecidedError
+	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove, By: "bob", Key: "k"}); !errors.As(err, &decided) ||
+		decided.Approval.Status != approvalExpired || !strings.Contains(decided.Approval.Reason.String, "approved by bob") {
+		t.Fatalf("the replay: %v", err)
 	}
 }

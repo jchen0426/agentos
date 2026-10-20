@@ -61,6 +61,10 @@ type Tool struct {
 // as the workflow's wait for it (design doc, section 5).
 const DefaultApprovalTTL = 24 * time.Hour
 
+// MaxApprovalTTL bounds approval_ttl: a run waiting for an approval wakes every 24 hours to ask
+// again, and each time is a call its loop limit counts.
+const MaxApprovalTTL = 30 * 24 * time.Hour
+
 type Model struct {
 	AllowedProviders []string `yaml:"allowed_providers"`
 }
@@ -107,8 +111,9 @@ func Load(path string) (*Policy, error) {
 			if t.Decision != "require_approval" {
 				return nil, fmt.Errorf("policy %s: tool %s: approval_ttl goes with decision require_approval", path, name)
 			}
-			if ttl, err := time.ParseDuration(t.ApprovalTTL); err != nil || ttl <= 0 {
-				return nil, fmt.Errorf("policy %s: tool %s: approval_ttl %q is not a positive duration such as 24h", path, name, t.ApprovalTTL)
+			if ttl, err := time.ParseDuration(t.ApprovalTTL); err != nil || ttl <= 0 || ttl > MaxApprovalTTL {
+				return nil, fmt.Errorf("policy %s: tool %s: approval_ttl %q is not a positive duration of at most %v, such as 24h",
+					path, name, t.ApprovalTTL, MaxApprovalTTL)
 			}
 		}
 	}

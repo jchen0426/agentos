@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"go.temporal.io/sdk/temporal"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/ledger"
@@ -86,6 +89,14 @@ func supersedeEdited(ctx context.Context, q *db.Queries, a *db.InsertApprovalPar
 	return nil
 }
 
+// recordingLock is the lock that makes a run's new effects of a tool that needs approval one at a
+// time (a stripe: another run's may share it, for as long as one record takes).
+func (g *Gateway) recordingLock(workflowID, tool string) *sync.Mutex {
+	h := fnv.New32a()
+	h.Write([]byte(workflowID + "\x00" + tool))
+	return &g.recording[h.Sum32()%uint32(len(g.recording))]
+}
+
 // writesBefore counts the run's writes of the tool that count against its limit, but for the
 // effect asked about and for the one whose edit this call carries, which recording it abandons.
 // The transaction that records the effect counts again.
@@ -113,7 +124,7 @@ func (g *Gateway) describe(ctx context.Context, run db.Run, t tools.Writer, req 
 		card["write"] = d.Describe(ctx, req, payload)
 	}
 	if task, ok := g.Tasks[run.Task]; ok && task.ApprovalContext != nil {
-		card["task"] = task.ApprovalContext(ctx, runOutputs{g.Ledger, run.WorkflowID})
+		card["task"] = task.ApprovalContext(ctx, runOutputs{g.Ledger, run.WorkflowID}, req.Args)
 	}
 	b, err := json.Marshal(card)
 	if err != nil {
@@ -128,8 +139,8 @@ type runOutputs struct {
 	workflowID string
 }
 
-func (r runOutputs) ModelOutput(ctx context.Context, task string) (map[string]any, bool, error) {
-	return r.l.LatestModelOutput(ctx, r.workflowID, task)
+func (r runOutputs) ModelOutputs(ctx context.Context, task string) ([]map[string]any, error) {
+	return r.l.ModelOutputs(ctx, r.workflowID, task)
 }
 
 // newApproval is the approval of a new effect, open for ttl.
@@ -253,6 +264,49 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 		g.Log.Info("approved write goes on", "workflow_id", e.WorkflowID, "effect_id", e.EffectID, "approval_id", a.ApprovalID)
 	}
 	return res, nil
+}
+
+// holdUnapproved holds back a PENDING effect the policy wants approved and nobody approved: one
+// recorded before the policy asked (a policy changed across a restart), or while its tool could
+// only dry-run, never claimed or given back unsent. In one transaction it goes to
+// AWAITING_APPROVAL with an approval of its own, and the call answers needs_approval. An effect
+// that became PENDING through its approval goes on: it returns no result then.
+func (g *Gateway) holdUnapproved(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, rule *approvalRule,
+	req tools.Request, canon []byte, payload json.RawMessage) (*agentosv1.Result, error) {
+	switch a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID); {
+	case err == nil && a.Status == approvalApproved && a.UsedAt.Valid:
+		return nil, nil
+	case err == nil:
+		return nil, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("effect %s is PENDING, but its approval %s is %s", e.EffectID, a.ApprovalID, a.Status), "BadApproval", nil)
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
+	card, err := g.describe(ctx, run, t, req, payload)
+	if err != nil {
+		return nil, err
+	}
+	a := newApproval(run, t.Name(), e.EffectID, canon, e.PayloadSha256, card, rule.ttl)
+	err = g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.HoldForApproval(ctx, db.HoldForApprovalParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version})
+		switch {
+		case err != nil:
+			return err
+		case n == 0:
+			return errChanged
+		}
+		return q.InsertApproval(ctx, a)
+	})
+	switch {
+	case errors.Is(err, errChanged):
+		return nil, errEffectBusy
+	case err != nil:
+		return nil, err
+	}
+	g.Log.Warn("approval requested for a write recorded without one", "workflow_id", run.WorkflowID,
+		"approval_id", a.ApprovalID, "effect_id", e.EffectID, "tool", t.Name(), "expires_at", a.ExpiresAt)
+	g.wakeExpiry()
+	return result(StatusNeedsApproval, map[string]any{"approval_id": a.ApprovalID, "expires_at": a.ExpiresAt})
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the
@@ -449,6 +503,9 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 			if !sameDecision(cur, d.Kind, reason, editedRef) {
 				return fmt.Errorf("%w: the idempotency key was used for another decision", ErrBadDecision)
 			}
+			if cur.Status == approvalExpired {
+				return &DecidedError{cur} // approved, and void since: the run did not act on it in time
+			}
 			replay = true
 			return nil
 		}
@@ -481,6 +538,16 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 		}
 		if sha256Hex(b) != cur.PayloadSha256 {
 			return fmt.Errorf("%w: the payload recorded for approval %s no longer hashes to %s", ErrStaleView, cur.ApprovalID, cur.PayloadSha256)
+		}
+		if d.Kind == DecisionEdit {
+			// The workflow's checks and the edited call read it as the run's own.
+			if err := q.PutBlob(ctx, db.PutBlobParams{Sha256: strings.TrimPrefix(editedRef, "sha256:"), Bytes: d.Patch}); err != nil {
+				return err
+			}
+			if err := q.AddBlobOwner(ctx, db.AddBlobOwnerParams{WorkflowID: cur.WorkflowID,
+				Sha256: strings.TrimPrefix(editedRef, "sha256:")}); err != nil {
+				return err
+			}
 		}
 		n, err := q.DecideApproval(ctx, db.DecideApprovalParams{
 			Status: status, DecidedBy: valid(d.By), DecidedAt: valid(ledger.Now()), DecisionKey: valid(d.Key),
@@ -597,16 +664,19 @@ func (g *Gateway) edit(ctx context.Context, a db.Approval, value []byte) (string
 		return "", "", fmt.Errorf("approval %s: the call's arguments: %w", a.ApprovalID, err)
 	}
 	ref := "sha256:" + sha256Hex(value)
-	if args[t.EditArg()] == ref {
-		return "", "", fmt.Errorf("%w: the edit is the %s waiting for approval; approve it instead", ErrBadDecision, t.EditArg())
-	}
 	args[t.EditArg()] = ref
 	canon, err := encodeCanonical(args)
 	if err != nil {
 		return "", "", err
 	}
-	// The workflow's checks and the edited call read it as the run's own.
-	if _, err := g.Ledger.PutRunBlob(ctx, a.WorkflowID, value); err != nil {
+	// The edited call must be a new one. The approval's own call (an edit that changes nothing),
+	// or another the run made already (an edit back to an earlier patch), answers edited again,
+	// and the workflow goes round between the two.
+	switch _, err := g.Ledger.Q.GetEffect(ctx, sha256Hex([]byte(a.WorkflowID), []byte(a.Tool), canon)); {
+	case err == nil:
+		return "", "", fmt.Errorf("%w: the run has asked for %s with that %s already; approve or reject instead",
+			ErrBadDecision, a.Tool, t.EditArg())
+	case !errors.Is(err, sql.ErrNoRows):
 		return "", "", err
 	}
 	return ref, sha256Hex(canon), nil

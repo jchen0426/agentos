@@ -132,6 +132,7 @@ func TestApprovalTTL(t *testing.T) {
 		"not a duration": "tools:\n  x: {decision: require_approval, approval_ttl: tomorrow}\n",
 		"zero":           "tools:\n  x: {decision: require_approval, approval_ttl: 0s}\n",
 		"negative":       "tools:\n  x: {decision: require_approval, approval_ttl: -1h}\n",
+		"too long":       "tools:\n  x: {decision: require_approval, approval_ttl: 721h}\n",
 		"no approval":    "tools:\n  x: {decision: allow, approval_ttl: 1h}\n",
 	} {
 		if _, err := Load(write(body)); err == nil {

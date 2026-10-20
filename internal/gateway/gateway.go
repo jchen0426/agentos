@@ -78,7 +78,8 @@ type Gateway struct {
 	executions sync.WaitGroup     // detached executions, drained on shutdown
 
 	expiryOnce sync.Once
-	expiryCh   chan struct{} // wakes ExpireApprovals: an approval was made
+	expiryCh   chan struct{}  // wakes ExpireApprovals: an approval was made
+	recording  [64]sync.Mutex // a run's new effects of a write that needs approval, one at a time (record)
 
 	sendMu  sync.Mutex      // makes claiming an effect and marking it sent one step
 	sending map[string]bool // effect IDs this process has claimed and is sending

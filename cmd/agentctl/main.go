@@ -375,7 +375,7 @@ func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) er
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("control socket %s: %w (is agentd running?)", path, err)
 	}
-	conn, err := grpc.NewClient("unix://"+path, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("unix://"+path, dialOptions()...)
 	if err != nil {
 		return err
 	}
@@ -383,6 +383,16 @@ func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) er
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	return fn(ctx, agentosv1.NewControlClient(conn))
+}
+
+// maxReceive is what agentctl takes in one answer: an approval card holds the whole payload, a
+// pull request's up to 20 files of 1 MiB, larger still once its text is escaped. gRPC's default
+// of 4 MiB would leave such an approval impossible to read, and so to decide.
+const maxReceive = 512 << 20
+
+func dialOptions() []grpc.DialOption {
+	return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxReceive))}
 }
 
 func printRun(g *globals, r *agentosv1.Run) error {

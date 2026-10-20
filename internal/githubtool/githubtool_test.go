@@ -2339,6 +2339,8 @@ func TestTheReportShowsTheApprovals(t *testing.T) {
 		{ID: "a1", Tool: "github.open_draft_pr", Status: "SUPERSEDED", DecidedBy: "carol", DecidedAt: "2026-10-20T09:00:00Z"},
 		{ID: "a2", Tool: "github.open_draft_pr", Status: "REJECTED", DecidedBy: "bob @mallory", DecidedAt: "2026-10-20T10:00:00Z",
 			Reason: "see https://evil.example and ``` this"},
+		{ID: "a3", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "dave", DecidedAt: "2026-10-20T11:00:00Z",
+			Unsent: "the run was cancelled before the approved write was sent"},
 	}}}
 	payload, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
 		"repo": "acme/payments", "commit": f.commit, "outcome": "rejected"}))
@@ -2350,12 +2352,14 @@ func TestTheReportShowsTheApprovals(t *testing.T) {
 	i := strings.Index(p.Body, "```")
 	head, fenced := p.Body[:i], p.Body[i:]
 	if !strings.Contains(head, "Approval of github.open_draft_pr: superseded\n") ||
+		!strings.Contains(head, "Approval of github.open_draft_pr: approved, not sent\n") ||
 		!strings.Contains(head, "Approval of github.open_draft_pr: rejected\n") ||
 		strings.Contains(head, "evil") || strings.Contains(head, "@") {
 		t.Fatalf("head:\n%s", head)
 	}
 	if !strings.Contains(fenced, "- github.open_draft_pr, approval a2: REJECTED by bob @mallory at 2026-10-20T10:00:00Z. Reason: see https://evil.example") ||
 		!strings.Contains(fenced, "approval a1: SUPERSEDED (edited by carol at 2026-10-20T09:00:00Z)") ||
+		!strings.Contains(fenced, "approval a3: APPROVED by dave at 2026-10-20T11:00:00Z; not sent: the run was cancelled") ||
 		!strings.HasPrefix(fenced, "````text\n") {
 		t.Fatalf("fenced:\n%s", fenced)
 	}

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -204,24 +205,27 @@ func (l *Ledger) LatestEffectResult(ctx context.Context, workflowID, tool string
 	return v, err == nil, err
 }
 
-// LatestModelOutput returns what the workflow got from the run's latest accepted answer of a
-// model task: the gateway's value (report_ref, the blob fields' refs, the other fields inline).
-// Refusals and answers that broke the task's output schema are not answers.
-func (l *Ledger) LatestModelOutput(ctx context.Context, workflowID, task string) (map[string]any, bool, error) {
+// ModelOutputs returns what the workflow got from each of the run's accepted answers of a model
+// task, newest first: the gateway's value (report_ref, the blob fields' refs, the other fields
+// inline). Refusals and answers that broke the task's output schema are not answers.
+func (l *Ledger) ModelOutputs(ctx context.Context, workflowID, task string) ([]map[string]any, error) {
 	rows, err := l.Q.ListModelAnswers(ctx, db.ListModelAnswersParams{WorkflowID: workflowID, Task: task})
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	var latest map[string]any
-	var at time.Time
+	type answer struct {
+		at    time.Time
+		value map[string]any
+	}
+	var answers []answer
 	for _, r := range rows {
 		finished, err := time.Parse(time.RFC3339Nano, r.FinishedAt.String)
-		if err != nil || r.StopReason.String == "invalid_output" || (latest != nil && !finished.After(at)) {
+		if err != nil || r.StopReason.String == "invalid_output" {
 			continue
 		}
 		b, err := l.GetBlob(ctx, r.ResponseBlob.String)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		var resp struct {
 			Status string          `json:"status"`
@@ -230,13 +234,16 @@ func (l *Ledger) LatestModelOutput(ctx context.Context, workflowID, task string)
 		if err := json.Unmarshal(b, &resp); err != nil || resp.Status != "ok" {
 			continue
 		}
-		v, err := DecodeObject(resp.Value)
-		if err != nil {
-			continue
+		if v, err := DecodeObject(resp.Value); err == nil {
+			answers = append(answers, answer{finished, v})
 		}
-		latest, at = v, finished
 	}
-	return latest, latest != nil, nil
+	slices.SortStableFunc(answers, func(a, b answer) int { return b.at.Compare(a.at) })
+	out := make([]map[string]any, 0, len(answers))
+	for _, a := range answers {
+		out = append(out, a.value)
+	}
+	return out, nil
 }
 
 // RunApprovals lists a run's approvals, oldest first.
