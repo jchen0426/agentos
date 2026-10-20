@@ -30,6 +30,32 @@ func (q *Queries) AbandonAwaitingEffect(ctx context.Context, arg AbandonAwaiting
 	return result.RowsAffected()
 }
 
+const abandonUnclaimedEffect = `-- name: AbandonUnclaimedEffect :execrows
+UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+`
+
+type AbandonUnclaimedEffectParams struct {
+	Reason    sql.NullString
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// A PENDING effect nobody claimed is never sent: its approval's time ran out first.
+func (q *Queries) AbandonUnclaimedEffect(ctx context.Context, arg AbandonUnclaimedEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, abandonUnclaimedEffect,
+		arg.Reason,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const abandonUnsentEffects = `-- name: AbandonUnsentEffects :execrows
 UPDATE effects SET status = 'ABANDONED', reason = 'the run was cancelled before the request was sent',
   version = version + 1, updated_at = ?
@@ -211,6 +237,26 @@ type ExpireUnusedApprovalParams struct {
 // An approval the run did not act on before its time was up: void as well.
 func (q *Queries) ExpireUnusedApproval(ctx context.Context, arg ExpireUnusedApprovalParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, expireUnusedApproval, arg.DecidedAt, arg.Reason, arg.ApprovalID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const expireUsedApproval = `-- name: ExpireUsedApproval :execrows
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NOT NULL
+`
+
+type ExpireUsedApprovalParams struct {
+	DecidedAt  sql.NullString
+	Reason     sql.NullString
+	ApprovalID string
+}
+
+// An approval whose write had not gone out when its time was up: void too, as nothing is in flight.
+func (q *Queries) ExpireUsedApproval(ctx context.Context, arg ExpireUsedApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, expireUsedApproval, arg.DecidedAt, arg.Reason, arg.ApprovalID)
 	if err != nil {
 		return 0, err
 	}
@@ -556,9 +602,21 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 	return i, err
 }
 
+const hasResolution = `-- name: HasResolution :one
+SELECT EXISTS (SELECT 1 FROM effect_resolutions WHERE effect_id = ?)
+`
+
+func (q *Queries) HasResolution(ctx context.Context, effectID string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, hasResolution, effectID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const holdForApproval = `-- name: HoldForApproval :execrows
 UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `
 
 type HoldForApprovalParams struct {
@@ -568,7 +626,7 @@ type HoldForApprovalParams struct {
 }
 
 // A PENDING effect nobody claimed, recorded before the policy asked for approval: it waits for
-// a person now.
+// a person now, unless its run was cancelled.
 func (q *Queries) HoldForApproval(ctx context.Context, arg HoldForApprovalParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, holdForApproval, arg.UpdatedAt, arg.EffectID, arg.Version)
 	if err != nil {

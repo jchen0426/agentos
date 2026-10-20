@@ -303,16 +303,10 @@ func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingReques
 		if at, err := time.Parse(time.RFC3339Nano, a.ExpiresAt); err == nil && !time.Now().Before(at) {
 			continue // expired: agentd records it as such any moment
 		}
-		// Without the payload, which GetApproval shows: a pull request's runs to 20 files of 1 MiB,
-		// and one large approval would make the whole list too large to receive.
-		item := &agentosv1.PendingItem{Kind: "approval", Id: a.ApprovalID, RunId: a.WorkflowID, ExpiresAt: a.ExpiresAt,
-			Tool: a.Tool, Since: a.CreatedAt, PayloadSha256: a.PayloadSha256}
-		if _, err := s.approvalPayload(ctx, a); errors.Is(err, errPayloadChanged) {
-			item.Reason = safetext.Line(err.Error())
-		} else if err != nil {
-			return nil, err
-		}
-		resp.Items = append(resp.Items, item)
+		// Without the payload, which GetApproval shows and checks: a pull request's runs to 20 files
+		// of 1 MiB, and one large approval would make the whole list too large to receive.
+		resp.Items = append(resp.Items, &agentosv1.PendingItem{Kind: "approval", Id: a.ApprovalID, RunId: a.WorkflowID,
+			ExpiresAt: a.ExpiresAt, Tool: a.Tool, Since: a.CreatedAt, PayloadSha256: a.PayloadSha256})
 	}
 	rows, err := s.Ledger.Q.ListEffectsByStatus(ctx, "UNKNOWN")
 	if err != nil {

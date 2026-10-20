@@ -421,13 +421,15 @@ func (r runRecords) RunApprovals(ctx context.Context, workflowID string) ([]gith
 		ga := githubtool.Approval{ID: a.ApprovalID, Tool: a.Tool, Status: a.Status, DecidedBy: a.DecidedBy.String,
 			DecidedAt: a.DecidedAt.String, Reason: a.Reason.String, ExpiresAt: a.ExpiresAt}
 		if a.Status == "APPROVED" {
-			// Approved, and refused at the last moment: the report must not read as if it went out.
+			// Approved, and refused or lost after: the report must not read as if it went out.
 			e, err := r.Ledger.Q.GetEffect(ctx, a.EffectID)
 			if err != nil {
 				return nil, err
 			}
-			if e.Status == "ABANDONED" {
-				ga.Unsent = e.Reason.String
+			ga.Write = map[string]string{"ABANDONED": "not sent", "DENIED": "not sent", "FAILED": "failed",
+				"UNKNOWN": "outcome unknown"}[e.Status]
+			if ga.Write != "" {
+				ga.WriteReason = e.Reason.String
 			}
 		}
 		out = append(out, ga)

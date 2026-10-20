@@ -1,12 +1,12 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
@@ -89,12 +89,45 @@ func supersedeEdited(ctx context.Context, q *db.Queries, a *db.InsertApprovalPar
 	return nil
 }
 
-// recordingLock is the lock that makes a run's new effects of a tool that needs approval one at a
-// time (a stripe: another run's may share it, for as long as one record takes).
-func (g *Gateway) recordingLock(workflowID, tool string) *sync.Mutex {
-	h := fnv.New32a()
-	h.Write([]byte(workflowID + "\x00" + tool))
-	return &g.recording[h.Sum32()%uint32(len(g.recording))]
+// keyedLock gives each key to one holder at a time: a run's new effects of a write that needs
+// approval, one at a time (record). A waiter gives up when its context ends.
+type keyedLock struct {
+	mu   sync.Mutex
+	keys map[string]*keyHold
+}
+
+type keyHold struct {
+	turn chan struct{} // holds a token while someone has the key
+	refs int           // holders and waiters
+}
+
+// lock waits for key and returns what releases it.
+func (k *keyedLock) lock(ctx context.Context, key string) (func(), error) {
+	k.mu.Lock()
+	if k.keys == nil {
+		k.keys = map[string]*keyHold{}
+	}
+	h := k.keys[key]
+	if h == nil {
+		h = &keyHold{turn: make(chan struct{}, 1)}
+		k.keys[key] = h
+	}
+	h.refs++
+	k.mu.Unlock()
+	leave := func() {
+		k.mu.Lock()
+		if h.refs--; h.refs == 0 {
+			delete(k.keys, key)
+		}
+		k.mu.Unlock()
+	}
+	select {
+	case h.turn <- struct{}{}:
+		return func() { <-h.turn; leave() }, nil
+	case <-ctx.Done():
+		leave()
+		return nil, ctx.Err()
+	}
 }
 
 // writesBefore counts the run's writes of the tool that count against its limit, but for the
@@ -266,16 +299,29 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 	return res, nil
 }
 
-// holdUnapproved holds back a PENDING effect the policy wants approved and nobody approved: one
-// recorded before the policy asked (a policy changed across a restart), or while its tool could
-// only dry-run, never claimed or given back unsent. In one transaction it goes to
-// AWAITING_APPROVAL with an approval of its own, and the call answers needs_approval. An effect
-// that became PENDING through its approval goes on: it returns no result then.
-func (g *Gateway) holdUnapproved(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, rule *approvalRule,
+// gate decides whether a PENDING effect nobody has claimed, of a write the policy wants approved,
+// may go out now. It returns no result when it may.
+//   - Its approval is approved and used (it moved the effect to PENDING): it goes, unless the
+//     approval's time ran out before the write went out. Nothing is in flight (the effect was never
+//     claimed, or was given back unsent), so the approval is void, as a rejection. A write a person
+//     reconciled as not executed goes all the same: they looked at it since.
+//   - It has no approval: recorded before the policy asked (a policy changed across a restart), or
+//     while its tool could only dry-run. It waits for one, made now, in one transaction with its
+//     move back to AWAITING_APPROVAL; the call answers needs_approval.
+func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, rule *approvalRule,
 	req tools.Request, canon []byte, payload json.RawMessage) (*agentosv1.Result, error) {
-	switch a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID); {
+	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)
+	switch {
 	case err == nil && a.Status == approvalApproved && a.UsedAt.Valid:
-		return nil, nil
+		if !expired(a) {
+			return nil, nil
+		}
+		if reconciled, err := g.Ledger.Q.HasResolution(ctx, e.EffectID); err != nil {
+			return nil, err
+		} else if reconciled != 0 {
+			return nil, nil
+		}
+		return g.expireUnsent(ctx, e, a)
 	case err == nil:
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("effect %s is PENDING, but its approval %s is %s", e.EffectID, a.ApprovalID, a.Status), "BadApproval", nil)
@@ -286,7 +332,7 @@ func (g *Gateway) holdUnapproved(ctx context.Context, run db.Run, t tools.Writer
 	if err != nil {
 		return nil, err
 	}
-	a := newApproval(run, t.Name(), e.EffectID, canon, e.PayloadSha256, card, rule.ttl)
+	na := newApproval(run, t.Name(), e.EffectID, canon, e.PayloadSha256, card, rule.ttl)
 	err = g.Ledger.Tx(ctx, func(q *db.Queries) error {
 		n, err := q.HoldForApproval(ctx, db.HoldForApprovalParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version})
 		switch {
@@ -295,7 +341,40 @@ func (g *Gateway) holdUnapproved(ctx context.Context, run db.Run, t tools.Writer
 		case n == 0:
 			return errChanged
 		}
-		return q.InsertApproval(ctx, a)
+		return q.InsertApproval(ctx, na)
+	})
+	switch {
+	case errors.Is(err, errChanged):
+		// Changed meanwhile, or the run was cancelled: a cancelled run's write is done with.
+		if cancelled, cerr := g.runCancelled(ctx, run.WorkflowID); cerr == nil && cancelled {
+			return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
+		}
+		return nil, errEffectBusy
+	case err != nil:
+		return nil, err
+	}
+	g.Log.Warn("approval requested for a write recorded without one", "workflow_id", run.WorkflowID,
+		"approval_id", na.ApprovalID, "effect_id", e.EffectID, "tool", t.Name(), "expires_at", na.ExpiresAt)
+	g.wakeExpiry()
+	return result(StatusNeedsApproval, map[string]any{"approval_id": na.ApprovalID, "expires_at": na.ExpiresAt})
+}
+
+// expireUnsent voids the used approval of an effect that never went out before the approval's time
+// ran out, and abandons the effect, in one transaction.
+func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) (*agentosv1.Result, error) {
+	reason := fmt.Sprintf("approved by %s at %s, but the write had not gone out when the approval expired at %s",
+		a.DecidedBy.String, a.DecidedAt.String, a.ExpiresAt)
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		now := ledger.Now()
+		if n, err := q.ExpireUsedApproval(ctx, db.ExpireUsedApprovalParams{
+			DecidedAt: valid(now), Reason: valid(reason), ApprovalID: a.ApprovalID}); err != nil || n == 0 {
+			return cmp.Or(err, errChanged)
+		}
+		if n, err := q.AbandonUnclaimedEffect(ctx, db.AbandonUnclaimedEffectParams{
+			Reason: valid("the approval expired: " + reason), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version}); err != nil || n == 0 {
+			return cmp.Or(err, errChanged)
+		}
+		return nil
 	})
 	switch {
 	case errors.Is(err, errChanged):
@@ -303,10 +382,26 @@ func (g *Gateway) holdUnapproved(ctx context.Context, run db.Run, t tools.Writer
 	case err != nil:
 		return nil, err
 	}
-	g.Log.Warn("approval requested for a write recorded without one", "workflow_id", run.WorkflowID,
-		"approval_id", a.ApprovalID, "effect_id", e.EffectID, "tool", t.Name(), "expires_at", a.ExpiresAt)
-	g.wakeExpiry()
-	return result(StatusNeedsApproval, map[string]any{"approval_id": a.ApprovalID, "expires_at": a.ExpiresAt})
+	g.Log.Warn("approval expired before its write went out", "workflow_id", e.WorkflowID, "approval_id", a.ApprovalID,
+		"effect_id", e.EffectID)
+	return result(StatusExpired, map[string]any{"approval_id": a.ApprovalID, "reason": reason, "expires_at": a.ExpiresAt})
+}
+
+// mayResend says whether recovery may send a claimed effect again, which may never have gone out:
+// always, unless the policy wants it approved; then only with an approval that is approved, used
+// and in its time. Otherwise recovery only looks, and an effect it gives back meets gate.
+func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule) (bool, error) {
+	if rule == nil {
+		return true, nil
+	}
+	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return a.Status == approvalApproved && a.UsedAt.Valid && !expired(a), nil
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the
@@ -483,9 +578,9 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 	case err != nil:
 		return db.Approval{}, err
 	}
-	var editedRef, editedArgs string
+	var editedRef, editedArgs, editedEffect string
 	if d.Kind == DecisionEdit {
-		if editedRef, editedArgs, err = g.edit(ctx, a, d.Patch); err != nil {
+		if editedRef, editedArgs, editedEffect, err = g.edit(a, d.Patch); err != nil {
 			return db.Approval{}, err
 		}
 	}
@@ -540,6 +635,16 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 			return fmt.Errorf("%w: the payload recorded for approval %s no longer hashes to %s", ErrStaleView, cur.ApprovalID, cur.PayloadSha256)
 		}
 		if d.Kind == DecisionEdit {
+			// The edited call must be a new one. The approval's own call (an edit that changes
+			// nothing), or another the run made already (an edit back to an earlier patch), answers
+			// with that call's outcome: edited again, and the workflow goes round between the two.
+			switch _, err := q.GetEffect(ctx, editedEffect); {
+			case err == nil:
+				return fmt.Errorf("%w: the run has asked for %s with that patch already; approve or reject instead",
+					ErrBadDecision, cur.Tool)
+			case !errors.Is(err, sql.ErrNoRows):
+				return err
+			}
 			// The workflow's checks and the edited call read it as the run's own.
 			if err := q.PutBlob(ctx, db.PutBlobParams{Sha256: strings.TrimPrefix(editedRef, "sha256:"), Bytes: d.Patch}); err != nil {
 				return err
@@ -643,43 +748,34 @@ func printable(s string, lines bool) bool {
 	return utf8.ValidString(s)
 }
 
-// edit stores a reviewer's patch as a blob of the run and returns its reference, with the hash of
-// the arguments of the call that will carry it: the edited call, whose approval supersedes this one.
-func (g *Gateway) edit(ctx context.Context, a db.Approval, value []byte) (string, string, error) {
+// edit checks a reviewer's patch and returns its reference, the hash of the arguments of the call
+// that will carry it (the edited call, whose approval supersedes this one), and that call's effect
+// ID. It reads nothing: the decision's transaction checks the run has not made that call already.
+func (g *Gateway) edit(a db.Approval, value []byte) (ref, argsSHA256, effectID string, err error) {
 	t, ok := g.Tools[a.Tool].(tools.Editable)
 	if !ok {
-		return "", "", fmt.Errorf("%w: %s takes no edits", ErrBadDecision, a.Tool)
+		return "", "", "", fmt.Errorf("%w: %s takes no edits", ErrBadDecision, a.Tool)
 	}
 	switch {
 	case len(value) == 0:
-		return "", "", fmt.Errorf("%w: the edit is empty", ErrBadDecision)
+		return "", "", "", fmt.Errorf("%w: the edit is empty", ErrBadDecision)
 	case len(value) > patch.MaxBytes:
-		return "", "", fmt.Errorf("%w: the edit is %d bytes, over the limit of %d", ErrBadDecision, len(value), patch.MaxBytes)
+		return "", "", "", fmt.Errorf("%w: the edit is %d bytes, over the limit of %d", ErrBadDecision, len(value), patch.MaxBytes)
 	}
 	if _, err := patch.Parse(value); err != nil {
-		return "", "", fmt.Errorf("%w: the edit is not a patch agentd takes: %v", ErrBadDecision, err)
+		return "", "", "", fmt.Errorf("%w: the edit is not a patch agentd takes: %v", ErrBadDecision, err)
 	}
 	args, err := ledger.DecodeObject([]byte(a.ArgsJson))
 	if err != nil {
-		return "", "", fmt.Errorf("approval %s: the call's arguments: %w", a.ApprovalID, err)
+		return "", "", "", fmt.Errorf("approval %s: the call's arguments: %w", a.ApprovalID, err)
 	}
-	ref := "sha256:" + sha256Hex(value)
+	ref = "sha256:" + sha256Hex(value)
 	args[t.EditArg()] = ref
 	canon, err := encodeCanonical(args)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	// The edited call must be a new one. The approval's own call (an edit that changes nothing),
-	// or another the run made already (an edit back to an earlier patch), answers edited again,
-	// and the workflow goes round between the two.
-	switch _, err := g.Ledger.Q.GetEffect(ctx, sha256Hex([]byte(a.WorkflowID), []byte(a.Tool), canon)); {
-	case err == nil:
-		return "", "", fmt.Errorf("%w: the run has asked for %s with that %s already; approve or reject instead",
-			ErrBadDecision, a.Tool, t.EditArg())
-	case !errors.Is(err, sql.ErrNoRows):
-		return "", "", err
-	}
-	return ref, sha256Hex(canon), nil
+	return ref, sha256Hex(canon), sha256Hex([]byte(a.WorkflowID), []byte(a.Tool), canon), nil
 }
 
 // sameDecision reports whether an approval holds the decision described. A person's decision is

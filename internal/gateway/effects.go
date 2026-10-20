@@ -170,10 +170,10 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 			if run.DryRun != 0 || !t.Live() {
 				return g.settle(ctx, e, effectDryRun, t.DryRun(payload), "")
 			}
-			// Recorded before the policy asked for approval, or while the tool could only dry-run:
-			// it waits for a person now, unless one approved it.
+			// A write the policy wants approved goes only with an approval in its time: recorded
+			// before the policy asked, or while the tool could only dry-run, it waits for one now.
 			if rule != nil {
-				if res, err := g.holdUnapproved(ctx, run, t, e, rule, req, canon, payload); res != nil || err != nil {
+				if res, err := g.gate(ctx, run, t, e, rule, req, canon, payload); res != nil || err != nil {
 					return res, err
 				}
 			}
@@ -198,8 +198,14 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 			return nil, errEffectBusy
 		default:
 			// Claimed by an agentd process that is gone, or by this one with nothing in
-			// flight: the request may or may not have gone out.
-			return g.recoverEffect(ctx, run, t, e, payload, "agentd lost track of the request after claiming it", true)
+			// flight: the request may or may not have gone out. Sent again only as the policy
+			// allows: a write it wants approved, without an approval in its time, is only looked
+			// up, and if given back meets gate on the next call.
+			resend, err := g.mayResend(ctx, e, rule)
+			if err != nil {
+				return nil, err
+			}
+			return g.recoverEffect(ctx, run, t, e, payload, "agentd lost track of the request after claiming it", resend)
 		}
 		// Another change came first: look again.
 		if e, err = g.Ledger.Q.GetEffect(ctx, e.EffectID); err != nil {
@@ -230,9 +236,11 @@ func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class 
 		// run has room for, which the transaction below counts again. One at a time for the run
 		// and tool, from that count to the record: calls with other arguments at once would each
 		// gather it first.
-		l := g.recordingLock(run.WorkflowID, t.Name())
-		l.Lock()
-		defer l.Unlock()
+		unlock, err := g.recording.lock(ctx, run.WorkflowID+"\x00"+t.Name())
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 		if n, err := g.writesBefore(ctx, run, t, req.EffectID, canon); err != nil {
 			return nil, err
 		} else if maxPerRun > 0 && n >= int64(maxPerRun) {

@@ -2340,7 +2340,9 @@ func TestTheReportShowsTheApprovals(t *testing.T) {
 		{ID: "a2", Tool: "github.open_draft_pr", Status: "REJECTED", DecidedBy: "bob @mallory", DecidedAt: "2026-10-20T10:00:00Z",
 			Reason: "see https://evil.example and ``` this"},
 		{ID: "a3", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "dave", DecidedAt: "2026-10-20T11:00:00Z",
-			Unsent: "the run was cancelled before the approved write was sent"},
+			Write: "not sent", WriteReason: "the run was cancelled before the approved write was sent"},
+		{ID: "a4", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "erin", DecidedAt: "2026-10-20T12:00:00Z",
+			Write: "failed", WriteReason: "GitHub refused: 403"},
 	}}}
 	payload, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
 		"repo": "acme/payments", "commit": f.commit, "outcome": "rejected"}))
@@ -2353,6 +2355,7 @@ func TestTheReportShowsTheApprovals(t *testing.T) {
 	head, fenced := p.Body[:i], p.Body[i:]
 	if !strings.Contains(head, "Approval of github.open_draft_pr: superseded\n") ||
 		!strings.Contains(head, "Approval of github.open_draft_pr: approved, not sent\n") ||
+		!strings.Contains(head, "Approval of github.open_draft_pr: approved, failed\n") ||
 		!strings.Contains(head, "Approval of github.open_draft_pr: rejected\n") ||
 		strings.Contains(head, "evil") || strings.Contains(head, "@") {
 		t.Fatalf("head:\n%s", head)

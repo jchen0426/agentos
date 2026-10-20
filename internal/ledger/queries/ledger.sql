@@ -199,9 +199,18 @@ WHERE effect_id = ? AND version = ? AND status = 'AWAITING_APPROVAL'
 
 -- name: HoldForApproval :execrows
 -- A PENDING effect nobody claimed, recorded before the policy asked for approval: it waits for
--- a person now.
+-- a person now, unless its run was cancelled.
 UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
+
+-- name: AbandonUnclaimedEffect :execrows
+-- A PENDING effect nobody claimed is never sent: its approval's time ran out first.
+UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL;
+
+-- name: HasResolution :one
+SELECT EXISTS (SELECT 1 FROM effect_resolutions WHERE effect_id = ?);
 
 -- name: AbandonAwaitingEffect :execrows
 -- An effect whose approval was rejected, expired or replaced is never sent.
@@ -251,6 +260,11 @@ WHERE approval_id = ? AND status = 'PENDING';
 -- An approval the run did not act on before its time was up: void as well.
 UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
 WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL;
+
+-- name: ExpireUsedApproval :execrows
+-- An approval whose write had not gone out when its time was up: void too, as nothing is in flight.
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NOT NULL;
 
 -- name: UseApproval :execrows
 UPDATE approvals SET used_at = ? WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL;

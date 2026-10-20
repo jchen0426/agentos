@@ -44,9 +44,11 @@ type Approval struct {
 	DecidedAt string
 	Reason    string // a rejection's reason, or why it expired
 	ExpiresAt string
-	// Unsent says why agentd did not send an approved write (the payload changed, the run was
-	// cancelled): its effect was abandoned. Empty otherwise.
-	Unsent string
+	// Write says what became of an approved write that did not go out as approved: "not sent"
+	// (agentd or the tool refused it before sending anything, or the run was cancelled), "failed"
+	// (the external system refused it) or "outcome unknown". Empty when it was sent, or is on its
+	// way. WriteReason says why.
+	Write, WriteReason string
 }
 
 // maxApprovalLines bounds the approvals the report names outside its fence: GitHub takes 65,536
@@ -186,8 +188,8 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 			break
 		}
 		status := strings.ToLower(a.Status)
-		if a.Unsent != "" {
-			status += ", not sent"
+		if a.Write != "" {
+			status += ", " + a.Write
 		}
 		fmt.Fprintf(&b, "Approval of %s: %s\n\n", a.Tool, status)
 	}
@@ -213,8 +215,8 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 			default:
 				fmt.Fprintf(&text, " by %s at %s", a.DecidedBy, a.DecidedAt)
 			}
-			if a.Unsent != "" {
-				fmt.Fprintf(&text, "; not sent: %s", a.Unsent)
+			if a.Write != "" {
+				fmt.Fprintf(&text, "; %s: %s", a.Write, a.WriteReason)
 			}
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/faults"
+	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
@@ -668,5 +670,165 @@ func TestAReplayedApprovalThatExpiredIsTold(t *testing.T) {
 	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove, By: "bob", Key: "k"}); !errors.As(err, &decided) ||
 		decided.Approval.Status != approvalExpired || !strings.Contains(decided.Approval.Reason.String, "approved by bob") {
 		t.Fatalf("the replay: %v", err)
+	}
+}
+
+// An edit sent again under its key is that edit, also once the workflow has made the edited
+// call; a second reviewer's late edit is told the first.
+func TestAnEditSentAgainIsTheEdit(t *testing.T) {
+	f := newFixture(t, false)
+	w := &editable{writer{class: policy.EffectLookup}}
+	f.g.Tools = tools.Registry{w.Name(): w}
+	if _, err := f.ask(t, w, map[string]any{"patch_ref": "sha256:" + strings.Repeat("1", 64)}, 1, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	a := f.one(t)
+	edit := Decision{Kind: DecisionEdit, Patch: []byte(editedPatch), By: "carol", Key: "k"}
+	if _, err := f.decide(t, a, edit); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.ask(t, w, map[string]any{"patch_ref": "sha256:" + sha256Hex([]byte(editedPatch))}, 1, time.Hour); err != nil ||
+		res.GetStatus() != StatusNeedsApproval {
+		t.Fatalf("the edited call: %v %v", res.GetStatus(), err)
+	}
+	if got, err := f.decide(t, a, edit); err != nil || got.Status != approvalSuperseded {
+		t.Fatalf("the edit again: %+v %v", got, err)
+	}
+	var decided *DecidedError
+	if _, err := f.decide(t, a, Decision{Kind: DecisionEdit, Patch: []byte(editedPatch), By: "dave"}); !errors.As(err, &decided) {
+		t.Fatalf("a second reviewer's edit: %v", err)
+	}
+}
+
+// One run's slow card holds up no other run's approval, and a call that waits for its own run's
+// turn gives up when its context ends.
+func TestTheRecordingLockIsTheRunsAlone(t *testing.T) {
+	var k keyedLock
+	unlock, err := k.lock(context.Background(), "wf\x00tool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 200 {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		other, err := k.lock(ctx, fmt.Sprintf("run-%d\x00tool", i))
+		cancel()
+		if err != nil {
+			t.Fatalf("run-%d waited on another run's lock", i)
+		}
+		other()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := k.lock(ctx, "wf\x00tool"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a waiter that gave up: %v", err)
+	}
+	unlock()
+	again, err := k.lock(context.Background(), "wf\x00tool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again()
+	if len(k.keys) != 0 {
+		t.Fatalf("%d keys left", len(k.keys))
+	}
+}
+
+// An approval holds until its write goes out, not only until the run acts on it: a write given
+// back unsent (nothing in flight) whose approval's time has run out is not sent, as a rejection.
+// One a person reconciled as not executed goes all the same.
+func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
+	f := newFixture(t, false)
+	w := &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
+	args := map[string]any{"n": 1}
+	if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	a := f.one(t)
+	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove, By: "bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ask(t, w, args, 1, time.Hour); err == nil {
+		t.Fatal("the unsent write did not fail the call")
+	}
+	w.err = nil
+	w.sent.Store(0)
+	time.Sleep(400 * time.Millisecond)
+	res, err := f.ask(t, w, args, 1, time.Hour)
+	if err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+	if a = f.one(t); a.Status != approvalExpired || !strings.Contains(a.Reason.String, "approved by bob") ||
+		!strings.Contains(a.Reason.String, "had not gone out") {
+		t.Fatalf("approval %+v", a)
+	}
+	if e := effectOf(t, f, a); e.Status != effectAbandoned {
+		t.Fatalf("effect %s", e.Status)
+	}
+
+	// The same, but a person reconciled it as not executed after the approval: it goes.
+	g := newFixture(t, false)
+	w = &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
+	if _, err := g.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	b := g.one(t)
+	if _, err := g.decide(t, b, Decision{Kind: DecisionApprove}); err != nil {
+		t.Fatal(err)
+	}
+	g.ask(t, w, args, 1, time.Hour)
+	if err := g.g.Ledger.Q.InsertResolution(context.Background(), db.InsertResolutionParams{EffectID: b.EffectID,
+		ResolveKey: "r", Executed: 0, Status: effectPending, ResolvedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	w.err = nil
+	w.sent.Store(0)
+	time.Sleep(400 * time.Millisecond)
+	if res, err := g.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+		t.Fatalf("reconciled: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+}
+
+// Recovery never sends again a write the policy wants approved that nobody approved: an effect an
+// earlier agentd claimed under a policy that did not ask is only looked up, given back, and then
+// waits for a person.
+func TestRecoveryDoesNotResendAnUnapprovedWrite(t *testing.T) {
+	for _, class := range []string{policy.EffectLookup, policy.EffectIdempotent} {
+		t.Run(class, func(t *testing.T) {
+			f := newFixture(t, false)
+			w := &finder{writer: writer{class: class}}
+			f.claimElsewhere(t, w)
+			req := f.req()
+			canon, _ := encodeCanonical(req.Args)
+			ask := func() (*agentosv1.Result, error) {
+				return f.g.effect(context.Background(), f.run, w, w.Class(), 1, &approvalRule{ttl: time.Hour}, req, canon, faults.Effect{})
+			}
+			res, err := ask()
+			if w.sent.Load() != 0 {
+				t.Fatalf("sent again without an approval: %v %v", res.GetStatus(), err)
+			}
+			res, err = ask()
+			if err != nil || res.GetStatus() != StatusNeedsApproval || w.sent.Load() != 0 {
+				t.Fatalf("given back: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+			}
+		})
+	}
+}
+
+// A run cancelled while its write was held for approval sends nothing, and waits for nobody.
+func TestACancelledRunsWriteIsNotHeld(t *testing.T) {
+	f := newFixture(t, false)
+	w := &writer{class: policy.EffectLookup}
+	args := map[string]any{"n": 1}
+	req, canon := call(t, w, args)
+	if res, err := f.g.record(context.Background(), f.run, w, w.Class(), 1, nil, req, canon); res != nil || err != nil {
+		t.Fatalf("record: %v %v", res, err)
+	}
+	f.cancel(t)
+	res, err := f.ask(t, w, args, 1, time.Hour)
+	if err != nil || res.GetStatus() != StatusDenied || w.sent.Load() != 0 || len(f.approvals(t)) != 0 {
+		t.Fatalf("%v %v, sent %d, %d approvals", res.GetStatus(), err, w.sent.Load(), len(f.approvals(t)))
+	}
+	if e, err := f.g.Ledger.Q.GetEffect(context.Background(), req.EffectID); err != nil || e.Status != effectAbandoned {
+		t.Fatalf("effect %s %v", e.Status, err)
 	}
 }
