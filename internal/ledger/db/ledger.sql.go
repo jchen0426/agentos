@@ -109,7 +109,7 @@ func (q *Queries) ApproveEffect(ctx context.Context, arg ApproveEffectParams) (i
 }
 
 const claimEffect = `-- name: ClaimEffect :execrows
-UPDATE effects SET claimed_by = ?, claimed_at = ?, maybe_sent = 1, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `
@@ -1567,26 +1567,40 @@ func (q *Queries) PutBlob(ctx context.Context, arg PutBlobParams) error {
 }
 
 const releaseEffect = `-- name: ReleaseEffect :execrows
-UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = ?, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
 `
 
 type ReleaseEffectParams struct {
-	MaybeSent int64
 	UpdatedAt string
 	EffectID  string
 	Version   int64
 }
 
-// Returns a claimed effect for a later attempt to send: one whose request never took effect
-// (maybe_sent 0), or an idempotent one that may have (1), sent again under its key.
+// Returns a claimed effect whose request never took effect, or an idempotent one that may have, for
+// a later attempt to send (under its key). maybe_sent stays: what went out went out.
 func (q *Queries) ReleaseEffect(ctx context.Context, arg ReleaseEffectParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, releaseEffect,
-		arg.MaybeSent,
-		arg.UpdatedAt,
-		arg.EffectID,
-		arg.Version,
-	)
+	result, err := q.db.ExecContext(ctx, releaseEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const releaseUnsentEffect = `-- name: ReleaseUnsentEffect :execrows
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = 0, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING'
+`
+
+type ReleaseUnsentEffectParams struct {
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// Returns a claimed effect a lookup found never took effect: as far as it goes, nothing went out.
+func (q *Queries) ReleaseUnsentEffect(ctx context.Context, arg ReleaseUnsentEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, releaseUnsentEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
 	if err != nil {
 		return 0, err
 	}
@@ -1732,7 +1746,7 @@ func (q *Queries) SupersedeApproval(ctx context.Context, arg SupersedeApprovalPa
 }
 
 const touchEffect = `-- name: TouchEffect :execrows
-UPDATE effects SET claimed_at = ?, updated_at = ?
+UPDATE effects SET claimed_at = ?, maybe_sent = 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `

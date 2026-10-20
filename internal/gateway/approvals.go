@@ -21,6 +21,7 @@ import (
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/outbox"
 	"github.com/jchen0426/agentos/internal/patch"
+	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
 )
 
@@ -301,10 +302,11 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 
 // gate decides whether a PENDING effect nobody has claimed, of a write the policy wants approved,
 // may go out now. It returns no result when it may.
-//   - Its request may have gone out (an idempotent effect given back without a lookup): it is in
-//     flight. With its approval it goes on, sent again under its key, whatever the approval's time.
-//     Without one (claimed before the policy asked), agentd cannot tell whether it went out, and
-//     sending it again could make a write nobody approved: a person settles it (UNKNOWN).
+//   - A request of it may have gone out (the tool said one went out, and it was given back without
+//     a lookup that found nothing: a retry, an idempotent recovery): it is in flight. With its
+//     approval it goes on, sent again under its key, whatever the approval's time. Without one (sent
+//     before the policy asked), sending it again could make a write nobody approved, and asking for
+//     an approval could "reject" a write that happened: a person settles it (UNKNOWN).
 //   - Nothing of it went out, and its approval is approved and used (it moved the effect to
 //     PENDING): it goes, unless the approval's time ran out first; then the approval is void, as a
 //     rejection.
@@ -391,10 +393,11 @@ func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) 
 }
 
 // mayResend says whether recovery may send a claimed effect again, which may never have gone out:
-// always, unless the policy wants it approved and nobody approved it (it was claimed under a policy
-// that did not ask). Then recovery only looks: one found never to have gone out meets gate on the
-// next call, and an idempotent one, which cannot be looked up, goes to a person. An approved write
-// once claimed is in flight: its approval's time no longer matters.
+// always, unless the policy wants it approved. Then only with its approval, approved and used: an
+// idempotent write, which cannot be looked up, is in flight whatever the approval's time; one a
+// lookup finds never took effect is a new send, and needs the approval in its time. Otherwise
+// recovery only looks, and an effect it gives back meets gate on the next call: one found never to
+// have taken effect, an expired approval or none; an idempotent one that may be out, a person.
 func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule) (bool, error) {
 	if rule == nil {
 		return true, nil
@@ -406,7 +409,7 @@ func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule
 	case err != nil:
 		return false, err
 	}
-	return a.Status == approvalApproved && a.UsedAt.Valid, nil
+	return a.Status == approvalApproved && a.UsedAt.Valid && (e.EffectClass == policy.EffectIdempotent || !expired(a)), nil
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the

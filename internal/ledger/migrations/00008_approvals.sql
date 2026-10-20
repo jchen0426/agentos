@@ -33,10 +33,11 @@ CREATE TABLE approvals (
 );
 CREATE INDEX approvals_pending ON approvals (expires_at) WHERE status = 'PENDING';
 CREATE INDEX approvals_by_run ON approvals (workflow_id, tool);
--- Whether an effect's request may have gone out: set when it is claimed, cleared when agentd knows
--- nothing went out (the tool sent nothing, a lookup found nothing in time, a person found it never
--- happened). An approval's time, and an approval it never had, matter only while it is clear: a
--- write that may be out is recovered by its class, or settled by a person.
+-- Whether a request of an effect may have reached the outside world: set when the tool says a
+-- visible request goes out (proceed); cleared when a lookup found the write never took effect, or a
+-- person found it never happened. An approval's time, and an approval it never had, matter only
+-- while it is clear: a write that may be out is in flight, recovered by its class, or settled by a
+-- person.
 ALTER TABLE effects ADD COLUMN maybe_sent INTEGER NOT NULL DEFAULT 0;
 
 -- Doorbells to deliver (design doc, section 10): each written in the same transaction as the

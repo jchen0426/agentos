@@ -27,6 +27,7 @@ type writer struct {
 	release chan struct{} // when set, Execute waits for it before it asks to proceed
 	err     error         // what Execute returns, once sent
 	deny    string        // when set, Execute refuses the payload before it sends anything
+	unsent  bool          // when set, Execute fails before it sends anything (ErrNotSent)
 }
 
 var noArgs = tools.MustSchema(`{"type": "object"}`)
@@ -49,6 +50,9 @@ func (w *writer) Execute(ctx context.Context, _ json.RawMessage, _ string, proce
 	}
 	if w.deny != "" {
 		return nil, &tools.DeniedError{Reason: w.deny}
+	}
+	if w.unsent {
+		return nil, tools.ErrNotSent
 	}
 	if err := proceed(ctx); err != nil {
 		return nil, err

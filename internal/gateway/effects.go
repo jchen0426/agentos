@@ -402,7 +402,7 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 			return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
 		}
 		if _, rerr := g.Ledger.Q.ReleaseEffect(ctx, db.ReleaseEffectParams{
-			MaybeSent: 0, UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
+			UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
 		}); rerr != nil {
 			g.Log.Error("could not release an unsent effect", "effect_id", e.EffectID, "error", rerr)
 		}
@@ -436,7 +436,7 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	case class == policy.EffectIdempotent && !cancelled && mayResend:
 		return g.resend(ctx, run, t, e, payload)
 	case class == policy.EffectIdempotent && !cancelled:
-		return g.release(ctx, e, true) // not looked up: it may have gone out
+		return g.release(ctx, e, false) // not looked up: it may have taken effect
 	case class == policy.EffectUnsafe || !canFind:
 		return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown: "+why)
 	}
@@ -477,20 +477,21 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	case cancelled:
 		return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled, and its request never took effect")
 	case !mayResend:
-		return g.release(ctx, e, false)
+		return g.release(ctx, e, true)
 	}
 	return g.resend(ctx, run, t, e, payload)
 }
 
-// release gives back a claimed effect for the run's next call: one that never took effect, or an
-// idempotent one that may have (maybeSent), which the next call sends again under its key.
-func (g *Gateway) release(ctx context.Context, e db.Effect, maybeSent bool) (*agentosv1.Result, error) {
-	var sent int64
-	if maybeSent {
-		sent = 1
+// release gives back a claimed effect for the run's next call: one a lookup found never took
+// effect (unsent), or an idempotent one that may have, which the next call sends again under its key.
+func (g *Gateway) release(ctx context.Context, e db.Effect, unsent bool) (*agentosv1.Result, error) {
+	release := g.Ledger.Q.ReleaseEffect
+	if unsent {
+		release = func(ctx context.Context, p db.ReleaseEffectParams) (int64, error) {
+			return g.Ledger.Q.ReleaseUnsentEffect(ctx, db.ReleaseUnsentEffectParams(p))
+		}
 	}
-	n, err := g.Ledger.Q.ReleaseEffect(ctx, db.ReleaseEffectParams{MaybeSent: sent, UpdatedAt: ledger.Now(), EffectID: e.EffectID,
-		Version: e.Version})
+	n, err := release(ctx, db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version})
 	if err != nil {
 		return nil, err
 	}

@@ -50,14 +50,14 @@ SELECT * FROM effects WHERE effect_id = ?;
 -- name: ClaimEffect :execrows
 -- Lets one sender send a PENDING effect, unless its run was cancelled: the cancel is checked
 -- in the same transaction that lets the request go out.
-UPDATE effects SET claimed_by = ?, claimed_at = ?, maybe_sent = 1, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
 -- name: TouchEffect :execrows
 -- Marks when a claimed effect's visible request goes out, unless its run was cancelled
 -- meanwhile: a lookup's wait for a request in flight counts from here.
-UPDATE effects SET claimed_at = ?, updated_at = ?
+UPDATE effects SET claimed_at = ?, maybe_sent = 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
@@ -68,9 +68,14 @@ SELECT CAST(COUNT(*) AS INTEGER) FROM effects
 WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED');
 
 -- name: ReleaseEffect :execrows
--- Returns a claimed effect for a later attempt to send: one whose request never took effect
--- (maybe_sent 0), or an idempotent one that may have (1), sent again under its key.
-UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = ?, version = version + 1, updated_at = ?
+-- Returns a claimed effect whose request never took effect, or an idempotent one that may have, for
+-- a later attempt to send (under its key). maybe_sent stays: what went out went out.
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'PENDING';
+
+-- name: ReleaseUnsentEffect :execrows
+-- Returns a claimed effect a lookup found never took effect: as far as it goes, nothing went out.
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = 0, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING';
 
 -- name: SetEffectStatus :execrows
