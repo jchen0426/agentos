@@ -507,3 +507,19 @@ func TestRunApprovalsInOrder(t *testing.T) {
 		}
 	}
 }
+
+// An approval gates an effect, and a read has none: agentd refuses at start a policy that asks
+// for approval of a read, and takes one that asks it of a write.
+func TestOnlyWritesAskForApproval(t *testing.T) {
+	reg := tools.Registry{}
+	reg.Add(&tools.ShowDiff{})
+	reg.Add(&writer{class: policy.EffectUnsafe})
+	read := &policy.Policy{Tools: map[string]policy.Tool{"git.show_diff": {Decision: "require_approval"}}}
+	if err := CheckTools(read, reg); err == nil || !strings.Contains(err.Error(), "only reads") {
+		t.Fatalf("a read that asks for approval: %v", err)
+	}
+	write := &policy.Policy{Tools: map[string]policy.Tool{"test.write": {Decision: "require_approval"}}}
+	if err := CheckTools(write, reg); err != nil {
+		t.Fatalf("a write that asks for approval: %v", err)
+	}
+}
