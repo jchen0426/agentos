@@ -355,6 +355,24 @@ func TestApprovalsExpire(t *testing.T) {
 			t.Fatalf("approval %+v", a)
 		}
 	})
+	t.Run("approved, never acted on, and the policy stopped asking", func(t *testing.T) {
+		// The approval moves the write to PENDING only in its time, whatever the policy says now.
+		f := newFixture(t, false)
+		w := &writer{class: policy.EffectLookup}
+		args := map[string]any{"n": 1}
+		if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove, By: "bob"}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(400 * time.Millisecond)
+		req, canon := call(t, w, args)
+		res, err := f.g.effect(context.Background(), f.run, w, w.Class(), 1, nil, req, canon, faults.Effect{})
+		if err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+			t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+		}
+	})
 }
 
 // Section 10, T5: what goes out is the payload recorded for the write, which must be the one
@@ -1041,5 +1059,46 @@ func TestAnEffectWithABadApprovalIsNotSent(t *testing.T) {
 				t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 			}
 		})
+	}
+}
+
+// unknownThenUnsent's first attempt makes a visible request and then cannot tell what came of it;
+// its second does nothing; later ones send.
+type unknownThenUnsent struct {
+	writer
+	attempts atomic.Int64
+}
+
+func (w *unknownThenUnsent) Execute(ctx context.Context, payload json.RawMessage, key string, proceed tools.Proceed) (map[string]any, error) {
+	switch w.attempts.Add(1) {
+	case 1:
+		if err := proceed(ctx); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("connection reset")
+	case 2:
+		return nil, tools.ErrNotSent
+	}
+	return w.writer.Execute(ctx, payload, key, proceed)
+}
+
+// An idempotent write whose outcome an attempt could not tell is in flight: sent again under its
+// key at once, and when that resend does nothing, still in flight, past its approval's time too.
+func TestAnAttemptThatMayHaveTakenEffectStaysInFlight(t *testing.T) {
+	f := newFixture(t, false)
+	w := &unknownThenUnsent{writer: writer{class: policy.EffectIdempotent}}
+	args := map[string]any{"n": 1}
+	if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ask(t, w, args, 1, time.Hour); err == nil || w.attempts.Load() != 2 {
+		t.Fatalf("the resend that did nothing: %v, %d attempts", err, w.attempts.Load())
+	}
+	time.Sleep(400 * time.Millisecond)
+	if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 }

@@ -412,6 +412,7 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 		return g.settle(ctx, e, effectUnknown, nil, conflict.Reason)
 	}
 	g.Log.Warn("effect outcome unknown", "workflow_id", run.WorkflowID, "effect_id", e.EffectID, "tool", t.Name(), "error", err)
+	e.MaybeSent = 1 // this attempt may have taken effect, whatever a later one does
 	return g.recoverEffect(ctx, run, t, e, payload, err.Error(), true)
 }
 
