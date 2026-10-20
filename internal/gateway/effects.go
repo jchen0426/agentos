@@ -413,7 +413,13 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 		return g.settle(ctx, e, effectUnknown, nil, conflict.Reason)
 	}
 	g.Log.Warn("effect outcome unknown", "workflow_id", run.WorkflowID, "effect_id", e.EffectID, "tool", t.Name(), "error", err)
-	e.MaybeSent = 1 // this attempt may have taken effect, whatever a later one does
+	// The attempt may have taken effect if it made a visible request, which proceed marked in the
+	// ledger: then whatever a later attempt does, the effect stays in flight.
+	cur, rerr := g.Ledger.Q.GetEffect(ctx, e.EffectID)
+	if rerr != nil {
+		return nil, rerr
+	}
+	e.MaybeSent = cur.MaybeSent
 	return g.recoverEffect(ctx, run, t, e, payload, err.Error(), true)
 }
 

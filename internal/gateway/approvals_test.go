@@ -1119,3 +1119,38 @@ func TestAnAttemptThatMayHaveTakenEffectStaysInFlight(t *testing.T) {
 		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 }
+
+// unknownBeforeAnyRequest's first attempt cannot tell what came of it, having made no visible
+// request, until after the approval's time; later ones send.
+type unknownBeforeAnyRequest struct {
+	writer
+	attempts atomic.Int64
+}
+
+func (w *unknownBeforeAnyRequest) Execute(ctx context.Context, payload json.RawMessage, key string, proceed tools.Proceed) (map[string]any, error) {
+	if w.attempts.Add(1) == 1 {
+		time.Sleep(400 * time.Millisecond)
+		return nil, errors.New("connection reset")
+	}
+	return w.writer.Execute(ctx, payload, key, proceed)
+}
+
+// An attempt whose outcome is unknown but which made no visible request made nothing: sending the
+// write again is a new request, which the approval no longer allows once its time is up.
+func TestAnAttemptThatMadeNoRequestIsNotInFlight(t *testing.T) {
+	f := newFixture(t, false)
+	w := &unknownBeforeAnyRequest{writer: writer{class: policy.EffectIdempotent}}
+	args := map[string]any{"n": 1}
+	if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ask(t, w, args, 1, time.Hour); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
+		t.Fatalf("recovery past the approval's time: %v, sent %d", err, w.sent.Load())
+	}
+	if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
+		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+}
