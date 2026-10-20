@@ -369,6 +369,11 @@ func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) (*agentosv1.Result, error) {
 	reason := fmt.Sprintf("approved by %s at %s, but the write had not taken effect when the approval expired at %s; "+
 		"agentd sends no more of it", a.DecidedBy.String, a.DecidedAt.String, a.ExpiresAt)
+	if e.LastRequestAt.Valid {
+		// A write of several requests may have made some, which stay (a branch, for a pull
+		// request never opened).
+		reason += fmt.Sprintf(". A request of it went out at %s, and what that request made may remain", e.LastRequestAt.String)
+	}
 	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
 		now := ledger.Now()
 		if n, err := q.ExpireUsedApproval(ctx, db.ExpireUsedApprovalParams{

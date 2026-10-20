@@ -475,7 +475,7 @@ func (q *Queries) GetEditedApproval(ctx context.Context, arg GetEditedApprovalPa
 }
 
 const getEffect = `-- name: GetEffect :one
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE effect_id = ?
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects WHERE effect_id = ?
 `
 
 func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error) {
@@ -498,12 +498,13 @@ func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error
 		&i.Version,
 		&i.Reason,
 		&i.MaybeSent,
+		&i.LastRequestAt,
 	)
 	return i, err
 }
 
 const getLatestEffect = `-- name: GetLatestEffect :one
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
 ORDER BY updated_at DESC LIMIT 1
 `
 
@@ -533,6 +534,7 @@ func (q *Queries) GetLatestEffect(ctx context.Context, arg GetLatestEffectParams
 		&i.Version,
 		&i.Reason,
 		&i.MaybeSent,
+		&i.LastRequestAt,
 	)
 	return i, err
 }
@@ -952,7 +954,7 @@ func (q *Queries) ListCancelledRuns(ctx context.Context) ([]Run, error) {
 }
 
 const listClaimedEffects = `-- name: ListClaimedEffects :many
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND claimed_by <> ?
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND claimed_by <> ?
 ORDER BY created_at
 `
 
@@ -984,6 +986,7 @@ func (q *Queries) ListClaimedEffects(ctx context.Context, claimedBy sql.NullStri
 			&i.Version,
 			&i.Reason,
 			&i.MaybeSent,
+			&i.LastRequestAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1036,7 +1039,7 @@ func (q *Queries) ListDueDoorbells(ctx context.Context, nextAttemptAt string) ([
 }
 
 const listEffectsByStatus = `-- name: ListEffectsByStatus :many
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE status = ? ORDER BY created_at
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects WHERE status = ? ORDER BY created_at
 `
 
 func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Effect, error) {
@@ -1065,6 +1068,7 @@ func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Eff
 			&i.Version,
 			&i.Reason,
 			&i.MaybeSent,
+			&i.LastRequestAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1748,17 +1752,18 @@ func (q *Queries) SupersedeApproval(ctx context.Context, arg SupersedeApprovalPa
 }
 
 const touchEffect = `-- name: TouchEffect :execrows
-UPDATE effects SET claimed_at = ?, maybe_sent = 1, updated_at = ?
+UPDATE effects SET claimed_at = ?, last_request_at = ?, maybe_sent = 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `
 
 type TouchEffectParams struct {
-	ClaimedAt sql.NullString
-	UpdatedAt string
-	EffectID  string
-	Version   int64
-	ClaimedBy sql.NullString
+	ClaimedAt     sql.NullString
+	LastRequestAt sql.NullString
+	UpdatedAt     string
+	EffectID      string
+	Version       int64
+	ClaimedBy     sql.NullString
 }
 
 // Marks when a claimed effect's visible request goes out, unless its run was cancelled
@@ -1766,6 +1771,7 @@ type TouchEffectParams struct {
 func (q *Queries) TouchEffect(ctx context.Context, arg TouchEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, touchEffect,
 		arg.ClaimedAt,
+		arg.LastRequestAt,
 		arg.UpdatedAt,
 		arg.EffectID,
 		arg.Version,

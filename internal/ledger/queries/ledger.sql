@@ -57,7 +57,7 @@ WHERE effect_id = ? AND version = ? AND status = 'PENDING'
 -- name: TouchEffect :execrows
 -- Marks when a claimed effect's visible request goes out, unless its run was cancelled
 -- meanwhile: a lookup's wait for a request in flight counts from here.
-UPDATE effects SET claimed_at = ?, maybe_sent = 1, updated_at = ?
+UPDATE effects SET claimed_at = ?, last_request_at = ?, maybe_sent = 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 

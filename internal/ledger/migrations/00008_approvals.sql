@@ -40,6 +40,10 @@ CREATE INDEX approvals_by_run ON approvals (workflow_id, tool);
 -- flight, recovered by its class, or settled by a person. A write of several requests may have
 -- made some of them without taking effect (a branch, for a pull request never opened).
 ALTER TABLE effects ADD COLUMN maybe_sent INTEGER NOT NULL DEFAULT 0;
+-- When agentd last made a visible request of an effect (proceed). Unlike maybe_sent, it stays
+-- when the effect is found not to have taken effect: a write of several requests may have left
+-- what some of them made (a branch, for a pull request never opened), which its record must not deny.
+ALTER TABLE effects ADD COLUMN last_request_at TEXT;
 -- An earlier agentd gave back an idempotent effect it could not look up, unsettled: one claimed
 -- before (its version moved on) and unclaimed now may have taken effect. Anything else it gave
 -- back had been found never to have.
@@ -62,6 +66,7 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_due ON outbox (next_attempt_at) WHERE delivered_at IS NULL;
 
 -- +goose Down
+ALTER TABLE effects DROP COLUMN last_request_at;
 ALTER TABLE effects DROP COLUMN maybe_sent;
 DROP TABLE outbox;
 DROP TABLE approvals;

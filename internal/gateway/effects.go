@@ -361,7 +361,8 @@ func (g *Gateway) proceed(e db.Effect) tools.Proceed {
 	return func(ctx context.Context) error {
 		now := ledger.Now()
 		n, err := g.Ledger.Q.TouchEffect(ctx, db.TouchEffectParams{
-			ClaimedAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version, ClaimedBy: valid(g.Incarnation),
+			ClaimedAt: valid(now), LastRequestAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+			ClaimedBy: valid(g.Incarnation),
 		})
 		switch {
 		case err != nil:
@@ -433,8 +434,10 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	}
 	finder, canFind := t.(tools.Finder)
 	switch class := e.EffectClass; {
+	case class == policy.EffectIdempotent && !cancelled && mayResend && e.MaybeSent != 0:
+		return g.resend(ctx, run, t, e, payload) // in flight, whatever its approval's time
 	case class == policy.EffectIdempotent && !cancelled && mayResend:
-		return g.resend(ctx, run, t, e, payload)
+		return g.resendNew(ctx, run, t, e, payload) // nothing of it went out
 	case class == policy.EffectIdempotent && !cancelled:
 		return g.release(ctx, e, false) // not looked up: it may have taken effect
 	case class == policy.EffectUnsafe || !canFind:
@@ -479,8 +482,13 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	case !mayResend:
 		return g.release(ctx, e, true)
 	}
-	// Sent again, it is a new request, which an approval allows only in its time: past it, the
-	// effect goes back to gate, which voids the approval.
+	return g.resendNew(ctx, run, t, e, payload)
+}
+
+// resendNew sends again an effect none of whose requests took effect, as far as agentd knows. It is
+// a new request, which an approval allows only in its time: past it, the effect goes back to gate,
+// which voids the approval.
+func (g *Gateway) resendNew(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage) (*agentosv1.Result, error) {
 	if lapsed, err := g.lapsed(ctx, e.EffectID); err != nil {
 		return nil, err
 	} else if lapsed {

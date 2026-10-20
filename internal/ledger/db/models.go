@@ -93,6 +93,7 @@ type Effect struct {
 	Version        int64
 	Reason         sql.NullString
 	MaybeSent      int64
+	LastRequestAt  sql.NullString
 }
 
 type EffectResolution struct {

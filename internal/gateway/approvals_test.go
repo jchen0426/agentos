@@ -803,7 +803,7 @@ func TestAnApprovedWriteThatHadNotTakenEffectExpires(t *testing.T) {
 		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 	if a = f.one(t); a.Status != approvalExpired || !strings.Contains(a.Reason.String, "approved by bob") ||
-		!strings.Contains(a.Reason.String, "had not taken effect") {
+		!strings.Contains(a.Reason.String, "had not taken effect") || strings.Contains(a.Reason.String, "went out") {
 		t.Fatalf("approval %+v", a)
 	}
 	if e := effectOf(t, f, a); e.Status != effectAbandoned {
@@ -835,6 +835,10 @@ func TestAnApprovedWriteThatHadNotTakenEffectExpires(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 	if res, err := p.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
 		t.Fatalf("one request of several: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+	// Its record says what went out: what that request made may remain.
+	if a := p.one(t); !strings.Contains(a.Reason.String, "A request of it went out at") {
+		t.Fatalf("approval %+v", a)
 	}
 
 	// A write that may have taken effect (the tool said a request went out, then it was given back,
@@ -941,8 +945,8 @@ func TestACancelledRunsWriteIsNotHeld(t *testing.T) {
 
 // approvedThenClaimedElsewhere records the fixture's call of w, which rule wants approved; has a
 // reviewer approve it, and the next call move it to PENDING; and has an agentd that is gone claim
-// it and send a request: what recovery finds. It returns the call.
-func (f *fixture) approvedThenClaimedElsewhere(t *testing.T, w tools.Writer, rule *approvalRule) func() (*agentosv1.Result, error) {
+// it, and send a request unless it stopped first (sent): what recovery finds. It returns the call.
+func (f *fixture) approvedThenClaimedElsewhere(t *testing.T, w tools.Writer, rule *approvalRule, sent bool) func() (*agentosv1.Result, error) {
 	t.Helper()
 	req := f.req()
 	canon, _ := encodeCanonical(req.Args)
@@ -959,8 +963,8 @@ func (f *fixture) approvedThenClaimedElsewhere(t *testing.T, w tools.Writer, rul
 	if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
 		t.Fatalf("approved: %v %v", res, err)
 	}
-	if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = 'gone', claimed_at = ?, maybe_sent = 1,
-		version = version + 1 WHERE effect_id = ?`, ledger.Now(), req.EffectID); err != nil {
+	if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = 'gone', claimed_at = ?, maybe_sent = ?,
+		version = version + 1 WHERE effect_id = ?`, ledger.Now(), sent, req.EffectID); err != nil {
 		t.Fatal(err)
 	}
 	return ask
@@ -973,7 +977,7 @@ func TestRecoveryOfAnApprovedWriteAfterItsApprovalExpired(t *testing.T) {
 	t.Run("lookup", func(t *testing.T) {
 		f := newFixture(t, false)
 		w := &finder{writer: writer{class: policy.EffectLookup}}
-		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond}, true)
 		time.Sleep(400 * time.Millisecond)
 		// The lookup finds nothing: the effect goes back, and the next call voids the approval.
 		if _, err := ask(); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
@@ -986,10 +990,23 @@ func TestRecoveryOfAnApprovedWriteAfterItsApprovalExpired(t *testing.T) {
 	t.Run("idempotent", func(t *testing.T) {
 		f := newFixture(t, false)
 		w := &finder{writer: writer{class: policy.EffectIdempotent}}
-		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond}, true)
 		time.Sleep(400 * time.Millisecond)
 		// In flight: recovery sends it again under its key, there and then.
 		if res, err := ask(); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+			t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+		}
+	})
+	t.Run("idempotent, and the agentd that is gone stopped before it sent anything", func(t *testing.T) {
+		// Nothing of it went out: sent now, it would be a new request, past the approval's time.
+		f := newFixture(t, false)
+		w := &finder{writer: writer{class: policy.EffectIdempotent}}
+		ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond}, false)
+		time.Sleep(400 * time.Millisecond)
+		if _, err := ask(); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
+			t.Fatalf("recovery: %v, sent %d", err, w.sent.Load())
+		}
+		if res, err := ask(); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
 			t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 		}
 	})
@@ -1004,7 +1021,7 @@ func TestAResendThatDoesNothing(t *testing.T) {
 		t.Run(class, func(t *testing.T) {
 			f := newFixture(t, false)
 			w := &finder{writer: writer{class: class, unsent: true}}
-			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond})
+			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 300 * time.Millisecond}, true)
 			if _, err := ask(); err == nil || errors.Is(err, errEffectReleased) {
 				t.Fatalf("the resend that did nothing: %v", err)
 			}
@@ -1024,7 +1041,7 @@ func TestAResendThatDoesNothing(t *testing.T) {
 func TestAnApprovalThatRunsOutWhileRecoveryWaits(t *testing.T) {
 	f := newFixture(t, false)
 	w := &finder{writer: writer{class: policy.EffectLookup}, settle: time.Second}
-	ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 500 * time.Millisecond})
+	ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: 500 * time.Millisecond}, true)
 	if _, err := ask(); !errors.Is(err, errEffectReleased) || w.sent.Load() != 0 {
 		t.Fatalf("recovery past the approval's time: %v, sent %d", err, w.sent.Load())
 	}
@@ -1041,7 +1058,7 @@ func TestAnEffectWithABadApprovalIsNotSent(t *testing.T) {
 		t.Run(fmt.Sprintf("claimed %v", claimed), func(t *testing.T) {
 			f := newFixture(t, false)
 			w := &finder{writer: writer{class: policy.EffectIdempotent}}
-			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: time.Hour})
+			ask := f.approvedThenClaimedElsewhere(t, w, &approvalRule{ttl: time.Hour}, true)
 			if _, err := f.g.Ledger.DB.Exec(`UPDATE approvals SET status = 'REJECTED', reason = 'no'`); err != nil {
 				t.Fatal(err)
 			}
