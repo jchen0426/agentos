@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -44,14 +45,21 @@ type Tool struct {
 	Decision string `yaml:"decision"`
 	// Effect is optional: the tool declares its class. When set it must be that class, or
 	// unsafe for a write, which only makes recovery more careful.
-	Effect      string   `yaml:"effect"`
-	DenyPaths   []string `yaml:"deny_paths"`   // enforced by the tool itself, not by the workflow
-	ApprovalTTL string   `yaml:"approval_ttl"` // M4
-	Render      string   `yaml:"render"`       // "template": the tool renders what it writes (all of agentd's do)
+	Effect    string   `yaml:"effect"`
+	DenyPaths []string `yaml:"deny_paths"` // enforced by the tool itself, not by the workflow
+	// ApprovalTTL is how long an approval of the tool's call stays open, and once approved how
+	// long the run has to act on it (a Go duration; DefaultApprovalTTL when left out). Only
+	// with require_approval.
+	ApprovalTTL string `yaml:"approval_ttl"`
+	Render      string `yaml:"render"` // "template": the tool renders what it writes (all of agentd's do)
 	// MaxPerRun is how many effects of a write one run may have, sent or maybe sent; 0 is
 	// the default, 1.
 	MaxPerRun int `yaml:"max_per_run"`
 }
+
+// DefaultApprovalTTL is how long an approval stays open when the policy does not say: as long
+// as the workflow's wait for it (design doc, section 5).
+const DefaultApprovalTTL = 24 * time.Hour
 
 type Model struct {
 	AllowedProviders []string `yaml:"allowed_providers"`
@@ -95,6 +103,14 @@ func Load(path string) (*Policy, error) {
 		if t.MaxPerRun < 0 {
 			return nil, fmt.Errorf("policy %s: tool %s: max_per_run must not be negative", path, name)
 		}
+		if t.ApprovalTTL != "" {
+			if t.Decision != "require_approval" {
+				return nil, fmt.Errorf("policy %s: tool %s: approval_ttl goes with decision require_approval", path, name)
+			}
+			if ttl, err := time.ParseDuration(t.ApprovalTTL); err != nil || ttl <= 0 {
+				return nil, fmt.Errorf("policy %s: tool %s: approval_ttl %q is not a positive duration such as 24h", path, name, t.ApprovalTTL)
+			}
+		}
 	}
 	return &p, nil
 }
@@ -106,6 +122,8 @@ type Verdict struct {
 	Effect   string // the effect class the policy states for the tool, if any; empty for model calls
 	// MaxPerRun is the tool's max_per_run; 0 when the policy leaves the default.
 	MaxPerRun int
+	// ApprovalTTL is how long an approval stays open, for RequireApproval.
+	ApprovalTTL time.Duration
 }
 
 // EvaluateTool decides a tool call. args is the decoded JSON object of the call; scope holds
@@ -136,7 +154,11 @@ func (p *Policy) EvaluateTool(name string, args map[string]any, scope map[string
 	case "allow":
 		return Verdict{Decision: Allow, Effect: t.Effect, MaxPerRun: t.MaxPerRun}
 	case "require_approval":
-		return Verdict{Decision: RequireApproval, Effect: t.Effect, MaxPerRun: t.MaxPerRun}
+		ttl := DefaultApprovalTTL
+		if t.ApprovalTTL != "" {
+			ttl, _ = time.ParseDuration(t.ApprovalTTL) // checked by Load
+		}
+		return Verdict{Decision: RequireApproval, Effect: t.Effect, MaxPerRun: t.MaxPerRun, ApprovalTTL: ttl}
 	default:
 		return Verdict{Decision: Deny, Reason: "denied by policy"}
 	}

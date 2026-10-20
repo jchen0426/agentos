@@ -79,10 +79,14 @@ func TestDevClaudeConfigLoads(t *testing.T) {
 	if v := pol.EvaluateModel("audit_v1", r.Provider); v.Decision != policy.Allow {
 		t.Errorf("the dev policy refuses %s: %s", r.Provider, v.Reason)
 	}
-	// Until approvals arrive (M4), a real model and real GitHub writes without approval never
-	// meet: injected text in a diff could open a pull request. This config only dry-runs.
+	// A real model and real GitHub writes never meet without a person in between: injected text
+	// in a diff could steer the model into a pull request. The dev policy has a person approve
+	// each one (section 10); this config, without a github section, only dry-runs.
+	if v := pol.EvaluateTool("github.open_draft_pr", map[string]any{"repo": "acme/payments"}, nil); v.Decision != policy.RequireApproval {
+		t.Errorf("the dev policy opens pull requests without approval: %v", v.Decision)
+	}
 	if c.GitHub != nil {
-		t.Error("agentd-claude.yaml configures GitHub: with the dev policy, nothing would ask before writing")
+		t.Error("agentd-claude.yaml configures GitHub: the dev configs only dry-run")
 	}
 }
 

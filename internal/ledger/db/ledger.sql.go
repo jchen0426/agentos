@@ -10,6 +10,26 @@ import (
 	"database/sql"
 )
 
+const abandonAwaitingEffect = `-- name: AbandonAwaitingEffect :execrows
+UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND status = 'AWAITING_APPROVAL'
+`
+
+type AbandonAwaitingEffectParams struct {
+	Reason    sql.NullString
+	UpdatedAt string
+	EffectID  string
+}
+
+// An effect whose approval was rejected, expired or replaced is never sent.
+func (q *Queries) AbandonAwaitingEffect(ctx context.Context, arg AbandonAwaitingEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, abandonAwaitingEffect, arg.Reason, arg.UpdatedAt, arg.EffectID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const abandonUnsentEffects = `-- name: AbandonUnsentEffects :execrows
 UPDATE effects SET status = 'ABANDONED', reason = 'the run was cancelled before the request was sent',
   version = version + 1, updated_at = ?
@@ -38,6 +58,28 @@ type AddBlobOwnerParams struct {
 func (q *Queries) AddBlobOwner(ctx context.Context, arg AddBlobOwnerParams) error {
 	_, err := q.db.ExecContext(ctx, addBlobOwner, arg.WorkflowID, arg.Sha256)
 	return err
+}
+
+const approveEffect = `-- name: ApproveEffect :execrows
+UPDATE effects SET status = 'PENDING', version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'AWAITING_APPROVAL'
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
+`
+
+type ApproveEffectParams struct {
+	UpdatedAt string
+	EffectID  string
+	Version   int64
+}
+
+// An approved effect goes on to be sent, unless its run was cancelled: from here on it is an
+// effect like any other (claimed, sent, recovered by its class).
+func (q *Queries) ApproveEffect(ctx context.Context, arg ApproveEffectParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, approveEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const claimEffect = `-- name: ClaimEffect :execrows
@@ -90,6 +132,42 @@ func (q *Queries) CountRunEffects(ctx context.Context, arg CountRunEffectsParams
 	return column_1, err
 }
 
+const decideApproval = `-- name: DecideApproval :execrows
+UPDATE approvals
+SET status = ?, decided_by = ?, decided_at = ?, decision_key = ?, reason = ?, edited_patch_blob = ?,
+  edited_args_sha256 = ?
+WHERE approval_id = ? AND status = 'PENDING'
+`
+
+type DecideApprovalParams struct {
+	Status           string
+	DecidedBy        sql.NullString
+	DecidedAt        sql.NullString
+	DecisionKey      sql.NullString
+	Reason           sql.NullString
+	EditedPatchBlob  sql.NullString
+	EditedArgsSha256 sql.NullString
+	ApprovalID       string
+}
+
+// A person's decision, if the approval still waits for one: the first valid decision wins.
+func (q *Queries) DecideApproval(ctx context.Context, arg DecideApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, decideApproval,
+		arg.Status,
+		arg.DecidedBy,
+		arg.DecidedAt,
+		arg.DecisionKey,
+		arg.Reason,
+		arg.EditedPatchBlob,
+		arg.EditedArgsSha256,
+		arg.ApprovalID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteRun = `-- name: DeleteRun :exec
 DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 `
@@ -97,6 +175,46 @@ DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 func (q *Queries) DeleteRun(ctx context.Context, workflowID string) error {
 	_, err := q.db.ExecContext(ctx, deleteRun, workflowID)
 	return err
+}
+
+const expirePendingApproval = `-- name: ExpirePendingApproval :execrows
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'PENDING'
+`
+
+type ExpirePendingApprovalParams struct {
+	DecidedAt  sql.NullString
+	Reason     sql.NullString
+	ApprovalID string
+}
+
+// agentd's decision when an approval's time is up and nobody decided: a rejection.
+func (q *Queries) ExpirePendingApproval(ctx context.Context, arg ExpirePendingApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, expirePendingApproval, arg.DecidedAt, arg.Reason, arg.ApprovalID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const expireUnusedApproval = `-- name: ExpireUnusedApproval :execrows
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL
+`
+
+type ExpireUnusedApprovalParams struct {
+	DecidedAt  sql.NullString
+	Reason     sql.NullString
+	ApprovalID string
+}
+
+// An approval the run did not act on before its time was up: void as well.
+func (q *Queries) ExpireUnusedApproval(ctx context.Context, arg ExpireUnusedApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, expireUnusedApproval, arg.DecidedAt, arg.Reason, arg.ApprovalID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const finishModelCall = `-- name: FinishModelCall :exec
@@ -128,6 +246,68 @@ func (q *Queries) FinishModelCall(ctx context.Context, arg FinishModelCallParams
 		arg.RequestSeq,
 	)
 	return err
+}
+
+const getApproval = `-- name: GetApproval :one
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE approval_id = ?
+`
+
+func (q *Queries) GetApproval(ctx context.Context, approvalID string) (Approval, error) {
+	row := q.db.QueryRowContext(ctx, getApproval, approvalID)
+	var i Approval
+	err := row.Scan(
+		&i.ApprovalID,
+		&i.EffectID,
+		&i.WorkflowID,
+		&i.Tool,
+		&i.ArgsJson,
+		&i.PayloadSha256,
+		&i.ContextBlob,
+		&i.Status,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.DecidedBy,
+		&i.DecidedAt,
+		&i.DecisionKey,
+		&i.Reason,
+		&i.EditedPatchBlob,
+		&i.EditedArgsSha256,
+		&i.Supersedes,
+		&i.SupersededBy,
+		&i.UsedAt,
+	)
+	return i, err
+}
+
+const getApprovalByEffect = `-- name: GetApprovalByEffect :one
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE effect_id = ?
+`
+
+func (q *Queries) GetApprovalByEffect(ctx context.Context, effectID string) (Approval, error) {
+	row := q.db.QueryRowContext(ctx, getApprovalByEffect, effectID)
+	var i Approval
+	err := row.Scan(
+		&i.ApprovalID,
+		&i.EffectID,
+		&i.WorkflowID,
+		&i.Tool,
+		&i.ArgsJson,
+		&i.PayloadSha256,
+		&i.ContextBlob,
+		&i.Status,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.DecidedBy,
+		&i.DecidedAt,
+		&i.DecisionKey,
+		&i.Reason,
+		&i.EditedPatchBlob,
+		&i.EditedArgsSha256,
+		&i.Supersedes,
+		&i.SupersededBy,
+		&i.UsedAt,
+	)
+	return i, err
 }
 
 const getBlob = `-- name: GetBlob :one
@@ -204,6 +384,46 @@ func (q *Queries) GetCallCounts(ctx context.Context, arg GetCallCountsParams) (G
 	)
 	var i GetCallCountsRow
 	err := row.Scan(&i.GatewayCalls, &i.ModelCalls, &i.SameCalls)
+	return i, err
+}
+
+const getEditedApproval = `-- name: GetEditedApproval :one
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals
+WHERE workflow_id = ? AND tool = ? AND status = 'EDITED' AND edited_args_sha256 = ?
+`
+
+type GetEditedApprovalParams struct {
+	WorkflowID       string
+	Tool             string
+	EditedArgsSha256 sql.NullString
+}
+
+// The approval whose edit a call carries: the reviewer's patch in the arguments of the call
+// that was edited.
+func (q *Queries) GetEditedApproval(ctx context.Context, arg GetEditedApprovalParams) (Approval, error) {
+	row := q.db.QueryRowContext(ctx, getEditedApproval, arg.WorkflowID, arg.Tool, arg.EditedArgsSha256)
+	var i Approval
+	err := row.Scan(
+		&i.ApprovalID,
+		&i.EffectID,
+		&i.WorkflowID,
+		&i.Tool,
+		&i.ArgsJson,
+		&i.PayloadSha256,
+		&i.ContextBlob,
+		&i.Status,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.DecidedBy,
+		&i.DecidedAt,
+		&i.DecisionKey,
+		&i.Reason,
+		&i.EditedPatchBlob,
+		&i.EditedArgsSha256,
+		&i.Supersedes,
+		&i.SupersededBy,
+		&i.UsedAt,
+	)
 	return i, err
 }
 
@@ -336,6 +556,42 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 	return i, err
 }
 
+const insertApproval = `-- name: InsertApproval :exec
+INSERT INTO approvals (
+  approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status,
+  created_at, expires_at, supersedes
+) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+`
+
+type InsertApprovalParams struct {
+	ApprovalID    string
+	EffectID      string
+	WorkflowID    string
+	Tool          string
+	ArgsJson      string
+	PayloadSha256 string
+	ContextBlob   string
+	CreatedAt     string
+	ExpiresAt     string
+	Supersedes    sql.NullString
+}
+
+func (q *Queries) InsertApproval(ctx context.Context, arg InsertApprovalParams) error {
+	_, err := q.db.ExecContext(ctx, insertApproval,
+		arg.ApprovalID,
+		arg.EffectID,
+		arg.WorkflowID,
+		arg.Tool,
+		arg.ArgsJson,
+		arg.PayloadSha256,
+		arg.ContextBlob,
+		arg.CreatedAt,
+		arg.ExpiresAt,
+		arg.Supersedes,
+	)
+	return err
+}
+
 const insertBudgetEntry = `-- name: InsertBudgetEntry :exec
 INSERT INTO budget_entries (
   workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, created_at
@@ -426,11 +682,32 @@ func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) error {
 	return err
 }
 
+const insertDoorbell = `-- name: InsertDoorbell :exec
+INSERT INTO outbox (workflow_id, kind, why, created_at, next_attempt_at) VALUES (?, 'doorbell', ?, ?, ?)
+`
+
+type InsertDoorbellParams struct {
+	WorkflowID    string
+	Why           string
+	CreatedAt     string
+	NextAttemptAt string
+}
+
+func (q *Queries) InsertDoorbell(ctx context.Context, arg InsertDoorbellParams) error {
+	_, err := q.db.ExecContext(ctx, insertDoorbell,
+		arg.WorkflowID,
+		arg.Why,
+		arg.CreatedAt,
+		arg.NextAttemptAt,
+	)
+	return err
+}
+
 const insertEffect = `-- name: InsertEffect :execrows
 INSERT INTO effects (
   effect_id, workflow_id, tool, effect_class, payload_sha256, payload_blob, idempotency_key, status,
   created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (effect_id) DO NOTHING
 `
 
@@ -442,10 +719,12 @@ type InsertEffectParams struct {
 	PayloadSha256  string
 	PayloadBlob    sql.NullString
 	IdempotencyKey string
+	Status         string
 	CreatedAt      string
 	UpdatedAt      string
 }
 
+// A new effect: PENDING, or AWAITING_APPROVAL when the policy wants a person to approve it first.
 func (q *Queries) InsertEffect(ctx context.Context, arg InsertEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, insertEffect,
 		arg.EffectID,
@@ -455,6 +734,7 @@ func (q *Queries) InsertEffect(ctx context.Context, arg InsertEffectParams) (int
 		arg.PayloadSha256,
 		arg.PayloadBlob,
 		arg.IdempotencyKey,
+		arg.Status,
 		arg.CreatedAt,
 		arg.UpdatedAt,
 	)
@@ -646,6 +926,43 @@ func (q *Queries) ListClaimedEffects(ctx context.Context, claimedBy sql.NullStri
 	return items, nil
 }
 
+const listDueDoorbells = `-- name: ListDueDoorbells :many
+SELECT seq, workflow_id, kind, why, created_at, attempts, next_attempt_at, delivered_at, outcome FROM outbox WHERE delivered_at IS NULL AND next_attempt_at <= ? ORDER BY seq LIMIT 200
+`
+
+func (q *Queries) ListDueDoorbells(ctx context.Context, nextAttemptAt string) ([]Outbox, error) {
+	rows, err := q.db.QueryContext(ctx, listDueDoorbells, nextAttemptAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Outbox
+	for rows.Next() {
+		var i Outbox
+		if err := rows.Scan(
+			&i.Seq,
+			&i.WorkflowID,
+			&i.Kind,
+			&i.Why,
+			&i.CreatedAt,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.DeliveredAt,
+			&i.Outcome,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEffectsByStatus = `-- name: ListEffectsByStatus :many
 SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE status = ? ORDER BY created_at
 `
@@ -689,6 +1006,53 @@ func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Eff
 	return items, nil
 }
 
+const listExpiredApprovals = `-- name: ListExpiredApprovals :many
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE status = 'PENDING' AND expires_at <= ? ORDER BY expires_at
+`
+
+func (q *Queries) ListExpiredApprovals(ctx context.Context, expiresAt string) ([]Approval, error) {
+	rows, err := q.db.QueryContext(ctx, listExpiredApprovals, expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Approval
+	for rows.Next() {
+		var i Approval
+		if err := rows.Scan(
+			&i.ApprovalID,
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.ArgsJson,
+			&i.PayloadSha256,
+			&i.ContextBlob,
+			&i.Status,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.DecisionKey,
+			&i.Reason,
+			&i.EditedPatchBlob,
+			&i.EditedArgsSha256,
+			&i.Supersedes,
+			&i.SupersededBy,
+			&i.UsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFinishedModelCalls = `-- name: ListFinishedModelCalls :many
 SELECT workflow_id, activity_id, attempt, request_seq, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls
 WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
@@ -703,6 +1067,56 @@ type ListFinishedModelCallsParams struct {
 // The answered requests of one model call, in the order they were sent.
 func (q *Queries) ListFinishedModelCalls(ctx context.Context, arg ListFinishedModelCallsParams) ([]ModelCall, error) {
 	rows, err := q.db.QueryContext(ctx, listFinishedModelCalls, arg.WorkflowID, arg.ActivityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ModelCall
+	for rows.Next() {
+		var i ModelCall
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.Attempt,
+			&i.RequestSeq,
+			&i.RequestBlob,
+			&i.ResponseBlob,
+			&i.Provider,
+			&i.Model,
+			&i.PromptVersion,
+			&i.Effort,
+			&i.StopReason,
+			&i.UsageJson,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listModelAnswers = `-- name: ListModelAnswers :many
+SELECT m.workflow_id, m.activity_id, m.attempt, m.request_seq, m.request_blob, m.response_blob, m.provider, m.model, m.prompt_version, m.effort, m.stop_reason, m.usage_json, m.started_at, m.finished_at FROM model_calls m
+WHERE m.workflow_id = ?1 AND m.response_blob IS NOT NULL AND m.activity_id IN (
+  SELECT c.activity_id FROM calls c WHERE c.workflow_id = ?1 AND c.kind = 'model' AND c.name = ?2)
+`
+
+type ListModelAnswersParams struct {
+	WorkflowID string
+	Task       string
+}
+
+// The answered requests of a run's calls of one model task: the run's model answers.
+func (q *Queries) ListModelAnswers(ctx context.Context, arg ListModelAnswersParams) ([]ModelCall, error) {
+	rows, err := q.db.QueryContext(ctx, listModelAnswers, arg.WorkflowID, arg.Task)
 	if err != nil {
 		return nil, err
 	}
@@ -768,6 +1182,103 @@ func (q *Queries) ListOpenReservations(ctx context.Context) ([]BudgetEntry, erro
 			&i.Reason,
 			&i.IdempotencyKey,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingApprovals = `-- name: ListPendingApprovals :many
+SELECT a.approval_id, a.effect_id, a.workflow_id, a.tool, a.args_json, a.payload_sha256, a.context_blob, a.status, a.created_at, a.expires_at, a.decided_by, a.decided_at, a.decision_key, a.reason, a.edited_patch_blob, a.edited_args_sha256, a.supersedes, a.superseded_by, a.used_at FROM approvals a JOIN runs r ON r.workflow_id = a.workflow_id
+WHERE a.status = 'PENDING' AND r.cancelled_at IS NULL
+ORDER BY a.created_at, a.approval_id
+`
+
+// What waits for a decision, but for the approvals of cancelled runs: nothing they approve goes out.
+func (q *Queries) ListPendingApprovals(ctx context.Context) ([]Approval, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingApprovals)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Approval
+	for rows.Next() {
+		var i Approval
+		if err := rows.Scan(
+			&i.ApprovalID,
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.ArgsJson,
+			&i.PayloadSha256,
+			&i.ContextBlob,
+			&i.Status,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.DecisionKey,
+			&i.Reason,
+			&i.EditedPatchBlob,
+			&i.EditedArgsSha256,
+			&i.Supersedes,
+			&i.SupersededBy,
+			&i.UsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunApprovals = `-- name: ListRunApprovals :many
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE workflow_id = ? ORDER BY created_at, approval_id
+`
+
+func (q *Queries) ListRunApprovals(ctx context.Context, workflowID string) ([]Approval, error) {
+	rows, err := q.db.QueryContext(ctx, listRunApprovals, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Approval
+	for rows.Next() {
+		var i Approval
+		if err := rows.Scan(
+			&i.ApprovalID,
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.ArgsJson,
+			&i.PayloadSha256,
+			&i.ContextBlob,
+			&i.Status,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.DecisionKey,
+			&i.Reason,
+			&i.EditedPatchBlob,
+			&i.EditedArgsSha256,
+			&i.Supersedes,
+			&i.SupersededBy,
+			&i.UsedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -904,6 +1415,32 @@ func (q *Queries) ListStartingRuns(ctx context.Context) ([]Run, error) {
 	return items, nil
 }
 
+const markDoorbellsDelivered = `-- name: MarkDoorbellsDelivered :execrows
+UPDATE outbox SET delivered_at = ?, outcome = ?
+WHERE workflow_id = ? AND seq <= ? AND delivered_at IS NULL
+`
+
+type MarkDoorbellsDeliveredParams struct {
+	DeliveredAt sql.NullString
+	Outcome     sql.NullString
+	WorkflowID  string
+	Seq         int64
+}
+
+// One signal wakes the run for every doorbell rung for it until then.
+func (q *Queries) MarkDoorbellsDelivered(ctx context.Context, arg MarkDoorbellsDeliveredParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markDoorbellsDelivered,
+		arg.DeliveredAt,
+		arg.Outcome,
+		arg.WorkflowID,
+		arg.Seq,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const markRunCancelled = `-- name: MarkRunCancelled :execrows
 UPDATE runs SET cancelled_at = ? WHERE workflow_id = ? AND cancelled_at IS NULL
 `
@@ -919,6 +1456,28 @@ func (q *Queries) MarkRunCancelled(ctx context.Context, arg MarkRunCancelledPara
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const nextApprovalExpiry = `-- name: NextApprovalExpiry :one
+SELECT CAST(COALESCE(MIN(expires_at), '') AS TEXT) FROM approvals WHERE status = 'PENDING'
+`
+
+func (q *Queries) NextApprovalExpiry(ctx context.Context) (string, error) {
+	row := q.db.QueryRowContext(ctx, nextApprovalExpiry)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const nextDoorbellDue = `-- name: NextDoorbellDue :one
+SELECT CAST(COALESCE(MIN(next_attempt_at), '') AS TEXT) FROM outbox WHERE delivered_at IS NULL
+`
+
+func (q *Queries) NextDoorbellDue(ctx context.Context) (string, error) {
+	row := q.db.QueryRowContext(ctx, nextDoorbellDue)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const putBlob = `-- name: PutBlob :exec
@@ -977,6 +1536,31 @@ func (q *Queries) ResolveEffect(ctx context.Context, arg ResolveEffectParams) (i
 		arg.UpdatedAt,
 		arg.EffectID,
 		arg.Version,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const retryDoorbells = `-- name: RetryDoorbells :execrows
+UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?, outcome = ?
+WHERE workflow_id = ? AND seq <= ? AND delivered_at IS NULL
+`
+
+type RetryDoorbellsParams struct {
+	NextAttemptAt string
+	Outcome       sql.NullString
+	WorkflowID    string
+	Seq           int64
+}
+
+func (q *Queries) RetryDoorbells(ctx context.Context, arg RetryDoorbellsParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, retryDoorbells,
+		arg.NextAttemptAt,
+		arg.Outcome,
+		arg.WorkflowID,
+		arg.Seq,
 	)
 	if err != nil {
 		return 0, err
@@ -1051,6 +1635,23 @@ func (q *Queries) SetRunID(ctx context.Context, arg SetRunIDParams) (int64, erro
 	return result.RowsAffected()
 }
 
+const supersedeApproval = `-- name: SupersedeApproval :execrows
+UPDATE approvals SET status = 'SUPERSEDED', superseded_by = ? WHERE approval_id = ? AND status = 'EDITED'
+`
+
+type SupersedeApprovalParams struct {
+	SupersededBy sql.NullString
+	ApprovalID   string
+}
+
+func (q *Queries) SupersedeApproval(ctx context.Context, arg SupersedeApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, supersedeApproval, arg.SupersededBy, arg.ApprovalID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const touchEffect = `-- name: TouchEffect :execrows
 UPDATE effects SET claimed_at = ?, updated_at = ?
 WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'
@@ -1075,6 +1676,23 @@ func (q *Queries) TouchEffect(ctx context.Context, arg TouchEffectParams) (int64
 		arg.Version,
 		arg.ClaimedBy,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const useApproval = `-- name: UseApproval :execrows
+UPDATE approvals SET used_at = ? WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL
+`
+
+type UseApprovalParams struct {
+	UsedAt     sql.NullString
+	ApprovalID string
+}
+
+func (q *Queries) UseApproval(ctx context.Context, arg UseApprovalParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, useApproval, arg.UsedAt, arg.ApprovalID)
 	if err != nil {
 		return 0, err
 	}

@@ -1,7 +1,7 @@
 # Like agentd.yaml, but the model task goes to Claude (../models.yaml), at real prices. It needs
-# the agentos-anthropic-api-key item in the login keychain; see the README. No github section, on
-# purpose: the dev policy opens PRs without approval, and until approvals arrive (M4) text in a
-# diff could steer a real model into one. The GitHub tools only dry-run.
+# the agentos-anthropic-api-key item in the login keychain; see the README. No github section: the
+# GitHub tools only dry-run. Given one (README), each pull request waits for a person's approval
+# (the dev policy): text in a diff can steer a real model, and a person sees the patch first.
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml

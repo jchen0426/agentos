@@ -17,7 +17,11 @@ write tools, tool argument schemas, dry runs and a lock that keeps one agentd pe
 directory ([docs/m3-notes.md](docs/m3-notes.md)). M3b reads repositories through a read-only
 git MCP server that agentd runs once per call in a sandbox: the call's mirror read-only, a
 private temporary directory, no network. agentd itself runs no git on a mirror: it resolves a
-run's commit and reads the files a patch touches through the same server.
+run's commit and reads the files a patch touches through the same server. M4 adds approvals:
+a write the policy marks waits for a person, who sees what agentd itself observed and exactly
+what will be sent, and approves it, edits it or rejects it; the approval holds for that payload
+alone, to the byte, and for a limited time. Decisions, reconciliations and budget extensions
+wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes.md](docs/m4-notes.md)).
 
 ## Layout
 
@@ -25,7 +29,8 @@ run's commit and reads the files a patch touches through the same server.
 | --- | --- |
 | `proto/agentos/v1/` | `gateway.proto` (Invoke's `Call`/`Result`), `control.proto` (the Control service) |
 | `cmd/agentd`, `cmd/agentctl` | the daemon and its command line |
-| `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol (claims, recovery by class, reconciliation) |
+| `internal/gateway` | `Invoke`: caller check, policy, model calls, the effect protocol (claims, recovery by class, reconciliation), approvals (decisions, expiry, the payload binding) |
+| `internal/outbox` | the doorbells that wake runs waiting for a person or for budget, delivered until Temporal has them |
 | `internal/tools`, `internal/patch` | the tools and the effect class and argument schema each declares; checks and applies a model's patch |
 | `internal/gitmcp`, `cmd/agentos-mcp-git` | the read-only git MCP server (`show_diff`, `apply_check`, `resolve_commit`, `read_files`) and agentd's client, which runs it once per call in a sandbox |
 | `internal/githubtool` | `github.open_draft_pr` and `github.comment_commit` (go-github) |
@@ -39,7 +44,7 @@ run's commit and reads the files a patch touches through the same server.
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T7 (concurrent calls against one budget), T8, T10, T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
 ## Requirements
@@ -113,8 +118,32 @@ repos:
 github: {token: "keyring:agentos-github-token"}
 ```
 
-Until approvals arrive (M4), do that only with the fake model: with the dev policy nothing asks
-before a PR is opened, and a real model can be steered by text in the diff.
+The dev policy then has a person approve each pull request before it is opened: text in a diff
+can steer a real model, so someone looks at the patch first. A run that asks waits in
+`WAITING_APPROVAL`:
+
+```bash
+bin/agentctl approvals list
+```
+
+```bash
+bin/agentctl approvals show <approval-id>
+```
+
+`show` prints what agentd itself observed (the patch in full, the files it changes, `git apply
+--check`, the findings, where the base branch stands on GitHub, what the run has spent), exactly
+what GitHub will receive, and the sha256 of that payload, which every decision names:
+
+```bash
+bin/agentctl approvals approve <approval-id> --payload-sha256 <sha256>
+```
+
+`reject ... --reason '...'` stops the pull request; the reason goes into the run's report. `edit
+... --patch-file fix.diff` sends your patch back to the run, which checks it again and asks for
+approval of the result. The first decision counts: a second, from you or anyone, is told who
+decided what, and when. An approval nobody decides in time (`approval_ttl` in the policy, 24 hours
+by default) expires as a rejection. Decisions are recorded under your user name; `--as` names
+someone else.
 
 A write whose outcome nobody knows (agentd stopped after sending it, and the tool cannot look it
 up) waits in `WAITING_RECONCILE`. Check the outside world, then say what you found:

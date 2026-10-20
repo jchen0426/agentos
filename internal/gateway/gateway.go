@@ -68,10 +68,17 @@ type Gateway struct {
 	// one agentd at a time, so an effect another incarnation claimed has nobody sending it.
 	Incarnation string
 
+	// Doorbells delivers the doorbells the gateway rings (an approval's expiry, a decision). With
+	// none, they wait in the ledger for the outbox to look.
+	Doorbells interface{ Poke() }
+
 	runIDWait  time.Duration      // how long a call waits for its run's ID; 0 is defaultRunIDWait
 	modelCalls singleflight.Group // in-flight model calls, by workflow and activity ID
 	effects    singleflight.Group // in-flight effects and their recoveries, by effect ID
 	executions sync.WaitGroup     // detached executions, drained on shutdown
+
+	expiryOnce sync.Once
+	expiryCh   chan struct{} // wakes ExpireApprovals: an approval was made
 
 	sendMu  sync.Mutex      // makes claiming an effect and marking it sent one step
 	sending map[string]bool // effect IDs this process has claimed and is sending
@@ -286,12 +293,21 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 				fmt.Sprintf("arguments of %s: %v", c.GetName(), err), "BadArguments", nil)
 		}
 		v := g.Policy.EvaluateTool(c.GetName(), args, scope)
+		var rule *approvalRule
 		switch v.Decision {
 		case policy.Deny:
 			return result(StatusDenied, map[string]any{"reason": v.Reason})
 		case policy.RequireApproval:
-			// M4 replaces this with the approvals table; until then nobody can approve.
-			return result(StatusNeedsApproval, nil)
+			// A person approves each effect of the write before it is sent (section 10): none for a
+			// dry run, which sends nothing, or for a tool that cannot reach its system, which only
+			// dry-runs. A read has no effect to approve; CheckTools refuses such a policy at start.
+			w, ok := t.(tools.Writer)
+			if !ok {
+				return result(StatusDenied, map[string]any{"reason": "approval applies to writes only"})
+			}
+			if run.DryRun == 0 && w.Live() {
+				rule = &approvalRule{ttl: v.ApprovalTTL}
+			}
 		}
 		class, err := effectClass(t, v.Effect)
 		if err != nil {
@@ -306,7 +322,7 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		if maxPerRun == 0 {
 			maxPerRun = 1
 		}
-		return g.callTool(ctx, info, run, t, class, maxPerRun, args, canon, fx)
+		return g.callTool(ctx, info, run, t, class, maxPerRun, rule, args, canon, fx)
 	default:
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("unknown call kind %q", c.GetKind()), "BadCall", nil)

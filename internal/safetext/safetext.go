@@ -30,6 +30,21 @@ func Line(s string) string {
 	return b.String()
 }
 
+// Text is s as lines of printable text: like Line, but newlines and tabs stay, so that a patch
+// or a reason reads as it was written. A carriage return is escaped: it could overwrite a line.
+func Text(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsPrint(r) || r == '\n' || r == '\t' {
+			b.WriteRune(r)
+			continue
+		}
+		q := strconv.QuoteRune(r)
+		b.WriteString(q[1 : len(q)-1])
+	}
+	return b.String()
+}
+
 // JSON rewrites the JSON text b so that it decodes to the same value but holds no raw rune
 // that is not printable: those become \u escapes. JSON encoders (encoding/json, protojson,
 // slog) escape only what JSON requires, the runes below U+0020, and leave DEL, C1 controls

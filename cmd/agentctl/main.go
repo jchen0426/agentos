@@ -46,7 +46,7 @@ func main() {
 	budget.AddCommand(extendCmd(g))
 	reconcile := &cobra.Command{Use: "reconcile", Short: "Settle external writes whose outcome nobody knows"}
 	reconcile.AddCommand(reconcileListCmd(g), reconcileShowCmd(g), reconcileResolveCmd(g))
-	root.AddCommand(runs, budget, reconcile)
+	root.AddCommand(runs, budget, reconcile, approvalsCmd(g))
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))

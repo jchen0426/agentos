@@ -37,10 +37,11 @@ WHERE workflow_id = ? AND activity_id = ? AND response_blob IS NOT NULL
 ORDER BY attempt, request_seq;
 
 -- name: InsertEffect :execrows
+-- A new effect: PENDING, or AWAITING_APPROVAL when the policy wants a person to approve it first.
 INSERT INTO effects (
   effect_id, workflow_id, tool, effect_class, payload_sha256, payload_blob, idempotency_key, status,
   created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (effect_id) DO NOTHING;
 
 -- name: GetEffect :one
@@ -182,3 +183,95 @@ INSERT INTO blob_owners (workflow_id, sha256) VALUES (?, ?) ON CONFLICT DO NOTHI
 
 -- name: IsBlobOwner :one
 SELECT EXISTS (SELECT 1 FROM blob_owners WHERE workflow_id = ? AND sha256 = ?);
+
+-- name: ListModelAnswers :many
+-- The answered requests of a run's calls of one model task: the run's model answers.
+SELECT m.* FROM model_calls m
+WHERE m.workflow_id = sqlc.arg(workflow_id) AND m.response_blob IS NOT NULL AND m.activity_id IN (
+  SELECT c.activity_id FROM calls c WHERE c.workflow_id = sqlc.arg(workflow_id) AND c.kind = 'model' AND c.name = sqlc.arg(task));
+
+-- name: ApproveEffect :execrows
+-- An approved effect goes on to be sent, unless its run was cancelled: from here on it is an
+-- effect like any other (claimed, sent, recovered by its class).
+UPDATE effects SET status = 'PENDING', version = version + 1, updated_at = ?
+WHERE effect_id = ? AND version = ? AND status = 'AWAITING_APPROVAL'
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
+
+-- name: AbandonAwaitingEffect :execrows
+-- An effect whose approval was rejected, expired or replaced is never sent.
+UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
+WHERE effect_id = ? AND status = 'AWAITING_APPROVAL';
+
+-- name: InsertApproval :exec
+INSERT INTO approvals (
+  approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status,
+  created_at, expires_at, supersedes
+) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?);
+
+-- name: GetApproval :one
+SELECT * FROM approvals WHERE approval_id = ?;
+
+-- name: GetApprovalByEffect :one
+SELECT * FROM approvals WHERE effect_id = ?;
+
+-- name: GetEditedApproval :one
+-- The approval whose edit a call carries: the reviewer's patch in the arguments of the call
+-- that was edited.
+SELECT * FROM approvals
+WHERE workflow_id = ? AND tool = ? AND status = 'EDITED' AND edited_args_sha256 = ?;
+
+-- name: ListPendingApprovals :many
+-- What waits for a decision, but for the approvals of cancelled runs: nothing they approve goes out.
+SELECT a.* FROM approvals a JOIN runs r ON r.workflow_id = a.workflow_id
+WHERE a.status = 'PENDING' AND r.cancelled_at IS NULL
+ORDER BY a.created_at, a.approval_id;
+
+-- name: ListRunApprovals :many
+SELECT * FROM approvals WHERE workflow_id = ? ORDER BY created_at, approval_id;
+
+-- name: DecideApproval :execrows
+-- A person's decision, if the approval still waits for one: the first valid decision wins.
+UPDATE approvals
+SET status = ?, decided_by = ?, decided_at = ?, decision_key = ?, reason = ?, edited_patch_blob = ?,
+  edited_args_sha256 = ?
+WHERE approval_id = ? AND status = 'PENDING';
+
+-- name: ExpirePendingApproval :execrows
+-- agentd's decision when an approval's time is up and nobody decided: a rejection.
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'PENDING';
+
+-- name: ExpireUnusedApproval :execrows
+-- An approval the run did not act on before its time was up: void as well.
+UPDATE approvals SET status = 'EXPIRED', decided_by = 'agentd', decided_at = ?, reason = ?
+WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL;
+
+-- name: UseApproval :execrows
+UPDATE approvals SET used_at = ? WHERE approval_id = ? AND status = 'APPROVED' AND used_at IS NULL;
+
+-- name: SupersedeApproval :execrows
+UPDATE approvals SET status = 'SUPERSEDED', superseded_by = ? WHERE approval_id = ? AND status = 'EDITED';
+
+-- name: ListExpiredApprovals :many
+SELECT * FROM approvals WHERE status = 'PENDING' AND expires_at <= ? ORDER BY expires_at;
+
+-- name: NextApprovalExpiry :one
+SELECT CAST(COALESCE(MIN(expires_at), '') AS TEXT) FROM approvals WHERE status = 'PENDING';
+
+-- name: InsertDoorbell :exec
+INSERT INTO outbox (workflow_id, kind, why, created_at, next_attempt_at) VALUES (?, 'doorbell', ?, ?, ?);
+
+-- name: ListDueDoorbells :many
+SELECT * FROM outbox WHERE delivered_at IS NULL AND next_attempt_at <= ? ORDER BY seq LIMIT 200;
+
+-- name: NextDoorbellDue :one
+SELECT CAST(COALESCE(MIN(next_attempt_at), '') AS TEXT) FROM outbox WHERE delivered_at IS NULL;
+
+-- name: MarkDoorbellsDelivered :execrows
+-- One signal wakes the run for every doorbell rung for it until then.
+UPDATE outbox SET delivered_at = ?, outcome = ?
+WHERE workflow_id = ? AND seq <= ? AND delivered_at IS NULL;
+
+-- name: RetryDoorbells :execrows
+UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?, outcome = ?
+WHERE workflow_id = ? AND seq <= ? AND delivered_at IS NULL;

@@ -12,6 +12,7 @@ service Control {
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
   rpc CancelRun(CancelRunRequest) returns (Run);
   rpc ListPending(ListPendingRequest) returns (ListPendingResponse);  // approvals and reconciliations (M3, M4)
+  rpc GetApproval(GetApprovalRequest) returns (Approval);             // M4: the approval card, decided or not
   rpc ResolveApproval(ResolveApprovalRequest) returns (ResolveApprovalResponse);                  // M4
   rpc ResolveReconciliation(ResolveReconciliationRequest) returns (ResolveReconciliationResponse); // M3
   rpc ExtendBudget(ExtendBudgetRequest) returns (Run);                                            // M2a, backs `agentctl budget extend`
@@ -73,17 +74,49 @@ message PendingItem {
   string reason = 6;                // why it waits: for a reconciliation, what is unknown
   string since = 7;                 // RFC 3339: when it started waiting
   string payload_json = 8;          // exactly what the external system was to receive
+  string payload_sha256 = 9;        // approvals: of payload_json, which a decision names
+}
+
+message GetApprovalRequest {
+  string approval_id = 1;
+}
+
+// An approval card (design doc, section 10): what agentd itself observed, never what the agent
+// says about the write. Text in it comes from models, tools and the outside world: it leaves
+// agentd without raw control characters.
+message Approval {
+  string approval_id = 1;
+  string run_id = 2;
+  string tool = 3;                  // the write, e.g. github.open_draft_pr
+  // PENDING, APPROVED, REJECTED, EXPIRED, EDITED (the edit went back to the workflow),
+  // SUPERSEDED (the approval of the edited call replaced it)
+  string status = 4;
+  string created_at = 5;            // RFC 3339
+  string expires_at = 6;            // RFC 3339: void from then on; agentd expires it as a rejection
+  string payload_sha256 = 7;        // of payload_json: a decision names it
+  string payload_json = 8;          // exactly what the external system will receive, as recorded
+  string context_json = 9;          // what agentd observed when it made the approval: the write and the task's context
+  string decided_by = 10;
+  string decided_at = 11;
+  string reason = 12;               // a rejection's reason, or why it expired
+  string supersedes = 13;           // the approval whose edit this one carries
+  string superseded_by = 14;
+  string edited_patch = 15;         // EDITED, SUPERSEDED: the reviewer's patch
+  int64 budget_spent_micros = 16;   // the run's spending, now
+  int64 budget_reserved_micros = 17;
+  int64 budget_limit_micros = 18;
 }
 
 message ResolveApprovalRequest {
   string approval_id = 1;
   string payload_sha256 = 2;        // hash of what the reviewer saw; must match the stored payload
-  string idempotency_key = 3;
+  string idempotency_key = 3;       // required: the same decision sent again applies once
   oneof decision {
     Approve approve = 4;
     ApproveWithEdits approve_with_edits = 5;  // returned to the workflow as "edited"
     Reject reject = 6;                        // reason is required
   }
+  string decided_by = 7;            // required: the reviewer, as recorded and reported
 }
 
 message Approve {}
@@ -96,8 +129,10 @@ message Reject {
   string reason = 1;
 }
 
+// The first valid decision wins: one that comes after another fails with FAILED_PRECONDITION,
+// naming the decision, who made it and when.
 message ResolveApprovalResponse {
-  string status = 1;                // APPROVED, REJECTED, SUPERSEDED, or the earlier decision on a conflict
+  string status = 1;                // APPROVED, REJECTED or EDITED; sent again, what became of it since
   string decided_by = 2;
   string decided_at = 3;
 }

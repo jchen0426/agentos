@@ -142,8 +142,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.getTree(w, r, g[1]+"/"+g[2], g[3])
 	case r.Method == http.MethodPost && m(reTrees) != nil:
 		sha := hash(body)
+		// The entries, contents and all: what a pull request's commit holds.
 		s.answer(w, r, "create_tree", http.StatusCreated, map[string]any{"sha": sha},
-			map[string]any{"sha": sha, "base_tree": body["base_tree"]})
+			map[string]any{"sha": sha, "base_tree": body["base_tree"], "tree": body["tree"]})
 	case r.Method == http.MethodPost && m(reCommits) != nil:
 		s.createCommit(w, r, body)
 	case r.Method == http.MethodGet && m(reRef) != nil:

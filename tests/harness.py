@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -37,7 +38,8 @@ BIN = Path(os.environ.get("AGENTOS_BIN", REPO / "bin"))
 SANDBOX = os.environ.get("AGENTOS_SANDBOX", "none")
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
 
-# Tests run without approvals (M3's test policy): the approvals table arrives in M4.
+# Most tests run without approvals; approval_policy() is the same policy with the design doc's
+# rule for opening the PR: a person approves it first (section 10).
 TEST_POLICY = """
 repos: [acme/payments]
 tools:
@@ -50,6 +52,16 @@ models:
 """
 
 AUDIT_SCHEMA = REPO / "config/schemas/audit_report.json"
+
+
+def approval_policy(ttl: str = "1h", policy: str | None = None) -> str:
+    """The test policy, or `policy`, with github.open_draft_pr waiting for a person's approval,
+    which stays open for `ttl` (a Go duration)."""
+    base = TEST_POLICY if policy is None else policy
+    out = base.replace("github.open_draft_pr:  {decision: allow,",
+                       f"github.open_draft_pr:  {{decision: require_approval, approval_ttl: {ttl},")
+    assert out != base, "the policy has no github.open_draft_pr rule to change"
+    return out
 
 # AGENTOS_GITHUB=live lets tests/test_t2_live.py, and only it (through the live_stack fixture),
 # write to a real test repository instead of the simulated GitHub: the one in AGENTOS_GITHUB_REPO
@@ -280,9 +292,12 @@ class Stack:
     temporal_tls: TLSConfig | None = None
     agentd_tls: dict | None = None
 
-    def __init__(self, tmp: Path, live_repo: str = "") -> None:
+    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False) -> None:
         self.tmp = tmp
         self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
+        # Temporal's dev server keeps everything in memory unless it has a database file: with one,
+        # restart_temporal() keeps the runs.
+        self.temporal_db = tmp / "temporal.db" if temporal_db else None
         # Unix socket paths must stay under 104 bytes (macOS), so they live in a short /tmp dir.
         self.sock_dir = Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
         self.procs: list[Proc] = []
@@ -305,10 +320,12 @@ class Stack:
         # that binds it by number before the server does. Then try another.
         for attempt in range(3):
             port = self.temporal_address.rsplit(":", 1)[1]
+            n = sum(p.name == "temporal" for p in self.procs)
             p = Proc("temporal", ["temporal", "server", "start-dev", "--ip", "127.0.0.1", "--port", port,
                                   "--ui-port", str(free_port()), "--headless", "--log-level", "warn",
-                                  "--search-attribute", "AgentState=Keyword"],
-                     self.tmp / f"temporal{attempt or ''}.log")
+                                  "--search-attribute", "AgentState=Keyword",
+                                  *(["--db-filename", str(self.temporal_db)] if self.temporal_db else [])],
+                     self.tmp / f"temporal{n or ''}.log")
             self.procs.append(p)
             wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
             if p.alive():
@@ -317,6 +334,14 @@ class Stack:
                 break
             self.temporal_address = f"127.0.0.1:{free_port()}"
         raise AssertionError(p.text())
+
+    def restart_temporal(self) -> None:
+        """Stop the Temporal dev server and start it again on the same port and database: the
+        runs, their timers and their history stay (only with temporal_db)."""
+        assert self.temporal_db is not None, "restart_temporal needs Stack(..., temporal_db=True)"
+        [p] = [p for p in self.procs if p.name == "temporal" and p.alive()]
+        p.stop()
+        self._start_temporal()
 
     def _temporal_ready(self) -> bool:
         try:
@@ -387,6 +412,12 @@ class Stack:
         lines = self.github_log_path.read_text().splitlines() if self.github_log_path.exists() else []
         return [e for e in map(json.loads, lines) if action is None or e["action"] == action]
 
+    def github_comments(self) -> list[dict]:
+        """The comments on the audited commit, as the simulated GitHub shows them."""
+        url = f"{self.github_url}repos/acme/payments/commits/{self.commit}/comments?per_page=100"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.load(r)
+
     def runtime_listen(self) -> str:
         if SANDBOX == "bwrap":
             return f"unix://{self.runtime_socket}"
@@ -394,9 +425,11 @@ class Stack:
 
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
-                     test_tools: bool = False, run_id_delay: str | None = None) -> Proc:
+                     test_tools: bool = False, run_id_delay: str | None = None,
+                     hold_doorbells: Path | None = None) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
-        duration) makes StartRun record each run's ID that much later."""
+        duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
+        exists, agentd delivers no doorbell: they wait in its outbox."""
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -424,12 +457,13 @@ class Stack:
             self._agentd_args.append("--insecure-dev")  # the git tool server runs unsandboxed too
         if test_tools:
             self._agentd_args.append("--test-tools")
-        if faults or run_id_delay:
+        if faults or run_id_delay or hold_doorbells:
             # A rule's "attempt" is Temporal's: it counts attempts the gateway refused before
             # the rules were consulted. A run's opening call that reaches agentd before StartRun
             # has recorded the run ID waits for it (up to 5 s) rather than being refused, so it
             # keeps attempt 1 even with a Worker that is already polling.
-            script = {"rules": faults or [], **({"run_id_delay": run_id_delay} if run_id_delay else {})}
+            script = {"rules": faults or [], **({"run_id_delay": run_id_delay} if run_id_delay else {}),
+                      **({"hold_doorbells_while_exists": str(hold_doorbells)} if hold_doorbells else {})}
             (d / "faults.json").write_text(json.dumps(script))
             self._agentd_args += ["--fault-script", d / "faults.json"]
         return self._launch_agentd()
@@ -493,11 +527,45 @@ class Stack:
     # --- agentctl ----------------------------------------------------------------------------
 
     def agentctl(self, *args: str) -> dict:
-        r = subprocess.run([BIN / "agentctl", "--socket", self.control_socket, "-o", "json", *args],
-                           capture_output=True, text=True, timeout=60)
+        r = self.agentctl_run(*args)
         if r.returncode != 0:
             raise AssertionError(f"agentctl {' '.join(args)} failed: {r.stderr.strip()}")
         return json.loads(r.stdout)
+
+    def agentctl_run(self, *args: str) -> subprocess.CompletedProcess:
+        """agentctl, with JSON output, as it ended: for the commands expected to fail."""
+        return subprocess.run(self.agentctl_args(*args), capture_output=True, text=True, timeout=60)
+
+    def agentctl_args(self, *args: str) -> list:
+        return [BIN / "agentctl", "--socket", self.control_socket, "-o", "json", *args]
+
+    def approvals(self) -> list[dict]:
+        """What waits for approval, as agentctl approvals list shows it."""
+        return self.agentctl("approvals", "list")["items"]
+
+    def approval(self, approval_id: str) -> dict:
+        """One approval card (agentctl approvals show), with its JSON fields decoded."""
+        a = self.agentctl("approvals", "show", approval_id)
+        return {**a, "payload": json.loads(a["payload_json"]), "context": json.loads(a["context_json"])}
+
+    def decide(self, approval: dict, decision: str, *extra: str) -> dict:
+        """A reviewer's decision (approve, edit or reject) on an approval whose payload they saw."""
+        return self.agentctl("approvals", decision, approval["id"] if "id" in approval else approval["approval_id"],
+                             "--payload-sha256", approval["payload_sha256"], *extra)
+
+    def wait_approval(self, run: dict, count: int = 1, timeout: float = 60) -> dict:
+        """The run's newest approval waiting for a decision, once it has `count` approvals in all."""
+        def check() -> dict | None:
+            rows = self.ledger("SELECT approval_id FROM approvals WHERE workflow_id = ? ORDER BY created_at", run["run_id"])
+            if len(rows) < count:
+                return None
+            mine = [a for a in self.approvals() if a["id"] == rows[-1]["approval_id"]]
+            return mine[0] if mine else None
+        return wait_for(check, f"approval {count} of run {run['run_id']}", timeout=timeout, interval=0.5)
+
+    def doorbells(self, run: dict) -> list[sqlite3.Row]:
+        """The run's doorbells in agentd's outbox."""
+        return self.ledger("SELECT * FROM outbox WHERE workflow_id = ? ORDER BY seq", run["run_id"])
 
     def start_run(self, budget_micros: int | None = None, dry_run: bool = False) -> dict:
         budget = ["--budget-micros", str(budget_micros)] if budget_micros else []

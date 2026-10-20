@@ -60,7 +60,10 @@ func (b blobs) GetRunBlob(_ context.Context, workflowID, ref string) ([]byte, er
 	return v, nil
 }
 
-type effects struct{ pr int64 }
+type effects struct {
+	pr        int64
+	approvals []Approval
+}
 
 func (e effects) LatestEffectResult(context.Context, string, string) (map[string]any, bool, error) {
 	if e.pr == 0 {
@@ -68,6 +71,8 @@ func (e effects) LatestEffectResult(context.Context, string, string) (map[string
 	}
 	return map[string]any{"number": json.Number(strconv.FormatInt(e.pr, 10))}, true, nil
 }
+
+func (e effects) RunApprovals(context.Context, string) ([]Approval, error) { return e.approvals, nil }
 
 func proceed(context.Context) error { return nil }
 
@@ -321,7 +326,7 @@ func TestCommentCommit(t *testing.T) {
 
 func TestRenderKeepsWithinGitHubsLimit(t *testing.T) {
 	body := render(strings.Repeat("a", 40), strings.Repeat("`", 30000)+strings.Repeat("x", 1990),
-		&report{Summary: strings.Repeat("`", 30000)}, 0, marker(strings.Repeat("ab", 32)))
+		&report{Summary: strings.Repeat("`", 30000)}, 0, nil, marker(strings.Repeat("ab", 32)))
 	if len(body) > 65536 || strings.Contains(body, strings.Repeat("`", maxBackticks+2)) {
 		t.Fatalf("%d characters, longest backtick run %d", len(body), longestRun(body, '`'))
 	}

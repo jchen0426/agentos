@@ -484,11 +484,12 @@ type PendingItem struct {
 	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // "approval" or "reconciliation"
 	Id            string                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`     // approval_id or effect_id
 	RunId         string                 `protobuf:"bytes,3,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	ExpiresAt     string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`       // RFC 3339; approvals only
-	Tool          string                 `protobuf:"bytes,5,opt,name=tool,proto3" json:"tool,omitempty"`                                  // the tool whose effect it is
-	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`                              // why it waits: for a reconciliation, what is unknown
-	Since         string                 `protobuf:"bytes,7,opt,name=since,proto3" json:"since,omitempty"`                                // RFC 3339: when it started waiting
-	PayloadJson   string                 `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"` // exactly what the external system was to receive
+	ExpiresAt     string                 `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`             // RFC 3339; approvals only
+	Tool          string                 `protobuf:"bytes,5,opt,name=tool,proto3" json:"tool,omitempty"`                                        // the tool whose effect it is
+	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`                                    // why it waits: for a reconciliation, what is unknown
+	Since         string                 `protobuf:"bytes,7,opt,name=since,proto3" json:"since,omitempty"`                                      // RFC 3339: when it started waiting
+	PayloadJson   string                 `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`       // exactly what the external system was to receive
+	PayloadSha256 string                 `protobuf:"bytes,9,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"` // approvals: of payload_json, which a decision names
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -579,24 +580,261 @@ func (x *PendingItem) GetPayloadJson() string {
 	return ""
 }
 
+func (x *PendingItem) GetPayloadSha256() string {
+	if x != nil {
+		return x.PayloadSha256
+	}
+	return ""
+}
+
+type GetApprovalRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ApprovalId    string                 `protobuf:"bytes,1,opt,name=approval_id,json=approvalId,proto3" json:"approval_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetApprovalRequest) Reset() {
+	*x = GetApprovalRequest{}
+	mi := &file_agentos_v1_control_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetApprovalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetApprovalRequest) ProtoMessage() {}
+
+func (x *GetApprovalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetApprovalRequest.ProtoReflect.Descriptor instead.
+func (*GetApprovalRequest) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetApprovalRequest) GetApprovalId() string {
+	if x != nil {
+		return x.ApprovalId
+	}
+	return ""
+}
+
+// An approval card (design doc, section 10): what agentd itself observed, never what the agent
+// says about the write. Text in it comes from models, tools and the outside world: it leaves
+// agentd without raw control characters.
+type Approval struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ApprovalId string                 `protobuf:"bytes,1,opt,name=approval_id,json=approvalId,proto3" json:"approval_id,omitempty"`
+	RunId      string                 `protobuf:"bytes,2,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Tool       string                 `protobuf:"bytes,3,opt,name=tool,proto3" json:"tool,omitempty"` // the write, e.g. github.open_draft_pr
+	// PENDING, APPROVED, REJECTED, EXPIRED, EDITED (the edit went back to the workflow),
+	// SUPERSEDED (the approval of the edited call replaced it)
+	Status               string `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+	CreatedAt            string `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`             // RFC 3339
+	ExpiresAt            string `protobuf:"bytes,6,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`             // RFC 3339: void from then on; agentd expires it as a rejection
+	PayloadSha256        string `protobuf:"bytes,7,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"` // of payload_json: a decision names it
+	PayloadJson          string `protobuf:"bytes,8,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`       // exactly what the external system will receive, as recorded
+	ContextJson          string `protobuf:"bytes,9,opt,name=context_json,json=contextJson,proto3" json:"context_json,omitempty"`       // what agentd observed when it made the approval: the write and the task's context
+	DecidedBy            string `protobuf:"bytes,10,opt,name=decided_by,json=decidedBy,proto3" json:"decided_by,omitempty"`
+	DecidedAt            string `protobuf:"bytes,11,opt,name=decided_at,json=decidedAt,proto3" json:"decided_at,omitempty"`
+	Reason               string `protobuf:"bytes,12,opt,name=reason,proto3" json:"reason,omitempty"`         // a rejection's reason, or why it expired
+	Supersedes           string `protobuf:"bytes,13,opt,name=supersedes,proto3" json:"supersedes,omitempty"` // the approval whose edit this one carries
+	SupersededBy         string `protobuf:"bytes,14,opt,name=superseded_by,json=supersededBy,proto3" json:"superseded_by,omitempty"`
+	EditedPatch          string `protobuf:"bytes,15,opt,name=edited_patch,json=editedPatch,proto3" json:"edited_patch,omitempty"`                      // EDITED, SUPERSEDED: the reviewer's patch
+	BudgetSpentMicros    int64  `protobuf:"varint,16,opt,name=budget_spent_micros,json=budgetSpentMicros,proto3" json:"budget_spent_micros,omitempty"` // the run's spending, now
+	BudgetReservedMicros int64  `protobuf:"varint,17,opt,name=budget_reserved_micros,json=budgetReservedMicros,proto3" json:"budget_reserved_micros,omitempty"`
+	BudgetLimitMicros    int64  `protobuf:"varint,18,opt,name=budget_limit_micros,json=budgetLimitMicros,proto3" json:"budget_limit_micros,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *Approval) Reset() {
+	*x = Approval{}
+	mi := &file_agentos_v1_control_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Approval) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Approval) ProtoMessage() {}
+
+func (x *Approval) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Approval.ProtoReflect.Descriptor instead.
+func (*Approval) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *Approval) GetApprovalId() string {
+	if x != nil {
+		return x.ApprovalId
+	}
+	return ""
+}
+
+func (x *Approval) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *Approval) GetTool() string {
+	if x != nil {
+		return x.Tool
+	}
+	return ""
+}
+
+func (x *Approval) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *Approval) GetCreatedAt() string {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *Approval) GetExpiresAt() string {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return ""
+}
+
+func (x *Approval) GetPayloadSha256() string {
+	if x != nil {
+		return x.PayloadSha256
+	}
+	return ""
+}
+
+func (x *Approval) GetPayloadJson() string {
+	if x != nil {
+		return x.PayloadJson
+	}
+	return ""
+}
+
+func (x *Approval) GetContextJson() string {
+	if x != nil {
+		return x.ContextJson
+	}
+	return ""
+}
+
+func (x *Approval) GetDecidedBy() string {
+	if x != nil {
+		return x.DecidedBy
+	}
+	return ""
+}
+
+func (x *Approval) GetDecidedAt() string {
+	if x != nil {
+		return x.DecidedAt
+	}
+	return ""
+}
+
+func (x *Approval) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *Approval) GetSupersedes() string {
+	if x != nil {
+		return x.Supersedes
+	}
+	return ""
+}
+
+func (x *Approval) GetSupersededBy() string {
+	if x != nil {
+		return x.SupersededBy
+	}
+	return ""
+}
+
+func (x *Approval) GetEditedPatch() string {
+	if x != nil {
+		return x.EditedPatch
+	}
+	return ""
+}
+
+func (x *Approval) GetBudgetSpentMicros() int64 {
+	if x != nil {
+		return x.BudgetSpentMicros
+	}
+	return 0
+}
+
+func (x *Approval) GetBudgetReservedMicros() int64 {
+	if x != nil {
+		return x.BudgetReservedMicros
+	}
+	return 0
+}
+
+func (x *Approval) GetBudgetLimitMicros() int64 {
+	if x != nil {
+		return x.BudgetLimitMicros
+	}
+	return 0
+}
+
 type ResolveApprovalRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	ApprovalId     string                 `protobuf:"bytes,1,opt,name=approval_id,json=approvalId,proto3" json:"approval_id,omitempty"`
-	PayloadSha256  string                 `protobuf:"bytes,2,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"` // hash of what the reviewer saw; must match the stored payload
-	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	PayloadSha256  string                 `protobuf:"bytes,2,opt,name=payload_sha256,json=payloadSha256,proto3" json:"payload_sha256,omitempty"`    // hash of what the reviewer saw; must match the stored payload
+	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // required: the same decision sent again applies once
 	// Types that are valid to be assigned to Decision:
 	//
 	//	*ResolveApprovalRequest_Approve
 	//	*ResolveApprovalRequest_ApproveWithEdits
 	//	*ResolveApprovalRequest_Reject
 	Decision      isResolveApprovalRequest_Decision `protobuf_oneof:"decision"`
+	DecidedBy     string                            `protobuf:"bytes,7,opt,name=decided_by,json=decidedBy,proto3" json:"decided_by,omitempty"` // required: the reviewer, as recorded and reported
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ResolveApprovalRequest) Reset() {
 	*x = ResolveApprovalRequest{}
-	mi := &file_agentos_v1_control_proto_msgTypes[9]
+	mi := &file_agentos_v1_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -608,7 +846,7 @@ func (x *ResolveApprovalRequest) String() string {
 func (*ResolveApprovalRequest) ProtoMessage() {}
 
 func (x *ResolveApprovalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[9]
+	mi := &file_agentos_v1_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -621,7 +859,7 @@ func (x *ResolveApprovalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveApprovalRequest.ProtoReflect.Descriptor instead.
 func (*ResolveApprovalRequest) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{9}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ResolveApprovalRequest) GetApprovalId() string {
@@ -679,6 +917,13 @@ func (x *ResolveApprovalRequest) GetReject() *Reject {
 	return nil
 }
 
+func (x *ResolveApprovalRequest) GetDecidedBy() string {
+	if x != nil {
+		return x.DecidedBy
+	}
+	return ""
+}
+
 type isResolveApprovalRequest_Decision interface {
 	isResolveApprovalRequest_Decision()
 }
@@ -709,7 +954,7 @@ type Approve struct {
 
 func (x *Approve) Reset() {
 	*x = Approve{}
-	mi := &file_agentos_v1_control_proto_msgTypes[10]
+	mi := &file_agentos_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -721,7 +966,7 @@ func (x *Approve) String() string {
 func (*Approve) ProtoMessage() {}
 
 func (x *Approve) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[10]
+	mi := &file_agentos_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -734,7 +979,7 @@ func (x *Approve) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Approve.ProtoReflect.Descriptor instead.
 func (*Approve) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{10}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 type ApproveWithEdits struct {
@@ -746,7 +991,7 @@ type ApproveWithEdits struct {
 
 func (x *ApproveWithEdits) Reset() {
 	*x = ApproveWithEdits{}
-	mi := &file_agentos_v1_control_proto_msgTypes[11]
+	mi := &file_agentos_v1_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -758,7 +1003,7 @@ func (x *ApproveWithEdits) String() string {
 func (*ApproveWithEdits) ProtoMessage() {}
 
 func (x *ApproveWithEdits) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[11]
+	mi := &file_agentos_v1_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -771,7 +1016,7 @@ func (x *ApproveWithEdits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApproveWithEdits.ProtoReflect.Descriptor instead.
 func (*ApproveWithEdits) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{11}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ApproveWithEdits) GetEditedPatch() string {
@@ -790,7 +1035,7 @@ type Reject struct {
 
 func (x *Reject) Reset() {
 	*x = Reject{}
-	mi := &file_agentos_v1_control_proto_msgTypes[12]
+	mi := &file_agentos_v1_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -802,7 +1047,7 @@ func (x *Reject) String() string {
 func (*Reject) ProtoMessage() {}
 
 func (x *Reject) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[12]
+	mi := &file_agentos_v1_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -815,7 +1060,7 @@ func (x *Reject) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Reject.ProtoReflect.Descriptor instead.
 func (*Reject) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{12}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Reject) GetReason() string {
@@ -825,9 +1070,11 @@ func (x *Reject) GetReason() string {
 	return ""
 }
 
+// The first valid decision wins: one that comes after another fails with FAILED_PRECONDITION,
+// naming the decision, who made it and when.
 type ResolveApprovalResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // APPROVED, REJECTED, SUPERSEDED, or the earlier decision on a conflict
+	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // APPROVED, REJECTED or EDITED; sent again, what became of it since
 	DecidedBy     string                 `protobuf:"bytes,2,opt,name=decided_by,json=decidedBy,proto3" json:"decided_by,omitempty"`
 	DecidedAt     string                 `protobuf:"bytes,3,opt,name=decided_at,json=decidedAt,proto3" json:"decided_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -836,7 +1083,7 @@ type ResolveApprovalResponse struct {
 
 func (x *ResolveApprovalResponse) Reset() {
 	*x = ResolveApprovalResponse{}
-	mi := &file_agentos_v1_control_proto_msgTypes[13]
+	mi := &file_agentos_v1_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -848,7 +1095,7 @@ func (x *ResolveApprovalResponse) String() string {
 func (*ResolveApprovalResponse) ProtoMessage() {}
 
 func (x *ResolveApprovalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[13]
+	mi := &file_agentos_v1_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -861,7 +1108,7 @@ func (x *ResolveApprovalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveApprovalResponse.ProtoReflect.Descriptor instead.
 func (*ResolveApprovalResponse) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ResolveApprovalResponse) GetStatus() string {
@@ -898,7 +1145,7 @@ type ResolveReconciliationRequest struct {
 
 func (x *ResolveReconciliationRequest) Reset() {
 	*x = ResolveReconciliationRequest{}
-	mi := &file_agentos_v1_control_proto_msgTypes[14]
+	mi := &file_agentos_v1_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -910,7 +1157,7 @@ func (x *ResolveReconciliationRequest) String() string {
 func (*ResolveReconciliationRequest) ProtoMessage() {}
 
 func (x *ResolveReconciliationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[14]
+	mi := &file_agentos_v1_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -923,7 +1170,7 @@ func (x *ResolveReconciliationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveReconciliationRequest.ProtoReflect.Descriptor instead.
 func (*ResolveReconciliationRequest) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ResolveReconciliationRequest) GetEffectId() string {
@@ -972,7 +1219,7 @@ type ResolveReconciliationResponse struct {
 
 func (x *ResolveReconciliationResponse) Reset() {
 	*x = ResolveReconciliationResponse{}
-	mi := &file_agentos_v1_control_proto_msgTypes[15]
+	mi := &file_agentos_v1_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -984,7 +1231,7 @@ func (x *ResolveReconciliationResponse) String() string {
 func (*ResolveReconciliationResponse) ProtoMessage() {}
 
 func (x *ResolveReconciliationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[15]
+	mi := &file_agentos_v1_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -997,7 +1244,7 @@ func (x *ResolveReconciliationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveReconciliationResponse.ProtoReflect.Descriptor instead.
 func (*ResolveReconciliationResponse) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{15}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ResolveReconciliationResponse) GetStatus() string {
@@ -1018,7 +1265,7 @@ type ExtendBudgetRequest struct {
 
 func (x *ExtendBudgetRequest) Reset() {
 	*x = ExtendBudgetRequest{}
-	mi := &file_agentos_v1_control_proto_msgTypes[16]
+	mi := &file_agentos_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1030,7 +1277,7 @@ func (x *ExtendBudgetRequest) String() string {
 func (*ExtendBudgetRequest) ProtoMessage() {}
 
 func (x *ExtendBudgetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[16]
+	mi := &file_agentos_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1043,7 +1290,7 @@ func (x *ExtendBudgetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExtendBudgetRequest.ProtoReflect.Descriptor instead.
 func (*ExtendBudgetRequest) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ExtendBudgetRequest) GetRunId() string {
@@ -1076,7 +1323,7 @@ type ExplainRunRequest struct {
 
 func (x *ExplainRunRequest) Reset() {
 	*x = ExplainRunRequest{}
-	mi := &file_agentos_v1_control_proto_msgTypes[17]
+	mi := &file_agentos_v1_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1088,7 +1335,7 @@ func (x *ExplainRunRequest) String() string {
 func (*ExplainRunRequest) ProtoMessage() {}
 
 func (x *ExplainRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[17]
+	mi := &file_agentos_v1_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1101,7 +1348,7 @@ func (x *ExplainRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExplainRunRequest.ProtoReflect.Descriptor instead.
 func (*ExplainRunRequest) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{17}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ExplainRunRequest) GetRunId() string {
@@ -1123,7 +1370,7 @@ type Explanation struct {
 
 func (x *Explanation) Reset() {
 	*x = Explanation{}
-	mi := &file_agentos_v1_control_proto_msgTypes[18]
+	mi := &file_agentos_v1_control_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1135,7 +1382,7 @@ func (x *Explanation) String() string {
 func (*Explanation) ProtoMessage() {}
 
 func (x *Explanation) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[18]
+	mi := &file_agentos_v1_control_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1148,7 +1395,7 @@ func (x *Explanation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Explanation.ProtoReflect.Descriptor instead.
 func (*Explanation) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{18}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Explanation) GetRunId() string {
@@ -1222,7 +1469,7 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x14\n" +
 	"\x12ListPendingRequest\"D\n" +
 	"\x13ListPendingResponse\x12-\n" +
-	"\x05items\x18\x01 \x03(\v2\x17.agentos.v1.PendingItemR\x05items\"\xcc\x01\n" +
+	"\x05items\x18\x01 \x03(\v2\x17.agentos.v1.PendingItemR\x05items\"\xf3\x01\n" +
 	"\vPendingItem\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\tR\x02id\x12\x15\n" +
@@ -1232,7 +1479,38 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x04tool\x18\x05 \x01(\tR\x04tool\x12\x16\n" +
 	"\x06reason\x18\x06 \x01(\tR\x06reason\x12\x14\n" +
 	"\x05since\x18\a \x01(\tR\x05since\x12!\n" +
-	"\fpayload_json\x18\b \x01(\tR\vpayloadJson\"\xc2\x02\n" +
+	"\fpayload_json\x18\b \x01(\tR\vpayloadJson\x12%\n" +
+	"\x0epayload_sha256\x18\t \x01(\tR\rpayloadSha256\"5\n" +
+	"\x12GetApprovalRequest\x12\x1f\n" +
+	"\vapproval_id\x18\x01 \x01(\tR\n" +
+	"approvalId\"\xed\x04\n" +
+	"\bApproval\x12\x1f\n" +
+	"\vapproval_id\x18\x01 \x01(\tR\n" +
+	"approvalId\x12\x15\n" +
+	"\x06run_id\x18\x02 \x01(\tR\x05runId\x12\x12\n" +
+	"\x04tool\x18\x03 \x01(\tR\x04tool\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\x05 \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"expires_at\x18\x06 \x01(\tR\texpiresAt\x12%\n" +
+	"\x0epayload_sha256\x18\a \x01(\tR\rpayloadSha256\x12!\n" +
+	"\fpayload_json\x18\b \x01(\tR\vpayloadJson\x12!\n" +
+	"\fcontext_json\x18\t \x01(\tR\vcontextJson\x12\x1d\n" +
+	"\n" +
+	"decided_by\x18\n" +
+	" \x01(\tR\tdecidedBy\x12\x1d\n" +
+	"\n" +
+	"decided_at\x18\v \x01(\tR\tdecidedAt\x12\x16\n" +
+	"\x06reason\x18\f \x01(\tR\x06reason\x12\x1e\n" +
+	"\n" +
+	"supersedes\x18\r \x01(\tR\n" +
+	"supersedes\x12#\n" +
+	"\rsuperseded_by\x18\x0e \x01(\tR\fsupersededBy\x12!\n" +
+	"\fedited_patch\x18\x0f \x01(\tR\veditedPatch\x12.\n" +
+	"\x13budget_spent_micros\x18\x10 \x01(\x03R\x11budgetSpentMicros\x124\n" +
+	"\x16budget_reserved_micros\x18\x11 \x01(\x03R\x14budgetReservedMicros\x12.\n" +
+	"\x13budget_limit_micros\x18\x12 \x01(\x03R\x11budgetLimitMicros\"\xe1\x02\n" +
 	"\x16ResolveApprovalRequest\x12\x1f\n" +
 	"\vapproval_id\x18\x01 \x01(\tR\n" +
 	"approvalId\x12%\n" +
@@ -1240,7 +1518,9 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x12/\n" +
 	"\aapprove\x18\x04 \x01(\v2\x13.agentos.v1.ApproveH\x00R\aapprove\x12L\n" +
 	"\x12approve_with_edits\x18\x05 \x01(\v2\x1c.agentos.v1.ApproveWithEditsH\x00R\x10approveWithEdits\x12,\n" +
-	"\x06reject\x18\x06 \x01(\v2\x12.agentos.v1.RejectH\x00R\x06rejectB\n" +
+	"\x06reject\x18\x06 \x01(\v2\x12.agentos.v1.RejectH\x00R\x06reject\x12\x1d\n" +
+	"\n" +
+	"decided_by\x18\a \x01(\tR\tdecidedByB\n" +
 	"\n" +
 	"\bdecision\"\t\n" +
 	"\aApprove\"5\n" +
@@ -1273,13 +1553,14 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x12\n" +
 	"\x04step\x18\x02 \x01(\tR\x04step\x12\x14\n" +
 	"\x05cause\x18\x03 \x01(\tR\x05cause\x12\x1a\n" +
-	"\bevidence\x18\x04 \x03(\tR\bevidence2\x9e\x05\n" +
+	"\bevidence\x18\x04 \x03(\tR\bevidence2\xe3\x05\n" +
 	"\aControl\x128\n" +
 	"\bStartRun\x12\x1b.agentos.v1.StartRunRequest\x1a\x0f.agentos.v1.Run\x124\n" +
 	"\x06GetRun\x12\x19.agentos.v1.GetRunRequest\x1a\x0f.agentos.v1.Run\x12E\n" +
 	"\bListRuns\x12\x1b.agentos.v1.ListRunsRequest\x1a\x1c.agentos.v1.ListRunsResponse\x12:\n" +
 	"\tCancelRun\x12\x1c.agentos.v1.CancelRunRequest\x1a\x0f.agentos.v1.Run\x12N\n" +
-	"\vListPending\x12\x1e.agentos.v1.ListPendingRequest\x1a\x1f.agentos.v1.ListPendingResponse\x12Z\n" +
+	"\vListPending\x12\x1e.agentos.v1.ListPendingRequest\x1a\x1f.agentos.v1.ListPendingResponse\x12C\n" +
+	"\vGetApproval\x12\x1e.agentos.v1.GetApprovalRequest\x1a\x14.agentos.v1.Approval\x12Z\n" +
 	"\x0fResolveApproval\x12\".agentos.v1.ResolveApprovalRequest\x1a#.agentos.v1.ResolveApprovalResponse\x12l\n" +
 	"\x15ResolveReconciliation\x12(.agentos.v1.ResolveReconciliationRequest\x1a).agentos.v1.ResolveReconciliationResponse\x12@\n" +
 	"\fExtendBudget\x12\x1f.agentos.v1.ExtendBudgetRequest\x1a\x0f.agentos.v1.Run\x12D\n" +
@@ -1298,7 +1579,7 @@ func file_agentos_v1_control_proto_rawDescGZIP() []byte {
 	return file_agentos_v1_control_proto_rawDescData
 }
 
-var file_agentos_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_agentos_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_agentos_v1_control_proto_goTypes = []any{
 	(*StartRunRequest)(nil),               // 0: agentos.v1.StartRunRequest
 	(*GetRunRequest)(nil),                 // 1: agentos.v1.GetRunRequest
@@ -1309,47 +1590,51 @@ var file_agentos_v1_control_proto_goTypes = []any{
 	(*ListPendingRequest)(nil),            // 6: agentos.v1.ListPendingRequest
 	(*ListPendingResponse)(nil),           // 7: agentos.v1.ListPendingResponse
 	(*PendingItem)(nil),                   // 8: agentos.v1.PendingItem
-	(*ResolveApprovalRequest)(nil),        // 9: agentos.v1.ResolveApprovalRequest
-	(*Approve)(nil),                       // 10: agentos.v1.Approve
-	(*ApproveWithEdits)(nil),              // 11: agentos.v1.ApproveWithEdits
-	(*Reject)(nil),                        // 12: agentos.v1.Reject
-	(*ResolveApprovalResponse)(nil),       // 13: agentos.v1.ResolveApprovalResponse
-	(*ResolveReconciliationRequest)(nil),  // 14: agentos.v1.ResolveReconciliationRequest
-	(*ResolveReconciliationResponse)(nil), // 15: agentos.v1.ResolveReconciliationResponse
-	(*ExtendBudgetRequest)(nil),           // 16: agentos.v1.ExtendBudgetRequest
-	(*ExplainRunRequest)(nil),             // 17: agentos.v1.ExplainRunRequest
-	(*Explanation)(nil),                   // 18: agentos.v1.Explanation
-	nil,                                   // 19: agentos.v1.StartRunRequest.ParamsEntry
-	nil,                                   // 20: agentos.v1.Run.ParamsEntry
+	(*GetApprovalRequest)(nil),            // 9: agentos.v1.GetApprovalRequest
+	(*Approval)(nil),                      // 10: agentos.v1.Approval
+	(*ResolveApprovalRequest)(nil),        // 11: agentos.v1.ResolveApprovalRequest
+	(*Approve)(nil),                       // 12: agentos.v1.Approve
+	(*ApproveWithEdits)(nil),              // 13: agentos.v1.ApproveWithEdits
+	(*Reject)(nil),                        // 14: agentos.v1.Reject
+	(*ResolveApprovalResponse)(nil),       // 15: agentos.v1.ResolveApprovalResponse
+	(*ResolveReconciliationRequest)(nil),  // 16: agentos.v1.ResolveReconciliationRequest
+	(*ResolveReconciliationResponse)(nil), // 17: agentos.v1.ResolveReconciliationResponse
+	(*ExtendBudgetRequest)(nil),           // 18: agentos.v1.ExtendBudgetRequest
+	(*ExplainRunRequest)(nil),             // 19: agentos.v1.ExplainRunRequest
+	(*Explanation)(nil),                   // 20: agentos.v1.Explanation
+	nil,                                   // 21: agentos.v1.StartRunRequest.ParamsEntry
+	nil,                                   // 22: agentos.v1.Run.ParamsEntry
 }
 var file_agentos_v1_control_proto_depIdxs = []int32{
-	19, // 0: agentos.v1.StartRunRequest.params:type_name -> agentos.v1.StartRunRequest.ParamsEntry
+	21, // 0: agentos.v1.StartRunRequest.params:type_name -> agentos.v1.StartRunRequest.ParamsEntry
 	5,  // 1: agentos.v1.ListRunsResponse.runs:type_name -> agentos.v1.Run
-	20, // 2: agentos.v1.Run.params:type_name -> agentos.v1.Run.ParamsEntry
+	22, // 2: agentos.v1.Run.params:type_name -> agentos.v1.Run.ParamsEntry
 	8,  // 3: agentos.v1.ListPendingResponse.items:type_name -> agentos.v1.PendingItem
-	10, // 4: agentos.v1.ResolveApprovalRequest.approve:type_name -> agentos.v1.Approve
-	11, // 5: agentos.v1.ResolveApprovalRequest.approve_with_edits:type_name -> agentos.v1.ApproveWithEdits
-	12, // 6: agentos.v1.ResolveApprovalRequest.reject:type_name -> agentos.v1.Reject
+	12, // 4: agentos.v1.ResolveApprovalRequest.approve:type_name -> agentos.v1.Approve
+	13, // 5: agentos.v1.ResolveApprovalRequest.approve_with_edits:type_name -> agentos.v1.ApproveWithEdits
+	14, // 6: agentos.v1.ResolveApprovalRequest.reject:type_name -> agentos.v1.Reject
 	0,  // 7: agentos.v1.Control.StartRun:input_type -> agentos.v1.StartRunRequest
 	1,  // 8: agentos.v1.Control.GetRun:input_type -> agentos.v1.GetRunRequest
 	2,  // 9: agentos.v1.Control.ListRuns:input_type -> agentos.v1.ListRunsRequest
 	4,  // 10: agentos.v1.Control.CancelRun:input_type -> agentos.v1.CancelRunRequest
 	6,  // 11: agentos.v1.Control.ListPending:input_type -> agentos.v1.ListPendingRequest
-	9,  // 12: agentos.v1.Control.ResolveApproval:input_type -> agentos.v1.ResolveApprovalRequest
-	14, // 13: agentos.v1.Control.ResolveReconciliation:input_type -> agentos.v1.ResolveReconciliationRequest
-	16, // 14: agentos.v1.Control.ExtendBudget:input_type -> agentos.v1.ExtendBudgetRequest
-	17, // 15: agentos.v1.Control.ExplainRun:input_type -> agentos.v1.ExplainRunRequest
-	5,  // 16: agentos.v1.Control.StartRun:output_type -> agentos.v1.Run
-	5,  // 17: agentos.v1.Control.GetRun:output_type -> agentos.v1.Run
-	3,  // 18: agentos.v1.Control.ListRuns:output_type -> agentos.v1.ListRunsResponse
-	5,  // 19: agentos.v1.Control.CancelRun:output_type -> agentos.v1.Run
-	7,  // 20: agentos.v1.Control.ListPending:output_type -> agentos.v1.ListPendingResponse
-	13, // 21: agentos.v1.Control.ResolveApproval:output_type -> agentos.v1.ResolveApprovalResponse
-	15, // 22: agentos.v1.Control.ResolveReconciliation:output_type -> agentos.v1.ResolveReconciliationResponse
-	5,  // 23: agentos.v1.Control.ExtendBudget:output_type -> agentos.v1.Run
-	18, // 24: agentos.v1.Control.ExplainRun:output_type -> agentos.v1.Explanation
-	16, // [16:25] is the sub-list for method output_type
-	7,  // [7:16] is the sub-list for method input_type
+	9,  // 12: agentos.v1.Control.GetApproval:input_type -> agentos.v1.GetApprovalRequest
+	11, // 13: agentos.v1.Control.ResolveApproval:input_type -> agentos.v1.ResolveApprovalRequest
+	16, // 14: agentos.v1.Control.ResolveReconciliation:input_type -> agentos.v1.ResolveReconciliationRequest
+	18, // 15: agentos.v1.Control.ExtendBudget:input_type -> agentos.v1.ExtendBudgetRequest
+	19, // 16: agentos.v1.Control.ExplainRun:input_type -> agentos.v1.ExplainRunRequest
+	5,  // 17: agentos.v1.Control.StartRun:output_type -> agentos.v1.Run
+	5,  // 18: agentos.v1.Control.GetRun:output_type -> agentos.v1.Run
+	3,  // 19: agentos.v1.Control.ListRuns:output_type -> agentos.v1.ListRunsResponse
+	5,  // 20: agentos.v1.Control.CancelRun:output_type -> agentos.v1.Run
+	7,  // 21: agentos.v1.Control.ListPending:output_type -> agentos.v1.ListPendingResponse
+	10, // 22: agentos.v1.Control.GetApproval:output_type -> agentos.v1.Approval
+	15, // 23: agentos.v1.Control.ResolveApproval:output_type -> agentos.v1.ResolveApprovalResponse
+	17, // 24: agentos.v1.Control.ResolveReconciliation:output_type -> agentos.v1.ResolveReconciliationResponse
+	5,  // 25: agentos.v1.Control.ExtendBudget:output_type -> agentos.v1.Run
+	20, // 26: agentos.v1.Control.ExplainRun:output_type -> agentos.v1.Explanation
+	17, // [17:27] is the sub-list for method output_type
+	7,  // [7:17] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
@@ -1360,7 +1645,7 @@ func file_agentos_v1_control_proto_init() {
 	if File_agentos_v1_control_proto != nil {
 		return
 	}
-	file_agentos_v1_control_proto_msgTypes[9].OneofWrappers = []any{
+	file_agentos_v1_control_proto_msgTypes[11].OneofWrappers = []any{
 		(*ResolveApprovalRequest_Approve)(nil),
 		(*ResolveApprovalRequest_ApproveWithEdits)(nil),
 		(*ResolveApprovalRequest_Reject)(nil),
@@ -1371,7 +1656,7 @@ func file_agentos_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentos_v1_control_proto_rawDesc), len(file_agentos_v1_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

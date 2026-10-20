@@ -28,6 +28,12 @@ def stack(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Stack]:
 
 
 @pytest.fixture
+def restartable_stack(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Stack]:
+    """A stack whose Temporal dev server keeps its runs in a database file: Stack.restart_temporal."""
+    yield from _stack(request, Stack(tmp_path, temporal_db=True))
+
+
+@pytest.fixture
 def live_stack(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Stack]:
     """A stack that writes to the real test repository (AGENTOS_GITHUB=live): only for the tests
     that ask for it by name."""

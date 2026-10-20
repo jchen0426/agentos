@@ -31,6 +31,19 @@ type CommentCommit struct {
 type Effects interface {
 	// LatestEffectResult is the result of the run's latest finished effect of tool.
 	LatestEffectResult(ctx context.Context, workflowID, tool string) (map[string]any, bool, error)
+	// RunApprovals is the run's approvals, oldest first (design doc, section 10).
+	RunApprovals(ctx context.Context, workflowID string) ([]Approval, error)
+}
+
+// Approval is one approval of a run's write, and how it was decided, as agentd recorded it. The
+// report shows them: a rejection's reason goes into it (design doc, section 10).
+type Approval struct {
+	ID, Tool  string
+	Status    string // PENDING, APPROVED, REJECTED, EXPIRED, EDITED or SUPERSEDED
+	DecidedBy string // the reviewer, as they named themselves; agentd for an expiry
+	DecidedAt string
+	Reason    string // a rejection's reason, or why it expired
+	ExpiresAt string
 }
 
 var commentArgs = tools.MustSchema(`{
@@ -112,11 +125,16 @@ func (t *CommentCommit) Prepare(ctx context.Context, req tools.Request) (json.Ra
 			pr, _ = n.Int64()
 		}
 	}
+	// So are the decisions on the run's writes, a rejection's reason with them.
+	approvals, err := t.Effects.RunApprovals(ctx, req.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
 	commit := tools.String(req.Args, "commit")
 	m := marker(req.EffectID)
 	return json.Marshal(commentPayload{
 		Owner: repo.Owner, Repo: repo.Name, Commit: commit, Marker: m,
-		Body: render(commit, tools.String(req.Args, "outcome"), rep, pr, m),
+		Body: render(commit, tools.String(req.Args, "outcome"), rep, pr, approvals, m),
 	})
 }
 
@@ -129,10 +147,10 @@ const (
 )
 
 // render builds the comment from what agentd checked itself (the commit, the severities, the
-// pull request's number), and puts everything a model or the workflow wrote into one code
-// fence, longer than any run of backticks inside it: GitHub renders neither links nor
-// mentions there.
-func render(commit, outcome string, rep *report, pr int64, marker string) string {
+// pull request's number, how each approval ended), and puts everything a model, the workflow or a
+// reviewer wrote into one code fence, longer than any run of backticks inside it: GitHub renders
+// neither links nor mentions there.
+func render(commit, outcome string, rep *report, pr int64, approvals []Approval, marker string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**agentos security audit** of commit `%s`\n\n", commit)
 	if rep != nil {
@@ -155,12 +173,33 @@ func render(commit, outcome string, rep *report, pr int64, marker string) string
 	if pr > 0 {
 		fmt.Fprintf(&b, "A draft pull request proposes a fix: #%d\n\n", pr)
 	}
+	for _, a := range approvals {
+		fmt.Fprintf(&b, "Approval of %s: %s\n\n", a.Tool, strings.ToLower(a.Status))
+	}
 	// The workflow's outcome may carry a long error: cut it rather than refuse the report.
 	if len(outcome) > maxOutcome {
 		outcome = strings.ToValidUTF8(outcome[:maxOutcome], "") + " [truncated]"
 	}
 	var text strings.Builder
 	text.WriteString("Outcome: " + outcome)
+	if len(approvals) > 0 {
+		text.WriteString("\n\nApprovals:")
+		for _, a := range approvals {
+			fmt.Fprintf(&text, "\n- %s, approval %s: %s", a.Tool, a.ID, a.Status)
+			switch a.Status {
+			case "PENDING":
+				fmt.Fprintf(&text, ", until %s", a.ExpiresAt)
+			case "EXPIRED":
+				fmt.Fprintf(&text, " at %s: %s", a.DecidedAt, a.Reason)
+			case "REJECTED":
+				fmt.Fprintf(&text, " by %s at %s. Reason: %s", a.DecidedBy, a.DecidedAt, a.Reason)
+			case "EDITED", "SUPERSEDED":
+				fmt.Fprintf(&text, " (edited by %s at %s)", a.DecidedBy, a.DecidedAt)
+			default:
+				fmt.Fprintf(&text, " by %s at %s", a.DecidedBy, a.DecidedAt)
+			}
+		}
+	}
 	if rep != nil {
 		text.WriteString("\n\nSummary:\n" + rep.Summary)
 		for i, f := range rep.Findings {

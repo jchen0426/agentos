@@ -68,3 +68,15 @@ func TestJSONWriter(t *testing.T) {
 		t.Error("raw C1 control written")
 	}
 }
+
+func TestText(t *testing.T) {
+	for in, want := range map[string]string{
+		"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+\tb\n": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+\tb\n",
+		"line\r\x1b[2Kforged":                       `line\r\x1b[2Kforged`,
+		"a\u202eb\u0085c":                           `a\u202eb\u0085c`,
+	} {
+		if got := Text(in); got != want {
+			t.Errorf("Text(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

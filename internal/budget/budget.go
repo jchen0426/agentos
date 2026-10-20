@@ -12,6 +12,7 @@ import (
 
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
+	"github.com/jchen0426/agentos/internal/outbox"
 )
 
 // ErrExhausted means the run cannot afford a reservation; nothing was recorded.
@@ -117,17 +118,25 @@ func Release(ctx context.Context, q *db.Queries, requestID string) error {
 	})
 }
 
-// Extend raises a run's limit by amount. The idempotency key makes a retried request a
-// no-op; Extend reports whether this call added to the limit.
+// Extend raises a run's limit by amount, and rings the run's doorbell in the same transaction:
+// calls paused in PAUSED_BUDGET ask again (design doc, section 10, the outbox). The idempotency
+// key makes a retried request a no-op; Extend reports whether this call added to the limit.
 func (b *Budget) Extend(ctx context.Context, workflowID string, amount int64, idempotencyKey string) (bool, error) {
 	if amount <= 0 {
 		return false, fmt.Errorf("extension of %d micros", amount)
 	}
-	n, err := b.Ledger.Q.InsertBudgetExtension(ctx, db.InsertBudgetExtensionParams{
-		WorkflowID: workflowID, AmountMicros: amount,
-		IdempotencyKey: sql.NullString{String: idempotencyKey, Valid: true}, CreatedAt: ledger.Now(),
+	var added bool
+	err := b.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.InsertBudgetExtension(ctx, db.InsertBudgetExtensionParams{
+			WorkflowID: workflowID, AmountMicros: amount,
+			IdempotencyKey: sql.NullString{String: idempotencyKey, Valid: true}, CreatedAt: ledger.Now(),
+		})
+		if added = n == 1; err != nil || !added {
+			return err
+		}
+		return outbox.Ring(ctx, q, workflowID, outbox.WhyBudget)
 	})
-	return n == 1, err
+	return added && err == nil, err
 }
 
 // SettleOpen charges every open reservation in full. agentd calls it at start, before it

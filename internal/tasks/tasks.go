@@ -25,6 +25,16 @@ type Task struct {
 	// Scope maps tool arguments to the resolved parameter they must equal: a run acts only
 	// on what it was started for, not on everything the policy allows.
 	Scope map[string]string
+	// ApprovalContext is what the task shows the reviewer of each of its runs' approvals, beyond
+	// what the write itself describes, from what agentd recorded of the run (design doc, section
+	// 10). Best-effort: what it cannot read, it says.
+	ApprovalContext func(ctx context.Context, run RunOutputs) map[string]any
+}
+
+// RunOutputs reads what agentd recorded of one run.
+type RunOutputs interface {
+	// ModelOutput is what the workflow got from the run's latest accepted answer of a model task.
+	ModelOutput(ctx context.Context, task string) (map[string]any, bool, error)
 }
 
 type Registry map[string]Task
@@ -50,10 +60,11 @@ var commitRe = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 // resolves the commit in its sandbox.
 func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Caller) Task {
 	return Task{
-		Name:          "security-audit",
-		WorkflowType:  "security-audit",
-		DefaultBudget: 5_000_000,
-		Scope:         map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
+		Name:            "security-audit",
+		WorkflowType:    "security-audit",
+		DefaultBudget:   5_000_000,
+		Scope:           map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
+		ApprovalContext: auditFindings,
 		Resolve: func(ctx context.Context, params map[string]string) (any, map[string]string, error) {
 			for k := range params {
 				if !slices.Contains([]string{"repo", "commit", "base"}, k) {
@@ -82,6 +93,30 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Calle
 				map[string]string{"repo": repo, "commit": full, "base": base}, nil
 		},
 	}
+}
+
+// auditFindings is the security audit's context for a reviewer: the summary and the findings of
+// the run's audit (severity, CWE, where, what), as the model reported them.
+func auditFindings(ctx context.Context, run RunOutputs) map[string]any {
+	v, ok, err := run.ModelOutput(ctx, "audit_v1")
+	switch {
+	case err != nil:
+		return map[string]any{"findings_error": "agentd could not read the run's audit: " + err.Error()}
+	case !ok:
+		return map[string]any{"findings_error": "the run has no accepted audit"}
+	}
+	var findings []any
+	list, _ := v["findings"].([]any)
+	for _, f := range list {
+		m, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		findings = append(findings, map[string]any{
+			"severity": m["severity"], "cwe": m["cwe"], "file": m["file"], "line": m["line"], "title": m["title"],
+		})
+	}
+	return map[string]any{"summary": v["summary"], "findings": findings}
 }
 
 // resolveCommit turns an abbreviated commit into the full SHA, using the mirror only: the git
