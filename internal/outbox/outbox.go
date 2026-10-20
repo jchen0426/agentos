@@ -99,7 +99,10 @@ func (o *Outbox) Deliver(ctx context.Context) time.Duration {
 		return 100 * time.Millisecond
 	}
 	rows, err := o.Ledger.Q.ListDueDoorbells(ctx, ledger.Stamp(time.Now()))
-	if err != nil {
+	switch {
+	case ctx.Err() != nil:
+		return 0 // agentd is stopping: the doorbells wait in the ledger
+	case err != nil:
 		o.Log.Error("doorbells: cannot read the outbox", "error", err)
 		return firstRetry
 	}
@@ -133,6 +136,9 @@ func (o *Outbox) Deliver(ctx context.Context) time.Duration {
 func (o *Outbox) deliverRun(ctx context.Context, workflowID string, last, attempts int64, why []string) {
 	log := o.Log.With("workflow_id", workflowID, "why", why)
 	err := o.signal(ctx, workflowID)
+	if ctx.Err() != nil {
+		return // agentd is stopping; the next one delivers it
+	}
 	var notFound *serviceerror.NotFound
 	outcome := "delivered"
 	switch {

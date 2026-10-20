@@ -80,3 +80,36 @@ func TestUSD(t *testing.T) {
 		}
 	}
 }
+
+// An approval card shows text a model, a tool or the outside world wrote: the patch, the
+// findings, the payload. On the terminal none of it can rewrite the screen or forge a line of
+// the card (a second status, a payload hash), and the patch still reads as written, line by line.
+func TestApprovalCardShowsTheirTextInert(t *testing.T) {
+	a := &agentosv1.Approval{
+		ApprovalId: "a1", RunId: "r1", Tool: "github.open_draft_pr", Status: "PENDING",
+		CreatedAt: "2026-10-20T00:00:00.000000000Z", ExpiresAt: "2026-10-21T00:00:00.000000000Z",
+		PayloadSha256: strings.Repeat("ab", 32),
+		PayloadJson:   `{"title":"fix\u001b[2J","body":"x\nstatus  APPROVED"}`,
+		ContextJson: `{"task":{"findings":[{"cwe":"CWE-89","title":"t\u009b2J"}]},` +
+			`"write":{"patch":"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\u001b]0;pwned\u0007\nstatus\tAPPROVED\n"}}`,
+	}
+	var b bytes.Buffer
+	if err := writeApproval(&b, a); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, r := range out {
+		if !unicode.IsPrint(r) && r != '\n' && r != '\t' {
+			t.Fatalf("raw %U in the card:\n%s", r, out)
+		}
+	}
+	statuses := 0
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "status") {
+			statuses++
+		}
+	}
+	if statuses != 1 || !strings.Contains(out, "      +++ b/x\n") || !strings.Contains(out, "agentctl approvals approve a1 --payload-sha256 "+a.PayloadSha256) {
+		t.Fatalf("card:\n%s", out)
+	}
+}

@@ -42,7 +42,21 @@
 
 ## 测试怎么测
 
-（待补：T4、T5、T6、T14 和 Go 测试的说明、三种环境的结果、改坏检查。）
+- **T4**（`tests/test_t4_approval_restart.py`），两个场景：
+  1. 任务停在 WAITING_APPROVAL 时 kill -9 agentd、重启 Temporal 开发服务器（测试框架给它一个数据库文件，`restartable_stack`，原来是内存的，重启就丢）、再起 agentd，Worker 不重启。审批单还在，ID 和载荷哈希不变；模拟 GitHub 没收到任何写请求。审批单的内容逐项核对：载荷的 base 和被审计提交、补丁全文、改动的文件、`git apply --check` 通过、base 的头和“identical、落后 0、在 base 历史里”、两处核对都是 ok、发现列表、已花的钱。批准之后任务跑完，只开出一个 PR，报告里写着这次批准；历史里只有一个信号，outbox 里那条门铃记 delivered。
+  2. 审批 8 秒过期，到期时 agentd 正停着：它启动后立刻把审批单记为 EXPIRED（agentd，“到期前没人决定”），任务被门铃唤醒、得到 `expired`、发报告（报告写明过期和原因）、以 SUCCEEDED 结束，没有 PR，副作用记录 ABANDONED。之后再批准，得到“already decided: EXPIRED by agentd”。
+- **T5**（`tests/test_t5_payload_binding.py`），四个场景：
+  1. 批准时把门铃扣住，停掉 agentd，把账本里记录的载荷改一个字节（`security fix` 改成 `security fiX`），再起 agentd：门铃送达，任务重发，网关拒绝发送，副作用记录 ABANDONED、原因写明两边的哈希，任务得到 `denied` 并发报告，GitHub 没收到任何写请求；`approvals show` 也拒绝展示这份载荷。
+  2. 审批人用自己的补丁修改：原审批单 EDITED，工作流对审批人的补丁重新跑了 `git.apply_check`（历史里它排在用新补丁开 PR 的调用之前），出现第二张审批单，取代第一张（SUPERSEDED），新审批单的载荷里是审批人的改法；批准第二张后 PR 开出，GitHub 收到的树里只有审批人的修复、没有模型的；第一条副作用 ABANDONED。
+  3. 审批人的补丁改了 `.github/workflows/`：工作流的 `git.apply_check` 拒绝，报告写 `patch rejected`，没有第二张审批单，没开 PR。
+  4. 恶意工作流（`tests/rogue_workflows.py` 的 `SwapsThePatch`）：让审批人修改、批准修改后的补丁，然后不用批准的那份，改用模型自己的补丁再调用：得到 `edited`，什么都没发出去；第二张审批单是 APPROVED 但没被用过。
+- **T6**（`tests/test_t6_concurrent_decisions.py`）：四个任务同时等审批，每张审批单同时起两个 agentctl，一个以 alice 批准、一个以 bob 拒绝。每张都只有一个成功，另一个以非 0 退出，错误里写着先到的决定、谁、何时；账本里的状态就是先到的那个。各自用原来的幂等键再发一次：先到的那个照样成功，后到的照样冲突。之后任务按先到的决定走：批准的开出一个 PR，拒绝的不开 PR，报告里有 bob 的理由。
+- **T14**（`tests/test_t14_doorbell_outbox.py`），两个场景：批准（和追加预算）的门铃扣在 outbox 里，确认它没送出、任务还在睡，kill -9 agentd，再起一个：门铃送达，任务跑完，历史里一个信号，outbox 记 delivered。工作流自己的定时器是 24 小时（预算是 1 小时），测试的等待只有 60 秒，所以唤醒任务的只能是门铃。
+- **其他黑盒测试的变化**：`test_cancel.py` 等审批时取消，现在还核对审批单不再列出、对它的批准被拒绝；`test_dry_run.py` 加了“dry-run 在需要审批的策略下也不建审批单”。测试框架加了 `approval_policy()`、`restart_temporal()`、扣住门铃的故障（`hold_doorbells_while_exists`）和读模拟 GitHub 评论的辅助函数；模拟 GitHub 的日志记下建树请求里的文件内容，测试才能看出 PR 里是谁的修复。
+- **Go 测试**：`internal/gateway/approvals_test.go`（批准前一直 needs_approval、只有带对哈希的决定算数、批准后只发一次；拒绝要理由；16 个决定同时到只有一个生效，其余被告知先到的决定，同键重发；三种过期；记录的载荷被改一个字节就不发、也批不了；修改、取代、只有修改后的那个调用能取代、批准后原调用照样得到 edited；不收改了等于没改的修改和不能修改的工具；已取消任务；只读工具不能要求审批），`internal/outbox/outbox_test.go`（每个任务一个信号、失败退避重试且不挡别的任务、执行已结束就丢弃、留到下一个 agentd 发、Poke 立即唤醒），`internal/githubtool`（审批单的 Describe：base 前进并改了补丁涉及的文件时，审批单写明落后 1 个提交、头上的核对被拒；报告里的审批：状态在围栏外、谁和理由在围栏里），`internal/policy`（approval_ttl），`internal/safetext`（Text）。
+- **改坏检查**：对 Go 代码逐条改坏 21 处（转 PENDING 时的哈希、到期、取消检查；决定时审批人的哈希、记录的载荷、先到者生效、门铃、拒绝要理由、拒绝时放弃副作用、改了等于没改；到期的门铃；取代原审批单；outbox 的丢弃、扣住、退避；审批单的落后数；报告里的理由；approval_ttl 只配 require_approval；只读工具不能要求审批），每一处都有用例失败。
+
+三种环境的结果：（待补。）
 
 ## 推送前审查
 
@@ -50,4 +64,12 @@
 
 ## 留到后面
 
-（待补。）
+- **已经结束的任务的审批单**：取消的不列，但 Temporal 里已经结束（失败、被终止）的任务，审批单会一直列到过期；对它的决定会被拒绝（“the run has ended”）。要在列表里也排除，`ListPending` 得逐个问 Temporal。
+- **做决定要连得上 Temporal**：为了拒绝对已结束任务的决定，`ResolveApproval` 先问 Temporal 任务的状态，和 `reconcile resolve` 一样；Temporal 不可用时决定报 Unavailable，稍后重试。
+- **审批人是自己报的名字**：v0.1 单用户，Control socket 在 0700 目录里。多人共用一台 agentd 时（v0.2 的团队部署），要按连接认人（Unix socket 的对端凭据，或者 mTLS 的证书主体），审计记录里才有可信的“谁”。
+- **修改后的补丁 agentd 只做语法检查**：越界、打不打得上，交给工作流的 `git.apply_check` 和 `open_draft_pr` 自己的检查。被攻破的工作流可以跳过 `apply_check`，但跳不过 `open_draft_pr` 在 agentd 里的检查，审批人还会在第二张审批单上看到 `git apply --check` 的结果。
+- **改过、但修改后的调用一直没来的审批单**：停在 EDITED，原副作用停在 AWAITING_APPROVAL，永远不会发出，也一直占着这个任务这种写操作的名额。
+- **策略中途改成需要审批**：改之前已经记成 PENDING 的副作用，是在旧策略下记下的，之后照样发出，不会补一张审批单。
+- **审批疲劳**（第 10 节最后一项）：v0.1 只有开 PR 一种审批，批准率和平均停留时长还没记；以后加第二种审批时一起做。
+- **审批单是建立时的快照**：base 分支之后再动，审批单上的“落后几个提交”“头上的核对”不会更新；Execute 发送前会再核对一遍，对不上就不推、交给人。
+- **门铃只要任务还在就一直重试**（最多每分钟一次）：Temporal 长时间不可用时，outbox 里会攒下这段时间的门铃，送达时按任务合并成一个信号。
