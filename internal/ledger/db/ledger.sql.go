@@ -602,17 +602,6 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 	return i, err
 }
 
-const hasResolution = `-- name: HasResolution :one
-SELECT EXISTS (SELECT 1 FROM effect_resolutions WHERE effect_id = ?)
-`
-
-func (q *Queries) HasResolution(ctx context.Context, effectID string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, hasResolution, effectID)
-	var column_1 int64
-	err := row.Scan(&column_1)
-	return column_1, err
-}
-
 const holdForApproval = `-- name: HoldForApproval :execrows
 UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL

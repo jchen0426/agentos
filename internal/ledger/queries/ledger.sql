@@ -209,9 +209,6 @@ WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NUL
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL;
 
--- name: HasResolution :one
-SELECT EXISTS (SELECT 1 FROM effect_resolutions WHERE effect_id = ?);
-
 -- name: AbandonAwaitingEffect :execrows
 -- An effect whose approval was rejected, expired or replaced is never sent.
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?

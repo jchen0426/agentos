@@ -734,8 +734,8 @@ func TestTheRecordingLockIsTheRunsAlone(t *testing.T) {
 }
 
 // An approval holds until its write goes out, not only until the run acts on it: a write given
-// back unsent (nothing in flight) whose approval's time has run out is not sent, as a rejection.
-// One a person reconciled as not executed goes all the same.
+// back unsent, or found never to have happened (nothing in flight), whose approval's time has run
+// out is not sent, as a rejection.
 func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 	f := newFixture(t, false)
 	w := &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
@@ -765,7 +765,8 @@ func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 		t.Fatalf("effect %s", e.Status)
 	}
 
-	// The same, but a person reconciled it as not executed after the approval: it goes.
+	// The same, after a person found it never happened: the finding sends nothing on an approval
+	// whose time is up.
 	g := newFixture(t, false)
 	w = &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
 	if _, err := g.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
@@ -783,7 +784,7 @@ func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 	w.err = nil
 	w.sent.Store(0)
 	time.Sleep(400 * time.Millisecond)
-	if res, err := g.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || w.sent.Load() != 1 {
+	if res, err := g.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
 		t.Fatalf("reconciled: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 }

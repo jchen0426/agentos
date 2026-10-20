@@ -303,8 +303,8 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 // may go out now. It returns no result when it may.
 //   - Its approval is approved and used (it moved the effect to PENDING): it goes, unless the
 //     approval's time ran out before the write went out. Nothing is in flight (the effect was never
-//     claimed, or was given back unsent), so the approval is void, as a rejection. A write a person
-//     reconciled as not executed goes all the same: they looked at it since.
+//     claimed, was given back unsent, or a person found it never happened), so the approval is
+//     void, as a rejection.
 //   - It has no approval: recorded before the policy asked (a policy changed across a restart), or
 //     while its tool could only dry-run. It waits for one, made now, in one transaction with its
 //     move back to AWAITING_APPROVAL; the call answers needs_approval.
@@ -314,11 +314,6 @@ func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 	switch {
 	case err == nil && a.Status == approvalApproved && a.UsedAt.Valid:
 		if !expired(a) {
-			return nil, nil
-		}
-		if reconciled, err := g.Ledger.Q.HasResolution(ctx, e.EffectID); err != nil {
-			return nil, err
-		} else if reconciled != 0 {
 			return nil, nil
 		}
 		return g.expireUnsent(ctx, e, a)
