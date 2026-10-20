@@ -32,7 +32,7 @@ func (q *Queries) AbandonAwaitingEffect(ctx context.Context, arg AbandonAwaiting
 
 const abandonUnclaimedEffect = `-- name: AbandonUnclaimedEffect :execrows
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
-WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0
 `
 
 type AbandonUnclaimedEffectParams struct {
@@ -42,7 +42,7 @@ type AbandonUnclaimedEffectParams struct {
 	Version   int64
 }
 
-// A PENDING effect nobody claimed is never sent: its approval's time ran out first.
+// A PENDING effect nothing of which went out is never sent: its approval's time ran out first.
 func (q *Queries) AbandonUnclaimedEffect(ctx context.Context, arg AbandonUnclaimedEffectParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, abandonUnclaimedEffect,
 		arg.Reason,
@@ -109,7 +109,7 @@ func (q *Queries) ApproveEffect(ctx context.Context, arg ApproveEffectParams) (i
 }
 
 const claimEffect = `-- name: ClaimEffect :execrows
-UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = ?, claimed_at = ?, maybe_sent = 1, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `
@@ -474,7 +474,7 @@ func (q *Queries) GetEditedApproval(ctx context.Context, arg GetEditedApprovalPa
 }
 
 const getEffect = `-- name: GetEffect :one
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE effect_id = ?
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE effect_id = ?
 `
 
 func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error) {
@@ -496,12 +496,13 @@ func (q *Queries) GetEffect(ctx context.Context, effectID string) (Effect, error
 		&i.ClaimedAt,
 		&i.Version,
 		&i.Reason,
+		&i.MaybeSent,
 	)
 	return i, err
 }
 
 const getLatestEffect = `-- name: GetLatestEffect :one
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE workflow_id = ? AND tool = ? AND status IN ('SUCCEEDED', 'DRY_RUN')
 ORDER BY updated_at DESC LIMIT 1
 `
 
@@ -530,6 +531,7 @@ func (q *Queries) GetLatestEffect(ctx context.Context, arg GetLatestEffectParams
 		&i.ClaimedAt,
 		&i.Version,
 		&i.Reason,
+		&i.MaybeSent,
 	)
 	return i, err
 }
@@ -604,7 +606,7 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 
 const holdForApproval = `-- name: HoldForApproval :execrows
 UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
-WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)
 `
 
@@ -949,7 +951,7 @@ func (q *Queries) ListCancelledRuns(ctx context.Context) ([]Run, error) {
 }
 
 const listClaimedEffects = `-- name: ListClaimedEffects :many
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND claimed_by <> ?
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND claimed_by <> ?
 ORDER BY created_at
 `
 
@@ -980,6 +982,7 @@ func (q *Queries) ListClaimedEffects(ctx context.Context, claimedBy sql.NullStri
 			&i.ClaimedAt,
 			&i.Version,
 			&i.Reason,
+			&i.MaybeSent,
 		); err != nil {
 			return nil, err
 		}
@@ -1032,7 +1035,7 @@ func (q *Queries) ListDueDoorbells(ctx context.Context, nextAttemptAt string) ([
 }
 
 const listEffectsByStatus = `-- name: ListEffectsByStatus :many
-SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason FROM effects WHERE status = ? ORDER BY created_at
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent FROM effects WHERE status = ? ORDER BY created_at
 `
 
 func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Effect, error) {
@@ -1060,6 +1063,7 @@ func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Eff
 			&i.ClaimedAt,
 			&i.Version,
 			&i.Reason,
+			&i.MaybeSent,
 		); err != nil {
 			return nil, err
 		}
@@ -1563,19 +1567,26 @@ func (q *Queries) PutBlob(ctx context.Context, arg PutBlobParams) error {
 }
 
 const releaseEffect = `-- name: ReleaseEffect :execrows
-UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
 `
 
 type ReleaseEffectParams struct {
+	MaybeSent int64
 	UpdatedAt string
 	EffectID  string
 	Version   int64
 }
 
-// Returns a claimed effect whose request never took effect, for a later attempt to send.
+// Returns a claimed effect for a later attempt to send: one whose request never took effect
+// (maybe_sent 0), or an idempotent one that may have (1), sent again under its key.
 func (q *Queries) ReleaseEffect(ctx context.Context, arg ReleaseEffectParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, releaseEffect, arg.UpdatedAt, arg.EffectID, arg.Version)
+	result, err := q.db.ExecContext(ctx, releaseEffect,
+		arg.MaybeSent,
+		arg.UpdatedAt,
+		arg.EffectID,
+		arg.Version,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -1584,7 +1595,7 @@ func (q *Queries) ReleaseEffect(ctx context.Context, arg ReleaseEffectParams) (i
 
 const resolveEffect = `-- name: ResolveEffect :execrows
 UPDATE effects
-SET status = ?, result_blob = ?, claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+SET status = ?, result_blob = ?, claimed_by = NULL, claimed_at = NULL, maybe_sent = 0, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'UNKNOWN'
 `
 

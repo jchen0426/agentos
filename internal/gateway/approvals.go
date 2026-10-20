@@ -301,27 +301,35 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 
 // gate decides whether a PENDING effect nobody has claimed, of a write the policy wants approved,
 // may go out now. It returns no result when it may.
-//   - Its approval is approved and used (it moved the effect to PENDING): it goes, unless the
-//     approval's time ran out before the write went out. Nothing is in flight (the effect was never
-//     claimed, was given back unsent, or a person found it never happened), so the approval is
-//     void, as a rejection.
-//   - It has no approval: recorded before the policy asked (a policy changed across a restart), or
-//     while its tool could only dry-run. It waits for one, made now, in one transaction with its
-//     move back to AWAITING_APPROVAL; the call answers needs_approval.
+//   - Its request may have gone out (an idempotent effect given back without a lookup): it is in
+//     flight. With its approval it goes on, sent again under its key, whatever the approval's time.
+//     Without one (claimed before the policy asked), agentd cannot tell whether it went out, and
+//     sending it again could make a write nobody approved: a person settles it (UNKNOWN).
+//   - Nothing of it went out, and its approval is approved and used (it moved the effect to
+//     PENDING): it goes, unless the approval's time ran out first; then the approval is void, as a
+//     rejection.
+//   - Nothing of it went out, and it has no approval: recorded before the policy asked (a policy
+//     changed across a restart), or while its tool could only dry-run. It waits for one, made now,
+//     in one transaction with its move back to AWAITING_APPROVAL; the call answers needs_approval.
 func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, rule *approvalRule,
 	req tools.Request, canon []byte, payload json.RawMessage) (*agentosv1.Result, error) {
 	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)
+	approved := err == nil && a.Status == approvalApproved && a.UsedAt.Valid
 	switch {
-	case err == nil && a.Status == approvalApproved && a.UsedAt.Valid:
-		if !expired(a) {
-			return nil, nil
-		}
-		return g.expireUnsent(ctx, e, a)
-	case err == nil:
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	case err == nil && !approved:
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("effect %s is PENDING, but its approval %s is %s", e.EffectID, a.ApprovalID, a.Status), "BadApproval", nil)
-	case !errors.Is(err, sql.ErrNoRows):
-		return nil, err
+	case e.MaybeSent != 0 && approved:
+		return nil, nil
+	case e.MaybeSent != 0:
+		return g.settle(ctx, e, effectUnknown, nil, "claimed before the policy asked for approval, and it may have gone out: "+
+			"agentd does not send it again without an approval")
+	case approved && !expired(a):
+		return nil, nil
+	case approved:
+		return g.expireUnsent(ctx, e, a)
 	}
 	card, err := g.describe(ctx, run, t, req, payload)
 	if err != nil {
@@ -383,8 +391,10 @@ func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) 
 }
 
 // mayResend says whether recovery may send a claimed effect again, which may never have gone out:
-// always, unless the policy wants it approved; then only with an approval that is approved, used
-// and in its time. Otherwise recovery only looks, and an effect it gives back meets gate.
+// always, unless the policy wants it approved and nobody approved it (it was claimed under a policy
+// that did not ask). Then recovery only looks: one found never to have gone out meets gate on the
+// next call, and an idempotent one, which cannot be looked up, goes to a person. An approved write
+// once claimed is in flight: its approval's time no longer matters.
 func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule) (bool, error) {
 	if rule == nil {
 		return true, nil
@@ -396,7 +406,7 @@ func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule
 	case err != nil:
 		return false, err
 	}
-	return a.Status == approvalApproved && a.UsedAt.Valid && !expired(a), nil
+	return a.Status == approvalApproved && a.UsedAt.Valid, nil
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the

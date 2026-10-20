@@ -33,6 +33,11 @@ CREATE TABLE approvals (
 );
 CREATE INDEX approvals_pending ON approvals (expires_at) WHERE status = 'PENDING';
 CREATE INDEX approvals_by_run ON approvals (workflow_id, tool);
+-- Whether an effect's request may have gone out: set when it is claimed, cleared when agentd knows
+-- nothing went out (the tool sent nothing, a lookup found nothing in time, a person found it never
+-- happened). An approval's time, and an approval it never had, matter only while it is clear: a
+-- write that may be out is recovered by its class, or settled by a person.
+ALTER TABLE effects ADD COLUMN maybe_sent INTEGER NOT NULL DEFAULT 0;
 
 -- Doorbells to deliver (design doc, section 10): each written in the same transaction as the
 -- change that should wake the run, and signalled until Temporal has it, or the run has ended.
@@ -50,6 +55,7 @@ CREATE TABLE outbox (
 CREATE INDEX outbox_due ON outbox (next_attempt_at) WHERE delivered_at IS NULL;
 
 -- +goose Down
+ALTER TABLE effects DROP COLUMN maybe_sent;
 DROP TABLE outbox;
 DROP TABLE approvals;
 CREATE TABLE approvals (

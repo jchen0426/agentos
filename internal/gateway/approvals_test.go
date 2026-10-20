@@ -15,7 +15,6 @@ import (
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/faults"
-	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
@@ -733,25 +732,30 @@ func TestTheRecordingLockIsTheRunsAlone(t *testing.T) {
 	}
 }
 
-// An approval holds until its write goes out, not only until the run acts on it: a write given
-// back unsent, or found never to have happened (nothing in flight), whose approval's time has run
-// out is not sent, as a rejection.
+// An approval holds until its write goes out, not only until the run acts on it: an approved
+// write nothing of which went out when the approval's time runs out (agentd stopped right after
+// it moved the write to PENDING, or the tool sent nothing) is not sent, as a rejection. One that
+// may have gone out is in flight, and is sent again under its key whatever the time.
 func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
-	f := newFixture(t, false)
-	w := &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
+	approve := func(f *fixture, w tools.Writer, args map[string]any) db.Approval {
+		t.Helper()
+		if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove, By: "bob"}); err != nil {
+			t.Fatal(err)
+		}
+		return f.one(t)
+	}
 	args := map[string]any{"n": 1}
-	if _, err := f.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
-		t.Fatal(err)
+
+	// Moved to PENDING, then agentd stopped before it claimed the write.
+	f := newFixture(t, false)
+	w := &writer{class: policy.EffectLookup}
+	a := approve(f, w, args)
+	if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
+		t.Fatalf("approved: %v %v", res, err)
 	}
-	a := f.one(t)
-	if _, err := f.decide(t, a, Decision{Kind: DecisionApprove, By: "bob"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.ask(t, w, args, 1, time.Hour); err == nil {
-		t.Fatal("the unsent write did not fail the call")
-	}
-	w.err = nil
-	w.sent.Store(0)
 	time.Sleep(400 * time.Millisecond)
 	res, err := f.ask(t, w, args, 1, time.Hour)
 	if err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
@@ -765,35 +769,80 @@ func TestAnApprovedWriteThatHadNotGoneOutExpires(t *testing.T) {
 		t.Fatalf("effect %s", e.Status)
 	}
 
-	// The same, after a person found it never happened: the finding sends nothing on an approval
-	// whose time is up.
+	// The tool sent nothing, and gave it back: nothing went out either.
 	g := newFixture(t, false)
 	w = &writer{class: policy.EffectLookup, err: tools.ErrNotSent}
-	if _, err := g.ask(t, w, args, 1, 300*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	b := g.one(t)
-	if _, err := g.decide(t, b, Decision{Kind: DecisionApprove}); err != nil {
-		t.Fatal(err)
-	}
-	g.ask(t, w, args, 1, time.Hour)
-	if err := g.g.Ledger.Q.InsertResolution(context.Background(), db.InsertResolutionParams{EffectID: b.EffectID,
-		ResolveKey: "r", Executed: 0, Status: effectPending, ResolvedAt: ledger.Now()}); err != nil {
-		t.Fatal(err)
+	approve(g, w, args)
+	if _, err := g.ask(t, w, args, 1, time.Hour); err == nil {
+		t.Fatal("the unsent write did not fail the call")
 	}
 	w.err = nil
 	w.sent.Store(0)
 	time.Sleep(400 * time.Millisecond)
 	if res, err := g.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
-		t.Fatalf("reconciled: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+		t.Fatalf("given back unsent: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
+	}
+
+	// An idempotent write that may have gone out (given back without a lookup, as at a start):
+	// in flight, sent again under its key after the approval's time.
+	h := newFixture(t, false)
+	iw := &writer{class: policy.EffectIdempotent}
+	a = approve(h, iw, args)
+	e := effectOf(t, h, a)
+	if res, err := h.g.approved(context.Background(), e, a); res != nil || err != nil {
+		t.Fatalf("approved: %v %v", res, err)
+	}
+	e = effectOf(t, h, a)
+	if _, ok, err := h.g.claim(context.Background(), e); !ok || err != nil {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	if _, err := h.g.release(context.Background(), effectOf(t, h, a), true); !errors.Is(err, errEffectReleased) {
+		t.Fatalf("release: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if res, err := h.ask(t, iw, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || iw.sent.Load() != 1 {
+		t.Fatalf("maybe sent: %v %v, sent %d", res.GetStatus(), err, iw.sent.Load())
+	}
+}
+
+// A write claimed before the policy asked for approval, and maybe gone out (an idempotent one,
+// which cannot be looked up), is neither sent again unapproved nor put up for an approval that
+// could reject a write that happened: a person settles it. Found never to have happened, it waits
+// for an approval like any other.
+func TestAWriteThatMayBeOutWithoutAnApprovalGoesToAPerson(t *testing.T) {
+	f := newFixture(t, false)
+	w := &writer{class: policy.EffectIdempotent}
+	args := map[string]any{"n": 1}
+	req, canon := call(t, w, args)
+	if res, err := f.g.record(context.Background(), f.run, w, w.Class(), 1, nil, req, canon); res != nil || err != nil {
+		t.Fatalf("record: %v %v", res, err)
+	}
+	e, _ := f.g.Ledger.Q.GetEffect(context.Background(), req.EffectID)
+	if _, ok, err := f.g.claim(context.Background(), e); !ok || err != nil {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	e, _ = f.g.Ledger.Q.GetEffect(context.Background(), req.EffectID)
+	if _, err := f.g.release(context.Background(), e, true); !errors.Is(err, errEffectReleased) {
+		t.Fatalf("release: %v", err)
+	}
+	res, err := f.ask(t, w, args, 1, time.Hour)
+	if err != nil || res.GetStatus() != StatusNeedsReconcile || w.sent.Load() != 0 || len(f.approvals(t)) != 0 {
+		t.Fatalf("%v %v, sent %d, %d approvals", res.GetStatus(), err, w.sent.Load(), len(f.approvals(t)))
+	}
+	if _, _, err := f.g.Reconcile(context.Background(), Resolution{EffectID: req.EffectID, Executed: false, Key: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusNeedsApproval || w.sent.Load() != 0 {
+		t.Fatalf("found never to have happened: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
 }
 
 // Recovery never sends again a write the policy wants approved that nobody approved: an effect an
-// earlier agentd claimed under a policy that did not ask is only looked up, given back, and then
-// waits for a person.
+// earlier agentd claimed under a policy that did not ask is only looked up. Found never to have
+// gone out, it waits for an approval; an idempotent one, which cannot be looked up and may have
+// gone out, waits for a person to settle it.
 func TestRecoveryDoesNotResendAnUnapprovedWrite(t *testing.T) {
-	for _, class := range []string{policy.EffectLookup, policy.EffectIdempotent} {
+	for class, want := range map[string]string{policy.EffectLookup: StatusNeedsApproval, policy.EffectIdempotent: StatusNeedsReconcile} {
 		t.Run(class, func(t *testing.T) {
 			f := newFixture(t, false)
 			w := &finder{writer: writer{class: class}}
@@ -808,7 +857,7 @@ func TestRecoveryDoesNotResendAnUnapprovedWrite(t *testing.T) {
 				t.Fatalf("sent again without an approval: %v %v", res.GetStatus(), err)
 			}
 			res, err = ask()
-			if err != nil || res.GetStatus() != StatusNeedsApproval || w.sent.Load() != 0 {
+			if err != nil || res.GetStatus() != want || w.sent.Load() != 0 {
 				t.Fatalf("given back: %v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 			}
 		})

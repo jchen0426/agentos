@@ -50,7 +50,7 @@ SELECT * FROM effects WHERE effect_id = ?;
 -- name: ClaimEffect :execrows
 -- Lets one sender send a PENDING effect, unless its run was cancelled: the cancel is checked
 -- in the same transaction that lets the request go out.
-UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?
+UPDATE effects SET claimed_by = ?, claimed_at = ?, maybe_sent = 1, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
@@ -68,8 +68,9 @@ SELECT CAST(COUNT(*) AS INTEGER) FROM effects
 WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED');
 
 -- name: ReleaseEffect :execrows
--- Returns a claimed effect whose request never took effect, for a later attempt to send.
-UPDATE effects SET claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+-- Returns a claimed effect for a later attempt to send: one whose request never took effect
+-- (maybe_sent 0), or an idempotent one that may have (1), sent again under its key.
+UPDATE effects SET claimed_by = NULL, claimed_at = NULL, maybe_sent = ?, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'PENDING';
 
 -- name: SetEffectStatus :execrows
@@ -79,7 +80,7 @@ WHERE effect_id = ? AND version = ? AND status = 'PENDING';
 -- name: ResolveEffect :execrows
 -- A person's finding about an effect whose outcome nobody knew.
 UPDATE effects
-SET status = ?, result_blob = ?, claimed_by = NULL, claimed_at = NULL, version = version + 1, updated_at = ?
+SET status = ?, result_blob = ?, claimed_by = NULL, claimed_at = NULL, maybe_sent = 0, version = version + 1, updated_at = ?
 WHERE effect_id = ? AND version = ? AND status = 'UNKNOWN';
 
 -- name: InsertResolution :exec
@@ -201,13 +202,13 @@ WHERE effect_id = ? AND version = ? AND status = 'AWAITING_APPROVAL'
 -- A PENDING effect nobody claimed, recorded before the policy asked for approval: it waits for
 -- a person now, unless its run was cancelled.
 UPDATE effects SET status = 'AWAITING_APPROVAL', version = version + 1, updated_at = ?
-WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL);
 
 -- name: AbandonUnclaimedEffect :execrows
--- A PENDING effect nobody claimed is never sent: its approval's time ran out first.
+-- A PENDING effect nothing of which went out is never sent: its approval's time ran out first.
 UPDATE effects SET status = 'ABANDONED', reason = ?, version = version + 1, updated_at = ?
-WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL;
+WHERE effect_id = ? AND version = ? AND status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0;
 
 -- name: AbandonAwaitingEffect :execrows
 -- An effect whose approval was rejected, expired or replaced is never sent.
