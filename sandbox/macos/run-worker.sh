@@ -7,7 +7,7 @@
 #   - network: allowedDomains = ["127.0.0.1:<runtime port>"], allowLocalBinding = false
 #   - files: the home directory (both $HOME and the one the user database names), the shared
 #     temporary directories (/private/tmp, where every launch and every tool call keeps its state
-#     and other programs their files, and /private/var/folders), and the paths in
+#     and other programs their files, /private/var/tmp and /private/var/folders), and the paths in
 #     AGENTOS_SANDBOX_DENY_READ, a JSON array, are unreadable except the Python environment, the
 #     task code and the Worker's private directory. Everything else can be read, so agentd's
 #     data directory and mirrors belong under the home directory or in AGENTOS_SANDBOX_DENY_READ.
@@ -109,7 +109,8 @@ node -e '
   // The shared temporary directories hold the state of every launch, this one included:
   // allowRead wins for what is inside, so the Worker reads its own private directory there and
   // nothing else.
-  const denied = ["/private/tmp", "/private/var/folders", ...homes, ...homes.map(h => path.join(h, ".agentos")), ...listed];
+  const denied = ["/private/tmp", "/private/var/tmp", "/private/var/folders", ...homes,
+    ...homes.map(h => path.join(h, ".agentos")), ...listed];
   const both = paths => [...new Set(paths.flatMap(p => [p, real(p)]))];
   console.log(JSON.stringify({
     network: { allowedDomains: [`127.0.0.1:${port}`], deniedDomains: [], allowLocalBinding: false },

@@ -26,7 +26,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import REPO, SANDBOX, Stack, command_of, descendants, free_port, wait_for
+from tests.harness import (REPO, SANDBOX, Stack, command_of, descendants, free_port, outside_root,
+                           remove_outside_root, wait_for)
 
 pytestmark = pytest.mark.skipif(SANDBOX == "none", reason="needs AGENTOS_SANDBOX=bwrap or srt")
 
@@ -52,14 +53,14 @@ def char_device(path):
         return False
 
 def writable_mounts():
-    # Mounts not read-only, but for those nothing can be stored in: /proc, the pseudo-terminals,
-    # and the device nodes bwrap binds (/dev/null and the like).
+    # Mounts not read-only, but for those nothing can be stored in: /proc and the device nodes
+    # bwrap binds (/dev/null and the like).
     found = []
     for line in open("/proc/self/mountinfo"):
         fields = line.split()
         point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
         fstype = fields[fields.index("-") + 1]
-        if "rw" in fields[5].split(",") and fstype not in ("proc", "devpts") and not char_device(point):
+        if "rw" in fields[5].split(",") and fstype != "proc" and not char_device(point):
             found.append(f"{point} ({fstype})")
     return found
 
@@ -174,11 +175,11 @@ def reach(launch: list[str], file: Path, way_out: Path, env: dict[str, str] | No
 
 
 @contextlib.contextmanager
-def scratch(root: str = "/tmp") -> Iterator[tuple[Path, Path | int]]:
-    """A short directory under root, and a Runtime entry the launcher accepts and nothing uses:
+def scratch(outside: bool = False) -> Iterator[tuple[Path, Path | int]]:
+    """A short directory under /tmp, and a Runtime entry the launcher accepts and nothing uses:
     on Linux a socket in a directory of its own, on macOS a port nobody dials. The macOS sandbox
-    denies the whole of /tmp: a test of its other rules keeps its files in /var/tmp."""
-    base = Path(tempfile.mkdtemp(prefix="aos-", dir=root))
+    denies the whole of /tmp: a test of its other rules keeps its files outside (harness.outside_root)."""
+    base = outside_root() if outside else Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
     try:
         if SANDBOX == "bwrap":
             (base / "runtime").mkdir()
@@ -188,7 +189,7 @@ def scratch(root: str = "/tmp") -> Iterator[tuple[Path, Path | int]]:
         else:
             yield base, free_port()
     finally:
-        shutil.rmtree(base, ignore_errors=True)
+        remove_outside_root(base)
 
 
 @pytest.mark.parametrize("holder", ["code", "code-symlink", "python-env"])
@@ -307,7 +308,7 @@ def test_worker_sandbox_denies_data_behind_a_symlink(where: str) -> None:
     told to deny, and Seatbelt matches real paths. agentd's default data directory, ~/.agentos,
     may be a symlink to somewhere else, and a path in AGENTOS_SANDBOX_DENY_READ may be spelled
     through one: either way the data behind it stays out of reach."""
-    with scratch("/var/tmp") as (base, port):
+    with scratch(outside=True) as (base, port):
         data = base / "elsewhere" / "data"
         data.mkdir(parents=True)
         (data / "ledger.db").write_text("a ledger")
@@ -532,9 +533,9 @@ def test_worker_sandbox_cannot_read_another_launchs_state() -> None:
 def test_worker_sandbox_can_create_no_files() -> None:
     """Memory in a tmpfs counts against no process: its data, and also its inodes and extended
     attributes, which --size does not limit. The OOM killer would pick agentd or Temporal, not a
-    Worker that filled one. bwrap makes the sandbox's root and /dev as tmpfs mounts as large as
-    half the memory. The Worker writes no files at all, so every mount is read-only, /tmp
-    included, but for /proc, the pseudo-terminals and the device nodes. Nor can the Worker make
+    Worker that filled one. bwrap makes the sandbox's root a tmpfs as large as half the memory.
+    The Worker writes no files at all, so every mount is read-only, /tmp and /dev included, but
+    for /proc and the five device nodes /dev holds (no pseudo-terminals). Nor can the Worker make
     a user namespace, in which it could mount a tmpfs of its own; and its IPC namespace is its
     own, so what it leaves there goes when the sandbox does."""
     tag = secrets.token_hex(4)

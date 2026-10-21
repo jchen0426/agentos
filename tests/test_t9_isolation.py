@@ -10,9 +10,10 @@ tests run unsandboxed too: there agentd still stands between a Worker that uses 
 entry and Temporal's other methods (an unsandboxed Worker could dial Temporal's port itself).
 What the operating system refuses needs AGENTOS_SANDBOX=srt (macOS) or bwrap (Linux).
 
-Not covered: another run's history stays readable through the Runtime entry, since
-GetWorkflowExecutionHistory names no run the Worker was given, and the outcome a workflow
-reports is its own text, which agentd shows in the report it posts (docs/m5-notes.md).
+Not covered: runs on the Worker's own task queue. Every Worker is handed their workflow tasks,
+histories included, so a subverted Worker reads every such run; the victim here sits on a queue
+nobody polls. And the outcome a workflow reports is its own text, which agentd shows in the
+report it posts (docs/m5-notes.md).
 """
 
 import json
@@ -20,14 +21,14 @@ import os
 import secrets
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
 import grpc
 import pytest
 from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
-from temporalio.api.enums.v1 import EventType, IndexedValueType
+from temporalio.api.deployment.v1 import WorkerDeploymentOptions
+from temporalio.api.enums.v1 import EventType, IndexedValueType, WorkerVersioningMode
 from temporalio.api.operatorservice.v1 import AddSearchAttributesRequest
 from temporalio.api.operatorservice.v1.service_pb2_grpc import OperatorServiceStub
 from temporalio.api.query.v1 import WorkflowQuery
@@ -37,7 +38,7 @@ from temporalio.api.workflowservice.v1.service_pb2_grpc import WorkflowServiceSt
 from temporalio.client import Client
 from temporalio.service import RPCError
 
-from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, Stack, in_keychain, wait_for
+from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, Stack, in_keychain, user_temp_dir, wait_for
 from tests.rogue_workflows import T9_VICTIM
 
 NOBODY_POLLS = "t9-nobody-polls"
@@ -107,6 +108,12 @@ def test_t9_a_workflow_task_reaches_no_other_run(stack: Stack) -> None:
     holds nothing from any of them."""
     stack.start_agentd()
     start_victim(stack)
+
+    async def register(c: Client) -> None:
+        # Temporal itself would refuse an attribute it does not know: this one it takes.
+        await c.operator_service.add_search_attributes(AddSearchAttributesRequest(
+            namespace="default", search_attributes={"T9Elsewhere": IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD}))
+    stack._temporal(register)
     stack.start_worker(workflows="tests.rogue_workflows:StepsOutOfLine")
     runs = {step: stack.start_run(base=step) for step in STEPS}
 
@@ -131,6 +138,11 @@ def runtime_channel(stack: Stack) -> grpc.Channel:
     if listen.startswith("unix://"):
         return grpc.insecure_channel("unix:" + listen.removeprefix("unix://"))
     return grpc.insecure_channel(listen.removeprefix("tcp://"))
+
+
+# A Worker Deployment a poll or a completion would register, starting its system workflows.
+ROGUE_DEPLOYMENT = WorkerDeploymentOptions(deployment_name="t9-rogue", build_id="b1",
+                                           worker_versioning_mode=WorkerVersioningMode.WORKER_VERSIONING_MODE_VERSIONED)
 
 
 def forbidden_calls(channel: grpc.Channel) -> dict[str, Callable[[], object]]:
@@ -159,6 +171,10 @@ def forbidden_calls(channel: grpc.Channel) -> dict[str, Callable[[], object]]:
             namespace="default", workflow_id="t9-started", workflow_type=audit, task_queue=queue)),
         "PollWorkflowTaskQueue(another queue)": lambda: s.PollWorkflowTaskQueue(ws.PollWorkflowTaskQueueRequest(
             namespace="default", task_queue=TaskQueue(name=NOBODY_POLLS)), timeout=5),
+        "PollWorkflowTaskQueue(deployment options)": lambda: s.PollWorkflowTaskQueue(ws.PollWorkflowTaskQueueRequest(
+            namespace="default", task_queue=queue, deployment_options=ROGUE_DEPLOYMENT), timeout=5),
+        "RespondWorkflowTaskCompleted(deployment options)": lambda: s.RespondWorkflowTaskCompleted(
+            ws.RespondWorkflowTaskCompletedRequest(namespace="default", task_token=b"t9", deployment_options=ROGUE_DEPLOYMENT)),
         "PollActivityTaskQueue": lambda: s.PollActivityTaskQueue(ws.PollActivityTaskQueueRequest(
             namespace="default", task_queue=TaskQueue(name="gateway")), timeout=5),
         "RespondActivityTaskCompleted": lambda: s.RespondActivityTaskCompleted(
@@ -179,7 +195,10 @@ def test_t9_the_runtime_entry_refuses_what_steers_another_run(stack: Stack) -> N
     """The methods a Worker never needs are refused before Temporal sees them, whatever the
     sandbox: signalling, cancelling, terminating, resetting or updating a run, starting one,
     reading another run's state, answering or polling the gateway's activities, polling another
-    task queue, Temporal's other services."""
+    task queue, Temporal's other services. So is a poll or a completion with deployment options,
+    which would register a Worker Deployment under a name the Worker picks and start its system
+    workflows. Temporal would refuse the completion's made-up task token: PERMISSION_DENIED is
+    agentd's answer, before it."""
     stack.start_agentd()
     start_victim(stack)
     with runtime_channel(stack) as channel:
@@ -193,6 +212,14 @@ def test_t9_the_runtime_entry_refuses_what_steers_another_run(stack: Stack) -> N
     print(json.dumps(got, indent=2))
     assert all(v.startswith("PERMISSION_DENIED") for v in got.values()), got
     assert_untouched(stack)
+
+    async def deployment(c: Client) -> str:
+        try:
+            await c.get_workflow_handle("temporal-sys-worker-deployment:t9-rogue").describe()
+            return "started"
+        except RPCError as e:
+            return e.status.name
+    assert stack._temporal(deployment) == "NOT_FOUND"
 
 
 sandboxed = pytest.mark.skipif(SANDBOX == "none", reason="needs AGENTOS_SANDBOX=bwrap or srt")
@@ -239,21 +266,18 @@ def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack
     nothing else: not Temporal's own port, the Control socket, the network, the home directory,
     agentd's ledger, the keychain (macOS) or the session bus (Linux), where a desktop's
     Secret Service would hand out keys. On macOS it reads nothing in the shared temporary
-    directories either, which hold other programs' files. Its environment holds only what the
-    launcher gave it."""
+    directories either (/tmp, /var/tmp, the user's own under /var/folders), which hold other
+    programs' files. Its environment holds only what the launcher gave it."""
     stack.start_agentd()
     tag = secrets.token_hex(4)
     canary = Path.home() / f".agentos-canary-{tag}"
     planted = []
     extra: dict = {"reads": {}, "sockets": {}}
     if SANDBOX == "srt":
-        for key, where in {"tmp": Path("/tmp"), "user_tmp": Path(tempfile.gettempdir())}.items():
+        for key, where in {"tmp": Path("/tmp"), "var_tmp": Path("/var/tmp"), "user_tmp": user_temp_dir()}.items():
             p = where / f"agentos-canary-{tag}"
             planted.append(p)
             extra["reads"][key] = str(p)
-        # Asked for by name, the way agentd reads its keys: attributes only, never a secret.
-        extra["keychain_file"] = str(LOGIN_KEYCHAIN)
-        extra["keychain_items"] = [s for s in KEYCHAIN_ITEMS if in_keychain(s)]
     else:
         bus = Path(f"/run/user/{os.getuid()}/bus")
         if bus.exists():
@@ -273,11 +297,32 @@ def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack
     for key in ("temporal_sdk", "temporal_tcp", "internet_tcp", "control_socket", "home_canary", "ssh_dir", "ledger",
                 "keychains", "keychain_items"):
         assert report[key].startswith("refused"), (key, report[key])
-    for group in ("reads", "sockets", "keychain"):
+    for group in ("reads", "sockets"):
         for key, result in report[group].items():
             assert result.startswith("refused"), (group, key, result)
-    if SANDBOX == "srt" and not extra["keychain_items"]:
-        print("no agentos item in the login keychain: its check did not run")
     if SANDBOX == "bwrap":
         assert report["dev"] == ["full", "null", "random", "shm", "urandom", "zero"], report["dev"]
     assert set(report["env"]) <= WORKER_ENV[SANDBOX], sorted(set(report["env"]) - WORKER_ENV[SANDBOX])
+
+
+@pytest.mark.skipif(SANDBOX != "srt", reason="the macOS keychain")
+def test_t9_the_worker_finds_no_key_in_the_keychain(stack: Stack) -> None:
+    """agentd's keys live in the login keychain, which the Worker's sandbox cannot read. The
+    sandbox lets it reach securityd all the same (sandbox-runtime allows those Mach services, and
+    has no setting to stop it): asked for by name, the way agentd reads them, the items must still
+    not be found. Attributes only, never a secret. Without an agentos item in the keychain there
+    is nothing to look for: the test is skipped, not passed."""
+    items = [s for s in KEYCHAIN_ITEMS if in_keychain(s)]
+    if not items:
+        pytest.skip("no agentos item in the login keychain")
+    stack.start_agentd()
+    canary = Path.home() / f".agentos-canary-{secrets.token_hex(4)}"
+    canary.write_text("a file the Worker must not read")
+    try:
+        report = probe(stack, canary, {"keychain_file": str(LOGIN_KEYCHAIN), "keychain_items": items})
+    finally:
+        canary.unlink()
+    print(json.dumps(report["keychain"], indent=2))
+    assert set(report["keychain"]) == set(items), report["keychain"]
+    for service, result in report["keychain"].items():
+        assert result.startswith("refused"), (service, result)

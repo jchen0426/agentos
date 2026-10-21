@@ -7,6 +7,7 @@
 package outbound
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 )
@@ -19,14 +20,20 @@ var proxyVars = []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy
 // the proxy variables that are set, which agentd now ignores: it says so when it starts, so that
 // nobody counts on them. Every HTTP client in agentd uses http.DefaultTransport unless it is given
 // another, and some copy it when they are made (anthropic-sdk-go), so this runs before any is.
-// gRPC connections take their own dial option, grpc.WithNoProxy.
-func IgnoreEnvProxies() []string {
-	http.DefaultTransport.(*http.Transport).Proxy = nil
+// gRPC connections take their own dial option, grpc.WithNoProxy. A default transport some import
+// replaced with one of its own is an error: its proxy cannot be told.
+func IgnoreEnvProxies() ([]string, error) {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("http.DefaultTransport is a %T: agentd cannot keep it off the environment's proxies",
+			http.DefaultTransport)
+	}
+	t.Proxy = nil
 	var set []string
 	for _, v := range proxyVars {
 		if _, ok := os.LookupEnv(v); ok {
 			set = append(set, v)
 		}
 	}
-	return set
+	return set, nil
 }

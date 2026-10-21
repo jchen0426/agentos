@@ -188,7 +188,9 @@ OpenAI and a local model server work the same way. `config/models.yaml` lists bo
 
 A provider that is not on this machine is reached over https only. agentd takes no proxy from
 its environment (`HTTPS_PROXY` and the like): its requests go straight to the hosts its
-configuration names, and it says at start which proxy variables it ignores.
+configuration names, and it says at start which proxy variables it ignores. On a network that
+reaches the internet only through a proxy, its model and GitHub requests fail: v0.1 has no proxy
+setting of its own.
 
 Point a task at either with `model`. Or list them in `cross_provider_fallback`, where they are
 asked, each in a request of its own, when the model declines.
@@ -217,7 +219,8 @@ as its code directory; see the headers of those scripts. A sandboxed Worker can 
 code directory and Python environment, so a launcher refuses either if it holds dev data
 (agentd's ledger, a `.agentos` directory, Temporal's database), a FIFO, or on Linux a Unix socket
 (a read-only mount does not stop `connect()`). On macOS the sandbox can also read everything
-outside the home directory and the shared temporary directories (`/tmp`, `/var/folders`): keep
+outside the home directory and the shared temporary directories (`/tmp`, `/var/tmp`,
+`/var/folders`): keep
 agentd's data and the mirrors under the home directory, or list them in
 `AGENTOS_SANDBOX_DENY_READ`, a JSON array of paths.
 

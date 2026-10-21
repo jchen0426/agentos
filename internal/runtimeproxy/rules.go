@@ -37,6 +37,33 @@ var requestTypes = map[string]func() proto.Message{
 	service + "RecordWorkerHeartbeat":        func() proto.Message { return &workflowservice.RecordWorkerHeartbeatRequest{} },
 }
 
+// requestFields are the fields each request may set: those the Temporal Python SDK (1.34) sets as
+// a workflow-only Worker, as observed through this proxy, and query_results, its answer to a query
+// that rides on a workflow task. nil allows every field this version of the API names, for the two
+// methods none of whose fields does more than read or answer: a page of a history, a query's
+// result. The other fields mean something to Temporal that a Worker has no business with:
+// deployment_options or versioning on a poll registers a Worker Deployment under the name the
+// Worker gives and starts its system workflows; worker_control_task_queue has Temporal send
+// control tasks to a queue the Worker names; sticky_attributes, a sticky queue (see
+// checkPollQueue); messages, workflow updates.
+var requestFields = map[string][]string{
+	service + "GetSystemInfo":     {},
+	service + "DescribeNamespace": {"namespace"},
+	service + "PollWorkflowTaskQueue": {"namespace", "task_queue", "identity", "worker_instance_key",
+		"worker_version_capabilities"},
+	service + "RespondWorkflowTaskCompleted": {"namespace", "task_token", "commands", "identity", "worker_version_stamp",
+		"sdk_metadata", "metering_metadata", "capabilities", "worker_instance_key", "query_results"},
+	service + "RespondWorkflowTaskFailed":   {"namespace", "task_token", "cause", "failure", "identity", "worker_version"},
+	service + "RespondQueryTaskCompleted":   nil,
+	service + "GetWorkflowExecutionHistory": nil,
+	service + "ShutdownWorker": {"namespace", "identity", "reason", "worker_heartbeat", "worker_instance_key",
+		"task_queue", "task_queue_types"},
+	service + "RecordWorkerHeartbeat": {"namespace", "identity", "worker_heartbeat"},
+}
+
+// versionFields are the requests' notes of the Worker's version: a build ID is all it may give.
+var versionFields = []protoreflect.Name{"worker_version_capabilities", "worker_version_stamp", "worker_version"}
+
 // Refusal says why a request was refused.
 type Refusal struct {
 	Reason  string
@@ -50,6 +77,13 @@ func refuse(command, format string, args ...any) *Refusal {
 	return &Refusal{Reason: fmt.Sprintf(format, args...), Command: command, rule: format}
 }
 
+// refuseField refuses a request for setting a field. The name comes from the API's descriptors,
+// never from the request, so each field is a rule of its own in the refusal log.
+func refuseField(name string) *Refusal {
+	reason := name + " is not available to workers"
+	return &Refusal{Reason: reason, rule: reason}
+}
+
 // Check decodes the raw request of method and returns a *Refusal when it is not allowed.
 func (r Rules) Check(method string, raw []byte) error {
 	newRequest, ok := requestTypes[method]
@@ -60,6 +94,14 @@ func (r Rules) Check(method string, raw []byte) error {
 	if err := proto.Unmarshal(raw, req); err != nil {
 		return refuse("", "cannot decode the request: %v", err)
 	}
+	// A field this version of the API does not name is passed on as it came, and agentd cannot
+	// tell what Temporal makes of it.
+	if hasUnknownFields(req.ProtoReflect()) {
+		return refuse("", "the request carries fields this agentd does not know")
+	}
+	if err := checkFields(req.ProtoReflect(), requestFields[method]); err != nil {
+		return err
+	}
 	if ns, ok := namespaceOf(req); ok && ns != r.Namespace {
 		return refuse("", "namespace %q is not available to workers", ns)
 	}
@@ -67,23 +109,74 @@ func (r Rules) Check(method string, raw []byte) error {
 	case *workflowservice.PollWorkflowTaskQueueRequest:
 		return r.checkPollQueue(m.GetTaskQueue())
 	case *workflowservice.RespondWorkflowTaskCompletedRequest:
-		if m.GetStickyAttributes() != nil {
-			return refuse("", "sticky execution is not available to workers")
-		}
 		for _, c := range m.GetCommands() {
 			if err := r.checkCommand(c); err != nil {
 				return err
 			}
 		}
-		if len(m.GetMessages()) > 0 {
-			return refuse("", "protocol messages (workflow updates) are not available to workers")
-		}
 	case *workflowservice.ShutdownWorkerRequest:
-		if q := m.GetStickyTaskQueue(); q != "" {
-			return refuse("", "sticky queue %q is not available to workers", q)
+		if q := m.GetTaskQueue(); q != "" && q != r.WorkflowQueue {
+			return refuse("", "task queue %q is not available to workers", q)
 		}
 	}
 	return nil
+}
+
+// checkFields refuses a request that sets a field allowed does not name (nil allows all), or that
+// says more about the Worker's version than its build ID.
+func checkFields(m protoreflect.Message, allowed []string) error {
+	var err error
+	m.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if allowed != nil && !slices.Contains(allowed, string(fd.Name())) {
+			err = refuseField(string(fd.Name()))
+		}
+		return err == nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, name := range versionFields {
+		fd := m.Descriptor().Fields().ByName(name)
+		if fd == nil || !m.Has(fd) {
+			continue
+		}
+		m.Get(fd).Message().Range(func(sub protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+			if sub.Name() != "build_id" {
+				err = refuseField(string(name) + "." + string(sub.Name()))
+			}
+			return err == nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasUnknownFields reports whether m, or any message in it, holds a field its descriptor does not
+// name. countValues has bounded the request's size and depth before it is decoded.
+func hasUnknownFields(m protoreflect.Message) bool {
+	if len(m.GetUnknown()) > 0 {
+		return true
+	}
+	found := false
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsList() && fd.Message() != nil:
+			for i := 0; i < v.List().Len() && !found; i++ {
+				found = hasUnknownFields(v.List().Get(i).Message())
+			}
+		case fd.IsMap() && fd.MapValue().Message() != nil:
+			v.Map().Range(func(_ protoreflect.MapKey, mv protoreflect.Value) bool {
+				found = hasUnknownFields(mv.Message())
+				return !found
+			})
+		case !fd.IsList() && !fd.IsMap() && fd.Message() != nil:
+			found = hasUnknownFields(v.Message())
+		}
+		return !found
+	})
+	return found
 }
 
 // checkPollQueue lets a Worker poll the workflow queue and nothing else. Sticky queues are

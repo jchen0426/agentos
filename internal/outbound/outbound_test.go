@@ -47,9 +47,9 @@ func TestNoProxyFromTheEnvironment(t *testing.T) {
 		t.Fatalf("the proxy saw %d requests, want 1", proxied.Load())
 	}
 
-	set := IgnoreEnvProxies()
-	if want := []string{"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}; !slices.Equal(set, want) {
-		t.Errorf("IgnoreEnvProxies() = %v, want %v", set, want)
+	set, err := IgnoreEnvProxies()
+	if want := []string{"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}; err != nil || !slices.Equal(set, want) {
+		t.Errorf("IgnoreEnvProxies() = %v, %v; want %v", set, err, want)
 	}
 	// The default client, and a transport copied from the default after, as SDKs make theirs.
 	copied := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(), Timeout: 300 * time.Millisecond}
@@ -61,5 +61,17 @@ func TestNoProxyFromTheEnvironment(t *testing.T) {
 	}
 	if proxied.Load() != 1 {
 		t.Errorf("the proxy saw %d requests after IgnoreEnvProxies, want only the first", proxied.Load())
+	}
+}
+
+// wrapped is a default transport an import replaced with one of its own, as tracing libraries do.
+type wrapped struct{ http.RoundTripper }
+
+func TestADefaultTransportOfAnotherKindStopsAgentd(t *testing.T) {
+	saved := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = saved })
+	http.DefaultTransport = wrapped{saved}
+	if _, err := IgnoreEnvProxies(); err == nil {
+		t.Error("IgnoreEnvProxies took a transport whose proxy it cannot tell")
 	}
 }

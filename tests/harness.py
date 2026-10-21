@@ -80,6 +80,36 @@ KEYCHAIN_ITEMS = ["agentos-anthropic-api-key", "agentos-openai-api-key", "agento
 LOGIN_KEYCHAIN = Path.home() / "Library/Keychains/login.keychain-db"
 
 
+def outside_root() -> Path:
+    """A directory for test data that the macOS sandboxes do not deny wholesale (unlike the home
+    directory, /tmp, /var/tmp and /var/folders), so that only the deny list a test checks keeps a
+    sandbox out of it, reached through a symlink: Seatbelt matches real paths. Linux mounts only
+    what a sandbox is given, so /var/tmp does there. The caller removes it, and the symlink's target."""
+    if sys.platform != "darwin":
+        return Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/var/tmp"))
+    real = Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/Users/Shared"))
+    link = real.with_name(real.name + "-link")
+    link.symlink_to(real, target_is_directory=True)
+    return link
+
+
+def user_temp_dir() -> Path:
+    """The user's own temporary directory on macOS, under /private/var/folders, whatever TMPDIR
+    says."""
+    found = Path(subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                                check=True).stdout.strip()).resolve()
+    assert found.is_relative_to("/private/var/folders"), found
+    return found
+
+
+def remove_outside_root(root: Path) -> None:
+    if root.is_symlink():
+        shutil.rmtree(root.resolve(), ignore_errors=True)
+        root.unlink()
+    else:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def in_keychain(service: str) -> bool:
     """Whether the item is there to find, asked the way the probes ask, outside any sandbox."""
     if not LOGIN_KEYCHAIN.exists():

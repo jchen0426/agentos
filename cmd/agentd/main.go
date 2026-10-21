@@ -82,9 +82,13 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	defer stop()
 
 	// Before any client is made: where agentd's requests go is its configuration's to say.
-	if set := outbound.IgnoreEnvProxies(); len(set) > 0 {
-		log.Warn("agentd ignores the proxy settings in its environment: its requests go straight to their hosts",
-			"variables", set)
+	set, err := outbound.IgnoreEnvProxies()
+	if err != nil {
+		return err
+	}
+	if len(set) > 0 {
+		log.Warn("agentd ignores the proxy settings in its environment: its requests go straight to their hosts, "+
+			"and fail where only a proxy reaches them", "variables", set)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {

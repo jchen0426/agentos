@@ -6,9 +6,14 @@ import (
 
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
+	deploymentpb "go.temporal.io/api/deployment/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
+	sdkpb "go.temporal.io/api/sdk/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	workerpb "go.temporal.io/api/worker/v1"
 	"go.temporal.io/api/workflowservice/v1"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -181,5 +186,148 @@ func TestWhatAWorkflowTaskMayCommand(t *testing.T) {
 	withMessages.Messages = append(withMessages.Messages, nil)
 	if err := check(t, "RespondWorkflowTaskCompleted", withMessages); err == nil {
 		t.Error("protocol messages were allowed")
+	}
+}
+
+// The Worker's requests as the Python SDK (1.34) sends them, field for field, as observed through
+// this proxy.
+func sdkPoll() *workflowservice.PollWorkflowTaskQueueRequest {
+	return &workflowservice.PollWorkflowTaskQueueRequest{
+		Namespace: "default", TaskQueue: &taskqueuepb.TaskQueue{Name: "agentos-workflows", Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		Identity: "1234@host", WorkerInstanceKey: "key", WorkerVersionCapabilities: &commonpb.WorkerVersionCapabilities{BuildId: "b"},
+	}
+}
+
+func sdkCompletion(cmds ...*commandpb.Command) *workflowservice.RespondWorkflowTaskCompletedRequest {
+	return &workflowservice.RespondWorkflowTaskCompletedRequest{
+		Namespace: "default", TaskToken: []byte("token"), Commands: cmds, Identity: "1234@host", WorkerInstanceKey: "key",
+		WorkerVersionStamp: &commonpb.WorkerVersionStamp{BuildId: "b"},
+		SdkMetadata:        &sdkpb.WorkflowTaskCompletedMetadata{CoreUsedFlags: []uint32{1}, SdkName: "temporal-python", SdkVersion: "1.34.0"},
+		MeteringMetadata:   &commonpb.MeteringMetadata{},
+		Capabilities:       &workflowservice.RespondWorkflowTaskCompletedRequest_Capabilities{DiscardSpeculativeWorkflowTaskWithEvents: true},
+	}
+}
+
+func sdkFailure() *workflowservice.RespondWorkflowTaskFailedRequest {
+	return &workflowservice.RespondWorkflowTaskFailedRequest{
+		Namespace: "default", TaskToken: []byte("token"), Cause: enumspb.WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE,
+		Failure: &failurepb.Failure{Message: "KeyError: 'blob'"}, Identity: "1234@host",
+		WorkerVersion: &commonpb.WorkerVersionStamp{BuildId: "b"},
+	}
+}
+
+func sdkShutdown() *workflowservice.ShutdownWorkerRequest {
+	return &workflowservice.ShutdownWorkerRequest{
+		Namespace: "default", Identity: "1234@host", Reason: "graceful shutdown", WorkerHeartbeat: &workerpb.WorkerHeartbeat{},
+		WorkerInstanceKey: "key", TaskQueue: "agentos-workflows", TaskQueueTypes: []enumspb.TaskQueueType{enumspb.TASK_QUEUE_TYPE_WORKFLOW},
+	}
+}
+
+func TestTheSDKsOwnRequestsAreAllowed(t *testing.T) {
+	for method, req := range map[string]proto.Message{
+		"GetSystemInfo":                &workflowservice.GetSystemInfoRequest{},
+		"DescribeNamespace":            &workflowservice.DescribeNamespaceRequest{Namespace: "default"},
+		"PollWorkflowTaskQueue":        sdkPoll(),
+		"RespondWorkflowTaskCompleted": sdkCompletion(activity("Invoke", "gateway", false)),
+		"RespondWorkflowTaskFailed":    sdkFailure(),
+		"ShutdownWorker":               sdkShutdown(),
+		"RecordWorkerHeartbeat": &workflowservice.RecordWorkerHeartbeatRequest{Namespace: "default", Identity: "1234@host",
+			WorkerHeartbeat: []*workerpb.WorkerHeartbeat{{}}},
+		"GetWorkflowExecutionHistory": &workflowservice.GetWorkflowExecutionHistoryRequest{Namespace: "default",
+			Execution: &commonpb.WorkflowExecution{WorkflowId: "run"}, MaximumPageSize: 100, NextPageToken: []byte("t")},
+	} {
+		if err := check(t, method, req); err != nil {
+			t.Errorf("%s as the SDK sends it was refused: %v", method, err)
+		}
+	}
+}
+
+func TestFieldsTheSDKNeverSetsAreRefused(t *testing.T) {
+	versioned := &deploymentpb.WorkerDeploymentOptions{DeploymentName: "t9-rogue", BuildId: "b1",
+		WorkerVersioningMode: enumspb.WORKER_VERSIONING_MODE_VERSIONED}
+	type req struct {
+		method string
+		msg    proto.Message
+	}
+	cases := map[string]req{}
+	poll := func(name string, change func(*workflowservice.PollWorkflowTaskQueueRequest)) {
+		m := sdkPoll()
+		change(m)
+		cases["poll "+name] = req{"PollWorkflowTaskQueue", m}
+	}
+	completion := func(name string, change func(*workflowservice.RespondWorkflowTaskCompletedRequest)) {
+		m := sdkCompletion(activity("Invoke", "gateway", false))
+		change(m)
+		cases["completion "+name] = req{"RespondWorkflowTaskCompleted", m}
+	}
+	failure := func(name string, change func(*workflowservice.RespondWorkflowTaskFailedRequest)) {
+		m := sdkFailure()
+		change(m)
+		cases["failure "+name] = req{"RespondWorkflowTaskFailed", m}
+	}
+	// What registers a Worker Deployment, and starts its system workflows, under a name the Worker picks.
+	poll("with deployment options", func(m *workflowservice.PollWorkflowTaskQueueRequest) { m.DeploymentOptions = versioned })
+	poll("using versioning", func(m *workflowservice.PollWorkflowTaskQueueRequest) {
+		m.WorkerVersionCapabilities.UseVersioning = true
+	})
+	poll("naming a deployment series", func(m *workflowservice.PollWorkflowTaskQueueRequest) {
+		m.WorkerVersionCapabilities.DeploymentSeriesName = "t9-rogue"
+	})
+	poll("naming a control queue", func(m *workflowservice.PollWorkflowTaskQueueRequest) { m.WorkerControlTaskQueue = "gateway" })
+	poll("with a binary checksum", func(m *workflowservice.PollWorkflowTaskQueueRequest) { m.BinaryChecksum = "c" })
+	completion("with deployment options", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) { m.DeploymentOptions = versioned })
+	completion("with a deployment", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) {
+		m.Deployment = &deploymentpb.Deployment{SeriesName: "t9-rogue", BuildId: "b1"}
+	})
+	completion("with a versioning behavior", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) {
+		m.VersioningBehavior = enumspb.VERSIONING_BEHAVIOR_PINNED
+	})
+	completion("using versioning", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) {
+		m.WorkerVersionStamp.UseVersioning = true
+	})
+	completion("naming a control queue", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) {
+		m.WorkerControlTaskQueue = "gateway"
+	})
+	completion("forcing a new workflow task", func(m *workflowservice.RespondWorkflowTaskCompletedRequest) {
+		m.ForceCreateNewWorkflowTask = true
+	})
+	failure("with deployment options", func(m *workflowservice.RespondWorkflowTaskFailedRequest) { m.DeploymentOptions = versioned })
+	failure("using versioning", func(m *workflowservice.RespondWorkflowTaskFailedRequest) { m.WorkerVersion.UseVersioning = true })
+	other := sdkShutdown()
+	other.TaskQueue = "gateway"
+	cases["shutdown of another task queue"] = req{"ShutdownWorker", other}
+	cases["namespace by id"] = req{"DescribeNamespace", &workflowservice.DescribeNamespaceRequest{Namespace: "default", Id: "x"}}
+
+	for name, c := range cases {
+		if err := check(t, c.method, c.msg); err == nil {
+			t.Errorf("%s: allowed", name)
+		}
+	}
+}
+
+func TestFieldsThisAgentdDoesNotKnowAreRefused(t *testing.T) {
+	unknown := func(raw []byte) []byte { // field 9999, a varint: no version of the API names it
+		return protowire.AppendVarint(protowire.AppendTag(raw, 9999, protowire.VarintType), 1)
+	}
+	raw, err := proto.Marshal(sdkPoll())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rules.Check(service+"PollWorkflowTaskQueue", unknown(raw)); err == nil {
+		t.Error("a poll with a field agentd does not know was allowed")
+	}
+	// Deep inside: one command's attributes.
+	cmdRaw, err := proto.Marshal(activity("Invoke", "gateway", false).GetScheduleActivityTaskCommandAttributes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := &commandpb.ScheduleActivityTaskCommandAttributes{}
+	if err := proto.Unmarshal(unknown(cmdRaw), attrs); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &commandpb.Command{CommandType: enumspb.COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK,
+		Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{ScheduleActivityTaskCommandAttributes: attrs}}
+	if err := check(t, "RespondWorkflowTaskCompleted", sdkCompletion(cmd)); err == nil {
+		t.Error("a command with a field agentd does not know was allowed")
 	}
 }
