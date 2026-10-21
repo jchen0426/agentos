@@ -146,7 +146,42 @@ M5 按设计文档第 12 节分成几个 PR，各自合并：沙箱定稿（C1�
 
 ### 测试怎么测
 
-（定稿后补：三种环境的结果、改坏检查的结果。）
+- **新测试**：
+  - `tests/test_t9_isolation.py`，四个测试：
+    - 工作流任务够不着别的任务（三种环境都跑）；
+    - Runtime 入口拒绝的方法（三种环境都跑）；
+    - 沙箱里只有 Runtime 入口（srt、bwrap）；
+    - 按名字查钥匙串（srt）。
+  - `tests/test_outbound.py`：agentd 经 `localhost.` 连 Temporal，代理什么都没收到。
+  - Go 测试：
+    - `internal/runtimeproxy/rules_test.go`，覆盖 SDK 自己发的请求、SDK 从不设的字段、不认识的字段（顶层、命令里、map 的值里）、优先级、带版本的活动；
+    - `internal/outbound/outbound_test.go`，确认请求不走环境里的代理，默认 transport 被换掉就拒绝启动。
+- **改动的老测试**：
+  - `test_sandbox.py`：探针挪走了；srt 的拒读列表测试改在 /Users/Shared 下做；不再排除 devpts。
+  - `test_tool_sandbox.py`：在 /Users/Shared 下起栈；报告 /dev；在 /var/tmp 和用户临时目录里放诱饵。
+- **字段白名单从哪来**：调试版 agentd 把每个请求设了哪些字段打到日志里，然后跑了 T1、T3、T4、T7、T10、取消、agentd 重启、Runtime 上限、模型输出这几组测试。结果是没有一个未知字段，心跳里的版本只带 build ID，活动命令都带一个空的 priority。
+- **三种环境的结果**（代码定稿于 baf741e，之后只改了这份记录）：
+
+  | 环境 | 通过 | 跳过 |
+  |---|---|---|
+  | macOS 不加沙箱 | 69 | 28 |
+  | macOS srt | 92 | 5 |
+  | Linux 虚拟机 bwrap | 81 | 16 |
+
+  跳过的都是另一种环境专属的用例，以及要真 GitHub 的 live 用例。srt 那一轮额外跑了要 `AGENTOS_TEMPORAL_SERVER` 的 mTLS 测试。`go test ./...` 全部通过。
+- **改坏检查**：一共改坏 19 处，每一处都有测试失败。
+  - 第一轮 15 处：
+    - 两处 `grpc.WithNoProxy` 拿掉；
+    - checkFields 什么都放行、未知字段放行、版本字段不查、ShutdownWorker 放行任意队列、任意搜索属性；
+    - Worker 启动脚本的三项整体拒读各拿掉一项，拒读列表不看；
+    - 工具启动脚本的 /var/tmp、/var/folders 两项整体拒读各拿掉一项；
+    - 两个 Linux 启动脚本各自恢复 `--dev /dev`。
+  - 复审之后又改坏 4 处：
+    - 心跳里的版本不查；
+    - 未知字段检查跳过 map；
+    - 活动优先级放行；
+    - `use_workflow_build_id` 放行。
+  - `outbound.go` 里 `Proxy = nil` 那一行去掉，只有 Go 测试会失败，因为测试里的 HTTP 目标都在回环地址上。这一处在最开始写的时候就验证过了。
 
 ### 留到后面
 
