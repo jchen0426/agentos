@@ -233,3 +233,15 @@ def test_the_bootstrap_is_reproducible_with_its_seed():
     assert one["ci"] == pytest.approx([6 / 21, 16 / 21])  # pinned: seed 42, 2000 resamples
     assert score.rate(groups, seed=43)["ci"] == pytest.approx([0.3, 10 / 13])
     assert score.rate([], seed=1) == {"hits": 0, "runs": 0, "rate": None, "ci": None}
+
+
+def test_a_journal_line_cut_short_is_skipped_and_the_next_one_starts_fresh(tmp_path):
+    from evals.runner import Journal
+    j = Journal(tmp_path / "journal.jsonl")
+    j.append({"event": "start", "run_id": "a"})
+    with open(j.path, "a") as f:
+        f.write('{"event": "result", "run_id": "a", "sp')  # the crash
+    j.append({"event": "start", "run_id": "b"})
+    assert [e["run_id"] for e in j.entries()] == ["a", "b"]
+    assert [e["run_id"] for e in j.unfinished()] == ["a", "b"] and j.results() == []
+    assert len(j.path.read_text().splitlines()) == 3, "no blank lines, the cut one on its own"

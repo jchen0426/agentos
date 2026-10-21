@@ -95,7 +95,10 @@ def repo_id(project: str) -> str:
 
 
 class Journal:
-    """One JSON line per event: a run started ("start"), a run ended ("result")."""
+    """One JSON line per event: a run started ("start"), a run ended ("result"). A line a crash
+    cut short is skipped: a lost start leaves a run the journal does not know, which the next
+    runner cancels, its spending counted from the ledger; a lost result leaves the run to be
+    collected again."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -103,11 +106,23 @@ class Journal:
     def entries(self) -> list[dict]:
         if not self.path.exists():
             return []
-        return [json.loads(line) for line in self.path.read_text().splitlines() if line.strip()]
+        out = []
+        for line in self.path.read_text(errors="replace").splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and entry.get("event") in ("start", "result"):
+                out.append(entry)
+        return out
 
     def append(self, entry: dict) -> None:
-        with open(self.path, "a") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        with open(self.path, "ab+") as f:  # appends go to the end, wherever it reads
+            end, cut = f.seek(0, 2), False
+            if end:
+                f.seek(end - 1)
+                cut = f.read(1) != b"\n"
+            f.write((b"\n" if cut else b"") + json.dumps(entry, sort_keys=True).encode() + b"\n")
 
     def results(self) -> list[dict]:
         return [e for e in self.entries() if e["event"] == "result"]
