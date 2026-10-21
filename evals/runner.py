@@ -33,8 +33,9 @@ it. The cap counts the price table's prices, not the provider's bill.
 One runner at a time uses a state directory, and its lock stays held while the Temporal a runner
 started still runs: a runner killed with SIGKILL leaves the directory locked until it is
 stopped, rather than to a second Temporal on the same database. Each stack lists its processes
-in its directory (pids), and the refusal names the ones still running. A signal while a stack
-starts or stops waits until it has (tests/harness.py's signals_deferred).
+in its directory (pids), and the refusal names the ones still running. The first SIGTERM,
+SIGHUP or Ctrl-C ends the runner, once any stack starting or stopping has (_Signals); later
+ones cannot cut the stopping short.
 
 On macOS the git tool's sandbox denies agentd's directories, the home directory and the
 temporary directories, and allows the rest: the state directory and the cache (deny_read)
@@ -43,6 +44,7 @@ must be in one of those, or the tool could read the journal and the other profil
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -50,8 +52,10 @@ import math
 import os
 import pwd
 import re
+import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -61,7 +65,7 @@ from pathlib import Path
 from evals.cases import Case, CaseSet
 from evals.mirrors import inside_repo
 from evals.score import detected, false_positive, void, void_reason
-from tests.harness import BIN, SANDBOX, TERMINAL, Stack, signals_deferred, wait_for
+from tests.harness import BIN, SANDBOX, TERMINAL, Stack, started_at, wait_for
 
 REPO = Path(__file__).resolve().parents[1]
 BUDGET = 1_500_000  # micros a run may spend: above the gateway's worst-case reservation (section 9)
@@ -199,6 +203,59 @@ class Journal:
         return [e for e in self.entries() if e["event"] == "start" and e["run_id"] not in ended]
 
 
+class _Signals:
+    """SIGTERM, SIGHUP and SIGINT while a runner runs. The first ends it, as an exception (SIGINT a
+    KeyboardInterrupt, the others SystemExit), except while a stack starts or stops (held): then
+    once that is done. Later ones are only noted, so that nothing cuts the stopping short. The
+    handlers stay in place from the runner's start to its end, and Python runs them in the main
+    thread whichever thread the OS hands a signal to (the Temporal SDK's runtime starts many):
+    neither swapping handlers around a stop nor blocking signals leaves a gap."""
+
+    def __init__(self) -> None:
+        self.got: list[int] = []
+        self.calm = 0  # stacks starting or stopping
+        self.raised = False
+
+    def handle(self, signum: int, _frame: object) -> None:
+        self.got.append(signum)
+        if not self.calm:
+            self._end()
+
+    def _end(self) -> None:
+        if self.raised or not self.got:
+            return
+        self.raised = True
+        signum = self.got[0]
+        raise KeyboardInterrupt if signum == signal.SIGINT else SystemExit(128 + signum)
+
+    @contextlib.contextmanager
+    def held(self):
+        """A stack starts or stops: a signal waits until it has."""
+        self.calm += 1
+        try:
+            yield
+        finally:
+            self.calm -= 1
+            if not self.calm:
+                self._end()
+
+    @contextlib.contextmanager
+    def installed(self):
+        """The handlers, while the runner runs; an ignored signal (nohup's SIGHUP) stays ignored."""
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        old = {}
+        try:
+            for n in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                if signal.getsignal(n) is not signal.SIG_IGN:
+                    old[n] = signal.signal(n, self.handle)
+            yield
+        finally:
+            for n, handler in old.items():
+                signal.signal(n, handler)
+
+
 @dataclass
 class _Run:
     """What one runner shares across its profiles."""
@@ -210,7 +267,7 @@ class _Run:
     budget_micros: int
     cap_micros: int | None
     lock: int  # the state directory's lock, which the stacks' Temporal holds too
-    agentos: dict
+    signals: _Signals
     log: object
 
 
@@ -258,16 +315,19 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
             left = "; ".join(f"{name} (process group {pid})" for name, pid in _left_running(state))
             raise RuntimeError(f"another runner is using {state}, or what is left of one, which holds it until "
                                f"its Temporal stops: {left or 'lsof ' + str(state / 'lock')}; stop them with "
-                               "kill -TERM -<group> (agentd may take a minute; -KILL does not wait)") from None
+                               "kill -TERM -<group> (agentd may take a minute; -KILL does not wait), and run "
+                               "again once they all have exited") from None
         journal = Journal(state / "journal.jsonl")
         gone = sorted(p for p in {e["profile"] for e in journal.entries()} if not _ledger(state, p).exists())
         if gone:
             raise RuntimeError(f"the journal in {state} has runs of {gone}, whose ledgers are gone: what those runs "
                                "spent is unknown, and the cap cannot count it (a new state directory starts afresh)")
+        signals = _Signals()
         r = _Run(cs, journal, state, {repo_id(n): {"mirror": str(p)} for n, p in mirrors.items()}, hidden,
-                 budget_micros, cap_micros, lock, {"commit": _agentos(), "bin": _binaries()}, log)
-        for profile in profiles:
-            _run_profile(r, profile, cases, runs, retry_void)
+                 budget_micros, cap_micros, lock, signals, log)
+        with signals.installed():
+            for profile in profiles:
+                _run_profile(r, profile, cases, runs, retry_void)
         return journal.results()
     finally:
         os.close(lock)
@@ -299,8 +359,10 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
     stack_dir = r.state / profile.name / "stack"
     stack_dir.mkdir(parents=True, exist_ok=True)
     stack = None
+    # What the runs run with, as the stack starts: a `make build` between profiles shows.
+    agentos = {"commit": _agentos(), "bin": _binaries()}
     try:
-        with signals_deferred():  # a signal while it starts arrives once it is up, and it stops whole
+        with r.signals.held():  # a signal while it starts arrives once it is up, and it stops whole
             stack = Stack(stack_dir, temporal_db=True, fixture=False, hold_fds=(r.lock,))
         stack.deny_read = r.deny_read  # the journal, the mirrors and the cache, besides agentd's data
         stack.start_agentd(policy=policy(list(r.repos)), models=profile.models, prices=profile.prices, repos=r.repos)
@@ -344,7 +406,7 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                             todo.clear()
                         break
                 c, rep, retry = todo.popleft()
-                entry = _start(stack, r.cs, c, rep, profile, r.budget_micros, r.agentos)
+                entry = _start(stack, r.cs, c, rep, profile, r.budget_micros, agentos)
                 journal.append(entry)
                 watching[entry["run_id"]] = {**entry, "since": time.monotonic(), "again": retry}
             for run_id, entry in list(watching.items()):
@@ -379,25 +441,23 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                 time.sleep(1)
     finally:
         if stack is not None:
-            with signals_deferred():  # rather than leave half of it running
+            with r.signals.held():  # rather than leave half of it running
                 stack.close()
 
 
 def _left_running(state: Path) -> list[tuple[str, int]]:
-    """The processes the state directory's stacks list that still run: what a runner killed with
-    SIGKILL left behind (or a live runner's)."""
+    """The processes the state directory's stacks list that still run, started when they were
+    (a PID that went to another process is not theirs): what a runner killed with SIGKILL left
+    behind, or a live runner's. A stack that stopped cleanly lists nothing."""
     out = []
     for path in sorted(state.glob("*/stack/pids")):
         try:
             procs = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        for name, pid in procs:
-            try:
-                os.kill(pid, 0)
-            except (ProcessLookupError, PermissionError):
-                continue
-            out.append((name, pid))
+        for name, pid, since in procs:
+            if since and started_at(pid) == since:
+                out.append((name, pid))
     return out
 
 

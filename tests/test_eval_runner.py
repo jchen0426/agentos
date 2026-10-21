@@ -166,28 +166,43 @@ def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() ->
     assert not score.void(record) and record["spent_micros"] == 10
 
 
-def test_a_signal_waits_for_the_stack_to_stop_whatever_thread_gets_it() -> None:
-    class Stopped(Exception):
-        pass
-
-    def stop(signum, frame):
-        raise Stopped(signum)
-    old = signal.signal(signal.SIGTERM, stop)
-    done = []
-    try:
-        with pytest.raises(Stopped):
-            with harness.signals_deferred():
+def test_a_signal_waits_for_the_stack_and_later_ones_cannot_cut_the_stopping_short() -> None:
+    signals, done = runner._Signals(), []
+    before = signal.getsignal(signal.SIGTERM)
+    with signals.installed():
+        with pytest.raises(SystemExit) as ended:
+            with signals.held():  # a stack starting
                 # Handed to another thread, as the OS may hand it to one of the Temporal SDK's:
-                # blocking it in this thread would not keep it from cutting the block short.
+                # blocking it in this thread would not keep it from cutting the start short.
                 t = threading.Thread(target=lambda: signal.pthread_kill(threading.get_ident(), signal.SIGTERM))
                 t.start()
                 t.join()
-                for _ in range(20):  # what the signal would cut short
-                    time.sleep(0.01)
-                done.append(True)
-        assert done, "the block ran to its end before the signal arrived"
-    finally:
-        signal.signal(signal.SIGTERM, old)
+                time.sleep(0.05)
+                done.append("started")
+        assert ended.value.code == 128 + signal.SIGTERM and done == ["started"]
+        # The runner is ending: another signal, while the stack stops or after, only waits its turn.
+        with signals.held():
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+            done.append("stopped")
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+    assert done == ["started", "stopped"] and signals.got == [signal.SIGTERM] * 3
+    assert signal.getsignal(signal.SIGTERM) is before
+    # Outside any stack starting or stopping, the first signal ends the runner at once.
+    signals = runner._Signals()
+    with signals.installed(), pytest.raises(SystemExit):
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+
+
+def test_a_process_listed_is_the_one_started_not_a_pid_used_again(tmp_path: Path) -> None:
+    pids = tmp_path / "state" / "a" / "stack" / "pids"
+    pids.parent.mkdir(parents=True)
+    me = os.getpid()
+    pids.write_text(json.dumps([["agentd", me, "Thu Jan  1 00:00:00 1970"], ["temporal", me, harness.started_at(me)],
+                                ["worker1", 999_999_999, "Thu Jan  1 00:00:00 1970"]]))
+    assert runner._left_running(tmp_path / "state") == [("temporal", me)]
 
 
 def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Path) -> None:
@@ -655,6 +670,7 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
             runner.run(cs, [b], repos, state)
     finally:
         left.close()
+    assert not (state / "x" / "stack" / "pids").exists(), "a stack that stopped lists nothing"
     # On macOS the git tool's sandbox reads what is neither under the home directory nor temporary.
     monkeypatch.setattr(runner, "SANDBOX", "srt")
     with pytest.raises(ValueError, match="on macOS the state directory and the cache"):

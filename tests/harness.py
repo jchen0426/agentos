@@ -12,7 +12,6 @@ Environment:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import platform
@@ -23,7 +22,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -260,24 +258,11 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
-@contextlib.contextmanager
-def signals_deferred(signums: tuple[int, ...] = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)):
-    """SIGTERM, SIGHUP and SIGINT wait until the block is done, then arrive: what they would cut
-    short (starting or stopping a stack) finishes. Python runs signal handlers in the main thread
-    whichever thread the OS hands a signal to (the Temporal SDK's runtime starts many), so this
-    swaps the handlers rather than block the signals."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    got: list[int] = []
-    old = {n: signal.signal(n, lambda signum, _frame: got.append(signum)) for n in signums}
-    try:
-        yield
-    finally:
-        for n, handler in old.items():
-            signal.signal(n, handler)
-        for n in dict.fromkeys(got):
-            signal.raise_signal(n)
+def started_at(pid: int) -> str:
+    """When a process started, as ps says it (to the second; empty once it is gone): with its
+    PID, which process it is, whatever it has exec'd since."""
+    return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                          env={**os.environ, "LC_ALL": "C"}).stdout.strip()
 
 
 def command_of(pid: int) -> str:
@@ -610,9 +595,11 @@ class Stack:
         return w
 
     def _remember(self) -> None:
-        """The stack's processes, each the leader of its own process group: what to stop when
-        whatever started them was killed (pids, in the stack's directory)."""
-        (self.tmp / "pids").write_text(json.dumps([[p.name, p.popen.pid] for p in self.procs]))
+        """The stack's processes, each the leader of its own process group, and when each started:
+        what to stop when whatever started them was killed (pids, in the stack's directory; gone
+        once the stack has stopped)."""
+        (self.tmp / "pids").write_text(json.dumps([[p.name, p.popen.pid, started_at(p.popen.pid)]
+                                                   for p in self.procs]))
 
     def close(self) -> None:
         errors = []
@@ -624,6 +611,7 @@ class Stack:
         shutil.rmtree(self.sock_dir, ignore_errors=True)
         if errors:
             raise errors[0]
+        (self.tmp / "pids").unlink(missing_ok=True)
 
     def logs(self) -> str:
         return "\n".join(f"===== {p.name} ({p.log})\n{p.text()[-6000:]}" for p in self.procs)
