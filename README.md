@@ -45,6 +45,7 @@ wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
 | `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `evals/`, `docs/eval/` | the first task's evaluation: the case set, its mirrors, the runner, the scoring and the per-model report (`python -m evals`); the reports |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
 ## Requirements
@@ -272,6 +273,50 @@ After a workflow change that is meant to be compatible, the replay gate
 `AGENTOS_WRITE_HISTORIES=1 uv run pytest tests/test_t10_versioning.py`.
 
 Generated code is committed: `make proto` (protobuf, Go and Python) and `make sqlc`.
+
+## Evaluation
+
+The first task's evaluation (design doc, section 11) audits a set of commits through the same
+runtime, in dry-run, under each model, and writes a per-model report: detection, false
+positives, injection false passes, patch applicability, cost, latency, cache hits, refusals and
+broken structured output, with confidence intervals from a bootstrap over cases. `evals/` uses
+the standard library only and reuses the black-box harness to bring up Temporal, agentd and the
+Worker; nothing of it is installed where the Worker runs.
+
+`evals/cases.json` holds commit IDs, labels (file, lines, CWE) and injection instructions,
+never the projects' code. `python -m evals mirrors` fetches each commit and its parent from the
+project into a cache outside the repository (`~/.cache/agentos-eval`, or
+`AGENTOS_EVAL_CACHE`) and makes the commits we make (a fix applied in reverse, a case with
+injected text) with a fixed author and date, so their IDs are the ones recorded.
+
+```bash
+uv run python -m evals mirrors                          # fetch, make, check every case
+uv run python -m evals table --out docs/eval/cases.md   # the case table, for spot checks
+```
+
+A run needs `make build`, and, like any run with a real model, the Worker in its sandbox. The
+state directory (`<cache>/state/default`, or `--state`) keeps the journal, and each profile's
+Temporal database and agentd ledger; a runner on it picks up where the last one stopped. A paid
+profile needs a cap on what the state directory's runs spend, every runner on it together (a
+new state directory is a new evaluation, with a cap of its own): a run starts only while what
+the ledgers say the runs have spent, plus the budgets of the paid runs in flight, plus its own
+budget (`--budget-usd`, $1.50 by default: room for the gateway's worst-case reservation) stay
+within it. A run whose model call did not end with the model's answer (one cancelled while it
+waited for budget, an approval or a reconciliation, or took longer than its profile allows; a
+policy that denied the call; a provider that kept failing) is void: it is in no rate, the
+report counts it by its reason, and `--retry-void` runs it again. A void first run stops the
+runner; after a void run the runs go one at a time until one is answered, and three void runs in
+a row stop the runner (not counting runs it stopped itself for the cap, runs picked up from an
+earlier runner, nor void runs run again that cost nothing). On macOS the
+state directory and the cache must be under the home directory (the default) or a temporary
+directory, which the sandboxes deny. The profiles are `config/models.yaml`'s providers,
+one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
+Ollama server above with gpt-oss:20b.
+
+```bash
+AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 50
+uv run python -m evals report --out docs/eval/<name>
+```
 
 ## License
 

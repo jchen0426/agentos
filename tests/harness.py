@@ -245,7 +245,10 @@ def free_port() -> int:
 
 
 def descendants(pid: int) -> list[int]:
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True).stdout
+    # ps in a session of its own: a Ctrl-C at the terminal, which the whole foreground process
+    # group gets, does not cut short a stack's stopping by killing it.
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True,
+                         start_new_session=True).stdout
     children: dict[int, list[int]] = {}
     for line in out.splitlines():
         p, pp = map(int, line.split())
@@ -258,19 +261,27 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
+def started_at(pid: int) -> str:
+    """When a process started, as ps says it (to the second; empty once it is gone): with its
+    PID, which process it is, whatever it has exec'd since."""
+    return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}, start_new_session=True).stdout.strip()
+
+
 def command_of(pid: int) -> str:
-    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                          start_new_session=True).stdout
 
 
 class Proc:
     """A child process with its output in a log file."""
 
     def __init__(self, name: str, args: list[str], log: Path, env: dict[str, str] | None = None,
-                 cwd: Path | None = None) -> None:
+                 cwd: Path | None = None, pass_fds: tuple[int, ...] = ()) -> None:
         self.name, self.log = name, log
         self._out = open(log, "w")
         self.popen = subprocess.Popen([str(a) for a in args], stdout=self._out, stderr=subprocess.STDOUT,
-                                      env=env, cwd=cwd, start_new_session=True)
+                                      env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
 
     def text(self) -> str:
         return self.log.read_text(errors="replace")
@@ -279,7 +290,15 @@ class Proc:
         return self.popen.poll() is None
 
     def signal_all(self, sig: int) -> None:
-        for pid in [*descendants(self.popen.pid), self.popen.pid]:
+        try:
+            pids = [*descendants(self.popen.pid), self.popen.pid]
+        except subprocess.CalledProcessError:  # ps did not finish: the process group, at least
+            pids = []
+            try:
+                os.killpg(self.popen.pid, sig)  # each Proc leads a session, and its group, of its own
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in pids:
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
@@ -332,14 +351,18 @@ def make_mirror(path: Path, live_repo: str = "") -> str:
 
 
 class Stack:
-    """One Temporal dev server, one agentd and its Workers, isolated in a temporary directory."""
+    """One Temporal dev server, one agentd and its Workers, isolated in a temporary directory.
+    With fixture=False there is neither the audit fixture's mirror nor the simulated GitHub: the
+    caller names agentd's repositories (start_agentd's repos), and the GitHub tools only dry-run
+    (the evaluation, evals/runner.py)."""
 
     # Set by subclasses that run Temporal with mTLS: the harness's client certificate and
     # the temporal.tls section of agentd.yaml.
     temporal_tls: TLSConfig | None = None
     agentd_tls: dict | None = None
 
-    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False) -> None:
+    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False, fixture: bool = True,
+                 hold_fds: tuple[int, ...] = ()) -> None:
         self.tmp = tmp
         self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
         # Temporal's dev server keeps everything in memory unless it has a database file: with one,
@@ -350,15 +373,26 @@ class Stack:
         self.procs: list[Proc] = []
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
-        self.commit = make_mirror(tmp / "mirror", live_repo)
+        self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
+        # Temporal keeps these open, and with them any lock on them: the evaluation's state
+        # directory stays locked while the Temporal a killed runner left behind still runs. Not
+        # agentd: the processes it starts (a sandboxed git tool) would inherit them.
+        self.hold_fds = hold_fds
+        self.fixture = fixture
+        self.commit = make_mirror(tmp / "mirror", live_repo) if fixture else ""
         self.data_dir = tmp / "agentd" / "data"
         # Separate directories: the Linux sandbox mounts the Runtime socket's directory.
         self.control_socket = self.sock_dir / "control" / "control.sock"
         self.runtime_port = free_port()
         self.runtime_socket = self.sock_dir / "runtime" / "runtime.sock"
         self.temporal_address = f"127.0.0.1:{free_port()}"
-        self._start_temporal()
-        self._start_github()
+        try:
+            self._start_temporal()
+            if fixture:
+                self._start_github()
+        except BaseException:  # a signal while Temporal starts, too: nothing is left running
+            self.close()
+            raise
 
     # --- processes ---------------------------------------------------------------------------
 
@@ -372,8 +406,9 @@ class Stack:
                                   "--ui-port", str(free_port()), "--headless", "--log-level", "warn",
                                   "--search-attribute", "AgentState=Keyword",
                                   *(["--db-filename", str(self.temporal_db)] if self.temporal_db else [])],
-                     self.tmp / f"temporal{n or ''}.log")
+                     self.tmp / f"temporal{n or ''}.log", pass_fds=self.hold_fds)
             self.procs.append(p)
+            self._remember()
             wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
             if p.alive():
                 return
@@ -408,6 +443,7 @@ class Stack:
                                "--repo", f"acme/payments={self.tmp / 'mirror'}"],
                  self.tmp / "githubsim.log")
         self.procs.append(p)
+        self._remember()
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated GitHub")
         assert p.alive(), p.text()
         self.github_url = f"http://{addr.read_text()}/"
@@ -473,10 +509,12 @@ class Stack:
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
                      test_tools: bool = False, run_id_delay: str | None = None,
-                     hold_doorbells: Path | None = None) -> Proc:
+                     hold_doorbells: Path | None = None, repos: dict | None = None) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
-        exists, agentd delivers no doorbell: they wait in its outbox."""
+        exists, agentd delivers no doorbell: they wait in its outbox. `repos` replaces the
+        fixture's acme/payments; a stack without the fixture has no GitHub section at all, so
+        the GitHub tools only dry-run."""
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -490,11 +528,13 @@ class Stack:
             "policy_file": "policy.yaml",
             "models_file": "models.yaml",
             "prices_file": "prices.yaml",
-            "repos": {"acme/payments": {"mirror": str(self.tmp / "mirror"), "github": self.live_repo or "acme/payments"}},
+            "repos": repos if repos is not None else
+                     {"acme/payments": {"mirror": str(self.tmp / "mirror"), "github": self.live_repo or "acme/payments"}},
             # The simulated GitHub needs no token, and applies a write as it receives it: a
             # lookup that finds nothing past the request timeout means it never took effect.
-            "github": ({"token": "keyring:agentos-github-test-token"} if self.live_repo
-                       else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"}),
+            **({"github": ({"token": "keyring:agentos-github-test-token"} if self.live_repo
+                           else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"})}
+               if self.fixture else {}),
             **({"git_tools": {"sandbox": [str(TOOL_LAUNCHER[SANDBOX])]}} if SANDBOX in TOOL_LAUNCHER else {}),
             **(extra or {}),
         }
@@ -520,6 +560,7 @@ class Stack:
         name = "agentd" if n == 0 else f"agentd{n + 1}"
         p = Proc(name, self._agentd_args, self.tmp / f"{name}.log")
         self.procs.append(p)
+        self._remember()
         self.agentd = p
         wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd")
         assert p.alive(), p.text()
@@ -551,22 +592,38 @@ class Stack:
     def sandbox_env(self) -> dict[str, str]:
         # In production agentd's data lives under the home directory, which the macOS sandbox
         # cannot read. Test data lives elsewhere, so keep it out of reach explicitly.
-        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps([str(self.tmp)])}
+        denied = [str(p) for p in [self.tmp, *self.deny_read]]
+        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied)}
 
     def start_worker(self, workflows: str | None = None) -> Worker:
         n = len(self.workers) + 1
         w = Worker(f"worker{n}", self.worker_command(workflows), self.tmp / f"worker{n}.log",
                    env=self.sandbox_env(), cwd=REPO)
         self.procs.append(w)
+        self._remember()
         self.workers.append(w)
         wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
         assert w.alive(), w.text()
         return w
 
+    def _remember(self) -> None:
+        """The stack's processes, each the leader of its own process group, and when each started:
+        what to stop when whatever started them was killed (pids, in the stack's directory; gone
+        once the stack has stopped)."""
+        (self.tmp / "pids").write_text(json.dumps([[p.name, p.popen.pid, started_at(p.popen.pid)]
+                                                   for p in self.procs]))
+
     def close(self) -> None:
+        errors = []
         for p in reversed(self.procs):
-            p.stop()
+            try:
+                p.stop()
+            except Exception as e:  # noqa: BLE001 - stop the others first
+                errors.append(e)
         shutil.rmtree(self.sock_dir, ignore_errors=True)
+        if errors:
+            raise errors[0]
+        (self.tmp / "pids").unlink(missing_ok=True)
 
     def logs(self) -> str:
         return "\n".join(f"===== {p.name} ({p.log})\n{p.text()[-6000:]}" for p in self.procs)
@@ -657,6 +714,14 @@ class Stack:
             return h.first_execution_run_id or h.result_run_id or ""
         return self._temporal(start)
 
+    def execution_times(self, run: dict) -> tuple[float, float | None]:
+        """When Temporal started the run's execution and when it closed (None while open), in
+        seconds since the epoch."""
+        async def describe(c: Client) -> tuple[float, float | None]:
+            d = await c.get_workflow_handle(run["run_id"], run_id=run["temporal_run_id"]).describe()
+            return d.start_time.timestamp(), d.close_time.timestamp() if d.close_time else None
+        return self._temporal(describe)
+
     def execution_closed(self, workflow_id: str, run_id: str) -> bool:
         async def describe(c: Client) -> bool:
             d = await c.get_workflow_handle(workflow_id, run_id=run_id).describe()
@@ -669,7 +734,7 @@ class Stack:
     # --- agentd's ledger and logs ------------------------------------------------------------
 
     def ledger(self, sql: str, *params: Any) -> list[sqlite3.Row]:
-        db = sqlite3.connect(f"file:{self.data_dir / 'ledger.db'}?mode=ro", uri=True)
+        db = sqlite3.connect((self.data_dir / "ledger.db").absolute().as_uri() + "?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         try:
             return db.execute(sql, params).fetchall()
