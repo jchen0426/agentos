@@ -46,7 +46,8 @@ import (
 //  2. No new request of such a write goes out at or after its approval's expires_at: only a
 //     resend, under the same key, of a write that may have taken effect (one in flight).
 //  3. A write the ledger says never happened (ABANDONED, DRY_RUN, DENIED, FAILED, or its approval
-//     EXPIRED or REJECTED) never took effect; one it says SUCCEEDED did.
+//     EXPIRED or REJECTED) never took effect, nor may have, as far as agentd was told; one it says
+//     SUCCEEDED did.
 //  4. maybe_sent is set while a request of the write went out and neither a tool's answer, a
 //     lookup nor a person has shown that the write did not take effect; a write that may have is
 //     never held for approval.
@@ -71,7 +72,7 @@ var regressionSeeds = []uint64{}
 
 const (
 	smSeeds = 200 // seeds walked by default
-	smSteps = 80  // a walk's steps, besides those taken while a tool waits
+	smSteps = 100 // a walk's steps, besides those taken while a tool waits
 	smDepth = 2   // how deep steps nest in steps taken while a tool waits
 )
 
@@ -190,11 +191,8 @@ func newMachine(t *testing.T, seed uint64, path string) *machine {
 	}
 	m.now = time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 	ledger.Clock = m.Now
-	// A walk calls few writes, so that each goes far: one run or two, one to three tools, one or
-	// two sets of arguments each.
-	for i := range 1 + m.rng.IntN(2) {
-		m.runs = append(m.runs, &runModel{id: fmt.Sprintf("wf%d", i+1), dryRun: m.rng.IntN(100) < 8})
-	}
+	// A walk calls few writes, so that each goes far: one to three tools, one or two sets of
+	// arguments each, in a run; another run starts now and then (newRun).
 	all := []string{"sm.idempotent", "sm.lookup", "sm.unsafe"}
 	m.rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
 	m.toolNames = all[:1+m.rng.IntN(3)]
@@ -209,24 +207,34 @@ func newMachine(t *testing.T, seed uint64, path string) *machine {
 		pol[name] = m.drawPolicy()
 	}
 	m.cur = m.start(pol, m.rng.IntN(100) < 92)
-	for _, r := range m.runs {
-		var dry int64
-		if r.dryRun {
-			dry = 1
-		}
-		if err := m.cur.led.Q.InsertRun(m.ctx, db.InsertRunParams{WorkflowID: r.id, Task: "security-audit", ParamsJson: "{}",
-			BudgetLimitMicros: 1, DryRun: dry, CreatedAt: ledger.Now()}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	m.logf("seed %d: runs %s, tools %v with arguments %v; %s, live %v, policy %s", seed, m.runNames(), m.toolNames, m.ns,
+	m.logf("seed %d: tools %v with arguments %v; %s, live %v, policy %s", seed, m.toolNames, m.ns,
 		m.cur.name, m.cur.live, m.policyText(m.cur.policy))
+	m.newRun()
 	return m
+}
+
+// newRun starts a run (now and then a dry run), up to five.
+func (m *machine) newRun() {
+	if len(m.runs) == 5 {
+		m.logf("no more runs start")
+		return
+	}
+	r := &runModel{id: fmt.Sprintf("wf%d", len(m.runs)+1), dryRun: m.rng.IntN(100) < 8}
+	var dry int64
+	if r.dryRun {
+		dry = 1
+	}
+	if err := m.cur.led.Q.InsertRun(m.ctx, db.InsertRunParams{WorkflowID: r.id, Task: "security-audit", ParamsJson: "{}",
+		BudgetLimitMicros: 1, DryRun: dry, CreatedAt: ledger.Now()}); err != nil {
+		m.fatal(err)
+	}
+	m.runs = append(m.runs, r)
+	m.logf("%s starts%s", r.id, map[bool]string{true: ", a dry run"}[r.dryRun])
 }
 
 func (m *machine) drawPolicy() toolPolicy {
 	p := toolPolicy{require: m.rng.IntN(100) < 75, max: 1}
-	p.ttl = []time.Duration{2 * time.Minute, 10 * time.Minute, time.Hour}[m.rng.IntN(3)]
+	p.ttl = []time.Duration{2 * time.Minute, 10 * time.Minute, time.Hour, 24 * time.Hour}[m.choose(3, 3, 3, 1)]
 	if m.rng.IntN(100) < 20 {
 		p.max = 2
 	}
@@ -280,9 +288,9 @@ func (m *machine) walk() {
 // act takes one step. Nested, it is taken while a tool waits: another call, a decision, the
 // clock, a cancel, agentd dying.
 func (m *machine) act(nested bool) {
-	weights := []int{36, 18, 14, 5, 9, 2, 6, 1}
+	weights := []int{40, 16, 12, 4, 8, 2, 3, 1, 3}
 	if nested {
-		weights = []int{20, 14, 20, 5, 5, 7, 10, 0}
+		weights = []int{20, 14, 20, 4, 4, 7, 7, 0, 0}
 	}
 	switch m.choose(weights...) {
 	case 0:
@@ -291,7 +299,7 @@ func (m *machine) act(nested bool) {
 		m.decide()
 	case 2:
 		d := []time.Duration{5 * time.Second, 45 * time.Second, 2 * time.Minute, 4 * time.Minute, 11 * time.Minute,
-			70 * time.Minute, 26 * time.Hour}[m.choose(14, 14, 16, 14, 14, 10, 4)]
+			70 * time.Minute, 26 * time.Hour}[m.choose(16, 16, 18, 16, 14, 6, 2)]
 		m.advance(d)
 		m.logf("%s pass", d)
 	case 3:
@@ -304,6 +312,8 @@ func (m *machine) act(nested bool) {
 		m.restart()
 	case 7:
 		m.end()
+	case 8:
+		m.newRun()
 	}
 }
 
@@ -350,9 +360,10 @@ type callSpec struct {
 }
 
 // call makes a call of a write, as a workflow does: one of the walk's, or the call an edit
-// asks for (the edited approval's call with the reviewer's patch).
+// asks for (the edited approval's call with the reviewer's patch). Mostly of a write that is
+// not over yet: one waiting for approval, being sent, or for a person; or not made yet.
 func (m *machine) call() {
-	var specs, edited []callSpec
+	var specs []callSpec
 	for _, r := range m.runs {
 		if r.ended {
 			continue
@@ -373,17 +384,31 @@ func (m *machine) call() {
 			m.fatal(err)
 		}
 		args["patch_ref"] = a.EditedPatchBlob.String
-		edited = append(edited, callSpec{run: m.run(a.WorkflowID), tool: a.Tool, args: args,
+		specs = append(specs, callSpec{run: m.run(a.WorkflowID), tool: a.Tool, args: args,
 			name: m.name(a.EffectID) + "+" + m.name(a.EditedPatchBlob.String)})
 	}
 	if len(specs) == 0 {
 		m.logf("no run calls any more")
 		return
 	}
-	spec := specs[m.rng.IntN(len(specs))]
-	if len(edited) > 0 && m.rng.IntN(100) < 40 {
-		spec = edited[m.rng.IntN(len(edited))]
+	weights := make([]int, len(specs))
+	for i, s := range specs {
+		canon, err := encodeCanonical(s.args)
+		if err != nil {
+			m.fatal(err)
+		}
+		switch e, err := m.cur.led.Q.GetEffect(m.ctx, sha256Hex([]byte(s.run.id), []byte(s.tool), canon)); {
+		case errors.Is(err, sql.ErrNoRows):
+			weights[i] = 4
+		case err != nil:
+			m.fatal(err)
+		case e.Status == effectPending, e.Status == effectAwaitingApproval, e.Status == effectUnknown:
+			weights[i] = 12
+		default:
+			weights[i] = 1
+		}
 	}
+	spec := specs[m.choose(weights...)]
 	inc := m.cur
 	row, err := inc.led.Q.GetRun(m.ctx, spec.run.id)
 	if err != nil {
@@ -671,18 +696,18 @@ func (m *machine) waitFor(inc *incarnation) func(ctx context.Context, d time.Dur
 // sometimes having seen another payload; sometimes sending again a decision that went through.
 func (m *machine) decide() {
 	all := m.approvals()
-	if len(all) == 0 {
-		m.logf("decide: nothing to decide")
-		return
-	}
 	var waiting []db.Approval
 	for _, a := range all {
 		if a.Status == approvalPending {
 			waiting = append(waiting, a)
 		}
 	}
+	if len(all) == 0 || len(waiting) == 0 && m.rng.IntN(100) < 85 {
+		m.logf("decide: nothing waits for a decision")
+		return
+	}
 	a := all[m.rng.IntN(len(all))]
-	if len(waiting) > 0 && m.rng.IntN(100) < 80 {
+	if len(waiting) > 0 && m.rng.IntN(100) < 90 {
 		a = waiting[m.rng.IntN(len(waiting))]
 	}
 	d := Decision{ApprovalID: a.ApprovalID, PayloadSHA256: a.PayloadSha256, Key: m.key(), By: []string{"alice", "bob"}[m.rng.IntN(2)]}
@@ -862,6 +887,8 @@ func (m *machine) check() {
 			m.fail("5: %s took effect %d times", m.name(id), made)
 		case never && made > 0:
 			m.fail("3: %s took effect, but it is %s (approval: %s)", m.name(id), e.Status, m.approvalText(hasApproval, a))
+		case never && inFlight:
+			m.fail("3: %s may have taken effect, but it is %s (approval: %s)", m.name(id), e.Status, m.approvalText(hasApproval, a))
 		case e.Status == effectSucceeded && made == 0:
 			m.fail("3: %s is SUCCEEDED, but it never took effect", m.name(id))
 		case e.Status == effectPending && inFlight && e.MaybeSent == 0:
