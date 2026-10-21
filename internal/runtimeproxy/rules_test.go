@@ -9,6 +9,7 @@ import (
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
+	querypb "go.temporal.io/api/query/v1"
 	sdkpb "go.temporal.io/api/sdk/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	workerpb "go.temporal.io/api/worker/v1"
@@ -126,6 +127,18 @@ func activity(activityType, queue string, eager bool) *commandpb.Command {
 	}
 }
 
+func prioritized(p *commonpb.Priority) *commandpb.Command {
+	c := activity("Invoke", "gateway", false)
+	c.GetScheduleActivityTaskCommandAttributes().Priority = p
+	return c
+}
+
+func versioned() *commandpb.Command {
+	c := activity("Invoke", "gateway", false)
+	c.GetScheduleActivityTaskCommandAttributes().UseWorkflowBuildId = true
+	return c
+}
+
 func upsert(keys ...string) *commandpb.Command {
 	fields := map[string]*commonpb.Payload{}
 	for _, k := range keys {
@@ -172,6 +185,9 @@ func TestWhatAWorkflowTaskMayCommand(t *testing.T) {
 		"activity on another queue": activity("Invoke", "agentos-workflows", false),
 		"another activity type":     activity("Steal", "gateway", false),
 		"eager gateway activity":    activity("Invoke", "gateway", true),
+		"activity ahead of others":  prioritized(&commonpb.Priority{PriorityKey: 1}),
+		"activity in a fair share":  prioritized(&commonpb.Priority{FairnessKey: "mine", FairnessWeight: 100}),
+		"versioned activity":        versioned(),
 		"another search attribute":  upsert("AgentState", "BuildIds"),
 		"a marker of its own":       marker("anything"),
 	} {
@@ -216,9 +232,20 @@ func sdkFailure() *workflowservice.RespondWorkflowTaskFailedRequest {
 	}
 }
 
+// sdkHeartbeat is a heartbeat as the SDK fills it in: its version is a build ID.
+func sdkHeartbeat() *workerpb.WorkerHeartbeat {
+	return &workerpb.WorkerHeartbeat{
+		WorkerInstanceKey: "key", WorkerIdentity: "1234@host", HostInfo: &workerpb.WorkerHostInfo{HostName: "host"},
+		TaskQueue: "agentos-workflows", DeploymentVersion: &deploymentpb.WorkerDeploymentVersion{BuildId: "b"},
+		SdkName: "temporal-python", SdkVersion: "1.34.0", Status: enumspb.WORKER_STATUS_RUNNING,
+		WorkflowTaskSlotsInfo: &workerpb.WorkerSlotsInfo{}, WorkflowPollerInfo: &workerpb.WorkerPollerInfo{},
+		Environment: &workerpb.EnvironmentInfo{},
+	}
+}
+
 func sdkShutdown() *workflowservice.ShutdownWorkerRequest {
 	return &workflowservice.ShutdownWorkerRequest{
-		Namespace: "default", Identity: "1234@host", Reason: "graceful shutdown", WorkerHeartbeat: &workerpb.WorkerHeartbeat{},
+		Namespace: "default", Identity: "1234@host", Reason: "graceful shutdown", WorkerHeartbeat: sdkHeartbeat(),
 		WorkerInstanceKey: "key", TaskQueue: "agentos-workflows", TaskQueueTypes: []enumspb.TaskQueueType{enumspb.TASK_QUEUE_TYPE_WORKFLOW},
 	}
 }
@@ -228,11 +255,11 @@ func TestTheSDKsOwnRequestsAreAllowed(t *testing.T) {
 		"GetSystemInfo":                &workflowservice.GetSystemInfoRequest{},
 		"DescribeNamespace":            &workflowservice.DescribeNamespaceRequest{Namespace: "default"},
 		"PollWorkflowTaskQueue":        sdkPoll(),
-		"RespondWorkflowTaskCompleted": sdkCompletion(activity("Invoke", "gateway", false)),
+		"RespondWorkflowTaskCompleted": sdkCompletion(prioritized(&commonpb.Priority{})),
 		"RespondWorkflowTaskFailed":    sdkFailure(),
 		"ShutdownWorker":               sdkShutdown(),
 		"RecordWorkerHeartbeat": &workflowservice.RecordWorkerHeartbeatRequest{Namespace: "default", Identity: "1234@host",
-			WorkerHeartbeat: []*workerpb.WorkerHeartbeat{{}}},
+			WorkerHeartbeat: []*workerpb.WorkerHeartbeat{sdkHeartbeat()}},
 		"GetWorkflowExecutionHistory": &workflowservice.GetWorkflowExecutionHistoryRequest{Namespace: "default",
 			Execution: &commonpb.WorkflowExecution{WorkflowId: "run"}, MaximumPageSize: 100, NextPageToken: []byte("t")},
 	} {
@@ -296,6 +323,14 @@ func TestFieldsTheSDKNeverSetsAreRefused(t *testing.T) {
 	other := sdkShutdown()
 	other.TaskQueue = "gateway"
 	cases["shutdown of another task queue"] = req{"ShutdownWorker", other}
+	// A heartbeat that names a Worker Deployment, in either request that carries one.
+	claiming := sdkHeartbeat()
+	claiming.DeploymentVersion.DeploymentName = "t9-rogue"
+	cases["heartbeat naming a deployment"] = req{"RecordWorkerHeartbeat",
+		&workflowservice.RecordWorkerHeartbeatRequest{Namespace: "default", WorkerHeartbeat: []*workerpb.WorkerHeartbeat{sdkHeartbeat(), claiming}}}
+	lastBeat := sdkShutdown()
+	lastBeat.WorkerHeartbeat = claiming
+	cases["shutdown heartbeat naming a deployment"] = req{"ShutdownWorker", lastBeat}
 	cases["namespace by id"] = req{"DescribeNamespace", &workflowservice.DescribeNamespaceRequest{Namespace: "default", Id: "x"}}
 
 	for name, c := range cases {
@@ -329,5 +364,28 @@ func TestFieldsThisAgentdDoesNotKnowAreRefused(t *testing.T) {
 		Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{ScheduleActivityTaskCommandAttributes: attrs}}
 	if err := check(t, "RespondWorkflowTaskCompleted", sdkCompletion(cmd)); err == nil {
 		t.Error("a command with a field agentd does not know was allowed")
+	}
+	// Inside a map's values: a query's result, and a payload in an activity's header.
+	resultRaw, err := proto.Marshal(&querypb.WorkflowQueryResult{ResultType: enumspb.QUERY_RESULT_TYPE_ANSWERED})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := &querypb.WorkflowQueryResult{}
+	if err := proto.Unmarshal(unknown(resultRaw), result); err != nil {
+		t.Fatal(err)
+	}
+	answered := sdkCompletion()
+	answered.QueryResults = map[string]*querypb.WorkflowQueryResult{"q1": result}
+	if err := check(t, "RespondWorkflowTaskCompleted", answered); err == nil {
+		t.Error("a query result with a field agentd does not know was allowed")
+	}
+	payload := &commonpb.Payload{}
+	if err := proto.Unmarshal(unknown(nil), payload); err != nil {
+		t.Fatal(err)
+	}
+	headed := activity("Invoke", "gateway", false)
+	headed.GetScheduleActivityTaskCommandAttributes().Header = &commonpb.Header{Fields: map[string]*commonpb.Payload{"h": payload}}
+	if err := check(t, "RespondWorkflowTaskCompleted", sdkCompletion(headed)); err == nil {
+		t.Error("a header payload with a field agentd does not know was allowed")
 	}
 }

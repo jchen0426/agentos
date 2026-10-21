@@ -46,6 +46,11 @@ var requestTypes = map[string]func() proto.Message{
 // Worker gives and starts its system workflows; worker_control_task_queue has Temporal send
 // control tasks to a queue the Worker names; sticky_attributes, a sticky queue (see
 // checkPollQueue); messages, workflow updates.
+//
+// The lists are this SDK's: a newer one that sets another field is refused until the field is
+// looked at and listed here, and so is a request whose field a newer API adds to the two
+// unrestricted methods only once go.temporal.io/api is upgraded (until then the field is unknown,
+// and refused). Look at both when upgrading either.
 var requestFields = map[string][]string{
 	service + "GetSystemInfo":     {},
 	service + "DescribeNamespace": {"namespace"},
@@ -136,21 +141,47 @@ func checkFields(m protoreflect.Message, allowed []string) error {
 		return err
 	}
 	for _, name := range versionFields {
-		fd := m.Descriptor().Fields().ByName(name)
-		if fd == nil || !m.Has(fd) {
-			continue
-		}
-		m.Get(fd).Message().Range(func(sub protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
-			if sub.Name() != "build_id" {
-				err = refuseField(string(name) + "." + string(sub.Name()))
+		if fd := m.Descriptor().Fields().ByName(name); fd != nil && m.Has(fd) {
+			if err := onlyBuildID(string(name), m.Get(fd).Message()); err != nil {
+				return err
 			}
-			return err == nil
-		})
-		if err != nil {
-			return err
+		}
+	}
+	// A heartbeat (RecordWorkerHeartbeat's, ShutdownWorker's last one) is the Worker's report of
+	// itself, for show, but for the version it names: the SDK gives its build ID there, and a
+	// deployment name would claim a Worker Deployment, as deployment options would.
+	fd := m.Descriptor().Fields().ByName("worker_heartbeat")
+	if fd == nil || !m.Has(fd) {
+		return nil
+	}
+	var beats []protoreflect.Message
+	if fd.IsList() {
+		for i := 0; i < m.Get(fd).List().Len(); i++ {
+			beats = append(beats, m.Get(fd).List().Get(i).Message())
+		}
+	} else {
+		beats = append(beats, m.Get(fd).Message())
+	}
+	for _, b := range beats {
+		if v := b.Descriptor().Fields().ByName("deployment_version"); v != nil && b.Has(v) {
+			if err := onlyBuildID("worker_heartbeat.deployment_version", b.Get(v).Message()); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// onlyBuildID refuses a note of the Worker's version, named name, that says more than its build ID.
+func onlyBuildID(name string, version protoreflect.Message) error {
+	var err error
+	version.Range(func(sub protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if sub.Name() != "build_id" {
+			err = refuseField(name + "." + string(sub.Name()))
+		}
+		return err == nil
+	})
+	return err
 }
 
 // hasUnknownFields reports whether m, or any message in it, holds a field its descriptor does not
@@ -208,6 +239,12 @@ func (r Rules) checkCommand(c *commandpb.Command) error {
 		case a.GetRequestEagerExecution():
 			// Eager execution would hand the gateway's activity task to the Worker itself.
 			return refuse(kind, "eager activity execution is not available to workers")
+		case proto.Size(a.GetPriority()) > 0:
+			// The SDK sends an empty one. A priority or a fairness key would move this run's
+			// calls ahead of other runs' on the one gateway queue.
+			return refuse(kind, "activity priority is not available to workers")
+		case a.GetUseWorkflowBuildId():
+			return refuse(kind, "versioned activities are not available to workers")
 		}
 	case enumspb.COMMAND_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES:
 		for k := range c.GetUpsertWorkflowSearchAttributesCommandAttributes().GetSearchAttributes().GetIndexedFields() {

@@ -121,6 +121,12 @@ def test_t9_a_workflow_task_reaches_no_other_run(stack: Stack) -> None:
         seen = {(e.get("command"), e["reason"]) for e in refusals(stack)}
         return all(any(c == command and why in reason for c, reason in seen) for command, why in STEPS.values())
     wait_for(refused_all, "agentd to refuse every step out of line", timeout=60)
+    # agentd logs a refusal before it answers. Each run's first workflow task then ends without a
+    # completion (it times out); a completion agentd had passed on would show in its place.
+    ended = {EventType.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT, EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED}
+    for step, run in runs.items():
+        wait_for(lambda: any(e.event_type in ended for e in stack.history(run)), f"{step}'s first workflow task to end",
+                 timeout=60, interval=1)
     print(json.dumps(refusals(stack), indent=2))
     assert {e["method"].rsplit("/", 1)[1] for e in refusals(stack)} == {"RespondWorkflowTaskCompleted"}
 
