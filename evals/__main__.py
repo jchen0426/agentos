@@ -30,13 +30,14 @@ def table(cs: CaseSet, built: dict[str, dict] | None = None) -> str:
     diff alone decides it."""
     out = ["# 评测集用例表", "",
            f"`evals/cases.json`，sha256 前 12 位 `{cs.sha256[:12]}`。提交链接指向上游；我们造的提交（反向应用修复、注入）"
-           "不在上游，链接的是它所依据的修复提交或漏洞用例。行号按审计的那个提交改后的文件算。", ""]
+           "不在上游，链接的是它所依据的修复提交或漏洞用例。行号按审计的那个提交改后的文件算。"
+           "“公开”取公告发布和修复提交中较早的日期：修复一推到 GitHub 就公开了。", ""]
     comp = casefile.composition(cs)
     out += [f"- 漏洞 {comp['vuln']} 个：blame 找到的引入提交 {comp['blame']} 个，反向应用修复 {comp['reverse']} 个；"
             f"正常提交 {comp['benign']} 个；注入用例 {comp['injection']} 个。语言：{'、'.join(comp['languages'])}。",
-            f"- 知识截止：" + "；".join(f"{m} {d}" for m, d in sorted(cs.cutoffs.items())) +
-            f"。截止之后公开的漏洞 {comp['after_cutoffs']} 个（晚于最晚的那个截止）。", ""]
-    out += ["| 用例 | 类别 | 项目（许可证） | 审计的提交 | CWE | 公告（公开日期） | 标注 | 改动行数 | 说明 |",
+            "- 知识截止：" + "；".join(f"{m} {d}" for m, d in sorted(cs.cutoffs.items())) +
+            f"。截止之后才公开的漏洞 {comp['after_cutoffs']} 个（晚于最晚的那个截止）。", ""]
+    out += ["| 用例 | 类别 | 项目（许可证） | 审计的提交 | CWE | 公告（发布 / 修复 / 公开） | 标注 | 改动行数 | 说明 |",
             "|---|---|---|---|---|---|---|---|---|"]
     for c in cs.cases:
         p = cs.projects[c.project]
@@ -48,9 +49,11 @@ def table(cs: CaseSet, built: dict[str, dict] | None = None) -> str:
         else:
             commit = f"{(c.commit or '?')[:12]}（{c.base} 加注入：{c.inject.file} 第 {c.inject.line} 行前）"
         labels = "；".join(f"{lb.file}:{','.join(map(str, lb.lines))}" for lb in c.labels) or "—"
-        advisory = f"{c.advisory}（{c.published}）" if c.advisory else "—"
+        advisory = (f"{c.advisory}（{c.published or '?'} / {c.fixed or '?'} / {casefile.public(c) or '?'}）"
+                    if c.advisory else "—")
         size = str(built[c.id]["changed"]) if built and c.id in built else "?"
-        why = c.why.replace("|", "\\|").replace("\n", " ")
+        why = c.why if not c.inject else f"{c.why}插入的文字：`{c.inject.text}`"
+        why = why.replace("|", "\\|").replace("\n", " ")
         out.append(f"| {c.id} | {report.KIND[c.kind]}（{report.SOURCE[c.source]}） | {c.project}（{p.license}） | {commit} | "
                    f"{c.cwe or '—'} | {advisory} | {labels} | {size} | {why} |")
     return "\n".join(out) + "\n"
