@@ -13,7 +13,7 @@ from evals import __main__ as cli
 from evals import cases as casefile
 from evals import runner, score
 from tests import eval_fixture
-from tests.harness import AUDIT_SCHEMA, BIN, Proc, wait_for
+from tests.harness import AUDIT_SCHEMA, BIN, Proc, Stack, wait_for
 
 PRICES = """
 price_table_version: eval-test
@@ -191,3 +191,54 @@ def test_a_run_paused_for_budget_is_stopped_and_found_nothing(tmp_path: Path, ev
     # Nothing reached the provider: 4096 tokens of output alone cost more than the budget.
     assert not (tmp_path / "modelsim.jsonl").exists()
     assert score.metrics(cs, [r])["a"]["outcomes"] == {"(budget)": 1}
+
+
+def test_a_budget_of_zero_is_refused(tmp_path: Path, evalset) -> None:
+    # agentd would take 0 for its default budget, which the cap would not count.
+    cs, repos, _ = evalset
+    with pytest.raises(ValueError, match="budget above 0"):
+        runner.run(cs, [profiles("http://127.0.0.1:9")[0]], repos, tmp_path / "state", budget_micros=0,
+                   cap_micros=1_000_000)
+
+
+def test_a_run_that_spends_past_its_budget_stops_the_paid_runs(tmp_path: Path, evalset, modelsim: str) -> None:
+    cs, repos, _ = evalset
+    # Counted as 1000 input tokens, billed as 100,000: agentd settles what the provider billed,
+    # past the reservation and the run's budget.
+    (tmp_path / "answers.json").write_text(json.dumps([{"contains": "format_price", "answers": [
+        {"report": eval_fixture.report(), "usage": {"input": 100_000, "cache_read": 0, "output": 10}}] * 3}]))
+    one_at_a_time = dataclasses.replace(profiles(modelsim)[0], concurrency=1)  # runs in flight carry on
+    results = run(cs, [one_at_a_time], repos, tmp_path / "state", runs=3, budget_micros=BUDGET,
+                  cap_micros=1_000_000, cases=[cs.case("py-benign")])
+    assert [(r["rep"], r["spent_micros"]) for r in results] == [(1, 100_000 + 50)], results
+
+
+def test_a_run_the_journal_never_saw_is_cancelled_and_its_spending_counts(tmp_path: Path, evalset,
+                                                                          modelsim: str) -> None:
+    cs, repos, _ = evalset
+    (tmp_path / "answers.json").write_text(json.dumps(
+        [{"contains": "format_price", "answers": [{"report": eval_fixture.report()}] * 3}]))
+    a = profiles(modelsim)[0]
+    state = tmp_path / "state"
+    benign = [cs.case("py-benign")]
+    assert len(run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=benign)) == 1
+
+    # A run started on the same stack but never written down, as if the runner had been stopped
+    # right after starting it: it waits for budget it will never get.
+    stack = Stack(state / "stack", temporal_db=True, fixture=False)
+    try:
+        ids = {runner.repo_id(name): {"mirror": str(path)} for name, path in repos.items()}
+        stack.start_agentd(policy=runner.policy(list(ids)), models=a.models, prices=a.prices, repos=ids)
+        stray = stack.agentctl("runs", "start", "security-audit", "--repo", runner.repo_id("shop"),
+                               "--commit", cs.case("py-benign").commit, "--base", "main", "--budget-micros", "10000",
+                               "--dry-run")
+    finally:
+        stack.close()
+
+    # The next runner cancels it, and still runs what it was asked to.
+    second = run(cs, [a], repos, state, runs=2, budget_micros=BUDGET, cap_micros=1_000_000, cases=benign)
+    assert sorted(r["rep"] for r in second) == [1, 2] and stray["run_id"] not in {r["run_id"] for r in second}
+    ledger = sqlite3.connect(f"file:{state / 'stack/agentd/data/ledger.db'}?mode=ro", uri=True)
+    [(cancelled,)] = ledger.execute("SELECT cancelled_at FROM runs WHERE workflow_id = ?", (stray["run_id"],)).fetchall()
+    ledger.close()
+    assert cancelled, "the stray run was not cancelled"

@@ -9,9 +9,13 @@ state directory records each run as it starts and as it ends; the state director
 Temporal's database and agentd's ledger, so a runner started again on it picks up the runs in
 flight and skips the ones done.
 
-Money: a paid profile needs a cap. A run starts only if what the runs so far have spent, plus
-the budgets of the paid runs in flight, plus its own budget stay within the cap. agentd never
-lets a run spend past its budget, so the runs never spend past the cap.
+Money: a paid profile needs a cap. A run starts only if what agentd's ledger says the state
+directory's runs have spent (settled, or reserved and not yet settled), plus the budgets of the
+paid runs not yet ended, plus its own budget stay within the cap. agentd never lets a run spend
+past its budget, so the runs never spend past the cap; if one ever did (a reservation bound
+that is wrong, which agentd logs as an error), the runner starts no more paid runs. A run the
+ledger has and the journal does not (a runner stopped between starting it and writing it down)
+is cancelled when the next runner starts: nobody would watch it.
 """
 
 from __future__ import annotations
@@ -120,6 +124,8 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
     returns the journal's results: these runs' and any an earlier runner on `state` finished."""
     if any(p.paid for p in profiles) and cap_micros is None:
         raise ValueError("a paid profile needs a cap on what the runs may spend")
+    if budget_micros <= 0:  # agentd takes 0 for its default budget, which the cap would not see
+        raise ValueError("each run needs a budget above 0")
     cases = list(cs.cases if cases is None else cases)
     missing = [c.id for c in cases if not c.commit]
     if missing:
@@ -129,6 +135,7 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
     repos = {repo_id(name): {"mirror": str(path)} for name, path in mirrors.items()}
     (state / "stack").mkdir(exist_ok=True)
     stack = Stack(state / "stack", temporal_db=True, fixture=False)
+    overspent = False
     try:
         for profile in profiles:
             done = {(e["case"], e["rep"]) for e in journal.results() if e["profile"] == profile.name}
@@ -142,13 +149,18 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
             stack.start_agentd(policy=policy(list(repos)), models=profile.models, prices=profile.prices, repos=repos)
             if not stack.workers:
                 stack.start_worker()
+                _cancel_unknown(stack, journal, log)
             log(f"[{profile.name}] {len(todo)} runs to start, {len(resumed)} to pick up")
             watching = {e["run_id"]: {**e, "since": time.monotonic()} for e in resumed}
             while todo or watching:
                 while todo and len(watching) < profile.concurrency:
+                    if profile.paid and overspent:
+                        log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
+                        todo.clear()
+                        break
                     if profile.paid and cap_micros is not None:
                         committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
-                        if _spent(journal) + committed + budget_micros > cap_micros:
+                        if _spent(stack) + committed + budget_micros > cap_micros:
                             if not watching:  # no run in flight will free any room
                                 log(f"[{profile.name}] {len(todo)} runs not started: one more could take the "
                                     f"spending past the cap of ${cap_micros / 1e6:.2f}")
@@ -164,6 +176,10 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
                         journal.append(record)
                         del watching[run_id]
                         log(_line(cs, record))
+                        if record["spent_micros"] > entry["budget_micros"]:
+                            overspent = True
+                            log(f"[{profile.name}] run {run_id} spent ${record['spent_micros'] / 1e6:.4f}, past its "
+                                f"budget of ${entry['budget_micros'] / 1e6:.4f}: no more paid runs start")
                 if watching:
                     time.sleep(1)
     finally:
@@ -171,8 +187,31 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
     return journal.results()
 
 
-def _spent(journal: Journal) -> int:
-    return sum(e["spent_micros"] for e in journal.results())
+def _spent(stack: Stack) -> int:
+    """What every run in agentd's ledger has spent, or may have: settled, and reserved but not
+    yet settled or released."""
+    if not (stack.data_dir / "ledger.db").exists():
+        return 0
+    [row] = stack.ledger(
+        "SELECT (SELECT COALESCE(SUM(amount_micros), 0) FROM budget_entries WHERE kind = 'SETTLE') + "
+        "(SELECT COALESCE(SUM(r.amount_micros), 0) FROM budget_entries r WHERE r.kind = 'RESERVE' AND NOT EXISTS "
+        "(SELECT 1 FROM budget_entries c WHERE c.request_id = r.request_id AND c.kind IN ('SETTLE', 'RELEASE'))) AS spent")
+    return row["spent"]
+
+
+def _cancel_unknown(stack: Stack, journal: Journal, log) -> None:
+    """Cancels the runs agentd has that the journal does not: a runner stopped between starting
+    them and writing them down. Their spending is in the ledger, and counts against the cap."""
+    known = {e["run_id"] for e in journal.entries()}
+    for row in stack.ledger("SELECT workflow_id, run_id FROM runs"):
+        if row["workflow_id"] in known or row["run_id"] is None:
+            continue
+        run = {"run_id": row["workflow_id"], "temporal_run_id": row["run_id"]}
+        if stack.get_run(run)["state"] not in TERMINAL | {"UNKNOWN"}:
+            log(f"cancelling run {row['workflow_id']}: started, but not in the journal")
+            stack.agentctl("runs", "cancel", row["workflow_id"])
+            wait_for(lambda: stack.get_run(run)["state"] in TERMINAL | {"UNKNOWN"},
+                     f"run {row['workflow_id']} to end", timeout=180, interval=1)
 
 
 def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budget: int) -> dict:
