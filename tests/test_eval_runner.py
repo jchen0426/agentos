@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from evals import __main__ as cli
 from evals import cases as casefile
-from evals import mirrors, report, runner, score
+from evals import runner, score
 from tests import eval_fixture
 from tests.harness import AUDIT_SCHEMA, BIN, Proc, wait_for
 
@@ -40,13 +41,14 @@ def profiles(url: str) -> list[runner.Profile]:
 
 
 @pytest.fixture
-def evalset(tmp_path: Path) -> tuple[casefile.CaseSet, dict[str, Path]]:
+def evalset(tmp_path: Path) -> tuple[casefile.CaseSet, dict[str, Path], Path]:
+    """The case set, with the IDs of the commits we make recorded (python -m evals mirrors
+    --record), its repositories, and its file."""
     root = tmp_path / "repos"
-    doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
-    built = mirrors.build(casefile.parse(doc), tmp_path / "cache", log=lambda *_: None)
-    for c in doc["cases"]:
-        c["commit"] = built[c["id"]]["commit"]
-    return casefile.parse(doc, "test"), {"shop": root / "shop", "cparse": root / "cparse"}
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(eval_fixture.cases_doc(root, eval_fixture.make_repos(root))))
+    assert cli.main(["--cases", str(path), "mirrors", "--cache", str(tmp_path / "cache"), "--record"]) == 0
+    return casefile.load(path), {"shop": root / "shop", "cparse": root / "cparse"}, path
 
 
 @pytest.fixture
@@ -75,7 +77,7 @@ def run(*args, **kwargs) -> list[dict]:
 
 
 def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, modelsim: str) -> None:
-    cs, repos = evalset
+    cs, repos, path = evalset
     (tmp_path / "answers.json").write_text(json.dumps(eval_fixture.answers()))
     state = tmp_path / "state"
     results = run(cs, profiles(modelsim), repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000)
@@ -133,18 +135,19 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert (b["refusals"], b["invalid_output"]["invalid"], b["cost_usd"]["total"], b["cache_hit_rate"]) == (0, 0, 0, 0)
 
     # The report shows them, and keeps no explanation or patch of any finding.
-    data = report.write(cs, results, tmp_path / "out" / "report", {"title": "test", "commit": "x", "runs": 3})
-    md = (tmp_path / "out" / "report.md").read_text()
+    out = tmp_path / "out" / "report"
+    assert cli.main(["--cases", str(path), "report", "--state", str(state), "--out", str(out), "--title", "test"]) == 0
+    md = out.with_suffix(".md").read_text()
     assert "44%（4/9；95% 区间" in md and "67%（6/9；95% 区间" in md, md
     assert "| anthropic/claude-opus-5-5 | local/gpt-oss:20b |" in md
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
-    raw = (tmp_path / "out" / "report.json").read_text()
+    raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw
-    assert data["metrics"]["a"]["detection"]["hits"] == 4
+    assert json.loads(raw)["metrics"] == json.loads(json.dumps(m))
 
 
 def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path: Path, evalset, modelsim: str) -> None:
-    cs, repos = evalset
+    cs, repos, _ = evalset
     (tmp_path / "answers.json").write_text(json.dumps(
         [{"contains": "format_price", "answers": [{"report": eval_fixture.report()}] * 6}]))
     benign = [cs.case("py-benign")]
@@ -162,3 +165,18 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     assert sorted(r["rep"] for r in second) == [1, 2, 3, 4, 5, 6]
     assert len({r["run_id"] for r in second}) == 6
     assert sum(r["spent_micros"] for r in second) == 6 * ANSWER
+
+
+def test_a_run_paused_for_budget_is_stopped_and_found_nothing(tmp_path: Path, evalset, modelsim: str) -> None:
+    cs, repos, _ = evalset
+    (tmp_path / "answers.json").write_text(json.dumps([{"contains": "format_price", "answers": [
+        {"report": eval_fixture.report(eval_fixture.finding(6, "CWE-20", "medium", "app/prices.py"))}]}]))
+    a = profiles(modelsim)[0]
+    # Less than one request's reservation: the run waits for more budget, and the runner stops it.
+    [r] = run(cs, [a], repos, tmp_path / "state", runs=1, budget_micros=10_000, cap_micros=1_000_000,
+              cases=[cs.case("py-benign")])
+    assert (r["ended_by"], r["state"], r["outcome"], r["report"], r["spent_micros"]) == ("budget", "CANCELLED", "", None, 0)
+    assert not score.false_positive(r, None)
+    # Nothing reached the provider: 4096 tokens of output alone cost more than the budget.
+    assert not (tmp_path / "modelsim.jsonl").exists()
+    assert score.metrics(cs, [r])["a"]["outcomes"] == {"(budget)": 1}

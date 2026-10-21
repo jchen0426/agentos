@@ -59,6 +59,7 @@ def table(cs: CaseSet, built: dict[str, dict] | None = None) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m evals", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cases", type=Path, default=casefile.CASES, help="the case set (default: evals/cases.json)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     m = sub.add_parser("mirrors", help="fetch the projects, make our commits, check every case")
     m.add_argument("--cache", type=Path, default=mirrors.default_cache())
@@ -86,14 +87,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cwe":
         cwe.DATA.write_text(json.dumps(cwe.generate(args.xml), separators=(",", ":")) + "\n")
         return 0
-    cs = casefile.load()
+    cs = casefile.load(args.cases)
     if args.cmd == "mirrors":
         built = mirrors.build(cs, args.cache)
         if args.record:
-            doc = json.loads(casefile.CASES.read_text())
+            doc = json.loads(args.cases.read_text())
             for case in doc["cases"]:
                 case["commit"] = built[case["id"]]["commit"]
-            casefile.CASES.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+            args.cases.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
         return 0
     if args.cmd == "table":
         text = table(cs, mirrors.build(cs, args.cache, log=lambda *_: None))

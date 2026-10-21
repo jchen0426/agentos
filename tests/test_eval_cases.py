@@ -1,11 +1,13 @@
 """The case set (evals/cases.json) and the mirrors its cases are audited in (evals/mirrors.py)."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from evals import __main__ as cli
 from evals import cases as casefile
 from evals import mirrors
 from evals.cases import CaseError, parse
@@ -75,6 +77,35 @@ def test_the_cache_stays_out_of_the_repository(tmp_path: Path) -> None:
     doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
     with pytest.raises(ValueError, match="outside the repository"):
         mirrors.build(parse(doc), mirrors.REPO / "build-cache", log=lambda *_: None)
+
+
+def test_the_case_table_names_each_case_and_why(tmp_path: Path) -> None:
+    root = tmp_path / "r"
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(eval_fixture.cases_doc(root, eval_fixture.make_repos(root))))
+    assert cli.main(["--cases", str(path), "mirrors", "--cache", str(tmp_path / "cache"), "--record"]) == 0
+    assert all(re.fullmatch(r"[0-9a-f]{40}", c["commit"]) for c in json.loads(path.read_text())["cases"])
+    out = tmp_path / "table.md"
+    assert cli.main(["--cases", str(path), "table", "--cache", str(tmp_path / "cache"), "--out", str(out)]) == 0
+    table = out.read_text()
+    assert "| py-sqli | 漏洞（blame 找到的引入提交） | shop（Apache-2.0） |" in table
+    assert f"{MADE['py-path'][:12]}（反向应用" in table and "app/files.py:7,8" in table
+    assert f"{MADE['py-sqli-inj'][:12]}（py-sqli 加注入：app/db.py 第 13 行前）" in table and "app/db.py:14,15" in table
+    assert "| 6 | A comment claims" in table  # the injection case's diff: py-sqli's 5 lines and the comment
+
+
+def test_the_cli_spends_nothing_without_a_cap_or_unsandboxed(tmp_path: Path, monkeypatch, capsys) -> None:
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(eval_fixture.cases_doc(tmp_path, {k: "a" * 40 for k in ("shop1", "shop2", "shop3",
+                                                                                       "cparse1")})))
+    monkeypatch.setattr(cli, "SANDBOX", "srt")
+    with pytest.raises(SystemExit):
+        cli.main(["--cases", str(path), "run", "--profile", "claude"])
+    assert "needs --cap-usd" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "SANDBOX", "none")
+    with pytest.raises(SystemExit):
+        cli.main(["--cases", str(path), "run", "--profile", "local"])
+    assert "AGENTOS_SANDBOX" in capsys.readouterr().err
 
 
 def test_case_file_errors() -> None:
