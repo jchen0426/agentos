@@ -55,7 +55,9 @@ import (
 //  6. The report's approval lines are the ledger's: each approval as it ended, an approved write
 //     as it went; and an approval that expired after a request of its write went out says so.
 //
-// An approval is also only ever used (it moves its write to PENDING) before it expires.
+// An approval is also only ever used (it moves its write to PENDING) before it expires; and no
+// request of a run's write goes out once the run is cancelled (proceed checks it in the same
+// statement that lets the request go out).
 //
 // A failing seed prints its walk. Walk one alone, with its log, with
 //
@@ -201,9 +203,10 @@ type toolPolicy struct {
 }
 
 type runModel struct {
-	id     string
-	dryRun bool
-	ended  bool // its workflow ended: nobody calls for it any more
+	id        string
+	dryRun    bool
+	cancelled bool
+	ended     bool // its workflow ended: nobody calls for it any more
 }
 
 // effectModel is what the walk knows of an effect: what the outside world and the tools told
@@ -649,6 +652,9 @@ func (m *machine) send(inc *incarnation, t *smTool, id, key string, payload json
 // checkRequest checks invariants 1 and 2 for a request of an effect about to go out.
 func (m *machine) checkRequest(inc *incarnation, t *smTool, id, key string, payload json.RawMessage, now time.Time) {
 	fx := m.effect(id)
+	if fx.run.cancelled {
+		m.fail("a request of %s went out after its run was cancelled", m.name(id))
+	}
 	pol := inc.policy[t.name]
 	rule := pol.require && inc.live && !fx.run.dryRun
 	a, err := inc.led.Q.GetApprovalByEffect(m.ctx, id)
@@ -856,6 +862,7 @@ func (m *machine) cancel() {
 	if err != nil {
 		m.fatal(err)
 	}
+	r.cancelled = true
 	m.logf("%s is cancelled (%d)", r.id, n)
 }
 

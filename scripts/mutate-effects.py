@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The mutation check of the effect protocol's state machine (docs/statemachine-notes.md).
 
-Each mutation puts back a bug that a review of M4 (docs/m4-notes.md, rounds 3 to 5) or the state
-machine found, as an exact edit of the code at the commit that added this script; the state machine
+Each mutation puts back a bug that a review of M4 found (docs/m4-notes.md: rounds 3 to 5, and a few
+from earlier rounds), or the state machine did, as an exact edit of the code at the commit that added this script; the state machine
 must then fail on its default seeds and regressionSeeds. The script applies one mutation at a time,
 runs `go test ./internal/gateway -run TestEffectProtocolStateMachine`, prints whether it was caught
 (the first failing seed and the broken invariant) and restores the files with `git checkout`.
@@ -89,6 +89,27 @@ MUTATIONS = {
     "R5.4 an approved write moves to PENDING past its approval's time": [
         (G + "approvals.go", "\t\tif expired(cur) {\n\t\t\treason := fmt.Sprintf(\"approved by %s at %s, but the run did not act on it",
          "\t\tif false {\n\t\t\treason := fmt.Sprintf(\"approved by %s at %s, but the run did not act on it")],
+    # Earlier rounds, and the cancel, for breadth.
+    "E1 a write recorded without an approval goes out unapproved (round 1, 1)": [
+        (G + "effects.go", "\t\t\tif rule != nil {\n\t\t\t\tif res, err := g.gate(",
+         "\t\t\tif false {\n\t\t\t\tif res, err := g.gate(")],
+    "E2 recovery sends again a write nobody approved (re-review, 4)": [
+        (G + "approvals.go", "\tif rule == nil {\n\t\treturn true, nil\n\t}\n\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)",
+         "\tif rule == nil || true {\n\t\treturn true, nil\n\t}\n\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)")],
+    "E3 a decision that names another payload counts": [
+        (G + "approvals.go", "\t\tcase d.PayloadSHA256 != cur.PayloadSha256:", "\t\tcase false:")],
+    "E4 a later decision replaces the first": [
+        (G + "approvals.go", "\t\tif cur.Status != approvalPending {\n\t\t\treturn &DecidedError{cur}\n\t\t}",
+         "\t\tif cur.Status == approvalExpired {\n\t\t\treturn &DecidedError{cur}\n\t\t}"),
+        (SQL, "  edited_args_sha256 = ?\nWHERE approval_id = ? AND status = 'PENDING'\n",
+              "  edited_args_sha256 = ?\nWHERE approval_id = ?\n")],
+    "C1 a cancelled run's write still goes out": [
+        (SQL, "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n"
+              "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n`\n\nconst",
+              "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n`\n\nconst"),
+        (SQL, "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n"
+              "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n",
+              "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n")],
     # The bugs this state machine found (the fixes, undone).
     "S1 an approved write that only dry-ran reads as approved": [
         (G + "records.go", "effectDenied: \"not sent\", effectDryRun: \"not sent\",", "effectDenied: \"not sent\",")],
