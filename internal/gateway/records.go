@@ -26,10 +26,15 @@ func (r RunRecords) RunApprovals(ctx context.Context, workflowID string) ([]gith
 			if err != nil {
 				return nil, err
 			}
-			ga.Write = map[string]string{effectAbandoned: "not sent", effectDenied: "not sent", effectFailed: "failed",
-				effectUnknown: "outcome unknown"}[e.Status]
+			ga.Write = map[string]string{effectAbandoned: "not sent", effectDenied: "not sent", effectDryRun: "not sent",
+				effectFailed: "failed", effectUnknown: "outcome unknown"}[e.Status]
 			if ga.Write != "" {
 				ga.WriteReason = e.Reason.String
+			}
+			if e.Status == effectDryRun {
+				// The approval was decided under an agentd that could reach the tool's system, and the
+				// write taken up by one that could not.
+				ga.WriteReason = "agentd could not reach the tool's system, and only dry-ran it"
 			}
 		}
 		out = append(out, ga)
