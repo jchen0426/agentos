@@ -168,6 +168,10 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 			return g.effectResult(ctx, e)
 		case !e.ClaimedBy.Valid:
 			if run.DryRun != 0 || !t.Live() {
+				if e.MaybeSent != 0 {
+					// An earlier agentd may have sent it: this one can neither send it again nor look.
+					return g.unsent(ctx, e, effectDryRun, "agentd cannot reach the tool's system now")
+				}
 				return g.settle(ctx, e, effectDryRun, t.DryRun(payload), "")
 			}
 			// A write the policy wants approved goes only with an approval in its time: recorded
@@ -191,7 +195,7 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 					return nil, err
 				}
 				if e.Status == effectPending && !e.ClaimedBy.Valid {
-					return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
+					return g.unsent(ctx, e, effectAbandoned, "the run was cancelled before the request was sent")
 				}
 			}
 		case e.ClaimedBy.String == g.Incarnation && g.isSending(e.EffectID):
@@ -395,20 +399,20 @@ func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 		return res, err
 	case errors.As(err, &denied):
 		// The tool refused the recorded payload before sending anything: it never will be.
-		return g.settle(ctx, e, effectDenied, nil, denied.Reason)
+		return g.unsent(ctx, e, effectDenied, denied.Reason)
 	case errors.Is(err, tools.ErrNotSent) || errors.As(err, &refused) && refused.Retryable:
 		// This attempt did nothing outside. A cancelled run's effect is done with; anyone else's goes
 		// back for a later attempt: as one that never took effect, unless an earlier attempt may
 		// have (e is as it was when this one began).
 		if cancelled, cerr := g.runCancelled(ctx, run.WorkflowID); cerr == nil && cancelled {
-			return g.settle(ctx, e, effectAbandoned, nil, "the run was cancelled before the request was sent")
+			return g.unsent(ctx, e, effectAbandoned, "the run was cancelled before the request was sent")
 		}
 		if _, rerr := g.giveBack(ctx, e, e.MaybeSent == 0); rerr != nil {
 			g.Log.Error("could not release an unsent effect", "effect_id", e.EffectID, "error", rerr)
 		}
 		return nil, temporal.NewApplicationError(fmt.Sprintf("tool %s: %v", t.Name(), err), "ToolNotSent")
 	case errors.As(err, &refused):
-		return g.settle(ctx, e, effectFailed, nil, refused.Reason)
+		return g.unsent(ctx, e, effectFailed, refused.Reason)
 	case errors.As(err, &conflict):
 		return g.settle(ctx, e, effectUnknown, nil, conflict.Reason)
 	}
@@ -557,7 +561,8 @@ func (g *Gateway) resend(ctx context.Context, run db.Run, t tools.Writer, e db.E
 		// Cancelled meanwhile, or changed: a cancelled run's effect is done with.
 		if cancelled, err := g.runCancelled(ctx, run.WorkflowID); err == nil && cancelled {
 			if cur, err := g.Ledger.Q.GetEffect(ctx, e.EffectID); err == nil && cur.Status == effectPending {
-				return g.settle(ctx, cur, effectAbandoned, nil, "the run was cancelled, and its request never took effect")
+				cur.MaybeSent = e.MaybeSent // what agentd knows: a lookup may have found it never took effect
+				return g.unsent(ctx, cur, effectAbandoned, "the run was cancelled before the request was sent again")
 			}
 		}
 		return nil, errEffectBusy
@@ -605,6 +610,16 @@ func (g *Gateway) settle(ctx context.Context, e db.Effect, status string, value 
 	return g.effectResult(ctx, e)
 }
 
+// unsent settles an effect this attempt did not send, nor will: as status, for reason; unless an
+// earlier attempt may have taken effect (e.MaybeSent). A write that may have is never recorded as
+// one that did not (ABANDONED, DENIED, FAILED, DRY_RUN): a person settles it.
+func (g *Gateway) unsent(ctx context.Context, e db.Effect, status, reason string) (*agentosv1.Result, error) {
+	if e.MaybeSent != 0 {
+		status, reason = effectUnknown, reason+"; but an earlier attempt may have taken effect"
+	}
+	return g.settle(ctx, e, status, nil, reason)
+}
+
 // effectResult is what a call gets for an effect in a settled state.
 func (g *Gateway) effectResult(ctx context.Context, e db.Effect) (*agentosv1.Result, error) {
 	switch e.Status {
@@ -639,14 +654,20 @@ func (g *Gateway) runCancelled(ctx context.Context, workflowID string) (bool, er
 }
 
 // RecoverEffects settles, as agentd starts, the effects the previous agentd process left:
-// those of cancelled runs it never sent are abandoned; those it claimed are looked up in the
-// background, under the key a retry of the call joins. Nothing is sent from here: an effect
-// that never took effect waits for its run's next call.
+// those of cancelled runs it did not hold are abandoned, or go to a person when an attempt may
+// have made them; those it claimed are looked up in the background, under the key a retry of
+// the call joins. Nothing is sent from here: an effect that never took effect waits for its
+// run's next call.
 func (g *Gateway) RecoverEffects(ctx context.Context) error {
 	if n, err := g.Ledger.Q.AbandonUnsentEffects(ctx, ledger.Now()); err != nil {
 		return err
 	} else if n > 0 {
 		g.Log.Info("abandoned the unsent effects of cancelled runs", "count", n)
+	}
+	if n, err := g.Ledger.Q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {
+		return err
+	} else if n > 0 {
+		g.Log.Warn("cancelled runs left effects that may have taken effect: a person settles them", "count", n)
 	}
 	claimed, err := g.Ledger.Q.ListClaimedEffects(ctx, valid(g.Incarnation))
 	if err != nil {

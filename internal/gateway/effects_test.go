@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
@@ -517,5 +518,89 @@ func TestEffectClassComesFromTheTool(t *testing.T) {
 		if (err != nil) != c.refused || got != c.want {
 			t.Errorf("%T stated %q: got %q, %v", c.tool, c.stated, got, err)
 		}
+	}
+}
+
+// A write that may have taken effect (a request of it went out, and nothing since showed that it did
+// not take effect: maybe_sent) is never recorded as one that did not, whatever stops the attempt at
+// hand: the tool denies it, the outside world refuses it for good, agentd only dry-runs, the run was
+// cancelled. An earlier attempt may have made it: a person settles it.
+func TestAWriteThatMayHaveTakenEffectIsNeverRecordedAsNotSent(t *testing.T) {
+	ctx := context.Background()
+	call := func(f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+		return f.g.effect(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil, faults.Effect{})
+	}
+	idempotent := func(w *writer) (tools.Writer, *writer) {
+		w.class = policy.EffectIdempotent
+		return w, w
+	}
+	for _, c := range []struct {
+		name string
+		w    func() (tools.Writer, *writer) // the tool, and what it sent
+		do   func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error)
+	}{
+		{"the tool denies it", func() (tools.Writer, *writer) { return idempotent(&writer{deny: "not what GitHub holds"}) }, nil},
+		{"the outside world refuses it for good", func() (tools.Writer, *writer) {
+			return idempotent(&writer{after: &tools.RefusedError{Reason: "unprocessable"}})
+		}, nil},
+		{"agentd only dry-runs", func() (tools.Writer, *writer) {
+			w := &offline{writer{class: policy.EffectIdempotent}}
+			return w, &w.writer
+		}, nil},
+		{"the run was cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				f.cancel(t)
+				return call(f, w)
+			}},
+		{"the run was cancelled while the tool sent nothing", func() (tools.Writer, *writer) {
+			return idempotent(&writer{release: make(chan struct{}), unsent: true})
+		}, func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+			type answer struct {
+				res *agentosv1.Result
+				err error
+			}
+			done := make(chan answer)
+			go func() {
+				res, err := call(f, w)
+				done <- answer{res, err}
+			}()
+			f.waitClaimed(t)
+			f.cancel(t)
+			close(w.(*writer).release)
+			a := <-done
+			return a.res, a.err
+		}},
+		{"agentd starts after the run was cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				f.cancel(t)
+				return nil, f.g.RecoverEffects(ctx)
+			}},
+		{"a resend finds the run cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				payload, err := f.g.payload(ctx, f.status(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.cancel(t)
+				return f.g.resend(ctx, f.run, w, f.status(t), payload)
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, false)
+			w, sent := c.w()
+			if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil); res != nil || err != nil {
+				t.Fatalf("record: %v %v", res, err)
+			}
+			f.sentThenGivenBack(t, f.req().EffectID)
+			do := c.do
+			if do == nil {
+				do = func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) { return call(f, w) }
+			}
+			res, err := do(t, f, w)
+			if e := f.status(t); err != nil || res != nil && res.GetStatus() != StatusNeedsReconcile || e.Status != effectUnknown ||
+				sent.sent.Load() != 0 {
+				t.Fatalf("%v %v: effect %s %q, sent %d", res.GetStatus(), err, e.Status, e.Reason.String, sent.sent.Load())
+			}
+		})
 	}
 }
