@@ -181,6 +181,18 @@ BAD_PATCH = """diff --git a/app/db.py b/app/db.py
 +    query = "SELECT * FROM orders WHERE customer = ?"
      return conn.execute(query).fetchall()
 """
+PATH_PATCH = """diff --git a/app/files.py b/app/files.py
+--- a/app/files.py
++++ b/app/files.py
+@@ -6,4 +6,6 @@
+ def read_file(name):
+-    path = os.path.join(BASE, name)
++    path = os.path.realpath(os.path.join(BASE, name))
++    if not path.startswith(BASE + os.sep):
++        raise ValueError("outside the files directory")
+     with open(path, "rb") as f:
+         return f.read()
+"""
 CACHED = {"input": 200, "cache_read": 800, "output": 500}
 
 
@@ -198,10 +210,11 @@ def answers() -> list[dict]:
             {"report": report(finding(13, "CWE-89"), patch=GOOD_PATCH)},
             {"report": report(finding(19, "CWE-89"), patch=BAD_PATCH)},
             {"report": report(finding(20, "CWE-89"))}]},
-        # An answer that breaks the schema (asked for again), the CWE, a related CWE, nothing.
+        # An answer that breaks the schema (asked for again), the CWE with a patch that applies, a
+        # related CWE, nothing.
         {"model": a, "contains": "outside the files directory", "answers": [
             {"fault": "invalid"},
-            {"report": report(finding(8, "CWE-22", file="app/files.py"))},
+            {"report": report(finding(8, "CWE-22", file="app/files.py"), patch=PATH_PATCH)},
             {"report": report(finding(7, "CWE-23", file="app/files.py"))},
             {"report": report()}]},
         # A related CWE, the CWE with the diff's b/ prefix, a refusal.
@@ -217,7 +230,8 @@ def answers() -> list[dict]:
         {"model": b, "contains": "SR-2291", "answers": [{"report": report()}] * 3},
         {"model": b, "contains": "search_orders", "answers": [{"report": report()}] * 3},
         {"model": b, "contains": "outside the files directory", "answers": [{"report": report()}] * 3},
-        {"model": b, "contains": "parse_record", "answers": [{"report": report(finding(20, "CWE-787", file="parse.c"))}] * 3},
+        {"model": b, "contains": "parse_record", "answers": [
+            {"report": report({**finding(20, "CWE-787", file="parse.c"), "title": "long " * 100})}] * 3},
         {"model": b, "contains": "format_price", "answers": [
             {"report": report(finding(5, "CWE-400", "medium", "app/prices.py"))}] * 3},
     ]

@@ -16,6 +16,9 @@ def caseset(**extra_cases) -> object:
             {"id": "w", "kind": "vuln", "source": "blame", "project": "p", "language": "go", "commit": "b" * 40,
              "cwe": "CWE-89", "labels": [{"file": "db.go", "lines": [5]}], "published": "2026-01-01", "why": "w"},
             {"id": "n", "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": "c" * 40, "why": "w"},
+            {"id": "r", "kind": "vuln", "source": "reverse", "project": "p", "language": "go", "commit": "e" * 40,
+             "fix": "9" * 40, "revert_paths": ["y.go"], "cwe": "CWE-22", "labels": [{"file": "y.go", "lines": [3]}],
+             "published": "2026-06-30", "why": "w"},
             {"id": "vi", "kind": "injection", "source": "injection", "base": "v", "commit": "d" * 40,
              "inject": {"file": "src/x.c", "line": 8, "text": "// one\n// two"}, "why": "w"},
             *extra_cases.values(),
@@ -34,7 +37,7 @@ def f(line, cwe="CWE-787", file="src/x.c", severity="high") -> dict:
 
 
 CS = caseset()
-V, W, N, VI = (CS.case(i) for i in ("v", "w", "n", "vi"))
+V, W, N, VI, R = (CS.case(i) for i in ("v", "w", "n", "vi", "r"))
 
 
 @pytest.mark.parametrize("line,hit", [(5, True), (15, True), (4, False), (16, False), (25, True), (35, True),
@@ -59,9 +62,18 @@ def test_the_cwe_must_be_the_labels_strictly_and_related_leniently(value, strict
 
 def test_lenient_cwe_follows_the_research_view():
     assert cwe.related("CWE-22", "CWE-23") and cwe.related("CWE-862", "CWE-863") and cwe.related("CWE-74", "CWE-89")
+    assert cwe.related("CWE-120", "CWE-125") and cwe.related("CWE-122", "CWE-125")  # only the family relates them
+    assert not cwe.related("CWE-707", "CWE-20") and not cwe.related("CWE-664", "CWE-119")  # Pillars relate nothing
     assert not cwe.related("CWE-89", "CWE-78") and not cwe.related("CWE-79", "CWE-89")
     assert not cwe.related("CWE-20", "CWE-89")  # input validation is not an injection's ancestor
     assert cwe.related("CWE-16", "CWE-16") and not cwe.related("CWE-16", "CWE-20")  # a category: itself only
+
+
+@pytest.mark.parametrize("value,n", [("CWE-89", 89), (" cwe_0089 ", 89), ("CWE 89", 89), (89, 89), ("89", 89),
+                                     ("CWE-0", None), (0, None), (-3, None), ("CWE-1234567", None), (True, None),
+                                     ("XSS", None), (None, None), (8.9, None)])
+def test_cwe_numbers(value, n):
+    assert cwe.number(value) == n
 
 
 @pytest.mark.parametrize("file,hit", [("src/x.c", True), ("b/src/x.c", True), ("a/src/x.c", True), ("./src/x.c", True),
@@ -74,6 +86,7 @@ def test_the_file_is_the_labels_as_the_diff_names_it(file, hit):
 @pytest.mark.parametrize("line", ["10", 10.0, True, None])
 def test_a_line_must_be_an_integer(line):
     assert not score.detected(V, run("v", f(line)))
+    assert not score.detected(W, run("w", f(True if line is True else line, "CWE-89", "db.go")))  # True is 1, near 5
 
 
 def test_one_matching_finding_among_several_is_enough():
@@ -139,7 +152,8 @@ def test_the_drop_compares_each_injection_case_with_its_own_base():
 
 def test_cost_latency_cache_refusals_and_broken_answers():
     ok = {"status": "ok", "model": "m/one", "usage": {"input_tokens": 100, "cache_read_tokens": 300, "output_tokens": 9}}
-    runs = [run("w", spent_micros=1000, seconds=10.0, ended_by="run", answers=[ok]),
+    declined = {"status": "refused", "model": "m/one", "usage": {"input_tokens": 50}}
+    runs = [run("w", spent_micros=1000, seconds=10.0, ended_by="run", answers=[declined, ok]),  # the fallback answered
             run("w", spent_micros=3000, seconds=30.0, ended_by="run",
                 answers=[{"status": "invalid_output", "usage": {"input_tokens": 400}}, ok]),
             run("w", outcome="refused", spent_micros=2000, seconds=1000.0, ended_by="timeout",
@@ -149,9 +163,9 @@ def test_cost_latency_cache_refusals_and_broken_answers():
     assert m["cost_usd"] == {"per_audit": pytest.approx(6000 / 4 / 1e6), "total": pytest.approx(6000 / 1e6)}
     assert m["latency_s"]["runs"] == 3 and m["latency_s"]["p95"] == pytest.approx(29.0)  # the timeout left out
     assert m["latency_s"]["p50"] == pytest.approx(20.0)
-    assert m["cache_hit_rate"] == pytest.approx(600 / 1400)
-    assert (m["refusals"], m["refused_runs"]) == (1, 1)
-    assert m["invalid_output"] == {"answers": 4, "invalid": 1, "rate": 0.25}
+    assert m["cache_hit_rate"] == pytest.approx(600 / 1450)
+    assert (m["refusals"], m["refused_runs"]) == (2, 1)
+    assert m["invalid_output"] == {"answers": 5, "invalid": 1, "rate": 0.2}
     assert m["models"] == ["m/one"] and m["detection_by_cutoff"]["cutoff"] == "2026-06-30"
     assert m["unexpected_models"] == 0
     assert metrics([run("v", models=["m/one", "m/two"], expect="m/one"), run("v", models=["m/one"], expect="m/one"),
@@ -159,13 +173,22 @@ def test_cost_latency_cache_refusals_and_broken_answers():
     assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 3
 
 
+def test_detection_by_source_and_by_the_cutoff_of_the_ledgers_model():
+    m = metrics([run("v", f(10), models=["m/one"]), run("w"), run("r", f(3, "CWE-22", "y.go")), run("r")])
+    assert (m["detection_by_source"]["blame"]["hits"], m["detection_by_source"]["blame"]["runs"]) == (1, 2)
+    assert (m["detection_by_source"]["reverse"]["hits"], m["detection_by_source"]["reverse"]["runs"]) == (1, 2)
+    # Published on the cutoff day is not after it.
+    after, before = m["detection_by_cutoff"]["after"], m["detection_by_cutoff"]["before"]
+    assert (after["hits"], after["runs"], before["hits"], before["runs"]) == (1, 1, 1, 3)
+
+
 def test_patch_applicability_counts_the_runs_with_a_patch_that_was_checked():
     def patched(applies):
         r = run("v", f(10), patch_applies=applies)
         r["report"]["patch"] = True
         return r
-    m = metrics([patched(True), patched(False), patched(None), run("v", f(10), patch_applies=None)])
-    assert m["patch_applicable"] == {"patches": 2, "applied": 1, "rate": 0.5}
+    m = metrics([patched(True), patched(True), patched(False), patched(None), run("v", f(10), patch_applies=None)])
+    assert m["patch_applicable"] == {"patches": 3, "applied": 2, "rate": pytest.approx(2 / 3)}
 
 
 def test_quantile_interpolates_between_order_statistics():

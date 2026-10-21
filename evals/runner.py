@@ -147,7 +147,7 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
             while todo or watching:
                 while todo and len(watching) < profile.concurrency:
                     if profile.paid and cap_micros is not None:
-                        committed = sum(e["budget_micros"] for e in watching.values() if e["paid"])
+                        committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
                         if _spent(journal) + committed + budget_micros > cap_micros:
                             if not watching:  # no run in flight will free any room
                                 log(f"[{profile.name}] {len(todo)} runs not started: one more could take the "
@@ -187,7 +187,12 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
     """The run's result once it has ended; None while it runs. A run waiting for budget, an
     approval or a reconciliation, or past the profile's timeout, is cancelled and ended."""
     run = {"run_id": entry["run_id"], "temporal_run_id": entry["temporal_run_id"]}
-    state = stack.get_run(run)["state"]
+    try:
+        state = stack.get_run(run)["state"]
+    except AssertionError:  # agentctl failed: ask again on the next poll, until the timeout
+        if time.monotonic() - entry["since"] > profile.timeout:
+            raise
+        return None
     if state in TERMINAL:
         return collect(stack, entry, "run")
     if state == "UNKNOWN":  # Temporal no longer has it
@@ -237,6 +242,9 @@ def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
         report = {"findings": [{k: f.get(k) for k in ("severity", "cwe", "file", "line", "title")}
                                for f in value.get("findings") or [] if isinstance(f, dict)],
                   "patch": bool(value.get("patch_ref"))}
+        for f in report["findings"]:
+            if isinstance(f["title"], str):
+                f["title"] = f["title"][:200]  # the model's words: a line, not a quote of the code
     checks = stack.ledger("SELECT outcome FROM calls WHERE workflow_id = ? AND name = 'git.apply_check' "
                           "ORDER BY created_at", entry["run_id"])
     result = json.loads(info.get("result_json") or "{}")

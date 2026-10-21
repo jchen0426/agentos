@@ -2,6 +2,7 @@
 up Temporal, agentd and a sandboxed Worker, audits a tiny case set (tests/eval_fixture.py) in
 dry-run under two profiles, and the metrics come out as the scripted answers make them."""
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -116,7 +117,7 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     drop = a["injection_drop"]
     assert (drop["pairs"], drop["base"], drop["injected"]) == (1, pytest.approx(2 / 3), pytest.approx(1 / 3))
     assert drop["drop"] == pytest.approx(1 / 3)
-    assert a["patch_applicable"] == {"patches": 2, "applied": 1, "rate": 0.5}
+    assert a["patch_applicable"] == {"patches": 3, "applied": 2, "rate": pytest.approx(2 / 3)}
     assert (a["refusals"], a["refused_runs"]) == (1, 1)
     assert a["invalid_output"] == {"answers": 16, "invalid": 1, "rate": 1 / 16}
     assert a["cache_hit_rate"] == pytest.approx(800 / 16_000)
@@ -144,6 +145,8 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw
+    titles = [f["title"] for r in results if r["report"] for f in r["report"]["findings"]]
+    assert max(map(len, titles)) == 200, "a finding's title is cut to a line"
     assert json.loads(raw)["metrics"] == json.loads(json.dumps(m))
 
 
@@ -154,9 +157,15 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     benign = [cs.case("py-benign")]
     a = profiles(modelsim)[0]
     state = tmp_path / "state"
+    # A paid run another profile left unfinished: it spends up to its budget when its profile
+    # runs again, so it counts against the cap until then.
+    state.mkdir()
+    (state / "journal.jsonl").write_text(json.dumps({"event": "start", "profile": "z", "case": "py-sqli", "rep": 1,
+                                                     "run_id": "left-behind", "temporal_run_id": "x",
+                                                     "budget_micros": BUDGET, "paid": True}) + "\n")
     # Room for one run in flight at a time, with what the runs before it spent: exactly three
     # (the third's budget fills the cap to the micro).
-    first = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=BUDGET + 2 * ANSWER, cases=benign)
+    first = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=2 * BUDGET + 2 * ANSWER, cases=benign)
     assert [r["rep"] for r in first] == [1, 2, 3], first
     assert sum(r["spent_micros"] for r in first) == 3 * ANSWER
     with pytest.raises(ValueError, match="cap"):
@@ -173,7 +182,7 @@ def test_a_run_paused_for_budget_is_stopped_and_found_nothing(tmp_path: Path, ev
     cs, repos, _ = evalset
     (tmp_path / "answers.json").write_text(json.dumps([{"contains": "format_price", "answers": [
         {"report": eval_fixture.report(eval_fixture.finding(6, "CWE-20", "medium", "app/prices.py"))}]}]))
-    a = profiles(modelsim)[0]
+    a = dataclasses.replace(profiles(modelsim)[0], timeout=60)  # were it not stopped, it would time out
     # Less than one request's reservation: the run waits for more budget, and the runner stops it.
     [r] = run(cs, [a], repos, tmp_path / "state", runs=1, budget_micros=10_000, cap_micros=1_000_000,
               cases=[cs.case("py-benign")])

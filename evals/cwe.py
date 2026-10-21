@@ -88,8 +88,8 @@ def _family(n: int) -> set[int]:
         if kind == "Class":
             found.add(m)
             continue
-        for p in parents:
-            if p not in seen and view.get(p, ("",))[0] != "Pillar":
+        for p in parents:  # a Pillar has no parents: the walk ends there without a Class
+            if p not in seen:
                 seen.add(p)
                 todo.append(p)
     return found or {n}
@@ -102,8 +102,5 @@ def related(a: object, b: object) -> bool:
         return False
     if x == y:
         return True
-    view = _view()
-    if x not in view or y not in view or "Pillar" in (view[x][0], view[y][0]):
-        return False
     return (x in _ancestors(y) or y in _ancestors(x) or bool(_parents(x) & _parents(y))
             or bool(_family(x) & _family(y)))
