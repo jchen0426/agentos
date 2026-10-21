@@ -5,9 +5,10 @@
 #     at all;
 #   - allowlisted mounts only: /usr read-only (git and the C library), the server binary and
 #     the one mirror the call needs, read-only; a private /tmp of at most 64 MiB. The home
-#     directory, /run and agentd's data are never mounted. The root and /dev (tmpfs mounts
-#     bwrap makes, as large as half the memory) are read-only: /tmp is the only place to
-#     write, and /dev/null and the like still work;
+#     directory, /run and agentd's data are never mounted. The root (a tmpfs bwrap makes, as
+#     large as half the memory) is read-only: /tmp is the only place to write. /dev holds five
+#     device nodes, null, zero, full, random and urandom: no terminal and no pseudo-terminals,
+#     whose number this machine's sandboxes share;
 #   - --clearenv: no inherited environment variables;
 #   - no further user namespaces (--disable-userns);
 #   - per process: at most 4 GiB of address space (a small crafted repository can make git ask
@@ -36,12 +37,15 @@ args=(
   --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8 --setenv AGENTOS_TMPDIR /tmp
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
-  --proc /proc --dev /dev --size 67108864 --tmpfs /tmp
+  --proc /proc --size 67108864 --tmpfs /tmp
   --ro-bind "$(readlink -f "$mirror")" "$mirror"
   --ro-bind "$(readlink -f "$server")" "$server"
 )
+for node in null zero full random urandom; do
+  args+=(--dev-bind "/dev/$node" "/dev/$node")
+done
 [[ -e /usr/lib64 ]] && args+=(--symlink usr/lib64 /lib64)
-args+=(--remount-ro /dev --remount-ro /) # last: the mounts above need their mount points made first
+args+=(--remount-ro /) # last: the mounts above need their mount points made first
 
 ulimit -v $((4 * 1024 * 1024)) # KiB
 ulimit -S -t 30 && ulimit -H -t 40 # soft first: it may not exceed the hard limit

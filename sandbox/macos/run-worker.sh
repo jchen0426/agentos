@@ -5,12 +5,14 @@
 # destination the sandbox's proxy lets through is that one port. The Worker dials it with
 # the SDK's HTTP CONNECT proxy support (--http-connect-proxy env).
 #   - network: allowedDomains = ["127.0.0.1:<runtime port>"], allowLocalBinding = false
-#   - files: the home directory (both $HOME and the one the user database names), and any
-#     colon-separated paths in AGENTOS_SANDBOX_DENY_READ, are unreadable except the Python
-#     environment and the task code. Everything else can be read, so agentd's data directory
-#     and mirrors belong under the home directory or in AGENTOS_SANDBOX_DENY_READ. Seatbelt
-#     matches real paths, and srt keeps a symlink's spelling when it leads elsewhere, so each
-#     denied path goes in as given and as its real path; agentd's default data directory,
+#   - files: the home directory (both $HOME and the one the user database names), the shared
+#     temporary directories (/private/tmp, where every launch and every tool call keeps its state
+#     and other programs their files, and /private/var/folders), and the paths in
+#     AGENTOS_SANDBOX_DENY_READ, a JSON array, are unreadable except the Python environment, the
+#     task code and the Worker's private directory. Everything else can be read, so agentd's
+#     data directory and mirrors belong under the home directory or in AGENTOS_SANDBOX_DENY_READ.
+#     Seatbelt matches real paths, and srt keeps a symlink's spelling when it leads elsewhere, so
+#     each path goes in as given and as its real path; agentd's default data directory,
 #     ~/.agentos, is denied wherever it really is (as resolved when the Worker starts). The
 #     launcher refuses a Python environment or code directory that holds dev data, which the
 #     Worker could read (agentd's ledger, a .agentos directory, Temporal's dev database), or a
@@ -20,7 +22,8 @@
 #     which srt otherwise always allows and hands out as TMPDIR, to everything it runs
 #   - state: each launch has a directory, /tmp/agentos-sandbox.*, for srt's settings, srt's
 #     own sockets and the Worker's private directory. A Worker can read none of them but its
-#     own private directory. It goes when srt does, however srt ends (kill -9 included), with
+#     own private directory, as it reads nothing else in /tmp. It goes when srt does, however
+#     srt ends (kill -9 included), with
 #     one exception: a kill of srt's whole process group (or SIGKILL/SIGSTOP) takes the remover
 #     too, so the directory stays, still out of every Worker's reach, until agentd owns this in
 #     M5. The remover (rm-state.py) walks fd-relative, never following a symlink, so untrusted
@@ -99,15 +102,20 @@ node -e '
     }
   };
   const homes = [home, require("os").userInfo().homedir];
-  const denied = [...homes, ...homes.map(h => path.join(h, ".agentos")), ...deny.split(":").filter(Boolean)];
-  // The state of every launch, as mktemp names it, this one included: allowRead wins, so the
-  // Worker reads its own private directory there and nothing else.
-  const launches = path.join(real(path.dirname(state)), "agentos-sandbox.*");
+  const listed = JSON.parse(deny || "[]");
+  if (!Array.isArray(listed) || !listed.every(p => typeof p === "string")) {
+    throw new Error("AGENTOS_SANDBOX_DENY_READ must be a JSON array of paths");
+  }
+  // The shared temporary directories hold the state of every launch, this one included:
+  // allowRead wins for what is inside, so the Worker reads its own private directory there and
+  // nothing else.
+  const denied = ["/private/tmp", "/private/var/folders", ...homes, ...homes.map(h => path.join(h, ".agentos")), ...listed];
+  const both = paths => [...new Set(paths.flatMap(p => [p, real(p)]))];
   console.log(JSON.stringify({
     network: { allowedDomains: [`127.0.0.1:${port}`], deniedDomains: [], allowLocalBinding: false },
     filesystem: {
-      denyRead: [...new Set(denied.flatMap(p => [p, real(p)])), launches],
-      allowRead: [pyenv, code, work],
+      denyRead: both(denied),
+      allowRead: both([pyenv, code, work]),
       allowWrite: [work],
       denyWrite: ["/tmp/claude", "/private/tmp/claude"],
     },

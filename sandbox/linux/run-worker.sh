@@ -9,12 +9,14 @@
 #     mount stops neither connect() nor a write to a FIFO), or dev data: agentd's ledger, and by
 #     default its Control socket, a .agentos directory, Temporal's dev database. It looks when it
 #     starts the Worker; what appears there later, the Worker sees too;
-#   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root and
-#     /dev, tmpfs mounts bwrap makes as large as half the memory, are read-only; /tmp and /run
-#     are only directories in the root. A tmpfs's data, inodes and extended attributes are
-#     charged to no process, so the OOM killer would kill other processes, not a Worker that
-#     filled one (--size bounds the data only). Without a writable /dev/shm, POSIX semaphores
-#     and shared memory (multiprocessing) fail with EROFS;
+#   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root, a
+#     tmpfs bwrap makes as large as half the memory, is read-only; /tmp, /run and /dev are only
+#     directories in it. A tmpfs's data, inodes and extended attributes are charged to no
+#     process, so the OOM killer would kill other processes, not a Worker that filled one
+#     (--size bounds the data only). Without a writable /dev/shm, POSIX semaphores and shared
+#     memory (multiprocessing) fail with EROFS;
+#   - /dev holds five device nodes, null, zero, full, random and urandom: no terminal and no
+#     pseudo-terminals, whose number this machine's sandboxes share;
 #   - no further user namespaces (--disable-userns): in one, the Worker could mount a tmpfs of
 #     its own;
 #   - --clearenv: no inherited environment variables;
@@ -70,13 +72,18 @@ args=(
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8
   --setenv PYTHONDONTWRITEBYTECODE 1
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
-  --proc /proc --dev /dev --dir /tmp
+  --proc /proc --dir /tmp --dir /dev/shm
+)
+for node in null zero full random urandom; do
+  args+=(--dev-bind "/dev/$node" "/dev/$node")
+done
+args+=(
   --ro-bind "$pyenv" "$pyenv"
   --ro-bind "$code" "$code" --chdir "$code"
   --ro-bind "$runtime_dir" /run/agentos
 )
 [[ -e /usr/lib64 ]] && args+=(--symlink usr/lib64 /lib64)
-args+=(--remount-ro /dev --remount-ro /) # last: the mounts above need their mount points made first
+args+=(--remount-ro /) # last: the mounts above need their mount points made first
 
 # Inside: start socat, wait until it listens (127.0.0.1:7233 is 0100007F:1C41 in
 # /proc/net/tcp, state 0A is LISTEN), then hand over to the command.

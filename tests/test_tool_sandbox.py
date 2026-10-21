@@ -24,15 +24,9 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import _stack
-from tests.harness import REPO, SANDBOX, TOOL_LAUNCHER, Stack
+from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, TOOL_LAUNCHER, Stack, in_keychain
 
 pytestmark = pytest.mark.skipif(SANDBOX not in TOOL_LAUNCHER, reason="needs AGENTOS_SANDBOX=bwrap or srt")
-
-# The login keychain items agentd may hold secrets in (README). Only their attributes are
-# asked for, never a password, and the keychain is named: the probe's HOME is not the user's,
-# and without it security(1) finds no keychain to search, sandbox or not.
-KEYCHAIN_ITEMS = ["agentos-anthropic-api-key", "agentos-github-token", "agentos-github-test-token"]
-LOGIN_KEYCHAIN = Path.home() / "Library/Keychains/login.keychain-db"
 
 PROBE = r"""
 import json, os, socket, subprocess, sys
@@ -115,16 +109,6 @@ def probe_env(state: str, deny: list[str]) -> dict:
     return {"PATH": os.environ["PATH"], "HOME": state, "TMPDIR": state, "AGENTOS_TMPDIR": state, "LANG": "C.UTF-8",
             "AGENTOS_SANDBOX_STATE": state, "AGENTOS_SANDBOX_DENY_READ": json.dumps(deny),
             "AGENTOS_TEST_CANARY": "a secret the tool server must not see"}
-
-
-def in_keychain(service: str) -> bool:
-    """Whether the item is there to find, asked the way the probe asks, outside the sandbox."""
-    if not LOGIN_KEYCHAIN.exists():
-        return False
-    with tempfile.TemporaryDirectory(dir="/tmp") as state:
-        return subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, str(LOGIN_KEYCHAIN)],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              env={**probe_env(state, []), "PATH": "/usr/bin:/bin"}).returncode == 0
 
 
 def probe(mirror: Path, args: dict, deny: list[str], env: dict[str, str] | None = None) -> dict:
