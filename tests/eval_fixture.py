@@ -232,6 +232,7 @@ def answers() -> list[dict]:
         {"model": b, "contains": "outside the files directory", "answers": [{"report": report()}] * 3},
         {"model": b, "contains": "parse_record", "answers": [
             {"report": report({**finding(20, "CWE-787", file="parse.c"), "title": "long " * 100})}] * 3},
+        # Model b's false alarms carry a file and a CWE too long to keep whole.
         {"model": b, "contains": "format_price", "answers": [
-            {"report": report(finding(5, "CWE-400", "medium", "app/prices.py"))}] * 3},
+            {"report": report(finding(5, "CWE-400 " + "y" * 100, "medium", "app/" + "x" * 400 + ".py"))}] * 3},
     ]

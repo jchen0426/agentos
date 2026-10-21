@@ -176,8 +176,8 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw
-    titles = [f["title"] for r in results if r["report"] for f in r["report"]["findings"]]
-    assert max(map(len, titles)) == 200, "a finding's title is cut to a line"
+    found = [f for r in results if r["report"] for f in r["report"]["findings"]]
+    assert [max(len(f[k]) for f in found) for k in ("title", "file", "cwe")] == [200, 300, 64], "cut to a line"
     assert json.loads(raw)["metrics"] == json.loads(json.dumps(m))
 
 
@@ -247,6 +247,9 @@ def test_a_run_that_spends_past_its_budget_stops_the_paid_runs(tmp_path: Path, e
     results = run(cs, [one_at_a_time], repos, tmp_path / "state", runs=3, budget_micros=BUDGET,
                   cap_micros=1_000_000, cases=[cs.case("py-benign")])
     assert [(r["rep"], r["spent_micros"]) for r in results] == [(1, 100_000 + 50)], results
+    # The next runner on the state remembers.
+    assert run(cs, [one_at_a_time], repos, tmp_path / "state", runs=3, budget_micros=BUDGET, cap_micros=1_000_000,
+               cases=[cs.case("py-benign")]) == results
 
 
 def test_runs_the_journal_never_saw_count_against_the_cap_and_are_cancelled(tmp_path: Path, evalset,
@@ -334,7 +337,7 @@ def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Pa
     cs, repos, _ = evalset
     (tmp_path / "answers.json").write_text(json.dumps(
         [{"contains": "format_price", "answers": [{"report": eval_fixture.report()}] * 3}]))
-    a = profiles(modelsim)[0]
+    a = dataclasses.replace(profiles(modelsim)[0], timeout=60)  # a runner blind to the death would time out
     state = tmp_path / "state"
     killed = []
 
