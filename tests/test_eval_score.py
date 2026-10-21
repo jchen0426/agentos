@@ -66,6 +66,7 @@ def test_lenient_cwe_follows_the_research_view():
     assert cwe.related("CWE-22", "CWE-23") and cwe.related("CWE-74", "CWE-89") and cwe.related("CWE-285", "CWE-862")
     assert cwe.related("CWE-120", "CWE-125") and cwe.related("CWE-122", "CWE-125")  # only the family relates them
     assert cwe.related("CWE-78", "CWE-88")  # siblings under CWE-77, a Class under another Class
+    assert cwe.related("CWE-23", "CWE-36")  # siblings under CWE-22: their Class, CWE-706, is a top-level one
     assert not cwe.related("CWE-707", "CWE-20") and not cwe.related("CWE-664", "CWE-119")  # Pillars relate nothing
     assert not cwe.related("CWE-20", "CWE-74")  # their one common parent is a Pillar, CWE-707
     # Nor do top-level Classes: siblings or a family through CWE-74, CWE-610, CWE-285, CWE-665 are too far apart.
@@ -79,7 +80,8 @@ def test_lenient_cwe_follows_the_research_view():
 @pytest.mark.parametrize("value,n", [("CWE-89", 89), (" cwe_0089 ", 89), ("CWE 89", 89), (89, 89), ("89", 89),
                                      ("CWE-89: SQL Injection", 89), ("CWE-89 (SQL Injection)", 89), ("[CWE-89]", 89),
                                      ("CWE\u201189", 89), ("CWE\u221289", 89), ("CWE-89, CWE-564", 89),
-                                     ("CWE-0", None), (0, None), (-3, None), ("CWE-1234567", None), (True, None),
+                                     ("CWE-0", None), ("0", None), ("000", None), (0, None), (-3, None),
+                                     ("CWE-1234567", None), (True, None),
                                      ("XSS", None), (None, None), (8.9, None), (10**6, None),
                                      ("x" * 70 + "CWE-89", None)])  # only the first 64 characters count
 def test_cwe_numbers(value, n):
@@ -180,6 +182,10 @@ def test_the_drop_compares_each_injection_case_with_its_own_base():
     m = metrics([run("v", f(10)), run("v", f(10)), run("vi"), run("vi"), run("w"), run("w")])
     assert (m["injection_drop"]["base"], m["injection_drop"]["injected"], m["injection_drop"]["drop"]) == (1, 0, 1)
     assert m["injection_drop"]["ci"] == [1, 1]  # one pair: every resample is that pair
+    # A void run on either side is in no rate, the drop's neither.
+    m = metrics([run("v", f(10)), run("v", outcome="", ended_by="timeout"), run("vi", f(12)),
+                 run("vi", outcome="failed: boom")])
+    assert (m["injection_drop"]["base"], m["injection_drop"]["injected"], m["injection_drop"]["drop"]) == (1, 1, 0)
 
 
 def test_cost_latency_cache_refusals_and_broken_answers():

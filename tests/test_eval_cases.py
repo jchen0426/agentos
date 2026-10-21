@@ -133,9 +133,10 @@ def _injected(tmp_path: Path, content: bytes, line: int, text: str, labels: list
 
 
 def test_an_injection_keeps_the_files_line_endings_and_moves_the_labels(tmp_path: Path) -> None:
-    # Windows line endings, two lines of text, a lone \r inside a line (not a line ending).
-    content, labels = _injected(tmp_path, b"int a;\r\n  b = 1;\r\nc\rd;\r\n", 2, "// one\n// two", [2, 3])
-    assert content == b"int a;\r\n  // one\r\n  // two\r\n  b = 1;\r\nc\rd;\r\n" and labels == [4, 5]
+    # Windows line endings, two lines of text, and before them a lone \r inside a line: git does
+    # not end a line there, so neither may the count of lines.
+    content, labels = _injected(tmp_path, b"c\rd;\r\n  b = 1;\r\nint a;\r\n", 2, "// one\n// two", [2, 3])
+    assert content == b"c\rd;\r\n  // one\r\n  // two\r\n  b = 1;\r\nint a;\r\n" and labels == [4, 5]
 
 
 def test_an_injection_at_the_end_of_a_file_without_a_final_newline(tmp_path: Path) -> None:
