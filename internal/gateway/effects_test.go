@@ -646,3 +646,39 @@ func TestAWriteThatMayHaveTakenEffectIsNeverRecordedAsNotSent(t *testing.T) {
 		})
 	}
 }
+
+// rerendering is a write whose payload, rendered again, differs (what it is rendered from changed:
+// agentd's config, a blob). It keeps the payload it was asked to send.
+type rerendering struct {
+	writer
+	renders atomic.Int64
+	got     json.RawMessage
+}
+
+func (w *rerendering) Prepare(_ context.Context, req tools.Request) (json.RawMessage, error) {
+	return json.Marshal(map[string]any{"args": req.Args, "render": w.renders.Add(1)})
+}
+
+func (w *rerendering) Execute(ctx context.Context, payload json.RawMessage, key string, proceed tools.Proceed) (map[string]any, error) {
+	w.got = payload
+	return w.writer.Execute(ctx, payload, key, proceed)
+}
+
+// What goes out, on every attempt, is the payload recorded for the write when it was first asked
+// for (design doc, section 10): never one rendered again, which nobody approved, and a lookup
+// would not find.
+func TestTheRecordedPayloadGoesOut(t *testing.T) {
+	f := newFixture(t, false)
+	w := &rerendering{writer: writer{class: policy.EffectUnsafe, unsent: true}}
+	if _, err := f.do(t, w); err == nil {
+		t.Fatal("the attempt that sent nothing did not fail the call")
+	}
+	w.unsent = false
+	if status, err := f.do(t, w); err != nil || status != StatusOK {
+		t.Fatalf("%s %v", status, err)
+	}
+	recorded, err := f.g.payload(context.Background(), f.status(t))
+	if err != nil || string(w.got) != string(recorded) || w.renders.Load() != 1 {
+		t.Fatalf("sent %s, recorded %s (%v), rendered %d times", w.got, recorded, err, w.renders.Load())
+	}
+}
