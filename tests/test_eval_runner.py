@@ -203,6 +203,8 @@ def test_a_process_listed_is_the_one_started_not_a_pid_used_again(tmp_path: Path
     pids.write_text(json.dumps([["agentd", me, "Thu Jan  1 00:00:00 1970"], ["temporal", me, harness.started_at(me)],
                                 ["worker1", 999_999_999, "Thu Jan  1 00:00:00 1970"]]))
     assert runner._left_running(tmp_path / "state") == [("temporal", me)]
+    pids.write_text(json.dumps([["agentd", me]]))  # an older stack's list: no start times, nothing listed
+    assert runner._left_running(tmp_path / "state") == []
 
 
 def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Path) -> None:
@@ -211,6 +213,15 @@ def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Pat
     assert runner._object('{"a":' * 100_000 + "1" + "}" * 100_000) == {}  # deeper than Python reads: unread
     with pytest.raises(ValueError):
         runner.Journal(tmp_path / "journal.jsonl").append({"event": "result", "x": float("inf")})
+
+
+def test_an_answer_too_deep_to_read_keeps_the_status_agentd_gave_it() -> None:
+    deep = '{"status": "invalid_output", "output": ' + "[" * 100_000 + "]" * 100_000 + "}"
+    call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "response_blob": "sha256:d",
+            "usage_json": "[]", "stop_reason": "invalid_output"}
+    record = runner.collect(LedgerOf([call], {"d": deep.encode()}), {"run_id": "r", "temporal_run_id": "t",
+                                                                     "profile": "p", "case": "py-sqli", "rep": 1}, "run")
+    assert [a["status"] for a in record["answers"]] == ["invalid_output"]
 
 
 def test_a_blank_patch_is_no_patch() -> None:
@@ -686,3 +697,130 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
         runner.run(cs, [runner.PROFILES["local"]], repos, state)
     with pytest.raises(ValueError, match="names"):
         runner.run(cs, [dataclasses.replace(profiles("http://127.0.0.1:9")[1], name="../b")], repos, state)
+
+
+class FakeStack:
+    """A stack whose runs end as soon as they start, as SCRIPT says for their case ("ok", or
+    "void": a request that got no answer, at a cost of SPEND micros): only the runner's own logic
+    (the plan, the streak, going one at a time, overspend) runs, in no time."""
+
+    SCRIPT: dict[str, str] = {}
+    SPEND = 0
+    OVERSPEND_AFTER: str | None = None  # the case whose collecting puts an overspent run in the ledger
+    batches: list[list[str]] = []  # the cases started between two polls
+
+    class Alive:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def alive(self) -> bool:
+            return True
+
+    def __init__(self, tmp: Path, **_kw) -> None:
+        self.tmp, self.data_dir = tmp, tmp / "agentd" / "data"
+        self.procs, self.workers, self.agentd = [self.Alive("temporal")], [], self.Alive("agentd")
+        self.runs: dict[str, str] = {}
+        self.cancelled: set[str] = set()
+        self.polled = True
+
+    def start_agentd(self, **_kw) -> None:
+        fake_ledger(self.data_dir / "ledger.db", {}, [])
+
+    def start_worker(self) -> None:
+        self.workers = [self.Alive("worker1")]
+
+    def close(self) -> None:
+        pass
+
+    def agentctl(self, *args: str) -> dict:
+        case = args[args.index("--commit") + 1]  # the fake case set's commits are their cases' names
+        if self.polled:
+            FakeStack.batches.append([])
+            self.polled = False
+        FakeStack.batches[-1].append(case)
+        run_id = f"run-{len(self.runs) + 1}"
+        self.runs[run_id] = case
+        return {"run_id": run_id, "temporal_run_id": "t"}
+
+    def agentctl_run(self, *args: str) -> subprocess.CompletedProcess:
+        if args[1] == "cancel":
+            self.cancelled.add(args[2])
+        self.polled = True
+        return subprocess.CompletedProcess(args, 0, json.dumps({"state": self.get_run({"run_id": args[2]})["state"]}), "")
+
+    def get_run(self, run: dict) -> dict:
+        case = self.runs[run["run_id"]]
+        void = run["run_id"] in self.cancelled or FakeStack.SCRIPT.get(case) == "void"
+        return {"state": "CANCELLED" if run["run_id"] in self.cancelled else "SUCCEEDED",
+                "result_json": json.dumps({"outcome": "failed: 500" if void else "ok"}),
+                "budget_spent_micros": str(FakeStack.SPEND if void else 0), "budget_reserved_micros": "0"}
+
+    def execution_times(self, run: dict) -> tuple[float, float]:
+        return 0.0, 1.0
+
+    def ledger(self, sql: str, *params) -> list[dict]:
+        if "FROM model_calls" in sql:
+            case = self.runs[params[0]]
+            if case == FakeStack.OVERSPEND_AFTER:
+                fake_ledger(self.data_dir / "ledger.db", {"over": 1}, [("over", "SETTLE", 2, "q")])
+            if params[0] in self.cancelled or FakeStack.SCRIPT.get(case) == "void":
+                return [{"provider": "local", "model": "m", "prompt_version": "p", "response_blob": None,
+                         "usage_json": "[]", "stop_reason": None}]
+            return [{"provider": "local", "model": "m", "prompt_version": "p", "response_blob": "sha256:ok",
+                     "usage_json": "[]", "stop_reason": "end_turn"}]
+        if "FROM blobs" in sql:
+            return [{"bytes": json.dumps({"status": "ok", "model": "local/m", "value": {"findings": []}}).encode()}]
+        return []  # runs (none unknown), calls (no patch checks)
+
+
+@pytest.fixture
+def fake(tmp_path: Path, monkeypatch):
+    """A case set of benign cases c1..c9 run on FakeStack, and the profiles to run them with."""
+    ids = [f"c{i}" for i in range(1, 10)]
+    cs = casefile.parse({"projects": {"p": {"url": "https://github.com/example/p", "license": "MIT"}}, "cases": [
+        {"id": i, "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": f"{i:0>40}",
+         "why": "w"} for i in ids]})
+    cs = dataclasses.replace(cs, cases=[dataclasses.replace(c, commit=c.id) for c in cs.cases])
+    monkeypatch.setattr(runner, "Stack", FakeStack)
+    monkeypatch.setattr(FakeStack, "SCRIPT", {})
+    monkeypatch.setattr(FakeStack, "SPEND", 0)
+    monkeypatch.setattr(FakeStack, "OVERSPEND_AFTER", None)
+    monkeypatch.setattr(FakeStack, "batches", [])
+    free = runner.Profile("free", "{}", "", "local/m", paid=False, concurrency=4)
+    paid = dataclasses.replace(free, name="paid", paid=True)
+    return cs, {i: cs.case(i) for i in ids}, free, paid, tmp_path / "state"
+
+
+def test_after_a_void_run_the_runs_go_one_at_a_time_until_one_is_answered(fake) -> None:
+    cs, c, free, _, state = fake
+    FakeStack.SCRIPT = {"c5": "void"}
+    runner.run(cs, [free], {}, state, runs=1, cases=[c[i] for i in sorted(c)], log=lambda *_: None)
+    # The first alone; four, the last void; one alone, answered; then four again.
+    assert [len(b) for b in FakeStack.batches] == [1, 4, 1, 3], FakeStack.batches
+
+
+def test_a_case_void_every_time_keeps_no_other_from_running_again(fake) -> None:
+    cs, c, _, paid, state = fake
+    FakeStack.SCRIPT = {i: "void" for i in ("c2", "c3", "c5")}  # never three in a row the first time
+    order = [c[i] for i in ("c1", "c2", "c3", "c4", "c5", "c6")]
+
+    def again() -> list[dict]:
+        return runner.run(cs, [paid], {}, state, runs=1, cases=order, cap_micros=10**9, retry_void=True,
+                          log=lambda *_: None)
+    again()
+    # Run again, void again, for nothing: none of them stops the runner; all three ran again.
+    assert sorted(r["case"] for r in again() if score.void(r)) == ["c2", "c3", "c5"]
+    assert len(runner.Journal(state / "journal.jsonl").replaced()) == 3
+    # A provider failing again costs money: three of those in a row stop the runner.
+    FakeStack.SPEND = 100
+    with pytest.raises(RuntimeError, match="3 runs in a row"):
+        again()
+
+
+def test_runs_the_runner_stopped_for_money_do_not_stop_it(fake) -> None:
+    cs, c, _, paid, state = fake
+    FakeStack.OVERSPEND_AFTER = "c2"  # when c2 is collected, a run has spent past its budget
+    results = runner.run(cs, [paid], {}, state, runs=1, cases=[c[i] for i in ("c1", "c2", "c3", "c4", "c5")],
+                         cap_micros=10**9, log=lambda *_: None)
+    stopped = sorted(r["case"] for r in results if r["ended_by"] == "overspent")
+    assert stopped == ["c3", "c4", "c5"], results  # three void in a row, and the runner carried on

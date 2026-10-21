@@ -10,12 +10,13 @@ profile, one rep of every case before the next, and judges each run by its outco
 ledger (evals/score.py). A journal in the state directory records each run as it starts and as
 it ends, so a runner started again on it picks up the runs in flight and skips the ones done.
 The first run of a profile goes alone: if the model gave it no answer (evals/score.py's void),
-the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. After any
-void run, runs go one at a time again until one gets an answer, and VOID_STREAK void runs in a
-row stop the runner (a provider that went away: each of its requests may cost the whole
-reservation): not the runs the runner stopped itself (overspent, cap), and a void run run again
-only if it cost money, since a case that is void every time (too long for the model, denied)
-must not keep the others from running again. Void runs run again only when asked
+the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. A void
+run that says something about the model or its provider (not one the runner stopped itself for
+money, overspent or cap, nor one picked up from an earlier runner) makes the runs go one at a
+time again until one gets an answer, and VOID_STREAK of them in a row stop the runner (a
+provider that went away: each of its requests may cost the whole reservation); one run again
+counts only if it cost money, since a case that is void every time (too long for the model,
+denied) must not keep the others from running again. Void runs run again only when asked
 (--retry-void), after the runs never run; one that is void again does not stop the runner as a
 first run would.
 
@@ -55,6 +56,7 @@ import re
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -205,18 +207,22 @@ class Journal:
 
 class _Signals:
     """SIGTERM, SIGHUP and SIGINT while a runner runs. The first ends it, as an exception (SIGINT a
-    KeyboardInterrupt, the others SystemExit), except while a stack starts or stops (held): then
-    once that is done. Later ones are only noted, so that nothing cuts the stopping short. The
-    handlers stay in place from the runner's start to its end, and Python runs them in the main
-    thread whichever thread the OS hands a signal to (the Temporal SDK's runtime starts many):
-    neither swapping handlers around a stop nor blocking signals leaves a gap."""
+    KeyboardInterrupt, the others SystemExit): at once where the runner waits for runs
+    (interruptible), or else, from a stack's start to its stop (held), once the stack has
+    stopped. Later ones are only noted, so that nothing cuts the stopping short. The handlers stay
+    in place from the runner's start to its end, and Python runs them in the main thread whichever
+    thread the OS hands a signal to (the Temporal SDK's runtime starts many): neither swapping
+    handlers nor blocking signals would leave no gap."""
 
     def __init__(self) -> None:
         self.got: list[int] = []
-        self.calm = 0  # stacks starting or stopping
+        self.calm = 0  # held, and not where the runner waits for runs
         self.raised = False
 
     def handle(self, signum: int, _frame: object) -> None:
+        if not self.got:
+            print("stopping: each stack stops first, and agentd may take a minute with requests in flight",
+                  file=sys.stderr, flush=True)
         self.got.append(signum)
         if not self.calm:
             self._end()
@@ -230,14 +236,29 @@ class _Signals:
 
     @contextlib.contextmanager
     def held(self):
-        """A stack starts or stops: a signal waits until it has."""
+        """From a stack's start to its stop: a signal waits until it has stopped. An error that
+        ends the runner meanwhile is the one to show; the signal is noted."""
         self.calm += 1
         try:
             yield
-        finally:
+        except BaseException:
             self.calm -= 1
-            if not self.calm:
-                self._end()
+            self.raised = self.raised or (not self.calm and bool(self.got))
+            raise
+        self.calm -= 1
+        if not self.calm:
+            self._end()
+
+    @contextlib.contextmanager
+    def interruptible(self):
+        """Where the runner waits for runs, inside held: a signal ends the runner at once, and one
+        that came while the stack started ends it now."""
+        calm, self.calm = self.calm, 0
+        try:
+            self._end()
+            yield
+        finally:
+            self.calm = calm
 
     @contextlib.contextmanager
     def installed(self):
@@ -358,90 +379,91 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
         return
     stack_dir = r.state / profile.name / "stack"
     stack_dir.mkdir(parents=True, exist_ok=True)
-    stack = None
     # What the runs run with, as the stack starts: a `make build` between profiles shows.
     agentos = {"commit": _agentos(), "bin": _binaries()}
-    try:
-        with r.signals.held():  # a signal while it starts arrives once it is up, and it stops whole
+    stack = None
+    with r.signals.held():  # from the stack's start to its stop: a signal waits until it has stopped
+        try:
             stack = Stack(stack_dir, temporal_db=True, fixture=False, hold_fds=(r.lock,))
-        stack.deny_read = r.deny_read  # the journal, the mirrors and the cache, besides agentd's data
-        stack.start_agentd(policy=policy(list(r.repos)), models=profile.models, prices=profile.prices, repos=r.repos)
-        if not _ledger(r.state, profile.name).exists():
-            raise RuntimeError(f"agentd is up, but its ledger is not at {_ledger(r.state, profile.name)}")
-        # Before the Worker comes up: agentd refuses the calls of the runs it has cancelled.
-        unknown = _cancel_unknown(stack, journal, log)
-        if profile.paid and resumed:
-            # Started under an earlier runner's cap: they stop if this one's cannot hold them.
-            committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
-            why = ("overspent" if _overspent(r.state) else
-                   "cap" if r.cap_micros is not None and _spent(r.state) + committed > r.cap_micros else None)
-            if why:
-                log(f"[{profile.name}] the {len(resumed)} paid runs left in flight stop: "
-                    + ("a run spent past its budget" if why == "overspent" else "they could take the spending past the cap"))
-                for e in resumed:
-                    e["stopped"] = why
-                    _cancel(stack, e)
-        stack.start_worker()
-        for gone in unknown:
-            _ended(stack, gone)
-        log(f"[{profile.name}] {len(todo)} runs to start ({sum(t[2] for t in todo)} again), "
-            f"{len(resumed)} to pick up")
-        watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
-        confirmed = False  # a run of this profile has got an answer from the model
-        alone = True  # one run at a time: the first, and after a void run until one is answered
-        streak = 0  # void runs in a row that say the provider is failing (_breaks)
-        while todo or watching:
-            _alive(stack)
-            while todo and len(watching) < (1 if alone else profile.concurrency):
-                if profile.paid and _overspent(r.state):
-                    log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
-                    todo.clear()
-                    break
-                if profile.paid and r.cap_micros is not None:
-                    committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
-                    if _spent(r.state) + committed + r.budget_micros > r.cap_micros:
-                        if not watching:  # no run in flight will free any room
-                            log(f"[{profile.name}] {len(todo)} runs not started: one more could take the "
-                                f"spending past the cap of ${r.cap_micros / 1e6:.2f}")
+            stack.deny_read = r.deny_read  # the journal, the mirrors and the cache, besides agentd's data
+            stack.start_agentd(policy=policy(list(r.repos)), models=profile.models, prices=profile.prices, repos=r.repos)
+            if not _ledger(r.state, profile.name).exists():
+                raise RuntimeError(f"agentd is up, but its ledger is not at {_ledger(r.state, profile.name)}")
+            # Before the Worker comes up: agentd refuses the calls of the runs it has cancelled.
+            unknown = _cancel_unknown(stack, journal, log)
+            if profile.paid and resumed:
+                # Started under an earlier runner's cap: they stop if this one's cannot hold them.
+                committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
+                why = ("overspent" if _overspent(r.state) else
+                       "cap" if r.cap_micros is not None and _spent(r.state) + committed > r.cap_micros else None)
+                if why:
+                    log(f"[{profile.name}] the {len(resumed)} paid runs left in flight stop: "
+                        + ("a run spent past its budget" if why == "overspent" else "they could take the spending past the cap"))
+                    for e in resumed:
+                        e["stopped"] = why
+                        _cancel(stack, e)
+            stack.start_worker()
+            for gone in unknown:
+                _ended(stack, gone)
+            log(f"[{profile.name}] {len(todo)} runs to start ({sum(t[2] for t in todo)} again), "
+                f"{len(resumed)} to pick up")
+            watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
+            confirmed = False  # a run of this profile has got an answer from the model
+            alone = True  # one run at a time: the first, and after a void run until one is answered
+            streak = 0  # void runs in a row that say the provider is failing (_breaks)
+            with r.signals.interruptible():  # only where the runner waits for runs
+                while todo or watching:
+                    _alive(stack)
+                    while todo and len(watching) < (1 if alone else profile.concurrency):
+                        if profile.paid and _overspent(r.state):
+                            log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
                             todo.clear()
-                        break
-                c, rep, retry = todo.popleft()
-                entry = _start(stack, r.cs, c, rep, profile, r.budget_micros, agentos)
-                journal.append(entry)
-                watching[entry["run_id"]] = {**entry, "since": time.monotonic(), "again": retry}
-            for run_id, entry in list(watching.items()):
-                record = _watch(stack, entry, profile)
-                if record is None:
-                    continue
-                journal.append(record)
-                del watching[run_id]
-                log(_line(r.cs, record))
-                stopping = [e for e in watching.values() if "stopped" not in e]
-                if profile.paid and stopping and _overspent(r.state):
-                    log(f"[{profile.name}] a run spent past its budget: no more paid runs, and the "
-                        f"{len(stopping)} in flight stop")
-                    for other in stopping:
-                        other["stopped"] = "overspent"
-                        _cancel(stack, other)
-                if not void(record):
-                    confirmed, alone, streak = True, False, 0
-                elif _about_the_model(record):
-                    alone = True
-                    if not confirmed and not entry.get("again"):
-                        raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
-                                           f"{void_reason(record)}")
-                    streak += _breaks(record, entry)
-                    if streak >= VOID_STREAK:
-                        raise RuntimeError(f"[{profile.name}] {streak} runs in a row ended without the model, the last "
-                                           f"{void_reason(record)}: stopping; the next runner picks up the runs in "
-                                           "flight, and --retry-void runs the void ones again")
-                    log(f"[{profile.name}] {record['case']} #{record['rep']} is void ({void_reason(record)}): "
-                        "the next run goes alone")
-            if watching:
-                time.sleep(1)
-    finally:
-        if stack is not None:
-            with r.signals.held():  # rather than leave half of it running
+                            break
+                        if profile.paid and r.cap_micros is not None:
+                            committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
+                            if _spent(r.state) + committed + r.budget_micros > r.cap_micros:
+                                if not watching:  # no run in flight will free any room
+                                    log(f"[{profile.name}] {len(todo)} runs not started: one more could take the "
+                                        f"spending past the cap of ${r.cap_micros / 1e6:.2f}")
+                                    todo.clear()
+                                break
+                        c, rep, retry = todo.popleft()
+                        entry = _start(stack, r.cs, c, rep, profile, r.budget_micros, agentos)
+                        journal.append(entry)
+                        watching[entry["run_id"]] = {**entry, "since": time.monotonic(), "again": retry}
+                    for run_id, entry in list(watching.items()):
+                        record = _watch(stack, entry, profile)
+                        if record is None:
+                            continue
+                        record["agentos_end"] = agentos  # a run picked up ran its end on this one
+                        journal.append(record)
+                        del watching[run_id]
+                        log(_line(r.cs, record))
+                        stopping = [e for e in watching.values() if "stopped" not in e]
+                        if profile.paid and stopping and _overspent(r.state):
+                            log(f"[{profile.name}] a run spent past its budget: no more paid runs, and the "
+                                f"{len(stopping)} in flight stop")
+                            for other in stopping:
+                                other["stopped"] = "overspent"
+                                _cancel(stack, other)
+                        if not void(record):
+                            confirmed, alone, streak = True, False, 0
+                        elif _about_the_model(record):
+                            alone = True
+                            if not confirmed and not entry.get("again"):
+                                raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
+                                                   f"{void_reason(record)}")
+                            streak += _breaks(record, entry)
+                            if streak >= VOID_STREAK:
+                                raise RuntimeError(f"[{profile.name}] {streak} runs in a row ended without the model, the last "
+                                                   f"{void_reason(record)}: stopping; the next runner picks up the runs in "
+                                                   "flight, and --retry-void runs the void ones again")
+                            log(f"[{profile.name}] {record['case']} #{record['rep']} is void ({void_reason(record)}): "
+                                "the next run goes alone")
+                    if watching:
+                        time.sleep(1)
+        finally:
+            if stack is not None:
                 stack.close()
 
 
@@ -455,9 +477,11 @@ def _left_running(state: Path) -> list[tuple[str, int]]:
             procs = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        for name, pid, since in procs:
-            if since and started_at(pid) == since:
-                out.append((name, pid))
+        for listed in procs if isinstance(procs, list) else []:
+            if isinstance(listed, list) and len(listed) == 3:  # an older stack's list has no start times
+                name, pid, since = listed
+                if since and started_at(pid) == since:
+                    out.append((name, pid))
     return out
 
 
@@ -652,9 +676,9 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
     except Exception:  # noqa: BLE001 - Temporal no longer has it
         started, closed = None, None
     answers, accepted, prompts = [], [], set()
-    for row in stack.ledger("SELECT provider, model, prompt_version, response_blob, usage_json FROM model_calls "
-                            "WHERE workflow_id = ? ORDER BY started_at, activity_id, attempt, request_seq",
-                            entry["run_id"]):
+    for row in stack.ledger("SELECT provider, model, prompt_version, response_blob, usage_json, stop_reason "
+                            "FROM model_calls WHERE workflow_id = ? ORDER BY started_at, activity_id, attempt, "
+                            "request_seq", entry["run_id"]):
         model = row["model"] if row["model"].startswith(row["provider"] + "/") else f"{row['provider']}/{row['model']}"
         prompts.add(row["prompt_version"])
         billed = json.loads(row["usage_json"] or "[]")
@@ -669,6 +693,8 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
             [blob] = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
             resp = _object(blob["bytes"])
             answer["status"], answer["answered_by"] = resp.get("status"), resp.get("model")
+            if not resp and row["stop_reason"] == "invalid_output":  # an answer too deep to read: agentd's word
+                answer["status"] = "invalid_output"
             if resp.get("status") == "ok":
                 value = resp.get("value")
                 accepted.append(value if isinstance(value, dict) else {})

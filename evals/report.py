@@ -65,6 +65,12 @@ def _name(m: dict, profile: str) -> str:
     return f"{profile}（{' + '.join(m['models']) or '账本里没有模型调用'}）"
 
 
+def _versions(runs: list[dict]) -> list:
+    """What each run ran with, as it started and as it ended (a run picked up by a later runner,
+    after a `git pull` and a `make build`, ran on both)."""
+    return [a for r in runs for a in (r.get("agentos"), r.get("agentos_end")) if a]
+
+
 def _commit(agentos: object) -> str | None:
     return agentos.get("commit") if isinstance(agentos, dict) else agentos  # type: ignore[return-value]
 
@@ -92,8 +98,9 @@ def markdown(cs: CaseSet, data: dict) -> str:
             f"{comp['benign']} 个正常提交，{comp['injection']} 个注入用例（各和一个漏洞用例配对）；语言：{'、'.join(comp['languages'])}。",
             f"- 每个用例每个模型最多跑 {meta.get('runs', '?')} 次，各配置实际的次数见下表。评测走同一套运行时"
             "（Temporal、agentd、沙箱里的 Worker），全部 dry-run：写类工具只记录、不执行。",
-            f"- 跑这些运行的 agentos 提交：{_sorted_unique(_commit(r.get('agentos')) for r in runs)}；二进制"
-            f"（sha256 前 16 位）：{_sorted_unique(_binaries(r.get('agentos')) for r in runs)}；"
+            f"- 跑这些运行的 agentos 提交：{_sorted_unique(_commit(a) for a in _versions(runs))}；二进制"
+            f"（sha256 前 16 位）：{_sorted_unique(_binaries(a) for a in _versions(runs))}"
+            "（接着跑的运行，开始和结束时的都算）；"
             f"提示词版本：{_sorted_unique(p for r in runs for p in r.get('prompts', []))}。",
             "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注：",
             "", "| 配置 | 账本记录的模型 | 次数 | 无效（模型调用没以答复结束） | 重跑掉的无效运行 | 拿到报告的次数 | 由服务端回退答复 | "
@@ -206,8 +213,9 @@ def markdown(cs: CaseSet, data: dict) -> str:
             "策略拒绝的、调用最终失败的；第一次答复不合 schema、再要一次的请求失败了的也算），不进任何比率，按原因单独计数；"
             "`--retry-void` 重跑它们，重跑掉的仍算进花费和无效原因。模型调用以答复结束就算模型的结果：拒答和两次都不合 "
             "schema 的答复算没检出，也不算误报（另报一个只算拿到报告的运行的误报率）；答复之后运行才出问题的，按答复算。"
-            f"同一个配置连着 {meta.get('void_streak', '?')} 次无效（不算评测程序因为上限或超支自己停掉的，"
-            "重跑的只算花了钱的），评测程序停下。",
+            "每个配置的第一次运行无效，评测程序就停下；之后出过无效运行（不算评测程序为上限或超支自己停掉的，"
+            "也不算从上一个评测程序接过来的）就改回一次一个，"
+            f"同一个配置连着 {meta.get('void_streak', '?')} 次这样的无效（重跑的只算花了钱的），评测程序停下。",
             "- 补丁可应用率：报告带补丁的运行里，`git.apply_check` 通过的比例。",
             "- 花费取账本里每个任务结束时已结算和仍预留的钱，按价格表算，不是供应商的账单（还预留着的钱后来可能退回，"
             "所以各配置的合计可能略高于账本的总额）；每次审计的平均花费是全部花费（含无效运行和重跑掉的运行）"

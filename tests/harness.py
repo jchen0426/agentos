@@ -245,7 +245,10 @@ def free_port() -> int:
 
 
 def descendants(pid: int) -> list[int]:
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True).stdout
+    # ps in a session of its own: a Ctrl-C at the terminal, which the whole foreground process
+    # group gets, does not cut short a stack's stopping by killing it.
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True,
+                         start_new_session=True).stdout
     children: dict[int, list[int]] = {}
     for line in out.splitlines():
         p, pp = map(int, line.split())
@@ -262,11 +265,12 @@ def started_at(pid: int) -> str:
     """When a process started, as ps says it (to the second; empty once it is gone): with its
     PID, which process it is, whatever it has exec'd since."""
     return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                          env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}, start_new_session=True).stdout.strip()
 
 
 def command_of(pid: int) -> str:
-    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                          start_new_session=True).stdout
 
 
 class Proc:
@@ -286,7 +290,15 @@ class Proc:
         return self.popen.poll() is None
 
     def signal_all(self, sig: int) -> None:
-        for pid in [*descendants(self.popen.pid), self.popen.pid]:
+        try:
+            pids = [*descendants(self.popen.pid), self.popen.pid]
+        except subprocess.CalledProcessError:  # ps did not finish: the process group, at least
+            pids = []
+            try:
+                os.killpg(self.popen.pid, sig)  # each Proc leads a session, and its group, of its own
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in pids:
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:

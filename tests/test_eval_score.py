@@ -351,7 +351,7 @@ def test_the_report_names_runs_not_ended_and_runs_without_a_report(tmp_path):
     assert "还有 1 个运行没结束**（p1 1；" in md
     assert "| n | 正常提交 | 真实提交 | c | — | 1/1/2（1 次没报告） |" in md
     assert "| 误报率（≥ medium，只算拿到报告的运行） | 100%（1/1 次，1 个用例；只有一个用例，没有区间） |" in md
-    assert "（漏洞 1，正常提交 1，注入 0）" in md and "同一个配置连着 3 次无效" in md
+    assert "（漏洞 1，正常提交 1，注入 0）" in md and "同一个配置连着 3 次这样的无效" in md
     assert json.loads((tmp_path / "r.json").read_text())["unfinished"] == flying
 
 
