@@ -115,6 +115,9 @@ MUTATIONS = {
     # The bugs this state machine found (the fixes, undone).
     "S1 an approved write that only dry-ran reads as approved": [
         (G + "records.go", "effectDenied: \"not sent\", effectDryRun: \"not sent\",", "effectDenied: \"not sent\",")],
+    "S1b the report of a write that only dry-ran does not say a request of it went out before": [
+        (G + "records.go", "\t\t\t\tif e.LastRequestAt.Valid {\n\t\t\t\t\tga.WriteReason +=",
+         "\t\t\t\tif false && e.LastRequestAt.Valid {\n\t\t\t\t\tga.WriteReason +=")],
     "S2 a write that may have taken effect is recorded as one that did not": [
         (G + "effects.go", "\tif e.MaybeSent != 0 {\n\t\tstatus, reason = effectUnknown,", "\tif false {\n\t\tstatus, reason = effectUnknown,")],
     "S2b agentd abandons at start a cancelled run's write that may have taken effect": [

@@ -50,8 +50,10 @@ type Writer interface {
 	// request renders the same payload on every attempt.
 	Prepare(ctx context.Context, req Request) (json.RawMessage, error)
 	// Execute sends the payload, calling proceed before each request whose effect someone
-	// could see; when proceed fails, Execute stops and returns its error. Its error tells what
-	// happened outside: ErrNotSent, a *RefusedError and a *DeniedError mean nothing did (a
+	// could see; when proceed fails, Execute stops and returns its error, unless a request it
+	// sent already may have made the write: then it returns an error that says so (a
+	// *ConflictError, as github.open_draft_pr does once it pushed its branch). Its error tells
+	// what happened outside: ErrNotSent, a *RefusedError and a *DeniedError mean nothing did (a
 	// *DeniedError, before anything was sent, refuses the payload for good); any other error
 	// leaves the outcome unknown.
 	Execute(ctx context.Context, payload json.RawMessage, idempotencyKey string, proceed Proceed) (map[string]any, error)

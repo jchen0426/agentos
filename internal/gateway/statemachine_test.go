@@ -74,6 +74,7 @@ var (
 // draws, and find them again (docs/statemachine-notes.md says how).
 var regressionSeeds = []uint64{
 	1189, 1596, // agentd, starting, abandoned a cancelled run's write that may have taken effect
+	306, 779, // recovery on a call sent again a write the policy wants approved, which nobody approved
 }
 
 const (
@@ -1004,6 +1005,12 @@ func (m *machine) checkReport(r *runModel) {
 			}
 		}
 		want = append(want, fmt.Sprintf("Approval of %s: %s", a.Tool, status))
+		m.mu.Lock()
+		wentOut := m.wentOut(a.EffectID)
+		m.mu.Unlock()
+		if a.Status == approvalApproved && e.Status == effectDryRun && wentOut && !strings.Contains(p.Body, "A request of it went out at") {
+			m.fail("6: the report of %s does not say that a request of %s went out before it only dry-ran", r.id, m.name(a.EffectID))
+		}
 		if line := fmt.Sprintf("\n- %s, approval %s: %s", a.Tool, a.ApprovalID, a.Status); !strings.Contains(p.Body, line) {
 			m.fail("6: the report of %s has no line %q", r.id, line)
 		}

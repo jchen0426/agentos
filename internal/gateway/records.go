@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jchen0426/agentos/internal/githubtool"
 	"github.com/jchen0426/agentos/internal/ledger"
@@ -33,8 +34,13 @@ func (r RunRecords) RunApprovals(ctx context.Context, workflowID string) ([]gith
 			}
 			if e.Status == effectDryRun {
 				// The approval was decided under an agentd that could reach the tool's system, and the
-				// write taken up by one that could not.
+				// write taken up by one that could not. An earlier attempt may have made a request of
+				// it, which did not take effect, and what that request made may remain.
 				ga.WriteReason = "agentd could not reach the tool's system, and only dry-ran it"
+				if e.LastRequestAt.Valid {
+					ga.WriteReason += fmt.Sprintf(". A request of it went out at %s, and what that request made may remain",
+						e.LastRequestAt.String)
+				}
 			}
 		}
 		out = append(out, ga)
