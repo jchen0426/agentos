@@ -224,8 +224,9 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
     mirrors = {name: Path(path).resolve() for name, path in mirrors.items()}
     hidden = [state, *mirrors.values(), *(Path(p).resolve() for p in deny_read)]
     if SANDBOX == "srt":
-        # Mirrors are denied by agentd itself; the rest only where the tool's sandbox denies anyway.
-        denied = [Path(h).resolve() for h in (os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir)]
+        # Mirrors are denied by agentd itself; the rest only where the tool's sandbox denies anyway:
+        # sandbox/macos/run-tool.sh's list, with the home directory from the user database, not $HOME.
+        denied = [Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()]
         denied += [Path(d) for d in ("/private/tmp", "/private/var/tmp", "/private/var/folders")]
         exposed = [p for p in [state, *(Path(d).resolve() for d in deny_read)]
                    if not any(p.is_relative_to(d) for d in denied)]
