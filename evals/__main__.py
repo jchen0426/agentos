@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -54,8 +55,9 @@ def table(cs: CaseSet, built: dict[str, dict] | None = None) -> str:
         size = str(built[c.id]["changed"]) if built and c.id in built else "?"
         why = c.why if not c.inject else f"{c.why}插入的文字：`{c.inject.text}`"
         why = why.replace("|", "\\|").replace("\n", " ")
+        cwes = (c.cwe or "—") + (f"（放宽口径另收 {'、'.join(c.cwe_also)}）" if c.cwe_also else "")
         out.append(f"| {c.id} | {report.KIND[c.kind]}（{report.SOURCE[c.source]}） | {c.project}（{p.license}） | {commit} | "
-                   f"{c.cwe or '—'} | {advisory} | {labels} | {size} | {why} |")
+                   f"{cwes} | {advisory} | {labels} | {size} | {why} |")
     return "\n".join(out) + "\n"
 
 
@@ -76,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--budget-usd", type=float, default=runner.BUDGET / 1e6, help="each run's budget")
     r.add_argument("--runs", type=int, default=3, help="runs of each case under each profile")
     r.add_argument("--case", action="append", help="only these cases")
+    r.add_argument("--retry-void", action="store_true", help="run again the runs the infrastructure ended")
     r.add_argument("--state", type=Path, help="the state directory: a new one by default; an old one resumes")
     r.add_argument("--cache", type=Path, default=mirrors.default_cache())
     p = sub.add_parser("report", help="the report of a state directory's runs")
@@ -90,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cwe":
         cwe.DATA.write_text(json.dumps(cwe.generate(args.xml), separators=(",", ":")) + "\n")
         return 0
+    # A terminal closed or a timeout's SIGTERM: unwind, so that the runner stops what it started.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
+    for name in ("cache", "state", "out"):
+        if getattr(args, name, None) is not None:
+            setattr(args, name, getattr(args, name).resolve())
     cs = casefile.load(args.cases)
     if args.cmd == "mirrors":
         built = mirrors.build(cs, args.cache)
@@ -118,19 +127,24 @@ def main(argv: list[str] | None = None) -> int:
         chosen = [cs.case(i) for i in args.case] if args.case else None
         state = args.state or args.cache / "state" / datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         print(f"state: {state} (pass --state {state} to pick it up again)")
-        used = {case.project for case in (chosen or cs.cases)}
-        runner.run(cs, profiles, {name: mirrors.mirror_of(cs, name, args.cache) for name in sorted(used)}, state,
+        # Every project's mirror: runs in flight from an earlier runner may audit any of them.
+        runner.run(cs, profiles, {name: mirrors.mirror_of(cs, name, args.cache) for name in cs.projects}, state,
                    runs=args.runs, budget_micros=round(args.budget_usd * 1e6),
-                   cap_micros=round(args.cap_usd * 1e6) if args.cap_usd is not None else None, cases=chosen)
+                   cap_micros=round(args.cap_usd * 1e6) if args.cap_usd is not None else None, cases=chosen,
+                   retry_void=args.retry_void)
         return 0
     if args.cmd == "report":
         results = runner.Journal(args.state / "journal.jsonl").results()
-        other = {r.get("cases_sha256") for r in results} - {cs.sha256}
-        if other:
-            ap.error(f"some runs used another version of cases.json ({sorted(map(str, other))})")
+        # Each run is scored with today's labels, so it must have audited today's commit of its
+        # case; a set changed elsewhere (a description, a label line) needs no new runs.
+        ids = {c.id: c.commit for c in cs.cases}
+        stale = sorted({r["case"] for r in results if ids.get(r["case"]) != r.get("commit")})
+        if stale:
+            ap.error(f"cases.json no longer has these cases, or not with the commits their runs audited: {stale}")
         head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         meta = {"title": args.title, "date": datetime.date.today().isoformat(), "commit": head,
-                "runs": max((r["rep"] for r in results), default=0)}
+                "runs": max((r["rep"] for r in results), default=0),
+                "ledger_spent_usd": runner.spent_in(args.state) / 1e6}
         report.write(cs, results, args.out, meta, seed=args.seed)
         print(f"wrote {args.out.with_suffix('.md')} and {args.out.with_suffix('.json')}")
         return 0

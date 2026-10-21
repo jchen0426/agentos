@@ -3,7 +3,10 @@ up Temporal, agentd and a sandboxed Worker, audits a tiny case set (tests/eval_f
 dry-run under two profiles, and the metrics come out as the scripted answers make them."""
 
 import dataclasses
+import fcntl
 import json
+import os
+import signal
 import sqlite3
 from pathlib import Path
 
@@ -13,7 +16,7 @@ from evals import __main__ as cli
 from evals import cases as casefile
 from evals import runner, score
 from tests import eval_fixture
-from tests.harness import AUDIT_SCHEMA, BIN, Proc, Stack, wait_for
+from tests.harness import AUDIT_SCHEMA, BIN, Proc, Stack, command_of, descendants, wait_for
 
 PRICES = """
 price_table_version: eval-test
@@ -68,13 +71,37 @@ def modelsim(tmp_path: Path):
 
 
 def run(*args, **kwargs) -> list[dict]:
-    """runner.run, printing the stack's logs if it fails."""
+    """runner.run, printing the stacks' logs if it fails."""
     try:
         return runner.run(*args, **kwargs)
     except BaseException:
-        for log in sorted((args[3] / "stack").glob("*.log")):
+        for log in sorted(args[3].glob("*/stack/*.log")):
             print(f"===== {log}\n{log.read_text(errors='replace')[-6000:]}")
         raise
+
+
+def ledger(state: Path, profile: str) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{state / profile / 'stack/agentd/data/ledger.db'}?mode=ro", uri=True)
+
+
+def stranded_run(state: Path, profile: runner.Profile, repos: dict, case, budget: int = BUDGET,
+                 worker: bool = False) -> dict:
+    """A run of `case` started on the profile's stack by hand, and left there as a runner stopped
+    at that moment would leave it: in flight (without a Worker), or ended (with one)."""
+    (state / profile.name / "stack").mkdir(parents=True, exist_ok=True)
+    stack = Stack(state / profile.name / "stack", temporal_db=True, fixture=False)
+    try:
+        ids = {runner.repo_id(name): {"mirror": str(path)} for name, path in repos.items()}
+        stack.start_agentd(policy=runner.policy(list(ids)), models=profile.models, prices=profile.prices, repos=ids)
+        if worker:
+            stack.start_worker()
+        started = stack.agentctl("runs", "start", "security-audit", "--repo", runner.repo_id(case.project),
+                                 "--commit", case.commit, "--base", "main", "--budget-micros", str(budget), "--dry-run")
+        if worker:
+            stack.wait_state(started, runner.TERMINAL | {"PAUSED_BUDGET"})
+        return started
+    finally:
+        stack.close()
 
 
 def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, modelsim: str) -> None:
@@ -92,12 +119,15 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert sum(e["path"] == "/v1/messages" for e in sent) == 16
     assert sum(e["path"] == "/v1/chat/completions" for e in sent) == 15
 
-    # Dry runs: every write was only recorded, and none asked for an approval.
-    ledger = sqlite3.connect(f"file:{state / 'stack/agentd/data/ledger.db'}?mode=ro", uri=True)
-    assert {s for (s,) in ledger.execute("SELECT DISTINCT status FROM effects")} == {"DRY_RUN"}
-    assert ledger.execute("SELECT count(*) FROM approvals").fetchone() == (0,)
-    assert ledger.execute("SELECT count(*) FROM runs WHERE dry_run = 0").fetchone() == (0,)
-    ledger.close()
+    # Dry runs: every write was only recorded, and none asked for an approval. Each profile had
+    # a stack, and a ledger, of its own.
+    for profile in "ab":
+        db = ledger(state, profile)
+        assert {s for (s,) in db.execute("SELECT DISTINCT status FROM effects")} == {"DRY_RUN"}
+        assert db.execute("SELECT count(*) FROM approvals").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM runs WHERE dry_run = 0").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (15,)
+        db.close()
 
     m = score.metrics(cs, results)
     a, b = m["a"], m["b"]
@@ -140,7 +170,8 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     out = tmp_path / "out" / "report"
     assert cli.main(["--cases", str(path), "report", "--state", str(state), "--out", str(out), "--title", "test"]) == 0
     md = out.with_suffix(".md").read_text()
-    assert "44%（4/9；95% 区间" in md and "67%（6/9；95% 区间" in md, md
+    assert "44%（4/9；95% 区间" in md, md
+    assert "67%（6/9；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
     assert "| anthropic/claude-opus-5-5 | local/gpt-oss:20b |" in md
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
@@ -178,19 +209,24 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     assert sum(r["spent_micros"] for r in second) == 6 * ANSWER
 
 
-def test_a_run_paused_for_budget_is_stopped_and_found_nothing(tmp_path: Path, evalset, modelsim: str) -> None:
+def test_a_run_paused_for_budget_is_stopped_and_a_first_run_that_is_void_stops_the_runner(
+        tmp_path: Path, evalset, modelsim: str) -> None:
     cs, repos, _ = evalset
     (tmp_path / "answers.json").write_text(json.dumps([{"contains": "format_price", "answers": [
         {"report": eval_fixture.report(eval_fixture.finding(6, "CWE-20", "medium", "app/prices.py"))}]}]))
     a = dataclasses.replace(profiles(modelsim)[0], timeout=60)  # were it not stopped, it would time out
+    state = tmp_path / "state"
     # Less than one request's reservation: the run waits for more budget, and the runner stops it.
-    [r] = run(cs, [a], repos, tmp_path / "state", runs=1, budget_micros=10_000, cap_micros=1_000_000,
-              cases=[cs.case("py-benign")])
+    # The first run of a profile goes alone: void, it stops the runner before the others start.
+    with pytest.raises(RuntimeError, match="the first run ended without the model: budget"):
+        run(cs, [a], repos, state, runs=3, budget_micros=10_000, cap_micros=1_000_000, cases=[cs.case("py-benign")])
+    [r] = runner.Journal(state / "journal.jsonl").results()
     assert (r["ended_by"], r["state"], r["outcome"], r["report"], r["spent_micros"]) == ("budget", "CANCELLED", "", None, 0)
-    assert not score.false_positive(r, None)
+    assert score.void(r) and not score.false_positive(r, None)
     # Nothing reached the provider: 4096 tokens of output alone cost more than the budget.
     assert not (tmp_path / "modelsim.jsonl").exists()
-    assert score.metrics(cs, [r])["a"]["outcomes"] == {"(budget)": 1}
+    m = score.metrics(cs, [r])["a"]
+    assert m["outcomes"] == {"(budget)": 1} and (m["void"], m["false_positive"]["runs"]) == (1, 0)
 
 
 def test_a_budget_of_zero_is_refused(tmp_path: Path, evalset) -> None:
@@ -213,32 +249,122 @@ def test_a_run_that_spends_past_its_budget_stops_the_paid_runs(tmp_path: Path, e
     assert [(r["rep"], r["spent_micros"]) for r in results] == [(1, 100_000 + 50)], results
 
 
-def test_a_run_the_journal_never_saw_is_cancelled_and_its_spending_counts(tmp_path: Path, evalset,
-                                                                          modelsim: str) -> None:
+def test_runs_the_journal_never_saw_count_against_the_cap_and_are_cancelled(tmp_path: Path, evalset,
+                                                                            modelsim: str) -> None:
+    cs, repos, _ = evalset
+    (tmp_path / "answers.json").write_text(json.dumps(
+        [{"contains": "format_price", "answers": [{"report": eval_fixture.report()}] * 4}]))
+    a = profiles(modelsim)[0]
+    state = tmp_path / "state"
+    benign = cs.case("py-benign")
+    assert len(run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=[benign])) == 1
+
+    # Two runs started on the same stack but never written down, as if the runner had been
+    # stopped right after starting each: one answered and spent, one waits for budget.
+    done = stranded_run(state, a, repos, benign, worker=True)
+    waiting = stranded_run(state, a, repos, benign, budget=10_000)
+
+    # The next runner cancels the waiting one, counts the answered one's spending, and stops where
+    # one more run could pass the cap: two runs and the stranded one spent, one budget of room.
+    second = run(cs, [a], repos, state, runs=3, budget_micros=BUDGET, cap_micros=3 * ANSWER + BUDGET - 1,
+                 cases=[benign])
+    assert sorted(r["rep"] for r in second) == [1, 2], second
+    assert not {done["run_id"], waiting["run_id"]} & {r["run_id"] for r in second}
+    db = ledger(state, "a")
+    states = dict(db.execute("SELECT workflow_id, cancelled_at IS NOT NULL FROM runs").fetchall())
+    db.close()
+    assert (states[done["run_id"]], states[waiting["run_id"]]) == (0, 1)
+    assert runner.spent_in(state) == 3 * ANSWER
+
+
+def test_a_run_left_in_flight_is_only_ever_answered_by_its_own_profile(tmp_path: Path, evalset, modelsim: str) -> None:
+    cs, repos, _ = evalset
+    (tmp_path / "answers.json").write_text(json.dumps([
+        {"model": "gpt-oss:20b", "contains": "parse_record",
+         "answers": [{"report": eval_fixture.report(eval_fixture.finding(21, "CWE-787", file="parse.c"))}]},
+        {"model": "claude-opus-5-5", "contains": "format_price", "answers": [{"report": eval_fixture.report()}]}]))
+    a, b = profiles(modelsim)
+    state = tmp_path / "state"
+    oob = cs.case("c-oob")
+    # Model b's run, written down and in flight when its runner stopped (no Worker answered it).
+    started = stranded_run(state, b, repos, oob)
+    runner.Journal(state / "journal.jsonl").append({
+        "event": "start", "profile": "b", "case": "c-oob", "rep": 1, "run_id": started["run_id"],
+        "temporal_run_id": started["temporal_run_id"], "budget_micros": BUDGET, "paid": False, "expect": b.expect,
+        "commit": oob.commit, "cases_sha256": cs.sha256, "at": 0})
+
+    # Model a's runner leaves it where it is: a's provider never sees b's case.
+    first = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=[cs.case("py-benign")])
+    assert [(r["profile"], r["case"]) for r in first] == [("a", "py-benign")]
+    assert [json.loads(line)["path"] for line in (tmp_path / "modelsim.jsonl").read_text().splitlines()
+            if "/v1/messages" in line] == ["/v1/messages/count_tokens", "/v1/messages"]
+
+    # Model b's runner picks it up, and its own provider answers.
+    second = run(cs, [b], repos, state, runs=1, budget_micros=BUDGET, cases=[oob])
+    [mine] = [r for r in second if r["run_id"] == started["run_id"]]
+    assert mine["resumed"] and mine["models"] == ["local/gpt-oss:20b"] and score.detected(oob, mine)
+    assert score.metrics(cs, [mine])["b"]["latency_s"]["runs"] == 0  # its seconds hold the downtime
+
+
+def test_void_runs_count_on_their_own_and_run_again_when_asked(tmp_path: Path, evalset, modelsim: str) -> None:
+    cs, repos, _ = evalset
+    # c-oob's provider answers 429 to every attempt (5), then a report: the first run is void.
+    (tmp_path / "answers.json").write_text(json.dumps([
+        {"contains": "format_price", "answers": [{"report": eval_fixture.report()}]},
+        {"contains": "parse_record", "answers": [{"fault": "429"}] * 5 + [
+            {"report": eval_fixture.report(eval_fixture.finding(21, "CWE-787", file="parse.c"))}]}]))
+    a = profiles(modelsim)[0]
+    state = tmp_path / "state"
+    both = [cs.case("py-benign"), cs.case("c-oob")]
+    first = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both)
+    [failed] = [r for r in first if r["case"] == "c-oob"]
+    assert score.void(failed) and failed["outcome"].startswith("failed") and failed["spent_micros"] == 0
+    m = score.metrics(cs, first)["a"]
+    assert (m["void"], m["detection"]["runs"]) == (1, 0)
+
+    # Without --retry-void the runner has nothing to do; with it, the void run runs again.
+    assert run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both) == first
+    second = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both, retry_void=True)
+    [again] = [r for r in second if r["case"] == "c-oob"]
+    assert again["run_id"] != failed["run_id"] and not score.void(again) and score.detected(cs.case("c-oob"), again)
+    assert score.metrics(cs, second)["a"]["void"] == 0
+
+
+def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Path, evalset, modelsim: str) -> None:
     cs, repos, _ = evalset
     (tmp_path / "answers.json").write_text(json.dumps(
         [{"contains": "format_price", "answers": [{"report": eval_fixture.report()}] * 3}]))
     a = profiles(modelsim)[0]
     state = tmp_path / "state"
-    benign = [cs.case("py-benign")]
-    assert len(run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=benign)) == 1
+    killed = []
 
-    # A run started on the same stack but never written down, as if the runner had been stopped
-    # right after starting it: it waits for budget it will never get.
-    stack = Stack(state / "stack", temporal_db=True, fixture=False)
-    try:
-        ids = {runner.repo_id(name): {"mirror": str(path)} for name, path in repos.items()}
-        stack.start_agentd(policy=runner.policy(list(ids)), models=a.models, prices=a.prices, repos=ids)
-        stray = stack.agentctl("runs", "start", "security-audit", "--repo", runner.repo_id("shop"),
-                               "--commit", cs.case("py-benign").commit, "--base", "main", "--budget-micros", "10000",
-                               "--dry-run")
-    finally:
-        stack.close()
+    def log(line: str) -> None:
+        print(line)
+        if "#1:" in line and not killed:  # the first run is done: kill the Worker (and its sandbox)
+            for pid in descendants(os.getpid()):
+                if "agentos_worker" in command_of(pid):
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
 
-    # The next runner cancels it, and still runs what it was asked to.
-    second = run(cs, [a], repos, state, runs=2, budget_micros=BUDGET, cap_micros=1_000_000, cases=benign)
-    assert sorted(r["rep"] for r in second) == [1, 2] and stray["run_id"] not in {r["run_id"] for r in second}
-    ledger = sqlite3.connect(f"file:{state / 'stack/agentd/data/ledger.db'}?mode=ro", uri=True)
-    [(cancelled,)] = ledger.execute("SELECT cancelled_at FROM runs WHERE workflow_id = ?", (stray["run_id"],)).fetchall()
-    ledger.close()
-    assert cancelled, "the stray run was not cancelled"
+    # Its runs would only time out: the runner stops instead, and records none of them.
+    with pytest.raises(RuntimeError, match="worker1 died"):
+        run(cs, [a], repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000, cases=[cs.case("py-benign")],
+            log=log)
+    assert killed and [r["rep"] for r in runner.Journal(state / "journal.jsonl").results()] == [1]
+    again = run(cs, [a], repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000, cases=[cs.case("py-benign")])
+    assert sorted(r["rep"] for r in again) == [1, 2, 3] and not any(score.void(r) for r in again)
+
+
+def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, evalset, monkeypatch) -> None:
+    cs, repos, _ = evalset
+    state = tmp_path / "state"
+    state.mkdir()
+    with open(state / "lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="another runner"):
+            runner.run(cs, [profiles("http://127.0.0.1:9")[1]], repos, state)
+    monkeypatch.setattr(runner, "SANDBOX", "none")
+    with pytest.raises(ValueError, match="sandbox"):
+        runner.run(cs, [runner.PROFILES["local"]], repos, state)
+    with pytest.raises(ValueError, match="names"):
+        runner.run(cs, [dataclasses.replace(profiles("http://127.0.0.1:9")[1], name="../b")], repos, state)

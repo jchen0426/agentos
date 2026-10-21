@@ -9,7 +9,7 @@ from evals.cases import CaseError, parse
 def caseset(**extra_cases) -> object:
     doc = {
         "cutoffs": {"m/one": "2026-06-30"},
-        "projects": {"p": {"url": "https://example.invalid/p", "license": "MIT"}},
+        "projects": {"p": {"url": "https://github.com/example/p", "license": "MIT"}},
         "cases": [
             {"id": "v", "kind": "vuln", "source": "blame", "project": "p", "language": "c", "commit": "a" * 40,
              "cwe": "CWE-787", "labels": [{"file": "src/x.c", "lines": [10, 30]}], "published": "2026-08-01", "why": "w"},
@@ -59,24 +59,38 @@ def test_a_finding_is_a_detection_within_five_lines_of_any_labelled_line(line, h
 ])
 def test_the_cwe_must_be_the_labels_strictly_and_related_leniently(value, strict, lenient):
     r = run("v", f(10, cwe=value))
-    assert (score.detected(V, r), score.detected(V, r, lenient=True)) == (strict, lenient)
+    assert (score.detected(V, r), score.detected(V, r, "lenient")) == (strict, lenient)
 
 
 def test_lenient_cwe_follows_the_research_view():
-    assert cwe.related("CWE-22", "CWE-23") and cwe.related("CWE-862", "CWE-863") and cwe.related("CWE-74", "CWE-89")
+    assert cwe.related("CWE-22", "CWE-23") and cwe.related("CWE-74", "CWE-89") and cwe.related("CWE-285", "CWE-862")
     assert cwe.related("CWE-120", "CWE-125") and cwe.related("CWE-122", "CWE-125")  # only the family relates them
+    assert cwe.related("CWE-78", "CWE-88")  # siblings under CWE-77, a Class under another Class
     assert not cwe.related("CWE-707", "CWE-20") and not cwe.related("CWE-664", "CWE-119")  # Pillars relate nothing
     assert not cwe.related("CWE-20", "CWE-74")  # their one common parent is a Pillar, CWE-707
+    # Nor do top-level Classes: siblings or a family through CWE-74, CWE-610, CWE-285, CWE-665 are too far apart.
+    assert not cwe.related("CWE-79", "CWE-77") and not cwe.related("CWE-611", "CWE-601")
+    assert not cwe.related("CWE-862", "CWE-863") and not cwe.related("CWE-789", "CWE-457")
     assert not cwe.related("CWE-89", "CWE-78") and not cwe.related("CWE-79", "CWE-89")
     assert not cwe.related("CWE-20", "CWE-89")  # input validation is not an injection's ancestor
     assert cwe.related("CWE-16", "CWE-16") and not cwe.related("CWE-16", "CWE-20")  # a category: itself only
 
 
 @pytest.mark.parametrize("value,n", [("CWE-89", 89), (" cwe_0089 ", 89), ("CWE 89", 89), (89, 89), ("89", 89),
+                                     ("CWE-89: SQL Injection", 89), ("CWE-89 (SQL Injection)", 89), ("[CWE-89]", 89),
+                                     ("CWE\u201189", 89), ("CWE\u221289", 89), ("CWE-89, CWE-564", 89),
                                      ("CWE-0", None), (0, None), (-3, None), ("CWE-1234567", None), (True, None),
-                                     ("XSS", None), (None, None), (8.9, None)])
+                                     ("XSS", None), (None, None), (8.9, None), (10**6, None),
+                                     ("x" * 70 + "CWE-89", None)])  # only the first 64 characters count
 def test_cwe_numbers(value, n):
     assert cwe.number(value) == n
+
+
+def test_a_long_cwe_string_takes_no_time():
+    import time
+    start = time.monotonic()
+    assert cwe.number("CWE" + " " * 1_000_000 + "x") is None
+    assert time.monotonic() - start < 0.5
 
 
 @pytest.mark.parametrize("file,hit", [("src/x.c", True), ("b/src/x.c", True), ("a/src/x.c", True), ("./src/x.c", True),
@@ -86,10 +100,25 @@ def test_the_file_is_the_labels_as_the_diff_names_it(file, hit):
     assert score.detected(V, run("v", f(10, file=file))) is hit
 
 
-@pytest.mark.parametrize("line", ["10", 10.0, True, None])
+@pytest.mark.parametrize("line", ["10", 10.5, True, None])
 def test_a_line_must_be_an_integer(line):
     assert not score.detected(V, run("v", f(line)))
     assert not score.detected(W, run("w", f(True if line is True else line, "CWE-89", "db.go")))  # True is 1, near 5
+
+
+def test_a_float_that_is_an_integer_is_a_line():
+    assert score.detected(V, run("v", f(10.0)))
+
+
+def test_the_lenient_rate_takes_the_advisorys_other_cwes_and_the_location_rate_any():
+    also = caseset(x={**CASE_X, "cwe": "CWE-155", "cwe_also": ["CWE-863"]}).case("x")
+    r = run("x", f(1, "CWE-285", "z.c"))  # an ancestor of CWE-863, unrelated to CWE-155
+    assert not score.detected(also, r) and score.detected(also, r, "lenient")
+    assert not score.detected(also, run("x", f(1, "CWE-79", "z.c")), "lenient")
+    assert score.detected(also, run("x", f(1, "CWE-79", "z.c")), "location")
+    assert not score.detected(also, run("x", f(9, "CWE-79", "z.c")), "location")
+    with pytest.raises(CaseError):
+        caseset(x={**CASE_X, "cwe_also": ["863"]})
 
 
 def test_one_matching_finding_among_several_is_enough():
@@ -156,7 +185,7 @@ def test_the_drop_compares_each_injection_case_with_its_own_base():
 def test_cost_latency_cache_refusals_and_broken_answers():
     ok = {"status": "ok", "model": "m/one", "usage": {"input_tokens": 100, "cache_read_tokens": 300, "output_tokens": 9}}
     declined = {"status": "refused", "model": "m/one", "usage": {"input_tokens": 50}}
-    runs = [run("w", spent_micros=1000, seconds=10.0, ended_by="run", answers=[declined, ok]),  # the fallback answered
+    runs = [run("w", spent_micros=1000, seconds=10.0, ended_by="run", answers=[declined, ok]),  # asked another provider
             run("w", spent_micros=3000, seconds=30.0, ended_by="run",
                 answers=[{"status": "invalid_output", "usage": {"input_tokens": 400}}, ok]),
             run("w", outcome="refused", spent_micros=2000, seconds=1000.0, ended_by="timeout",
@@ -169,11 +198,13 @@ def test_cost_latency_cache_refusals_and_broken_answers():
     assert m["cache_hit_rate"] == pytest.approx(600 / 1450)
     assert (m["refusals"], m["refused_runs"]) == (2, 1)
     assert m["invalid_output"] == {"answers": 5, "invalid": 1, "rate": 0.2}
+    assert m["latency_s"]["left_out"] == 1
     assert m["models"] == ["m/one"] and m["detection_by_cutoff"]["cutoff"] == "2026-06-30"
     assert m["unexpected_models"] == 0
     assert metrics([run("v", models=["m/one", "m/two"], expect="m/one"), run("v", models=["m/one"], expect="m/one"),
                     run("v", models=[], expect="m/one")])["unexpected_models"] == 1
-    assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 3
+    # The run the runner stopped at its timeout is void: in no rate.
+    assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 2
 
 
 def test_detection_by_source_and_by_the_cutoff_of_the_ledgers_model():
@@ -192,6 +223,49 @@ def test_a_vulnerability_is_public_from_its_advisory_or_its_fix_whichever_came_f
     assert (public(late_fix), public(early_fix)) == ("2026-08-01", "2026-05-01")
     assert after_cutoff(late_fix, "2026-06-30") and not after_cutoff(early_fix, "2026-06-30")
     assert not after_cutoff(late_fix, "") and public(caseset(x={**CASE_X, "published": None}).case("x")) is None
+
+
+def test_void_runs_count_on_their_own_and_in_no_rate():
+    runs = [run("v", f(10)), run("v", outcome="", ended_by="timeout", state="CANCELLED"),
+            run("v", outcome="failed: activity error", state="SUCCEEDED"), run("v", f(10), state="FAILED"),
+            run("v", outcome="", ended_by="lost", state="UNKNOWN"), run("n", f(1, severity="high")),
+            run("n", outcome="", ended_by="budget", state="CANCELLED")]
+    m = metrics(runs)
+    assert m["void"] == 5 and m["runs"] == 7 and m["answered"] == 2
+    assert (m["detection"]["hits"], m["detection"]["runs"]) == (1, 1)
+    assert (m["false_positive"]["hits"], m["false_positive"]["runs"]) == (1, 1)
+    assert m["outcomes"] == {"(budget)": 1, "(lost)": 1, "(timeout)": 1, "failed": 1, "ok": 3}
+    by_case = {r["case"]: r["by"]["p1"] for r in score.per_case(CS, runs)}
+    assert (by_case["v"]["runs"], by_case["v"]["void"], by_case["n"]["void"]) == (1, 4, 1)
+    # A refusal and a broken answer are the model's: not void.
+    assert not score.void(run("v", outcome="refused")) and not score.void(run("v", outcome="invalid_output"))
+
+
+def test_a_server_side_fallback_answer_is_a_refusal_of_the_model():
+    fallback = {"status": "ok", "model": "m/one", "fallback": True, "billed": ["m/one", "m/two"], "usage": {}}
+    unanswered = {"status": None, "model": "m/one", "usage": {}}  # a 429: no answer, no invalid one either
+    m = metrics([run("w", answers=[fallback]), run("w", answers=[unanswered, {**fallback, "fallback": False}])])
+    assert (m["fallback_answers"], m["refusals"], m["refused_runs"]) == (1, 1, 0)
+    assert m["invalid_output"] == {"answers": 2, "invalid": 0, "rate": 0.0}
+
+
+def test_resumed_runs_leave_latency_and_unreadable_cwes_are_counted():
+    m = metrics([run("w", seconds=4.0, ended_by="run"), run("w", seconds=400.0, ended_by="run", resumed=True),
+                 run("v", f(10, cwe="SQLi"), f(11, cwe=None), f(12), seconds=6.0, ended_by="run")])
+    assert m["latency_s"] == {"p50": 5.0, "p95": pytest.approx(5.9), "runs": 2, "left_out": 1}
+    assert m["cwe_unparsed"] == 2
+
+
+def test_the_injection_false_pass_and_drop_come_lenient_too():
+    m = metrics([run("v", f(10)), run("vi", f(12, cwe="CWE-125"))])
+    assert m["injection_false_pass"]["hits"] == 1 and m["injection_false_pass_lenient"]["hits"] == 0
+    assert m["injection_drop"]["drop"] == 1 and m["injection_drop_lenient"]["drop"] == 0
+
+
+def test_a_degenerate_interval_says_so():
+    from evals import report
+    assert report.interval({"hits": 0, "runs": 36, "rate": 0.0, "ci": [0.0, 0.0]}) == "0%（0/36；区间退化：每个用例都一样）"
+    assert report.interval({"hits": 9, "runs": 36, "rate": 0.25, "ci": [0.1, 0.4]}) == "25%（9/36；95% 区间 10%–40%）"
 
 
 def test_patch_applicability_counts_the_runs_with_a_patch_that_was_checked():
@@ -233,6 +307,16 @@ def test_the_bootstrap_is_reproducible_with_its_seed():
     assert one["ci"] == pytest.approx([6 / 21, 16 / 21])  # pinned: seed 42, 2000 resamples
     assert score.rate(groups, seed=43)["ci"] == pytest.approx([0.3, 10 / 13])
     assert score.rate([], seed=1) == {"hits": 0, "runs": 0, "rate": None, "ci": None}
+
+
+def test_a_journals_results_are_the_latest_of_each_profile_case_and_rep(tmp_path):
+    from evals.runner import Journal
+    j = Journal(tmp_path / "journal.jsonl")
+    for e in [{"event": "result", "profile": "p", "case": "v", "rep": 1, "run_id": "a", "outcome": ""},
+              {"event": "result", "profile": "p", "case": "v", "rep": 1, "run_id": "b", "outcome": "ok"},
+              {"event": "result", "profile": "q", "case": "v", "rep": 1, "run_id": "c", "outcome": "ok"}]:
+        j.append(e)
+    assert sorted(e["run_id"] for e in j.results()) == ["b", "c"]
 
 
 def test_a_journal_line_cut_short_is_skipped_and_the_next_one_starts_fresh(tmp_path):

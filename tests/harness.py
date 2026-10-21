@@ -306,6 +306,7 @@ class Stack:
         self.procs: list[Proc] = []
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
+        self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
         self.fixture = fixture
         self.commit = make_mirror(tmp / "mirror", live_repo) if fixture else ""
         self.data_dir = tmp / "agentd" / "data"
@@ -377,10 +378,8 @@ class Stack:
         addr = self.tmp / "modelsim.addr"
         self.modelsim_log = self.tmp / "modelsim.jsonl"
         self.modelsim_faults = self.tmp / "modelsim-faults.json"
-        self.modelsim_answers = self.tmp / "modelsim-answers.json"
         p = Proc("modelsim", [BIN / "modelsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
-                              "--log", self.modelsim_log, "--faults", self.modelsim_faults,
-                              "--answers", self.modelsim_answers],
+                              "--log", self.modelsim_log, "--faults", self.modelsim_faults],
                  self.tmp / "modelsim.log")
         self.procs.append(p)
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated model providers")
@@ -390,11 +389,6 @@ class Stack:
     def model_faults(self, script: dict) -> None:
         """The faults the simulated model providers answer with next, each once, per API."""
         self.modelsim_faults.write_text(json.dumps(script))
-
-    def model_answers(self, rules: list[dict]) -> None:
-        """The answers the simulated model providers give, by model and request body
-        (internal/modelsim's package comment)."""
-        self.modelsim_answers.write_text(json.dumps(rules))
 
     def modelsim_requests(self, api: str) -> list[dict]:
         """The simulated model providers' own record of the requests one API got."""
@@ -520,7 +514,7 @@ class Stack:
     def sandbox_env(self) -> dict[str, str]:
         # In production agentd's data lives under the home directory, which the macOS sandbox
         # cannot read. Test data lives elsewhere, so keep it out of reach explicitly.
-        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": str(self.tmp)}
+        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": ":".join(map(str, [self.tmp, *self.deny_read]))}
 
     def start_worker(self, workflows: str | None = None) -> Worker:
         n = len(self.workers) + 1

@@ -12,7 +12,8 @@ one of:
     It is paired with that case and scored against the same labels, moved down by the lines
     the text adds.
 A label is a file and its lines in the commit's version of the file (after the change), with
-the CWE of the vulnerability.
+the CWE of the vulnerability. A case may name other CWEs its advisory gives for the same flaw
+(cwe_also): the lenient rate takes them too, the strict one does not.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _CWE = re.compile(r"^CWE-[1-9][0-9]*$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# A project is fetched from GitHub by URL: nothing else may reach git fetch's command line.
+_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ class Case:
     commit: str  # the audited commit; for one we make, the ID making it must give ("" until made)
     why: str  # why the diff alone decides it (vuln), what the change is (benign), the injection's ploy
     cwe: str | None = None
+    cwe_also: tuple[str, ...] = ()  # other CWEs of the same flaw, for the lenient rate
     labels: tuple[Label, ...] = ()
     advisory: str | None = None  # CVE or GHSA ID
     published: str | None = None  # the advisory's publication date
@@ -111,6 +115,8 @@ def parse(doc: dict, sha256: str = "") -> CaseSet:
     for name, p in doc["projects"].items():
         if not _ID.match(name) or bool(p.get("url")) == bool(p.get("path")):
             raise CaseError(f"project {name!r}: a lowercase name, and either a url or a path")
+        if p.get("url") and not _URL.match(p["url"]):
+            raise CaseError(f"project {name!r}: the url must be https://github.com/<owner>/<repo>")
         projects[name] = Project(name=name, license=p["license"], base=p.get("base", "main"),
                                  url=p.get("url"), path=p.get("path"))
     raw = {c["id"]: c for c in doc["cases"]}
@@ -152,22 +158,24 @@ def _case(c: dict, raw: dict, projects: dict[str, Project]) -> Case:
                                                for n in lb["lines"]))
                        for lb in base["labels"])
         return Case(id=cid, kind=kind, source=source, project=base["project"], language=base["language"],
-                    commit=commit, why=why, cwe=base["cwe"], labels=labels, advisory=base.get("advisory"),
+                    commit=commit, why=why, cwe=base["cwe"], cwe_also=tuple(base.get("cwe_also", [])), labels=labels,
+                    advisory=base.get("advisory"),
                     published=base.get("published"), fix=base.get("fix"), fixed=base.get("fixed"), base=base["id"],
                     inject=inject)
     project = c.get("project", "")
     if project not in projects:
         raise CaseError(f"{where}: unknown project {project!r}")
     case = Case(id=cid, kind=kind, source=source, project=project, language=c["language"], commit=commit, why=why,
-                cwe=c.get("cwe"), labels=tuple(Label(lb["file"], tuple(lb["lines"])) for lb in c.get("labels", [])),
+                cwe=c.get("cwe"), cwe_also=tuple(c.get("cwe_also", [])),
+                labels=tuple(Label(lb["file"], tuple(lb["lines"])) for lb in c.get("labels", [])),
                 advisory=c.get("advisory"), published=c.get("published"), fix=c.get("fix"), fixed=c.get("fixed"),
                 revert_paths=tuple(c.get("revert_paths", [])))
     if kind == "benign":
-        if case.cwe or case.labels or case.fix:
+        if case.cwe or case.cwe_also or case.labels or case.fix:
             raise CaseError(f"{where}: a benign case has no CWE, labels or fix")
         return case
-    if not (case.cwe and _CWE.match(case.cwe)):
-        raise CaseError(f"{where}: cwe must look like CWE-89")
+    if not (case.cwe and _CWE.match(case.cwe)) or not all(_CWE.match(x) for x in case.cwe_also):
+        raise CaseError(f"{where}: cwe and cwe_also must look like CWE-89")
     if not case.labels or any(not lb.file or not lb.lines or min(lb.lines) < 1 for lb in case.labels):
         raise CaseError(f"{where}: labels need a file and lines from 1")
     if any(d is not None and not _DATE.match(d) for d in (case.published, case.fixed)):

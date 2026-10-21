@@ -15,7 +15,7 @@ from tests import eval_fixture
 
 # The commits evals/mirrors.py makes from tests/eval_fixture.py's repositories: fixed authors and
 # dates make the same IDs anywhere.
-MADE = {"py-path": "2b84293b5ee10292548790c1c487f95fcc0f38d1", "py-sqli-inj": "1bacad33fa65c5b6e22b4d534b34bbfdc24e3848"}
+MADE = {"py-path": "f87aacae121aba58b8669881f07e6cd905fafffa", "py-sqli-inj": "03ca12995a55e68c033249e9622b6c92634e816c"}
 PERMISSIVE = {"MIT", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "ISC", "Zlib", "curl", "PSF-2.0", "Unlicense",
               "0BSD", "MIT-0", "BSL-1.0", "libtiff", "X11"}
 
@@ -29,7 +29,7 @@ def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
 
 
-def test_made_commits_have_the_same_ids_anywhere(tmp_path: Path) -> None:
+def test_made_commits_have_the_same_ids_in_two_places(tmp_path: Path) -> None:
     _, one = build(tmp_path / "one", tmp_path / "cache1")
     _, two = build(tmp_path / "two", tmp_path / "cache2")
     assert {k: v["commit"] for k, v in one.items()} == {k: v["commit"] for k, v in two.items()}
@@ -93,6 +93,86 @@ def test_the_cache_stays_out_of_the_repository(tmp_path: Path) -> None:
         mirrors.build(parse(doc), mirrors.REPO / "build-cache", log=lambda *_: None)
 
 
+def test_inside_the_repository_however_it_is_spelled(tmp_path: Path) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(mirrors.REPO / "evals")
+    assert mirrors.inside_repo(link / "cache") and mirrors.inside_repo(mirrors.REPO / "docs" / ".." / "x")
+    shouted = Path(str(mirrors.REPO).upper())
+    if shouted.exists():  # a case-insensitive file system (macOS)
+        assert mirrors.inside_repo(shouted / "cache")
+    assert not mirrors.inside_repo(tmp_path / "cache") and not mirrors.inside_repo(mirrors.REPO.parent / "x")
+
+
+def _repo(root: Path, before: dict[str, bytes], after: dict[str, bytes]) -> tuple[str, str]:
+    """A repository with two commits: files as `before`, then as `after`. Returns both IDs."""
+    root.mkdir(parents=True)
+    git(root, "init", "-q", "-b", "main")
+    ids = []
+    for files in (before, after):
+        for name, content in files.items():
+            (root / name).write_bytes(content)
+        git(root, "add", "-A")
+        git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+        ids.append(git(root, "rev-parse", "HEAD").strip())
+    return ids[0], ids[1]
+
+
+def _injected(tmp_path: Path, content: bytes, line: int, text: str, labels: list[int]) -> tuple[bytes, list[int]]:
+    """The file an injection case makes from a vuln commit that writes `content`, and its labels."""
+    _, vuln = _repo(tmp_path / "r", {"x.c": b"int a;\n"}, {"x.c": content})
+    doc = {"projects": {"p": {"path": str(tmp_path / "r"), "license": "MIT"}},
+           "cases": [{"id": "v", "kind": "vuln", "source": "blame", "project": "p", "language": "c", "commit": vuln,
+                      "cwe": "CWE-787", "labels": [{"file": "x.c", "lines": labels}], "why": "w"},
+                     {"id": "i", "kind": "injection", "source": "injection", "base": "v",
+                      "inject": {"file": "x.c", "line": line, "text": text}, "why": "w"}]}
+    built = mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+    out = subprocess.run(["git", "-C", str(tmp_path / "r"), "cat-file", "blob", f"{built['i']['commit']}:x.c"],
+                         check=True, capture_output=True).stdout
+    return out, list(parse({**doc, "cases": [doc["cases"][0], {**doc["cases"][1], "commit": built["i"]["commit"]}]})
+                     .case("i").labels[0].lines)
+
+
+def test_an_injection_keeps_the_files_line_endings_and_moves_the_labels(tmp_path: Path) -> None:
+    # Windows line endings, two lines of text, a lone \r inside a line (not a line ending).
+    content, labels = _injected(tmp_path, b"int a;\r\n  b = 1;\r\nc\rd;\r\n", 2, "// one\n// two", [2, 3])
+    assert content == b"int a;\r\n  // one\r\n  // two\r\n  b = 1;\r\nc\rd;\r\n" and labels == [4, 5]
+
+
+def test_an_injection_at_the_end_of_a_file_without_a_final_newline(tmp_path: Path) -> None:
+    content, labels = _injected(tmp_path, b"int a;\nint b = x[9];", 3, "// three", [2])
+    assert content == b"int a;\nint b = x[9];\n// three\n" and labels == [2]
+
+
+def test_a_case_may_change_at_most_400_lines(tmp_path: Path) -> None:
+    _, big = _repo(tmp_path / "r", {"x.c": b"int a;\n"}, {"x.c": b"int a;\n" + b"int b;\n" * 401})
+    doc = {"projects": {"p": {"path": str(tmp_path / "r"), "license": "MIT"}},
+           "cases": [{"id": "n", "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": big,
+                      "why": "w"}]}
+    with pytest.raises(RuntimeError, match="changes 401 lines, over 400"):
+        mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+
+
+def test_a_commit_at_a_shallow_boundary_is_refused(tmp_path: Path) -> None:
+    # Its diff would be its whole tree: a later shallow fetch can leave a case's commit there.
+    _, commit = _repo(tmp_path / "r", {"x.c": b"int a;\n"}, {"x.c": b"int b;\n"})
+    (tmp_path / "r/.git/shallow").write_text(commit + "\n")
+    doc = {"projects": {"p": {"path": str(tmp_path / "r"), "license": "MIT"}},
+           "cases": [{"id": "n", "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": commit,
+                      "why": "w"}]}
+    with pytest.raises(RuntimeError, match="exactly one parent"):
+        mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+
+
+def test_a_project_url_is_github_and_nothing_else() -> None:
+    good = {"id": "n", "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": "a" * 40,
+            "why": "w"}
+    for url in ("--upload-pack=touch /tmp/x;true", "https://github.com/a/b --x", "http://github.com/a/b",
+                "https://github.com/a/b/c", "ext::sh -c x", "https://evil.example/a/b", "file:///tmp/r"):
+        with pytest.raises(CaseError, match="url"):
+            parse({"projects": {"p": {"url": url, "license": "MIT"}}, "cases": [good]})
+    assert parse({"projects": {"p": {"url": "https://github.com/a-b/c.d_e", "license": "MIT"}}, "cases": [good]})
+
+
 def test_the_case_table_names_each_case_and_why(tmp_path: Path) -> None:
     root = tmp_path / "r"
     path = tmp_path / "cases.json"
@@ -123,7 +203,7 @@ def test_the_cli_spends_nothing_without_a_cap_or_unsandboxed(tmp_path: Path, mon
 
 
 def test_case_file_errors() -> None:
-    project = {"p": {"url": "https://example.invalid/p", "license": "MIT"}}
+    project = {"p": {"url": "https://github.com/example/p", "license": "MIT"}}
     good = {"id": "v", "kind": "vuln", "source": "blame", "project": "p", "language": "c", "commit": "a" * 40,
             "cwe": "CWE-787", "labels": [{"file": "x.c", "lines": [1]}], "why": "w"}
     for bad in ({"source": "reverse"}, {"cwe": "787"}, {"labels": []}, {"labels": [{"file": "x.c", "lines": [0]}]},
