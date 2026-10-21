@@ -178,7 +178,7 @@ func (r runOutputs) ModelOutputs(ctx context.Context, task string) ([]map[string
 
 // newApproval is the approval of a new effect, open for ttl.
 func newApproval(run db.Run, tool, effectID string, canon []byte, payloadSHA256, card string, ttl time.Duration) db.InsertApprovalParams {
-	now := time.Now()
+	now := ledger.Clock()
 	return db.InsertApprovalParams{
 		ApprovalID: uuid.NewString(), EffectID: effectID, WorkflowID: run.WorkflowID, Tool: tool,
 		ArgsJson: string(canon), PayloadSha256: payloadSHA256, ContextBlob: card,
@@ -189,7 +189,7 @@ func newApproval(run db.Run, tool, effectID string, canon []byte, payloadSHA256,
 // expired reports whether an approval's time is up. One whose expiry agentd cannot read is.
 func expired(a db.Approval) bool {
 	at, err := time.Parse(time.RFC3339Nano, a.ExpiresAt)
-	return err != nil || !time.Now().Before(at)
+	return err != nil || !ledger.Clock().Before(at)
 }
 
 // awaitApproval answers a call of an effect in AWAITING_APPROVAL from its approval. It returns no
@@ -497,7 +497,7 @@ func (g *Gateway) expire(ctx context.Context, a db.Approval) (bool, error) {
 func (g *Gateway) ExpireApprovals(ctx context.Context) {
 	for {
 		pause := 50 * time.Millisecond
-		due, err := g.Ledger.Q.ListExpiredApprovals(ctx, ledger.Stamp(time.Now()))
+		due, err := g.Ledger.Q.ListExpiredApprovals(ctx, ledger.Stamp(ledger.Clock()))
 		if err != nil && ctx.Err() == nil {
 			g.Log.Error("approvals: cannot list the expired ones", "error", err)
 			pause = time.Second
@@ -511,7 +511,7 @@ func (g *Gateway) ExpireApprovals(ctx context.Context) {
 		wait := time.Minute
 		if next, err := g.Ledger.Q.NextApprovalExpiry(ctx); err == nil && next != "" {
 			if at, err := time.Parse(time.RFC3339Nano, next); err == nil {
-				wait = min(wait, time.Until(at))
+				wait = min(wait, at.Sub(ledger.Clock()))
 			}
 		}
 		t := time.NewTimer(max(wait, pause))

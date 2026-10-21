@@ -466,11 +466,9 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 		if err != nil {
 			return nil, fmt.Errorf("effect %s: claimed_at: %w", e.EffectID, err)
 		}
-		if wait := time.Until(sentAt.Add(finder.Settle())); wait > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(wait):
+		if wait := sentAt.Add(finder.Settle()).Sub(ledger.Clock()); wait > 0 {
+			if err := g.sleep(ctx, wait); err != nil {
+				return nil, err
 			}
 			if v, found, err = finder.Find(ctx, payload); err != nil {
 				return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown, and looking it up failed: "+err.Error())
@@ -489,6 +487,22 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 		return g.release(ctx, e, true)
 	}
 	return g.resendNew(ctx, run, t, e, payload)
+}
+
+// sleep waits d, or until ctx ends: on the system's clock, unless a test that moves ledger.Clock
+// moves it here too (wait).
+func (g *Gateway) sleep(ctx context.Context, d time.Duration) error {
+	if g.wait != nil {
+		return g.wait(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // resendNew sends again an effect none of whose requests took effect, as far as agentd knows. It is
@@ -641,10 +655,9 @@ func (g *Gateway) RecoverEffects(ctx context.Context) error {
 	for _, e := range claimed {
 		g.Log.Warn("recovering an effect agentd claimed before it stopped", "workflow_id", e.WorkflowID,
 			"effect_id", e.EffectID, "tool", e.Tool, "class", e.EffectClass)
-		go func() {
-			v, err, _ := g.effects.Do(e.EffectID, func() (any, error) {
-				return g.track(func() (any, error) { return g.recoverClaimed(ctx, e.EffectID) })
-			})
+		// Counted before it starts: Drain, on shutdown, waits for it too.
+		g.executions.Go(func() {
+			v, err, _ := g.effects.Do(e.EffectID, func() (any, error) { return g.recoverClaimed(ctx, e.EffectID) })
 			switch {
 			case errors.Is(err, errEffectReleased):
 			case err != nil:
@@ -652,7 +665,7 @@ func (g *Gateway) RecoverEffects(ctx context.Context) error {
 			default:
 				g.Log.Info("effect recovered", "effect_id", e.EffectID, "status", v.(*agentosv1.Result).GetStatus())
 			}
-		}()
+		})
 	}
 	return nil
 }
@@ -752,7 +765,7 @@ func (g *Gateway) Reconcile(ctx context.Context, r Resolution) (string, string, 
 		} else if f, ok := t.(tools.Finder); ok && e.ClaimedAt.Valid {
 			// The request may still land while GitHub works on it: the finding can wait.
 			if sentAt, err := time.Parse(time.RFC3339Nano, e.ClaimedAt.String); err == nil {
-				if until := sentAt.Add(f.Settle()); time.Now().Before(until) {
+				if until := sentAt.Add(f.Settle()); ledger.Clock().Before(until) {
 					return "", "", fmt.Errorf("%w: the request may still take effect until %s; look again then",
 						ErrTooEarly, until.UTC().Format(time.RFC3339))
 				}

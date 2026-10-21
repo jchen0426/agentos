@@ -101,8 +101,13 @@ func (l *Ledger) Tx(ctx context.Context, fn func(q *db.Queries) error) error {
 	return tx.Commit()
 }
 
+// Clock is where the ledger's times come from, and the times the effect protocol compares them
+// with (an approval's expiry, a request that may still take effect): time.Now, unless a test
+// moves time itself.
+var Clock = time.Now
+
 // Now is the ledger's timestamp format: RFC 3339 in UTC with nanoseconds.
-func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+func Now() string { return Clock().UTC().Format(time.RFC3339Nano) }
 
 // stampLayout is RFC 3339 in UTC with all nine digits of the fraction. Now drops trailing zeros,
 // so its times do not sort as text; these do, and SQL compares them as text.
