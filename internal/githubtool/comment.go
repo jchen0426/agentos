@@ -45,7 +45,8 @@ type Approval struct {
 	Reason    string // a rejection's reason, or why it expired
 	ExpiresAt string
 	// Write says what became of an approved write that did not go out as approved: "not sent"
-	// (agentd or the tool refused it before sending anything, or the run was cancelled), "failed"
+	// (agentd or the tool refused it before sending anything, the run was cancelled, or agentd could
+	// only dry-run it), "failed"
 	// (the external system refused it) or "outcome unknown". Empty when it was sent, or is on its
 	// way. WriteReason says why.
 	Write, WriteReason string

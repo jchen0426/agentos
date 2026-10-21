@@ -1,5 +1,5 @@
 """Runs inside the Worker sandbox and reports, as one JSON object on stdout, what the
-sandbox lets through. tests/test_sandbox.py launches it the way Workers are launched."""
+sandbox lets through. tests/test_t9_isolation.py launches it the way Workers are launched."""
 
 import argparse
 import asyncio
@@ -43,11 +43,29 @@ def read(path: str) -> str:
         return f"refused: {e.__class__.__name__}: {e}"
 
 
+def listdir_names(path: str) -> list[str] | str:
+    try:
+        return sorted(os.listdir(path))
+    except OSError as e:
+        return f"refused: {e.__class__.__name__}: {e}"
+
+
 def listdir(path: str) -> str:
     try:
         return f"listed {len(os.listdir(path))} entries"
     except OSError as e:
         return f"refused: {e.__class__.__name__}: {e}"
+
+
+def keychain_item(service: str, keychain: str) -> str:
+    """Whether an item agentd may keep a secret in can be found: its attributes only, never
+    the secret (no -w, no -g)."""
+    try:
+        r = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, keychain],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"refused: {type(e).__name__}"
+    return "found" if r.returncode == 0 else f"refused: exit {r.returncode}"
 
 
 def keychain_items(home: str) -> str:
@@ -109,7 +127,9 @@ async def main() -> None:
     p.add_argument("--home", required=True)
     p.add_argument("--home-canary", required=True, help="a file in the home directory")
     p.add_argument("--ledger", required=True, help="agentd's ledger file")
+    p.add_argument("--extra", default="{}", help="JSON: more reads, sockets and keychain items to try")
     a = p.parse_args()
+    extra = json.loads(a.extra)
 
     report: dict = {}
     report["runtime_sdk"], client = await sdk(a.runtime, a.proxy)
@@ -124,6 +144,10 @@ async def main() -> None:
     # agentd's model keys live in the login keychain (macOS): out of the Worker's reach.
     report["keychains"] = listdir(os.path.join(a.home, "Library", "Keychains"))
     report["keychain_items"] = keychain_items(a.home)
+    report["reads"] = {k: read(path) for k, path in extra.get("reads", {}).items()}
+    report["sockets"] = {k: unix(path) for k, path in extra.get("sockets", {}).items()}
+    report["keychain"] = {s: keychain_item(s, extra["keychain_file"]) for s in extra.get("keychain_items", [])}
+    report["dev"] = listdir_names("/dev")
     report["env"] = sorted(os.environ)
     print(json.dumps(report))
 

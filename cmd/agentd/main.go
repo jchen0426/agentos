@@ -42,6 +42,7 @@ import (
 	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/outbound"
 	"github.com/jchen0426/agentos/internal/outbox"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/pricing"
@@ -80,6 +81,15 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Before any client is made: where agentd's requests go is its configuration's to say.
+	set, err := outbound.IgnoreEnvProxies()
+	if err != nil {
+		return err
+	}
+	if len(set) > 0 {
+		log.Warn("agentd ignores the proxy settings in its environment: its requests go straight to their hosts, "+
+			"and fail where only a proxy reaches them", "variables", set)
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -154,7 +164,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		HostPort:          cfg.Temporal.Address,
 		Namespace:         cfg.Temporal.Namespace,
 		Logger:            tlog.NewStructuredLogger(log.With("component", "temporal-sdk")),
-		ConnectionOptions: client.ConnectionOptions{TLS: tlsConfig},
+		ConnectionOptions: client.ConnectionOptions{TLS: tlsConfig, DialOptions: []grpc.DialOption{grpc.WithNoProxy()}},
 	})
 	if err != nil {
 		return fmt.Errorf("connect to Temporal at %s: %w", cfg.Temporal.Address, err)
@@ -249,7 +259,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		creds = credentials.NewTLS(tlsConfig)
 	}
 	backend, err := grpc.NewClient(cfg.Temporal.Address,
-		append(runtimeproxy.DialOptions(), grpc.WithTransportCredentials(creds))...)
+		append(runtimeproxy.DialOptions(), grpc.WithTransportCredentials(creds), grpc.WithNoProxy())...)
 	if err != nil {
 		return err
 	}
@@ -399,42 +409,12 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 		pol.Tools["github.open_draft_pr"].DenyPaths)
 	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
 	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
-	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: runRecords{led}})
+	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: gateway.RunRecords{Ledger: led}})
 	if testTools {
 		log.Warn("TEST TOOLS ENABLED: never run this outside tests")
 		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})
 	}
 	return reg, nil
-}
-
-// runRecords is what github.comment_commit reads of agentd's own record of a run: its effects'
-// results, and its approvals.
-type runRecords struct{ *ledger.Ledger }
-
-func (r runRecords) RunApprovals(ctx context.Context, workflowID string) ([]githubtool.Approval, error) {
-	rows, err := r.Ledger.RunApprovals(ctx, workflowID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]githubtool.Approval, 0, len(rows))
-	for _, a := range rows {
-		ga := githubtool.Approval{ID: a.ApprovalID, Tool: a.Tool, Status: a.Status, DecidedBy: a.DecidedBy.String,
-			DecidedAt: a.DecidedAt.String, Reason: a.Reason.String, ExpiresAt: a.ExpiresAt}
-		if a.Status == "APPROVED" {
-			// Approved, and refused or lost after: the report must not read as if it went out.
-			e, err := r.Ledger.Q.GetEffect(ctx, a.EffectID)
-			if err != nil {
-				return nil, err
-			}
-			ga.Write = map[string]string{"ABANDONED": "not sent", "DENIED": "not sent", "FAILED": "failed",
-				"UNKNOWN": "outcome unknown"}[e.Status]
-			if ga.Write != "" {
-				ga.WriteReason = e.Reason.String
-			}
-		}
-		out = append(out, ga)
-	}
-	return out, nil
 }
 
 // gitServer is how agentd runs the read-only git MCP server. Its sandbox launcher is required:

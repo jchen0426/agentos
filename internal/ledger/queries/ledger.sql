@@ -102,10 +102,20 @@ SELECT * FROM effects WHERE status = 'PENDING' AND claimed_by IS NOT NULL AND cl
 ORDER BY created_at;
 
 -- name: AbandonUnsentEffects :execrows
--- Effects of cancelled runs that were never claimed never went out, and never will.
+-- Effects of cancelled runs that nobody holds, and that no attempt may have made, never took
+-- effect, and never will.
 UPDATE effects SET status = 'ABANDONED', reason = 'the run was cancelled before the request was sent',
   version = version + 1, updated_at = ?
-WHERE status = 'PENDING' AND claimed_by IS NULL
+WHERE status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0
+  AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL);
+
+-- name: HandOverUnsentEffects :execrows
+-- Effects of cancelled runs that nobody holds, but that an attempt may have made: nothing sends
+-- them again, and a person settles them.
+UPDATE effects SET status = 'UNKNOWN',
+  reason = 'the run was cancelled before the request was sent again; but an earlier attempt may have taken effect',
+  version = version + 1, updated_at = ?
+WHERE status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 1
   AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL);
 
 -- name: ListEffectsByStatus :many

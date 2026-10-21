@@ -1,10 +1,9 @@
-"""The Worker sandbox and its bridge to Temporal (design doc, section 8; the M1 prototype
-of T9). Inside the sandbox the Temporal SDK reaches Temporal through agentd's Runtime entry,
-and nothing else: not Temporal's own port, not the Control socket, not the network, not the
-home directory, not the caller's environment. On Linux it can create no files at all; on macOS
-only in a private directory of its own, which no other Worker can read and which goes when the
-Worker does. The launchers refuse a code directory or Python environment that would expose dev
-data, a FIFO, or on Linux a Unix socket.
+"""The Worker sandbox's launchers (design doc, section 8; what the sandbox lets the Worker
+reach is T9, in tests/test_t9_isolation.py). On Linux the Worker can create no files at all; on
+macOS only in a private directory of its own, which no other Worker can read and which goes when
+the Worker does, and it reads nothing in the shared temporary directories. The launchers refuse a
+code directory or Python environment that would expose dev data, a FIFO, or on Linux a Unix
+socket.
 
 Run with AGENTOS_SANDBOX=srt on macOS or AGENTOS_SANDBOX=bwrap on Linux.
 """
@@ -27,7 +26,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import REPO, SANDBOX, Stack, command_of, descendants, free_port, wait_for
+from tests.harness import (REPO, SANDBOX, Stack, command_of, descendants, free_port, outside_root,
+                           remove_outside_root, wait_for)
 
 pytestmark = pytest.mark.skipif(SANDBOX == "none", reason="needs AGENTOS_SANDBOX=bwrap or srt")
 
@@ -53,14 +53,14 @@ def char_device(path):
         return False
 
 def writable_mounts():
-    # Mounts not read-only, but for those nothing can be stored in: /proc, the pseudo-terminals,
-    # and the device nodes bwrap binds (/dev/null and the like).
+    # Mounts not read-only, but for those nothing can be stored in: /proc and the device nodes
+    # bwrap binds (/dev/null and the like).
     found = []
     for line in open("/proc/self/mountinfo"):
         fields = line.split()
         point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
         fstype = fields[fields.index("-") + 1]
-        if "rw" in fields[5].split(",") and fstype not in ("proc", "devpts") and not char_device(point):
+        if "rw" in fields[5].split(",") and fstype != "proc" and not char_device(point):
             found.append(f"{point} ({fstype})")
     return found
 
@@ -175,10 +175,11 @@ def reach(launch: list[str], file: Path, way_out: Path, env: dict[str, str] | No
 
 
 @contextlib.contextmanager
-def scratch() -> Iterator[tuple[Path, Path | int]]:
+def scratch(outside: bool = False) -> Iterator[tuple[Path, Path | int]]:
     """A short directory under /tmp, and a Runtime entry the launcher accepts and nothing uses:
-    on Linux a socket in a directory of its own, on macOS a port nobody dials."""
-    base = Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
+    on Linux a socket in a directory of its own, on macOS a port nobody dials. The macOS sandbox
+    denies the whole of /tmp: a test of its other rules keeps its files outside (harness.outside_root)."""
+    base = outside_root() if outside else Path(tempfile.mkdtemp(prefix="aos-", dir="/tmp"))
     try:
         if SANDBOX == "bwrap":
             (base / "runtime").mkdir()
@@ -188,41 +189,7 @@ def scratch() -> Iterator[tuple[Path, Path | int]]:
         else:
             yield base, free_port()
     finally:
-        shutil.rmtree(base, ignore_errors=True)
-
-
-def probe(stack: Stack, canary: Path) -> dict:
-    args = [sys.executable, REPO / "tests/sandbox_probe.py",
-            "--temporal-port", stack.temporal_address.rsplit(":", 1)[1],
-            "--control-socket", stack.control_socket, "--home", Path.home(), "--home-canary", canary,
-            "--ledger", stack.data_dir / "ledger.db"]
-    if SANDBOX == "bwrap":
-        args += ["--runtime", "127.0.0.1:7233"]
-    else:
-        args += ["--runtime", f"127.0.0.1:{stack.runtime_port}", "--proxy", "env"]
-    r = subprocess.run([*launcher(runtime_entry(stack)), *map(str, args)], capture_output=True, text=True, timeout=120,
-                       cwd=REPO, env={**stack.sandbox_env(), "AGENTOS_TEST_CANARY": "a secret the Worker must not see"})
-    assert r.returncode == 0, r.stderr
-    return json.loads(r.stdout.strip().splitlines()[-1])
-
-
-def test_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack) -> None:
-    stack.start_agentd()
-    canary = Path.home() / f".agentos-canary-{secrets.token_hex(4)}"
-    canary.write_text("a file the Worker must not read")
-    try:
-        report = probe(stack, canary)
-    finally:
-        canary.unlink()
-    print(json.dumps(report, indent=2))
-
-    assert report["runtime_sdk"].startswith("connected"), report
-    assert report["forbidden"] and all(v.startswith("refused: PERMISSION_DENIED")
-                                       for v in report["forbidden"].values()), report["forbidden"]
-    for key in ("temporal_sdk", "temporal_tcp", "internet_tcp", "control_socket", "home_canary", "ssh_dir", "ledger",
-                "keychains", "keychain_items"):
-        assert report[key].startswith("refused"), (key, report[key])
-    assert "AGENTOS_TEST_CANARY" not in report["env"]
+        remove_outside_root(base)
 
 
 @pytest.mark.parametrize("holder", ["code", "code-symlink", "python-env"])
@@ -249,7 +216,7 @@ def test_worker_launcher_refuses_agentd_data_in_reach(stack: Stack, holder: str)
     sock = stack.control_socket if holder == "python-env" else given / "data" / "control" / "control.sock"
     # As the home directory is on macOS: denied, so that only the directory the launcher is given
     # can let the Worker in. (Linux mounts nothing that is not given.)
-    env = {**stack.sandbox_env(), "AGENTOS_SANDBOX_DENY_READ": f"{stack.tmp}:{exposed}"}
+    env = {**stack.sandbox_env(), "AGENTOS_SANDBOX_DENY_READ": json.dumps([str(stack.tmp), str(exposed)])}
     r = reach(launcher(runtime_entry(stack), pyenv, code), given / "data" / "ledger.db", sock, env=env)
     assert r.returncode != 0 and not r.stdout, f"the Worker started and reached {r.stdout}"
     assert f"{given / 'data'}{os.sep}" in r.stderr, r.stderr  # the launcher names what it found
@@ -341,7 +308,7 @@ def test_worker_sandbox_denies_data_behind_a_symlink(where: str) -> None:
     told to deny, and Seatbelt matches real paths. agentd's default data directory, ~/.agentos,
     may be a symlink to somewhere else, and a path in AGENTOS_SANDBOX_DENY_READ may be spelled
     through one: either way the data behind it stays out of reach."""
-    with scratch() as (base, port):
+    with scratch(outside=True) as (base, port):
         data = base / "elsewhere" / "data"
         data.mkdir(parents=True)
         (data / "ledger.db").write_text("a ledger")
@@ -355,7 +322,7 @@ def test_worker_sandbox_denies_data_behind_a_symlink(where: str) -> None:
             (home / ".agentos").symlink_to(data, target_is_directory=True)
         else:
             (base / "link").symlink_to(data, target_is_directory=True)
-            env["AGENTOS_SANDBOX_DENY_READ"] = str(base / "link")
+            env["AGENTOS_SANDBOX_DENY_READ"] = json.dumps([str(base / "link")])
         r = reach(launcher(port, sys.prefix, code), data / "ledger.db", code / "absent", env=env)
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["file"] == "refused: PermissionError", r.stdout
@@ -566,9 +533,9 @@ def test_worker_sandbox_cannot_read_another_launchs_state() -> None:
 def test_worker_sandbox_can_create_no_files() -> None:
     """Memory in a tmpfs counts against no process: its data, and also its inodes and extended
     attributes, which --size does not limit. The OOM killer would pick agentd or Temporal, not a
-    Worker that filled one. bwrap makes the sandbox's root and /dev as tmpfs mounts as large as
-    half the memory. The Worker writes no files at all, so every mount is read-only, /tmp
-    included, but for /proc, the pseudo-terminals and the device nodes. Nor can the Worker make
+    Worker that filled one. bwrap makes the sandbox's root a tmpfs as large as half the memory.
+    The Worker writes no files at all, so every mount is read-only, /tmp and /dev included, but
+    for /proc and the five device nodes /dev holds (no pseudo-terminals). Nor can the Worker make
     a user namespace, in which it could mount a tmpfs of its own; and its IPC namespace is its
     own, so what it leaves there goes when the sandbox does."""
     tag = secrets.token_hex(4)

@@ -72,6 +72,53 @@ GITHUB_LIVE_REPO = os.environ.get("AGENTOS_GITHUB_REPO", "") if os.environ.get("
 # and dates. A live repository must hold exactly that.
 FIXTURE_COMMIT = "01f7b30c0dd024bac65d30d17395693903c759ed"
 
+# The login keychain items agentd may hold secrets in (README). Tests ask only for their
+# attributes, never a password, and name the keychain: a sandboxed probe's HOME is not the user's,
+# and without it security(1) finds no keychain to search, sandbox or not.
+KEYCHAIN_ITEMS = ["agentos-anthropic-api-key", "agentos-openai-api-key", "agentos-github-token",
+                  "agentos-github-test-token"]
+LOGIN_KEYCHAIN = Path.home() / "Library/Keychains/login.keychain-db"
+
+
+def outside_root() -> Path:
+    """A directory for test data that the macOS sandboxes do not deny wholesale (unlike the home
+    directory, /tmp, /var/tmp and /var/folders), so that only the deny list a test checks keeps a
+    sandbox out of it, reached through a symlink: Seatbelt matches real paths. Linux mounts only
+    what a sandbox is given, so /var/tmp does there. The caller removes it, and the symlink's target."""
+    if sys.platform != "darwin":
+        return Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/var/tmp"))
+    real = Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/Users/Shared"))
+    link = real.with_name(real.name + "-link")
+    link.symlink_to(real, target_is_directory=True)
+    return link
+
+
+def user_temp_dir() -> Path:
+    """The user's own temporary directory on macOS, under /private/var/folders, whatever TMPDIR
+    says."""
+    found = Path(subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                                check=True).stdout.strip()).resolve()
+    assert found.is_relative_to("/private/var/folders"), found
+    return found
+
+
+def remove_outside_root(root: Path) -> None:
+    if root.is_symlink():
+        shutil.rmtree(root.resolve(), ignore_errors=True)
+        root.unlink()
+    else:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def in_keychain(service: str) -> bool:
+    """Whether the item is there to find, asked the way the probes ask, outside any sandbox."""
+    if not LOGIN_KEYCHAIN.exists():
+        return False
+    with tempfile.TemporaryDirectory(dir="/tmp") as home:
+        return subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, str(LOGIN_KEYCHAIN)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              env={"PATH": "/usr/bin:/bin", "HOME": home}).returncode == 0
+
 # How agentd launches the git tool server in each sandbox mode.
 TOOL_LAUNCHER = {"srt": REPO / "sandbox/macos/run-tool.sh", "bwrap": REPO / "sandbox/linux/run-tool.sh"}
 
@@ -523,9 +570,7 @@ class Stack:
         # In production agentd's data lives under the home directory, which the macOS sandbox
         # cannot read. Test data lives elsewhere, so keep it out of reach explicitly.
         denied = [str(p) for p in [self.tmp, *self.deny_read]]
-        if any(":" in p for p in denied):  # the list is separated by ':'
-            raise ValueError(f"a path the Worker may not read has a ':' in it: {denied}")
-        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": ":".join(denied)}
+        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied)}
 
     def start_worker(self, workflows: str | None = None) -> Worker:
         n = len(self.workers) + 1
@@ -588,11 +633,11 @@ class Stack:
         """The run's doorbells in agentd's outbox."""
         return self.ledger("SELECT * FROM outbox WHERE workflow_id = ? ORDER BY seq", run["run_id"])
 
-    def start_run(self, budget_micros: int | None = None, dry_run: bool = False) -> dict:
+    def start_run(self, budget_micros: int | None = None, dry_run: bool = False, base: str = "main") -> dict:
         budget = ["--budget-micros", str(budget_micros)] if budget_micros else []
         dry = ["--dry-run"] if dry_run else []
         return self.agentctl("runs", "start", "security-audit", "--repo", "acme/payments",
-                             "--commit", self.commit[:7], "--base", "main", *budget, *dry)
+                             "--commit", self.commit[:7], "--base", base, *budget, *dry)
 
     def get_run(self, run: dict) -> dict:
         return self.agentctl("runs", "get", run["run_id"])

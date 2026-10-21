@@ -212,9 +212,6 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
         raise ValueError(f"the state directory {state} must be outside the repository: the sandboxed Worker reads it")
     mirrors = {name: Path(path).resolve() for name, path in mirrors.items()}
     hidden = [state, *mirrors.values(), *(Path(p).resolve() for p in deny_read)]
-    if any(":" in str(p) for p in hidden):
-        raise ValueError(f"no ':' in the paths of the state directory, the mirrors and the cache, please: the "
-                         f"sandbox's list of paths it denies the Worker is separated by ':' ({hidden})")
     state.mkdir(parents=True, exist_ok=True)
     lock = os.open(state / "lock", os.O_RDONLY | os.O_CREAT, 0o600)
     try:

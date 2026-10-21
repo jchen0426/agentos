@@ -24,15 +24,10 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import _stack
-from tests.harness import REPO, SANDBOX, TOOL_LAUNCHER, Stack
+from tests.harness import (KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, TOOL_LAUNCHER, Stack, in_keychain,
+                           outside_root, remove_outside_root, user_temp_dir)
 
 pytestmark = pytest.mark.skipif(SANDBOX not in TOOL_LAUNCHER, reason="needs AGENTOS_SANDBOX=bwrap or srt")
-
-# The login keychain items agentd may hold secrets in (README). Only their attributes are
-# asked for, never a password, and the keychain is named: the probe's HOME is not the user's,
-# and without it security(1) finds no keychain to search, sandbox or not.
-KEYCHAIN_ITEMS = ["agentos-anthropic-api-key", "agentos-github-token", "agentos-github-test-token"]
-LOGIN_KEYCHAIN = Path.home() / "Library/Keychains/login.keychain-db"
 
 PROBE = r"""
 import json, os, socket, subprocess, sys
@@ -83,6 +78,7 @@ print(json.dumps({
     "writes": {k: write(p) for k, p in a["writes"].items()},
     "sockets": {k: connect(u) for k, u in a["sockets"].items()},
     "keychain": {s: keychain(s, a["keychain_file"]) for s in a["keychain"]},
+    "dev": sorted(os.listdir("/dev")),
     "env": sorted(os.environ),
 }))
 """
@@ -90,15 +86,14 @@ print(json.dumps({
 
 @pytest.fixture
 def outside_stack(request: pytest.FixtureRequest) -> Iterator[Stack]:
-    """A stack outside what the macOS launcher denies wholesale (the home directory, /tmp,
-    /var/folders), so that only agentd's own list keeps the server out of its data and its
-    other mirrors. /var/tmp is also reached through a symlink on macOS (/private/var/tmp),
-    and Seatbelt matches real paths."""
-    tmp = Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/var/tmp"))
+    """A stack outside what the macOS launcher denies wholesale (the home directory and the shared
+    temporary directories), so that only agentd's own list keeps the server out of its data and
+    its other mirrors, reached through a symlink: Seatbelt matches real paths."""
+    tmp = outside_root()
     try:
         yield from _stack(request, Stack(tmp))
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_outside_root(tmp)
 
 
 def connect(url: str) -> None:
@@ -115,16 +110,6 @@ def probe_env(state: str, deny: list[str]) -> dict:
     return {"PATH": os.environ["PATH"], "HOME": state, "TMPDIR": state, "AGENTOS_TMPDIR": state, "LANG": "C.UTF-8",
             "AGENTOS_SANDBOX_STATE": state, "AGENTOS_SANDBOX_DENY_READ": json.dumps(deny),
             "AGENTOS_TEST_CANARY": "a secret the tool server must not see"}
-
-
-def in_keychain(service: str) -> bool:
-    """Whether the item is there to find, asked the way the probe asks, outside the sandbox."""
-    if not LOGIN_KEYCHAIN.exists():
-        return False
-    with tempfile.TemporaryDirectory(dir="/tmp") as state:
-        return subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, str(LOGIN_KEYCHAIN)],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              env={**probe_env(state, []), "PATH": "/usr/bin:/bin"}).returncode == 0
 
 
 def probe(mirror: Path, args: dict, deny: list[str], env: dict[str, str] | None = None) -> dict:
@@ -173,6 +158,7 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
     if SANDBOX == "bwrap":
         writes["dev_shm"] = Path(f"/dev/shm/agentos-planted-{tag}")  # a tmpfs as large as half the memory
     escaped: list[Path] = []
+    cleanup: list[Path] = []
     try:
         canary.write_text("a file the tool server must not read")
         another_call = Path(tempfile.mkdtemp(prefix="agentos-tools.1.", dir="/tmp"))  # as another agentd's
@@ -180,6 +166,12 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
         (another_call / "work" / "index").write_text("another call's files")
         reads = {"ledger": stack.data_dir / "ledger.db", "other_mirror": other_mirror / "app.py",
                  "home_canary": canary, "another_call": another_call / "work" / "index"}
+        if SANDBOX == "srt":  # other programs' files in the shared temporary directories
+            for key, where in {"var_tmp": "/var/tmp", "user_tmp": user_temp_dir()}.items():
+                planted = Path(where) / f"agentos-canary-{tag}"
+                planted.write_text("another program's file")
+                cleanup.append(planted)
+                reads[key] = planted
         sockets = {"control": f"unix://{stack.control_socket}", "runtime": stack.runtime_listen(),
                    "temporal": f"tcp://{stack.temporal_address}",
                    "github": "tcp://" + stack.github_url.removeprefix("http://").rstrip("/")}
@@ -195,6 +187,8 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
                                "keychain": keychain, "keychain_file": str(LOGIN_KEYCHAIN)}, deny)
     finally:
         canary.unlink(missing_ok=True)
+        for p in cleanup:
+            p.unlink(missing_ok=True)
         if another_call:
             shutil.rmtree(another_call, ignore_errors=True)
         escaped = [p for p in writes.values() if p.exists()]
@@ -219,6 +213,8 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
         if not (SANDBOX == "bwrap" and key in ("shared_tmp", "srt_tmp")):
             assert result.startswith("refused"), (key, result)
     assert "AGENTOS_TEST_CANARY" not in report["env"] and "AGENTOS_SANDBOX_DENY_READ" not in report["env"], report["env"]
+    if SANDBOX == "bwrap":  # no terminal and no pseudo-terminals, whose number the machine's sandboxes share
+        assert report["dev"] == ["full", "null", "random", "urandom", "zero"], report["dev"]
 
 
 @pytest.mark.skipif(SANDBOX != "srt", reason="the macOS launcher's deny list")
@@ -230,7 +226,7 @@ def test_the_git_tool_server_cannot_read_a_home_directory_named_through_a_symlin
     Node's os.userInfo(), through NODE_OPTIONS."""
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     canary = home / f".agentos-canary-{secrets.token_hex(4)}"
-    base = Path(tempfile.mkdtemp(prefix="agentos-probe-", dir="/var/tmp"))  # not denied wholesale
+    base = outside_root()  # not denied wholesale
     try:
         canary.write_text("a file the tool server must not read")
         (base / "mirror").mkdir()
@@ -244,6 +240,6 @@ def test_the_git_tool_server_cannot_read_a_home_directory_named_through_a_symlin
                        env={"NODE_OPTIONS": f"--require={user_info}", "AGENTOS_TEST_HOMEDIR": str(base / "home")})
     finally:
         canary.unlink(missing_ok=True)
-        shutil.rmtree(base, ignore_errors=True)
+        remove_outside_root(base)
     assert report["reads"]["home_canary"].startswith("refused"), report["reads"]
     assert report["home_list"].startswith("refused"), report["home_list"]

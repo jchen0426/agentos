@@ -158,7 +158,9 @@ bin/agentctl reconcile resolve <effect-id> --not-executed
 ```
 
 `--not-executed` has the run send the write again under its original idempotency key, unless the
-run has ended or the write's approval has run out by then. `--executed --result '{...}'` records
+run has ended or the write's approval has run out by then. For a write its tool can look up,
+agentd takes `--not-executed` only once no request of it can still take effect, and says when
+that is. `--executed --result '{...}'` records
 what the write produced instead, and `--executed --lookup` lets agentd look it up for tools that
 can.
 
@@ -167,7 +169,7 @@ To send the audit to Claude instead of the fake model, store an API key in the l
 `config/dev/agentd-claude.yaml`. Every run then costs money; the budget caps each run.
 Run the Worker in its sandbox whenever agentd holds a real key: an unsandboxed Worker runs as
 you and could read the key from the keychain with `security`. Under the sandbox the keychain is
-out of its reach, which `tests/test_sandbox.py` checks.
+out of its reach, which `tests/test_t9_isolation.py` checks.
 
 ```bash
 security add-generic-password -U -s agentos-anthropic-api-key -a "$USER" -w
@@ -187,7 +189,11 @@ OpenAI and a local model server work the same way. `config/models.yaml` lists bo
   they run on Ollama's servers. agentd also asks Ollama about the model before every request and
   sends nothing to a cloud model, whatever it is called.
 
-A provider that is not on this machine is reached over https only.
+A provider that is not on this machine is reached over https only. agentd takes no proxy from
+its environment (`HTTPS_PROXY` and the like): its requests go straight to the hosts its
+configuration names, and it says at start which proxy variables it ignores. On a network that
+reaches the internet only through a proxy, its model and GitHub requests fail: v0.1 has no proxy
+setting of its own.
 
 Point a task at either with `model`. Or list them in `cross_provider_fallback`, where they are
 asked, each in a request of its own, when the model declines.
@@ -216,8 +222,10 @@ as its code directory; see the headers of those scripts. A sandboxed Worker can 
 code directory and Python environment, so a launcher refuses either if it holds dev data
 (agentd's ledger, a `.agentos` directory, Temporal's database), a FIFO, or on Linux a Unix socket
 (a read-only mount does not stop `connect()`). On macOS the sandbox can also read everything
-outside the home directory: keep agentd's data and the mirrors under it, or list their real paths
-in `AGENTOS_SANDBOX_DENY_READ`.
+outside the home directory and the shared temporary directories (`/tmp`, `/var/tmp`,
+`/var/folders`): keep
+agentd's data and the mirrors under the home directory, or list them in
+`AGENTOS_SANDBOX_DENY_READ`, a JSON array of paths.
 
 ```bash
 sandbox/macos/run-worker.sh 7244 "$PWD/.venv" "$PWD/python" -- "$PWD/.venv/bin/python" -m agentos_worker --endpoint 127.0.0.1:7244 --http-connect-proxy env

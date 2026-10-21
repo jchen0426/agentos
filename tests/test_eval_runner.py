@@ -532,10 +532,6 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
     with pytest.raises(RuntimeError, match="ledgers are gone"):
         runner.run(cs, [b], repos, state)
     (state / "journal.jsonl").unlink()
-    # The sandbox's list of paths the Worker may not read is separated by ':'.
-    with pytest.raises(ValueError, match="':'"):
-        runner.run(cs, [b], repos, state, deny_read=[tmp_path / "a:b"])
-    assert not (state / "b").exists(), "refused before any stack started"
     monkeypatch.setattr(runner, "SANDBOX", "none")
     with pytest.raises(ValueError, match="sandbox"):
         runner.run(cs, [runner.PROFILES["local"]], repos, state)
