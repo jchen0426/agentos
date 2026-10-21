@@ -154,7 +154,8 @@ def main(argv: list[str] | None = None) -> int:
         meta = {"title": args.title, "date": datetime.date.today().isoformat(), "commit": head,
                 "runs": max((r["rep"] for r in results), default=0),
                 "ledger_spent_usd": runner.spent_in(state) / 1e6}
-        report.write(cs, results, args.out, meta, seed=args.seed, replaced=journal.replaced())
+        report.write(cs, results, args.out, meta, seed=args.seed, replaced=journal.replaced(),
+                     unfinished=journal.unfinished())
         print(f"wrote {args.out.with_suffix('.md')} and {args.out.with_suffix('.json')}")
         return 0
     return 2

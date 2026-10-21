@@ -10,9 +10,11 @@ profile, one rep of every case before the next, and judges each run by its outco
 ledger (evals/score.py). A journal in the state directory records each run as it starts and as
 it ends, so a runner started again on it picks up the runs in flight and skips the ones done.
 The first run of a profile goes alone: if the model gave it no answer (evals/score.py's void),
-the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. Void
-runs run again only when asked (--retry-void), after the runs never run; one that is void again
-does not stop the runner, the run after it goes alone instead.
+the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker, and so
+do VOID_STREAK void runs in a row later on (a provider that went away: each of its requests may
+cost the whole reservation). Void runs run again only when asked (--retry-void), after the runs
+never run; one that is void again does not stop the runner, the run after it goes alone
+instead.
 
 Money: a paid profile needs a cap on what the state directory's runs spend, every runner on it
 together; a new state directory is a new evaluation, with a cap of its own. A run starts only
@@ -55,6 +57,7 @@ BUDGET = 1_500_000  # micros a run may spend: above the gateway's worst-case res
 TASK = "security-audit"
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ENDED = TERMINAL | {"UNKNOWN"}
+VOID_STREAK = 5  # runs in a row the model gives no answer, after the first, that stop the runner
 
 
 @dataclass(frozen=True)
@@ -271,15 +274,16 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
         if profile.paid and resumed and _overspent(r.state):
             log(f"[{profile.name}] a run spent past its budget: the {len(resumed)} paid runs left in flight stop")
             for e in resumed:
-                e["stopped"] = "overspent" if _cancel(stack, e) else "run"
+                e["stopped"] = "overspent"
+                _cancel(stack, e)
         stack.start_worker()
         for gone in unknown:
-            wait_for(lambda gone=gone: stack.get_run(gone)["state"] in ENDED, f"run {gone['run_id']} to end",
-                     timeout=300, interval=1)
+            _ended(stack, gone)
         log(f"[{profile.name}] {len(todo)} runs to start ({sum(t[2] for t in todo)} again), "
             f"{len(resumed)} to pick up")
         watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
         confirmed = False  # a run of this profile has got an answer from the model
+        streak = 0  # runs this runner started that ended void, in a row
         while todo or watching:
             _alive(stack)
             while todo and len(watching) < (profile.concurrency if confirmed else 1):
@@ -311,14 +315,22 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                     log(f"[{profile.name}] a run spent past its budget: no more paid runs, and the "
                         f"{len(stopping)} in flight stop")
                     for other in stopping:
-                        other["stopped"] = "overspent" if _cancel(stack, other) else "run"
+                        other["stopped"] = "overspent"
+                        _cancel(stack, other)
                 if not void(record):
-                    confirmed = True
-                elif not confirmed and not record["resumed"]:
-                    if not entry.get("again"):
+                    confirmed, streak = True, 0
+                elif not record["resumed"]:
+                    streak += 1
+                    if not confirmed and not entry.get("again"):
                         raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
                                            f"{void_reason(record)}")
-                    log(f"[{profile.name}] {record['case']} #{record['rep']} is void again: the next run goes alone too")
+                    if streak >= VOID_STREAK:
+                        raise RuntimeError(f"[{profile.name}] {streak} runs in a row ended without the model, the last "
+                                           f"{void_reason(record)}: stopping; the next runner picks up the runs in "
+                                           "flight, and --retry-void runs the void ones again")
+                    if not confirmed:
+                        log(f"[{profile.name}] {record['case']} #{record['rep']} is void again: "
+                            "the next run goes alone too")
             if watching:
                 time.sleep(1)
     finally:
@@ -392,12 +404,19 @@ def spent_in(state: Path) -> int:
     return _spent(state.resolve())
 
 
-def _cancel(stack: Stack, run: dict) -> bool:
-    """Cancels a run, unless it has ended meanwhile; whether it cancelled it."""
+def _cancel(stack: Stack, run: dict) -> None:
+    """Cancels a run, unless it has ended meanwhile."""
     done = stack.agentctl_run("runs", "cancel", run["run_id"])
     if done.returncode != 0 and stack.get_run(run)["state"] not in ENDED:
         raise AssertionError(f"agentctl runs cancel {run['run_id']} failed: {done.stderr.strip()}")
-    return done.returncode == 0
+
+
+def _ended(stack: Stack, run: dict) -> str:
+    """The run's state once it has ended."""
+    def state() -> str | None:
+        s = stack.get_run(run)["state"]
+        return s if s in ENDED else None
+    return wait_for(state, f"run {run['run_id']} to end", timeout=300, interval=1)
 
 
 def _cancel_unknown(stack: Stack, journal: Journal, log) -> list[dict]:
@@ -448,8 +467,8 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
             raise AssertionError(f"agentctl runs get {run['run_id']} failed: {got.stderr.strip()}")
         return None  # ask again on the next poll, until the timeout
     state = json.loads(got.stdout)["state"]
-    if state in TERMINAL:
-        return collect(stack, entry, entry.get("stopped", "run"))
+    if state in TERMINAL:  # the runner stopped it if it asked to and the run ended cancelled
+        return collect(stack, entry, entry.get("stopped", "run") if state == "CANCELLED" else "run")
     if state == "UNKNOWN":  # Temporal no longer has it
         return collect(stack, entry, "lost")
     ended_by = {"PAUSED_BUDGET": "budget", "WAITING_APPROVAL": "waiting", "WAITING_RECONCILE": "waiting"}.get(state)
@@ -457,9 +476,9 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
         ended_by = "timeout"
     if ended_by is None:
         return None
-    if not _cancel(stack, run):  # it ended by itself meanwhile
+    _cancel(stack, run)
+    if _ended(stack, run) != "CANCELLED":  # it ended by itself meanwhile
         ended_by = "run"
-    wait_for(lambda: stack.get_run(run)["state"] in ENDED, f"run {entry['run_id']} to end", timeout=300, interval=1)
     return collect(stack, entry, ended_by)
 
 
@@ -479,6 +498,15 @@ def _object(raw: str | bytes) -> dict:
     """A JSON object that holds what a model wrote."""
     value = json.loads(raw, parse_int=_int)
     return value if isinstance(value, dict) else {}
+
+
+def _patch(stack: Stack, ref: object) -> bool:
+    """Whether the report has a patch: a blank one is none, though the workflow checks it (and
+    finds it rejected)."""
+    if not isinstance(ref, str) or not ref:
+        return False
+    rows = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", ref.removeprefix("sha256:"))
+    return not rows or bool(bytes(rows[0]["bytes"]).strip())
 
 
 def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) -> dict:
@@ -524,7 +552,7 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
                                 "file": _cut(f.get("file"), 300), "line": f.get("line"),
                                 "title": _cut(f.get("title"), 200)}  # the model's words: a line, not the code
                                for f in value.get("findings") or [] if isinstance(f, dict)],
-                  "patch": bool(value.get("patch_ref"))}
+                  "patch": _patch(stack, value.get("patch_ref"))}
     checks = stack.ledger("SELECT outcome FROM calls WHERE workflow_id = ? AND name = 'git.apply_check' "
                           "ORDER BY created_at", entry["run_id"])
     result = _object(info.get("result_json") or "{}")

@@ -164,6 +164,44 @@ def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() ->
     assert not score.void(record) and record["spent_micros"] == 10
 
 
+def test_a_blank_patch_is_no_patch() -> None:
+    def record(patch: bytes) -> dict:
+        value = {"findings": [], "patch_ref": "sha256:patch"}
+        call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "response_blob": "sha256:a",
+                "usage_json": json.dumps([{"model": "local/gpt-oss:20b"}])}
+        blobs = {"a": json.dumps({"status": "ok", "model": "local/gpt-oss:20b", "value": value}).encode(), "patch": patch}
+        return runner.collect(LedgerOf([call], blobs), {"run_id": "r", "temporal_run_id": "t", "profile": "p",
+                                                        "case": "py-benign", "rep": 1}, "run")
+    assert record(b" \n\t")["report"]["patch"] is False
+    assert record(b"--- a/x\n+++ b/x\n")["report"]["patch"] is True
+
+
+class Ended(LedgerOf):
+    """A run in `state`, which a cancel turns into `after`."""
+
+    def __init__(self, state: str, after: str | None = None) -> None:
+        super().__init__([], {})
+        self.state, self.after = state, after
+
+    def agentctl_run(self, *args: str) -> subprocess.CompletedProcess:
+        if args[:2] == ("runs", "cancel"):
+            self.state = self.after
+        return subprocess.CompletedProcess(args, 0, json.dumps({"state": self.state}), "")
+
+    def get_run(self, run: dict) -> dict:
+        return {**super().get_run(run), "state": self.state}
+
+
+def test_the_runner_stopped_a_run_only_if_it_ended_cancelled() -> None:
+    a = profiles("http://127.0.0.1:9")[0]
+    entry = {"run_id": "r", "temporal_run_id": "t", "profile": "a", "case": "py-benign", "rep": 1, "since": 0}
+    stopped = {**entry, "stopped": "overspent"}
+    assert runner._watch(Ended("CANCELLED"), stopped, a)["ended_by"] == "overspent"
+    assert runner._watch(Ended("SUCCEEDED"), stopped, a)["ended_by"] == "run"  # it ended before the cancel
+    assert runner._watch(Ended("PAUSED_BUDGET", after="CANCELLED"), entry, a)["ended_by"] == "budget"
+    assert runner._watch(Ended("PAUSED_BUDGET", after="SUCCEEDED"), entry, a)["ended_by"] == "run"
+
+
 def test_the_plan_puts_the_runs_never_run_before_the_runs_again(tmp_path: Path) -> None:
     j = runner.Journal(tmp_path / "journal.jsonl")
 
@@ -280,7 +318,7 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert "44%（4/9；95% 区间" in md, md
     assert "67%（6/9；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
     assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b） |" in md
-    assert "0%（0/3；区间退化：每个用例都一样）" in md and "区间退化：每一对都一样" in md  # model b's
+    assert "0%（0/3；区间退化：每个用例都一样）" in md and "区间退化：每一对的下降都一样" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw
@@ -475,6 +513,24 @@ def test_void_runs_count_on_their_own_and_run_again_when_asked(tmp_path: Path, e
     reasons = collections.Counter(score.void_reason(r) for r in (failed, still, lost))
     assert (m["void"], m["replaced"], m["void_reasons"]) == (1, 2, dict(reasons))
     assert m["cost_usd"]["total"] == pytest.approx(sum(r["spent_micros"] for r in [*third, failed, still]) / 1e6)
+
+
+def test_runs_void_in_a_row_stop_the_runner(tmp_path: Path, evalset, modelsim: str, monkeypatch) -> None:
+    # The provider answers the first run, then only 429: a provider gone away, whose requests
+    # may each cost a whole reservation, stops the runner after VOID_STREAK void runs in a row.
+    cs, repos, _ = evalset
+    (tmp_path / "answers.json").write_text(json.dumps([
+        {"contains": "format_price", "answers": [{"report": eval_fixture.report()}]},
+        {"contains": "parse_record", "answers": [{"fault": "429"}] * 5},
+        {"contains": "read_file", "answers": [{"fault": "429"}] * 5}]))
+    monkeypatch.setattr(runner, "VOID_STREAK", 2)
+    a = dataclasses.replace(profiles(modelsim)[0], concurrency=1)
+    state = tmp_path / "state"
+    with pytest.raises(RuntimeError, match="2 runs in a row ended without the model"):
+        run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000,
+            cases=[cs.case("py-benign"), cs.case("c-oob"), cs.case("py-path"), cs.case("py-sqli")])
+    results = runner.Journal(state / "journal.jsonl").results()
+    assert [(r["case"], score.void(r)) for r in results] == [("py-benign", False), ("c-oob", True), ("py-path", True)]
 
 
 def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Path, evalset, modelsim: str) -> None:

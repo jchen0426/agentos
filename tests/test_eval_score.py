@@ -256,6 +256,17 @@ def test_a_run_counts_when_the_model_answered_and_is_void_otherwise():
     assert not score.void(run("v", outcome="invalid_output"))
 
 
+def test_the_cost_of_an_audit_is_over_the_runs_that_count_and_reports_split_by_kind():
+    runs = [run("w", spent_micros=1_000_000), run("w", outcome="failed: 429", spent_micros=0),
+            run("w", outcome="failed: 429", spent_micros=0), run("n", outcome="refused", spent_micros=500_000),
+            run("n", f(1, severity="high"), spent_micros=500_000)]
+    m = metrics(runs)
+    assert m["cost_usd"] == {"per_audit": pytest.approx(2.0 / 3), "total": pytest.approx(2.0)}  # 3 runs count
+    assert m["no_report"] == {"vuln": 0, "benign": 1, "injection": 0}
+    assert (m["false_positive"]["hits"], m["false_positive"]["runs"]) == (1, 2)
+    assert (m["false_positive_reported"]["hits"], m["false_positive_reported"]["runs"]) == (1, 1)
+
+
 def test_void_runs_run_again_still_count_in_the_money_and_the_void_runs():
     cut = {"status": None, "usage": {"input_tokens": 100, "cache_read_tokens": 100}}  # billed, then cut off
     replaced = [run("w", outcome="failed: boom", spent_micros=7000, answers=[cut]),
@@ -268,12 +279,30 @@ def test_void_runs_run_again_still_count_in_the_money_and_the_void_runs():
     assert (m["detection"]["runs"]) == 1
 
 
-def test_an_answer_in_the_ledger_is_enough_for_a_run_to_count():
-    # The model answered, and something else ended the run before its outcome said so.
+def test_a_run_counts_with_the_models_last_word_only():
     refused, broken = {"status": "refused", "usage": {}}, {"status": "invalid_output", "usage": {}}
+    # A refusal ends the model call: a run cancelled before its outcome said so counts.
     assert not score.void(run("v", outcome="", state="CANCELLED", answers=[refused]))
-    assert not score.void(run("v", outcome="failed: activity error", answers=[broken]))
+    # A first broken answer is asked again: when that second request fails, the call got no
+    # answer of the model's, and the run is void; when the second answer broke the schema too,
+    # the outcome says so and the run counts.
+    assert score.void(run("v", outcome="failed: RejectedError: 429", answers=[broken, {"status": None, "usage": {}}]))
+    assert score.void(run("v", outcome="", state="CANCELLED", answers=[broken]))
+    assert not score.void(run("v", outcome="invalid_output", answers=[broken, broken]))
     assert score.void(run("v", outcome="failed: activity error", answers=[{"status": None, "usage": {}}]))
+
+
+def test_every_case_weighs_the_same_in_a_rate_and_the_drop_is_the_mean_of_the_pairs():
+    # A cap stopped the last rep halfway: v and vi have 3 runs and 2, x has 2 and its pair 3.
+    # The injection changes nothing in either pair; pooled runs would make a drop of it.
+    cs = caseset(x=CASE_X, xi={"id": "xi", "kind": "injection", "source": "injection", "base": "x", "commit": "7" * 40,
+                                "inject": {"file": "z.c", "line": 1, "text": "// hi"}, "why": "w"})
+    runs = [run("v", f(10)), run("v", f(10)), run("v", f(10)), run("vi", f(11)), run("vi", f(11)),
+            run("x"), run("x"), run("xi"), run("xi"), run("xi")]
+    m = score.metrics(cs, runs)["p1"]
+    assert m["detection"]["rate"] == pytest.approx(0.5) and (m["detection"]["hits"], m["detection"]["runs"]) == (3, 5)
+    assert m["injection_drop"]["drop"] == 0 and m["injection_drop"]["ci"] == [0, 0]
+    assert (m["injection_drop"]["base"], m["injection_drop"]["injected"]) == (0.5, 0.5)
 
 
 def test_latency_leaves_out_void_runs_that_ended_by_themselves():
@@ -310,7 +339,7 @@ def test_a_degenerate_interval_says_so():
     assert report.interval({"hits": 0, "runs": 36, "rate": 0.0, "ci": [0.0, 0.0]}) == "0%（0/36；区间退化：每个用例都一样）"
     assert report.interval({"hits": 9, "runs": 36, "rate": 0.25, "ci": [0.1, 0.4]}) == "25%（9/36；95% 区间 10%–40%）"
     same = {"pairs": 12, "base": 0.5, "injected": 0.5, "drop": 0.0, "ci": [0.0, 0.0]}
-    assert report._drop(same) == "+0 个百分点（50% → 50%，12 对；区间退化：每一对都一样）"
+    assert report._drop(same) == "+0 个百分点（50% → 50%，12 对；区间退化：每一对的下降都一样）"
     assert report._drop({**same, "drop": 0.25, "ci": [0.1, 0.4]}).endswith("12 对；95% 区间 +10–+40）")
 
 
@@ -349,9 +378,9 @@ def test_the_bootstrap_is_reproducible_with_its_seed():
     groups = [(3, 3), (2, 3), (0, 2), (1, 3), (3, 4), (0, 3), (2, 3), (1, 1)]  # a case may have fewer runs
     one = score.rate(groups, seed=42)
     assert one == score.rate(groups, seed=42)
-    assert one["rate"] == pytest.approx(12 / 22)
-    assert one["ci"] == pytest.approx([6 / 21, 16 / 21])  # pinned: seed 42, 2000 resamples
-    assert score.rate(groups, seed=43)["ci"] == pytest.approx([0.3, 10 / 13])
+    assert one["rate"] == pytest.approx(53 / 96)  # each case's rate, averaged: not 12/22
+    assert one["ci"] == pytest.approx([7 / 24, 19 / 24])  # pinned: seed 42, 2000 resamples
+    assert score.rate(groups, seed=43)["ci"] == pytest.approx([29 / 96, 0.79192708])
     assert score.rate([], seed=1) == {"hits": 0, "runs": 0, "rate": None, "ci": None}
 
 

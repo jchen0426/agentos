@@ -301,10 +301,11 @@ profile needs a cap on what the state directory's runs spend, every runner on it
 new state directory is a new evaluation, with a cap of its own): a run starts only while what
 the ledgers say the runs have spent, plus the budgets of the paid runs in flight, plus its own
 budget (`--budget-usd`, $1.50 by default: room for the gateway's worst-case reservation) stay
-within it. A run the model gave no answer (one cancelled while it waited for budget, an
-approval or a reconciliation, or took longer than its profile allows; a policy that denied the
-call; a provider that kept failing) is void: it is in no rate, the report counts it by its
-reason, and `--retry-void` runs it again. The profiles are `config/models.yaml`'s providers,
+within it. A run whose model call did not end with the model's answer (one cancelled while it
+waited for budget, an approval or a reconciliation, or took longer than its profile allows; a
+policy that denied the call; a provider that kept failing) is void: it is in no rate, the
+report counts it by its reason, and `--retry-void` runs it again. Five void runs in a row stop
+the runner. The profiles are `config/models.yaml`'s providers,
 one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
 Ollama server above with gpt-oss:20b.
 
