@@ -59,11 +59,12 @@ func (q *Queries) AbandonUnclaimedEffect(ctx context.Context, arg AbandonUnclaim
 const abandonUnsentEffects = `-- name: AbandonUnsentEffects :execrows
 UPDATE effects SET status = 'ABANDONED', reason = 'the run was cancelled before the request was sent',
   version = version + 1, updated_at = ?
-WHERE status = 'PENDING' AND claimed_by IS NULL
+WHERE status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 0
   AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL)
 `
 
-// Effects of cancelled runs that were never claimed never went out, and never will.
+// Effects of cancelled runs that nobody holds, and that no attempt may have made, never took
+// effect, and never will.
 func (q *Queries) AbandonUnsentEffects(ctx context.Context, updatedAt string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, abandonUnsentEffects, updatedAt)
 	if err != nil {
@@ -605,6 +606,24 @@ func (q *Queries) GetRun(ctx context.Context, workflowID string) (Run, error) {
 		&i.DryRun,
 	)
 	return i, err
+}
+
+const handOverUnsentEffects = `-- name: HandOverUnsentEffects :execrows
+UPDATE effects SET status = 'UNKNOWN',
+  reason = 'the run was cancelled before the request was sent again; but an earlier attempt may have taken effect',
+  version = version + 1, updated_at = ?
+WHERE status = 'PENDING' AND claimed_by IS NULL AND maybe_sent = 1
+  AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL)
+`
+
+// Effects of cancelled runs that nobody holds, but that an attempt may have made: nothing sends
+// them again, and a person settles them.
+func (q *Queries) HandOverUnsentEffects(ctx context.Context, updatedAt string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, handOverUnsentEffects, updatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const holdForApproval = `-- name: HoldForApproval :execrows

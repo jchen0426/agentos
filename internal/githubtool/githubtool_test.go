@@ -366,6 +366,14 @@ func TestNotConfiguredOnlyDryRuns(t *testing.T) {
 	if _, err := tool.Execute(context.Background(), json.RawMessage(`{}`), "key", proceed); !errors.Is(err, tools.ErrNotSent) {
 		t.Fatalf("got %v, want not sent", err)
 	}
+	// An agentd without GitHub's config may find a request another one sent (a person reconciles
+	// it): it does not know that one's settle, and waits at least as long as the default config's
+	// (30s requests and 30s more) before a lookup that finds nothing means anything.
+	for _, f := range []tools.Finder{tool, &CommentCommit{}} {
+		if f.Settle() < time.Minute {
+			t.Errorf("%s settles in %s without a config", f.Name(), f.Settle())
+		}
+	}
 }
 
 // liar is a git tool server that a crafted repository has subverted: for the paths in lies,
