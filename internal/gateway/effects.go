@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -792,20 +793,25 @@ func (g *Gateway) Reconcile(ctx context.Context, r Resolution) (string, string, 
 		}
 		blob = valid(ref)
 	} else {
+		// The request may still land while GitHub works on it: the finding can wait, whatever
+		// becomes of the effect then. A claim holds when its last request went out; an effect
+		// given back has no claim, and its record holds it.
+		if f, ok := t.(tools.Finder); ok {
+			if sent := cmp.Or(e.ClaimedAt, e.LastRequestAt); sent.Valid {
+				if sentAt, err := time.Parse(time.RFC3339Nano, sent.String); err == nil {
+					if until := sentAt.Add(f.Settle()); ledger.Clock().Before(until) {
+						return "", "", fmt.Errorf("%w: the request may still take effect until %s; look again then",
+							ErrTooEarly, until.UTC().Format(time.RFC3339))
+					}
+				}
+			}
+		}
 		cancelled, err := g.runCancelled(ctx, e.WorkflowID)
 		if err != nil {
 			return "", "", err
 		}
 		if cancelled || r.RunClosed {
 			status = effectAbandoned
-		} else if f, ok := t.(tools.Finder); ok && e.ClaimedAt.Valid {
-			// The request may still land while GitHub works on it: the finding can wait.
-			if sentAt, err := time.Parse(time.RFC3339Nano, e.ClaimedAt.String); err == nil {
-				if until := sentAt.Add(f.Settle()); ledger.Clock().Before(until) {
-					return "", "", fmt.Errorf("%w: the request may still take effect until %s; look again then",
-						ErrTooEarly, until.UTC().Format(time.RFC3339))
-				}
-			}
 		}
 	}
 	now := ledger.Now()

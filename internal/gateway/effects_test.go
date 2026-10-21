@@ -459,22 +459,64 @@ func TestReconcile(t *testing.T) {
 			t.Fatalf("the key reused for another finding: %v", err)
 		}
 	})
-	t.Run("too early to say a lookup tool's write never happened", func(t *testing.T) {
-		f := newFixture(t, false)
-		w := &finder{writer: writer{class: policy.EffectLookup}, findErr: errors.New("rate limited"), settle: time.Hour}
-		f.g.Tools.Add(w)
+}
+
+// A person's finding that a lookup tool's write never happened waits until no request of it can
+// take effect any more (Settle after the last one went out), whatever becomes of the write then:
+// also when its run was cancelled or has ended, which abandons it, and when it was given back,
+// which leaves no claim to hold the time of its last request (its record does).
+func TestAFindingThatAWriteNeverHappenedWaits(t *testing.T) {
+	ctx := context.Background()
+	unknown := func(t *testing.T, f *fixture, w *finder) {
 		f.claimElsewhere(t, w)
-		if status, err := f.do(t, w); err != nil || status != StatusNeedsReconcile {
+		if status, err := f.do(t, w); err != nil || status != StatusNeedsReconcile { // the lookup fails
 			t.Fatalf("status %s, err %v", status, err)
 		}
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "a"}); !errors.Is(err, ErrTooEarly) {
-			t.Fatalf("got %v, want too early", err)
-		}
-		status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "b", RunClosed: true})
-		if err != nil || status != effectAbandoned {
-			t.Fatalf("an ended run's effect: %s %v", status, err)
-		}
-	})
+	}
+	for _, c := range []struct {
+		name  string
+		class string
+		setup func(t *testing.T, f *fixture, w *finder) // leaves the write to a person
+		r     Resolution
+		want  string
+	}{
+		{"the run goes on", policy.EffectLookup, unknown, Resolution{}, effectPending},
+		{"the run was cancelled", policy.EffectLookup, func(t *testing.T, f *fixture, w *finder) {
+			unknown(t, f, w)
+			f.cancel(t)
+		}, Resolution{}, effectAbandoned},
+		{"the run has ended", policy.EffectLookup, unknown, Resolution{RunClosed: true}, effectAbandoned},
+		{"the write was given back", policy.EffectIdempotent, func(t *testing.T, f *fixture, w *finder) {
+			// A request of it went out, and it was given back unsettled; the policy asks for approval
+			// now, and nobody approved it.
+			if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil); res != nil || err != nil {
+				t.Fatalf("record: %v %v", res, err)
+			}
+			f.sentThenGivenBack(t, f.req().EffectID)
+			res, err := f.g.effect(ctx, f.run, w, w.Class(), 1, &approvalRule{ttl: time.Hour}, f.req(), nil, faults.Effect{})
+			if err != nil || res.GetStatus() != StatusNeedsReconcile {
+				t.Fatalf("%v %v", res.GetStatus(), err)
+			}
+		}, Resolution{}, effectPending},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			clock := useClock(t)
+			f := newFixture(t, false)
+			w := &finder{writer: writer{class: c.class}, findErr: errors.New("rate limited"), settle: time.Hour}
+			f.g.Tools.Add(w)
+			c.setup(t, f, w)
+			r := c.r
+			r.EffectID, r.Key = f.req().EffectID, "a"
+			if _, _, err := f.g.Reconcile(ctx, r); !errors.Is(err, ErrTooEarly) {
+				t.Fatalf("got %v, want too early", err)
+			}
+			clock.advance(time.Hour)
+			r.Key = "b"
+			if status, _, err := f.g.Reconcile(ctx, r); err != nil || status != c.want {
+				t.Fatalf("once it is not: %s %v", status, err)
+			}
+		})
+	}
 }
 
 func TestOneWritePerRunByDefault(t *testing.T) {

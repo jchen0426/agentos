@@ -108,8 +108,43 @@ func TestEffectProtocolStateMachine(t *testing.T) {
 	}
 }
 
+// mix is how often a walk does what: drawn for each walk, so that walks differ in what they do much
+// of (swarm testing): one dies often, another changes its policy, another has tools that cannot
+// tell what came of their requests.
+type mix struct {
+	steps, nested []int // weights of act's steps: at the top, and while a tool waits
+	attempts      []int // weights of the attempt kinds
+	waits         int   // percent: a tool's wait is a pause for steps
+	recovers      int   // percent: an agentd that starts recovers what the last one claimed
+	newPolicy     int   // percent: an agentd that starts has a tool's policy changed
+	flipLive      int   // percent: an agentd that starts can reach the outside world when the last could not, or the other way
+}
+
+// drawMix draws a walk's mix: each weight the usual one, none, or more.
+func (m *machine) drawMix() mix {
+	scale := func(base ...int) []int {
+		out := make([]int, len(base))
+		for i, w := range base {
+			out[i] = w * []int{0, 1, 1, 3}[m.rng.IntN(4)]
+		}
+		return out
+	}
+	x := mix{steps: scale(40, 16, 12, 4, 8, 2, 3, 1, 3), nested: scale(20, 14, 20, 4, 4, 7, 7, 0, 0),
+		attempts: scale(30, 24, 6, 8, 12, 5, 5, 3)}
+	// Every walk calls, decides and moves the clock; its tools send something.
+	x.steps[0], x.steps[1], x.steps[2] = max(x.steps[0], 40), max(x.steps[1], 16), max(x.steps[2], 12)
+	x.nested[2] = max(x.nested[2], 20)
+	x.attempts[0], x.attempts[1] = max(x.attempts[0], 30), max(x.attempts[1], 24)
+	x.waits = []int{20, 35, 60}[m.rng.IntN(3)]
+	x.recovers = []int{50, 80, 100}[m.rng.IntN(3)]
+	x.newPolicy = []int{10, 30, 60}[m.rng.IntN(3)]
+	x.flipLive = []int{0, 10, 30}[m.rng.IntN(3)]
+	return x
+}
+
 // machine is one walk.
 type machine struct {
+	mix
 	world // guarded by mu, as are the effects' models
 
 	t         *testing.T
@@ -191,6 +226,7 @@ func newMachine(t *testing.T, seed uint64, path string) *machine {
 	}
 	m.now = time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 	ledger.Clock = m.Now
+	m.mix = m.drawMix()
 	// A walk calls few writes, so that each goes far: one to three tools, one or two sets of
 	// arguments each, in a run; another run starts now and then (newRun).
 	all := []string{"sm.idempotent", "sm.lookup", "sm.unsafe"}
@@ -288,9 +324,9 @@ func (m *machine) walk() {
 // act takes one step. Nested, it is taken while a tool waits: another call, a decision, the
 // clock, a cancel, agentd dying.
 func (m *machine) act(nested bool) {
-	weights := []int{40, 16, 12, 4, 8, 2, 3, 1, 3}
+	weights := m.steps
 	if nested {
-		weights = []int{20, 14, 20, 4, 4, 7, 7, 0, 0}
+		weights = m.nested
 	}
 	switch m.choose(weights...) {
 	case 0:
@@ -336,7 +372,7 @@ func (m *machine) choose(weights ...int) int {
 // pause is where a tool waits on the outside world: the walk may take other steps there, or
 // have the tool's agentd die. Not during recovery at start, which runs in goroutines of its own.
 func (m *machine) pause(inc *incarnation, where string) {
-	if m.recovering || m.violation != "" || m.depth >= smDepth || m.rng.IntN(100) >= 35 {
+	if m.recovering || m.violation != "" || m.depth >= smDepth || m.rng.IntN(100) >= m.waits {
 		return
 	}
 	m.depth++
@@ -495,7 +531,7 @@ func (m *machine) execute(ctx context.Context, t *smTool, payload json.RawMessag
 			m.mu.Unlock()
 		}
 	}
-	kind := attemptKind(m.choose(30, 24, 6, 8, 12, 5, 5, 3))
+	kind := attemptKind(m.choose(m.attempts...))
 	two := kind != attemptUnknownBefore && kind != attemptNotSent && kind != attemptDenied && m.rng.IntN(100) < 30
 	m.logf("%s sends %s: %s%s", inc.name, m.name(id), attemptNames[kind], map[bool]string{true: ", after a request before it"}[two])
 	m.pause(inc, "before its first request")
@@ -827,7 +863,7 @@ func (m *machine) end() {
 }
 
 // restart has the agentd that is up die, wherever it is, and another start on the same ledger:
-// mostly with the same policy and tools, and mostly recovering at start.
+// mostly with the same policy and tools, and mostly recovering at start (as the walk's mix says).
 func (m *machine) restart() {
 	old := m.cur
 	old.dead = true
@@ -836,15 +872,15 @@ func (m *machine) restart() {
 	}
 	pol := maps.Clone(old.policy)
 	live := old.live
-	if m.rng.IntN(100) < 30 {
+	if m.rng.IntN(100) < m.newPolicy {
 		name := m.toolNames[m.rng.IntN(len(m.toolNames))]
 		pol[name] = m.drawPolicy()
 	}
-	if m.rng.IntN(100) < 10 {
+	if m.rng.IntN(100) < m.flipLive {
 		live = !live
 	}
 	m.cur = m.start(pol, live)
-	atStart := m.rng.IntN(100) < 80
+	atStart := m.rng.IntN(100) < m.recovers
 	m.logf("%s dies; %s starts, live %v, policy %s, recovering at start: %v", old.name, m.cur.name, live, m.policyText(pol), atStart)
 	if !atStart {
 		return
