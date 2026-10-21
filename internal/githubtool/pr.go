@@ -376,7 +376,7 @@ func (t *OpenDraftPR) write(ctx context.Context, w *treeWalk, p prPayload, tip, 
 	}
 	if err := proceed(ctx); errors.Is(err, tools.ErrStopped) {
 		return nil, &tools.ConflictError{Reason: "branch " + p.Branch +
-			" exists, but the pull request was not opened: the run was cancelled, or the effect changed"}
+			" exists, but the pull request was not opened: the run was cancelled, its approval expired, or the effect changed"}
 	} else if err != nil {
 		return nil, err
 	}

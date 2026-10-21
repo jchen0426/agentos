@@ -418,16 +418,20 @@ func (g *Gateway) mayResend(ctx context.Context, e db.Effect, rule *approvalRule
 	return a.Status == approvalApproved && a.UsedAt.Valid, nil
 }
 
-// lapsed reports whether an effect has an approval, and its time is up.
-func (g *Gateway) lapsed(ctx context.Context, effectID string) (bool, error) {
-	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, effectID)
+// bound is the approval whose time bounds the requests of e that would be new: its own, unless it
+// is in flight (maybe_sent), and goes out again under its key whatever the time. Nil when none does.
+func (g *Gateway) bound(ctx context.Context, e db.Effect) (*db.Approval, error) {
+	if e.MaybeSent != 0 {
+		return nil, nil
+	}
+	a, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
+		return nil, nil
 	case err != nil:
-		return false, err
+		return nil, err
 	}
-	return expired(a), nil
+	return &a, nil
 }
 
 // decidedResult answers a call of an ABANDONED effect from its approval, if it has one: the

@@ -83,7 +83,8 @@ type Editable interface {
 }
 
 // Proceed is asked before each visible request of a write. It fails with ErrStopped when the
-// request must not go out (the run was cancelled meanwhile), and with another error that wraps
+// request must not go out (the run was cancelled meanwhile, or the write's approval ran out while
+// the tool prepared the request), and with another error that wraps
 // ErrNotSent when agentd cannot record the request; and it marks the moment the request goes
 // out: a lookup's wait for a request in flight counts from the last one.
 type Proceed func(ctx context.Context) error
@@ -102,10 +103,11 @@ type Finder interface {
 // happened: sending it again is safe.
 var ErrNotSent = errors.New("request not sent")
 
-// ErrStopped is what Proceed fails with when the run was cancelled, or the effect is no longer
-// this sender's to send: nothing more of the write may go out. It is ErrNotSent too. Proceed
-// failing otherwise (agentd could not record the request) may be tried again.
-var ErrStopped = fmt.Errorf("%w: the run was cancelled, or the effect changed", ErrNotSent)
+// ErrStopped is what Proceed fails with when the run was cancelled, the write's approval ran out,
+// or the effect is no longer this sender's to send: nothing more of the write may go out. It is
+// ErrNotSent too. Proceed failing otherwise (agentd could not record the request) may be tried
+// again.
+var ErrStopped = fmt.Errorf("%w: the run was cancelled, the approval expired, or the effect changed", ErrNotSent)
 
 // DeniedError refuses a call as it stands, before anything is sent: for example a patch that
 // touches a file the policy protects, or (from Execute, which then ends the effect) one whose

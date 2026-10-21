@@ -231,7 +231,7 @@ func TestProceedStopsOnceTheRunIsCancelled(t *testing.T) {
 	if !ok || err != nil {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	proceed := f.g.proceed(e)
+	proceed := f.g.proceed(e, nil)
 	if err := proceed(ctx); err != nil {
 		t.Fatalf("before the cancel: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestAWriteThatMayHaveTakenEffectIsNeverRecordedAsNotSent(t *testing.T) {
 					t.Fatal(err)
 				}
 				f.cancel(t)
-				return f.g.resend(ctx, f.run, w, f.status(t), payload)
+				return f.g.resend(ctx, f.run, w, f.status(t), payload, nil)
 			}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

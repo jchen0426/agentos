@@ -176,9 +176,14 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 			}
 			// A write the policy wants approved goes only with an approval in its time: recorded
 			// before the policy asked, or while the tool could only dry-run, it waits for one now.
+			// The approval's time holds to the last request of it that goes out.
+			var bound *db.Approval
 			if rule != nil {
 				if res, err := g.gate(ctx, run, t, e, rule, req, canon, payload); res != nil || err != nil {
 					return res, err
+				}
+				if bound, err = g.bound(ctx, e); err != nil {
+					return nil, err
 				}
 			}
 			claimed, ok, err := g.claimToSend(ctx, e)
@@ -186,7 +191,7 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 				return nil, err
 			}
 			if ok {
-				return g.send(ctx, run, t, claimed, payload, fx)
+				return g.send(ctx, run, t, claimed, payload, bound, fx)
 			}
 			if cancelled, err := g.runCancelled(ctx, run.WorkflowID); err != nil {
 				return nil, err
@@ -360,9 +365,14 @@ func (g *Gateway) isSending(effectID string) bool {
 }
 
 // proceed is what a tool asks before each visible request of e: the run must not have been
-// cancelled since, and the request's time is recorded, for a later lookup's wait.
-func (g *Gateway) proceed(e db.Effect) tools.Proceed {
+// cancelled since, nor the approval that bounds the attempt (bound: none for a write in flight)
+// have run out, however long the tool prepared the request; and the request's time is recorded,
+// for a later lookup's wait.
+func (g *Gateway) proceed(e db.Effect, bound *db.Approval) tools.Proceed {
 	return func(ctx context.Context) error {
+		if bound != nil && expired(*bound) {
+			return tools.ErrStopped
+		}
 		now := ledger.Now()
 		n, err := g.Ledger.Q.TouchEffect(ctx, db.TouchEffectParams{
 			ClaimedAt: valid(now), LastRequestAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
@@ -378,16 +388,17 @@ func (g *Gateway) proceed(e db.Effect) tools.Proceed {
 	}
 }
 
-// send sends an effect claimed with claimToSend and records what came of it.
+// send sends an effect claimed with claimToSend and records what came of it. No request of it goes
+// out once the approval that bounds the attempt (bound) has run out.
 func (g *Gateway) send(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage,
-	fx faults.Effect) (*agentosv1.Result, error) {
+	bound *db.Approval, fx faults.Effect) (*agentosv1.Result, error) {
 	defer func() {
 		g.sendMu.Lock()
 		delete(g.sending, e.EffectID)
 		g.sendMu.Unlock()
 	}()
 	fx.StallAfterClaim(ctx.Done())
-	value, err := t.Execute(ctx, payload, e.IdempotencyKey, g.proceed(e))
+	value, err := t.Execute(ctx, payload, e.IdempotencyKey, g.proceed(e, bound))
 	fx.StallBeforeRecord(ctx.Done())
 	var refused *tools.RefusedError
 	var conflict *tools.ConflictError
@@ -445,7 +456,7 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	finder, canFind := t.(tools.Finder)
 	switch class := e.EffectClass; {
 	case class == policy.EffectIdempotent && !cancelled && mayResend && e.MaybeSent != 0:
-		return g.resend(ctx, run, t, e, payload) // in flight, whatever its approval's time
+		return g.resend(ctx, run, t, e, payload, nil) // in flight, whatever its approval's time
 	case class == policy.EffectIdempotent && !cancelled && mayResend:
 		return g.resendNew(ctx, run, t, e, payload) // nothing of it went out
 	case class == policy.EffectIdempotent && !cancelled:
@@ -513,13 +524,15 @@ func (g *Gateway) sleep(ctx context.Context, d time.Duration) error {
 // a new request, which an approval allows only in its time: past it, the effect goes back to gate,
 // which voids the approval.
 func (g *Gateway) resendNew(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage) (*agentosv1.Result, error) {
-	if lapsed, err := g.lapsed(ctx, e.EffectID); err != nil {
+	e.MaybeSent = 0 // no earlier request took effect: only the next one can
+	bound, err := g.bound(ctx, e)
+	switch {
+	case err != nil:
 		return nil, err
-	} else if lapsed {
+	case bound != nil && expired(*bound):
 		return g.release(ctx, e, true)
 	}
-	e.MaybeSent = 0 // no earlier request took effect: only the next one can
-	return g.resend(ctx, run, t, e, payload)
+	return g.resend(ctx, run, t, e, payload, bound)
 }
 
 // release gives back a claimed effect for the run's next call: one a lookup found never took
@@ -551,8 +564,10 @@ func (g *Gateway) giveBack(ctx context.Context, e db.Effect, unsent bool) (int64
 	return g.Ledger.Q.ReleaseEffect(ctx, p)
 }
 
-// resend claims e again and sends it under its original key.
-func (g *Gateway) resend(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage) (*agentosv1.Result, error) {
+// resend claims e again and sends it under its original key, within the time of the approval that
+// bounds it (bound), if any.
+func (g *Gateway) resend(ctx context.Context, run db.Run, t tools.Writer, e db.Effect, payload json.RawMessage,
+	bound *db.Approval) (*agentosv1.Result, error) {
 	claimed, ok, err := g.claimToSend(ctx, e)
 	if err != nil {
 		return nil, err
@@ -568,7 +583,7 @@ func (g *Gateway) resend(ctx context.Context, run db.Run, t tools.Writer, e db.E
 		return nil, errEffectBusy
 	}
 	g.Log.Info("sending an effect again", "workflow_id", run.WorkflowID, "effect_id", e.EffectID, "tool", t.Name())
-	return g.send(ctx, run, t, claimed, payload, faults.Effect{})
+	return g.send(ctx, run, t, claimed, payload, bound, faults.Effect{})
 }
 
 // settle records how an effect ended, if nobody changed it since e was read, and returns
