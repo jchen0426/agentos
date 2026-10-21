@@ -104,9 +104,11 @@ MUTATIONS = {
         (SQL, "  edited_args_sha256 = ?\nWHERE approval_id = ? AND status = 'PENDING'\n",
               "  edited_args_sha256 = ?\nWHERE approval_id = ?\n")],
     "C1 a cancelled run's write still goes out": [
-        (SQL, "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n"
-              "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n`\n\nconst",
-              "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n`\n\nconst"),
+        (SQL, "UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?\n"
+              "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n"
+              "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n",
+              "UPDATE effects SET claimed_by = ?, claimed_at = ?, version = version + 1, updated_at = ?\n"
+              "WHERE effect_id = ? AND version = ? AND status = 'PENDING'\n"),
         (SQL, "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n"
               "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n",
               "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n")],
@@ -171,8 +173,8 @@ def apply(edits):
 
 def main():
     only = sys.argv[1:]
-    if subprocess.run(["git", "diff", "--quiet"]).returncode != 0:
-        sys.exit("the worktree has changes: commit them first")
+    if subprocess.run(["git", "diff", "--quiet", "--", "internal"]).returncode != 0:
+        sys.exit("internal/ has changes: commit them first")
     for name, edits in MUTATIONS.items():
         if only and not any(name.startswith(o) for o in only):
             continue
