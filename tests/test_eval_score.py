@@ -74,6 +74,10 @@ def test_lenient_cwe_follows_the_research_view():
     assert not cwe.related("CWE-862", "CWE-863") and not cwe.related("CWE-789", "CWE-457")
     assert not cwe.related("CWE-89", "CWE-78") and not cwe.related("CWE-79", "CWE-89")
     assert not cwe.related("CWE-20", "CWE-89")  # input validation is not an injection's ancestor
+    # Only primary parents: CWE-415's other parents (CWE-666, CWE-1341) would tie it, through CWE-672,
+    # to session expiry; its primary chain (CWE-825, CWE-119) ties it to the buffer errors.
+    assert cwe.related("CWE-415", "CWE-125") and not cwe.related("CWE-415", "CWE-613")
+    assert not cwe.related("CWE-613", "CWE-825") and not cwe.related("CWE-798", "CWE-1188")
     assert cwe.related("CWE-16", "CWE-16") and not cwe.related("CWE-16", "CWE-20")  # a category: itself only
 
 
@@ -253,11 +257,29 @@ def test_a_run_counts_when_the_model_answered_and_is_void_otherwise():
 
 
 def test_void_runs_run_again_still_count_in_the_money_and_the_void_runs():
-    replaced = [run("w", outcome="failed: boom", spent_micros=7000)]
-    m = score.metrics(CS, [run("w", spent_micros=1000)], seed=7, replaced=replaced)["p1"]
-    assert (m["replaced"], m["void"], m["void_reasons"]) == (1, 0, {"failed: boom": 1})
+    cut = {"status": None, "usage": {"input_tokens": 100, "cache_read_tokens": 100}}  # billed, then cut off
+    replaced = [run("w", outcome="failed: boom", spent_micros=7000, answers=[cut]),
+                run("w", outcome="failed: other", spent_micros=5000, profile="p2")]
+    answered = {"status": "ok", "usage": {"input_tokens": 100}}
+    m = score.metrics(CS, [run("w", spent_micros=1000, answers=[answered])], seed=7, replaced=replaced)["p1"]
+    assert (m["replaced"], m["void"], m["void_reasons"]) == (1, 0, {"failed: boom": 1})  # p2's is p2's
     assert m["cost_usd"] == {"per_audit": pytest.approx(8000 / 1e6), "total": pytest.approx(8000 / 1e6)}
+    assert m["cache_hit_rate"] == pytest.approx(100 / 300)  # the replaced run's tokens too
     assert (m["detection"]["runs"]) == 1
+
+
+def test_an_answer_in_the_ledger_is_enough_for_a_run_to_count():
+    # The model answered, and something else ended the run before its outcome said so.
+    refused, broken = {"status": "refused", "usage": {}}, {"status": "invalid_output", "usage": {}}
+    assert not score.void(run("v", outcome="", state="CANCELLED", answers=[refused]))
+    assert not score.void(run("v", outcome="failed: activity error", answers=[broken]))
+    assert score.void(run("v", outcome="failed: activity error", answers=[{"status": None, "usage": {}}]))
+
+
+def test_latency_leaves_out_void_runs_that_ended_by_themselves():
+    runs = [run("w", seconds=10.0, ended_by="run", answers=[{"status": "ok", "usage": {}}]),
+            run("w", outcome="denied", seconds=500.0, ended_by="run")]  # void: the policy denied the call
+    assert metrics(runs)["latency_s"] == {"p50": 10.0, "p95": 10.0, "runs": 1, "left_out": 1}
 
 
 def test_a_server_side_fallback_answer_is_a_refusal_of_the_model():

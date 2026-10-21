@@ -274,8 +274,7 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
         if profile.paid and resumed and _overspent(r.state):
             log(f"[{profile.name}] a run spent past its budget: the {len(resumed)} paid runs left in flight stop")
             for e in resumed:
-                e["stopped"] = "overspent"
-                _cancel(stack, e)
+                e["stopped"] = "overspent" if _cancel(stack, e) else "run"
         stack.start_worker()
         for gone in unknown:
             wait_for(lambda gone=gone: stack.get_run(gone)["state"] in ENDED, f"run {gone['run_id']} to end",
@@ -315,8 +314,7 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                     log(f"[{profile.name}] a run spent past its budget: no more paid runs, and the "
                         f"{len(stopping)} in flight stop")
                     for other in stopping:
-                        other["stopped"] = "overspent"
-                        _cancel(stack, other)
+                        other["stopped"] = "overspent" if _cancel(stack, other) else "run"
                 if not void(record):
                     confirmed = True
                 elif not confirmed and not record["resumed"]:
@@ -397,11 +395,12 @@ def spent_in(state: Path) -> int:
     return _spent(state.resolve())
 
 
-def _cancel(stack: Stack, run: dict) -> None:
-    """Cancels a run, unless it has ended meanwhile."""
+def _cancel(stack: Stack, run: dict) -> bool:
+    """Cancels a run, unless it has ended meanwhile; whether it cancelled it."""
     done = stack.agentctl_run("runs", "cancel", run["run_id"])
     if done.returncode != 0 and stack.get_run(run)["state"] not in ENDED:
         raise AssertionError(f"agentctl runs cancel {run['run_id']} failed: {done.stderr.strip()}")
+    return done.returncode == 0
 
 
 def _cancel_unknown(stack: Stack, journal: Journal, log) -> list[dict]:
@@ -461,7 +460,8 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
         ended_by = "timeout"
     if ended_by is None:
         return None
-    _cancel(stack, run)
+    if not _cancel(stack, run):  # it ended by itself meanwhile
+        ended_by = "run"
     wait_for(lambda: stack.get_run(run)["state"] in ENDED, f"run {entry['run_id']} to end", timeout=300, interval=1)
     return collect(stack, entry, ended_by)
 
