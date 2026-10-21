@@ -86,6 +86,19 @@ def test_a_case_may_not_change_a_binary_file(tmp_path: Path) -> None:
         mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
 
 
+def test_a_local_projects_hooks_do_not_run(tmp_path: Path) -> None:
+    # A project's local path is someone else's repository: building only reads and writes objects.
+    root = tmp_path / "r"
+    doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
+    ran = tmp_path / "hook-ran"
+    for hook in ("reference-transaction", "post-index-change"):
+        path = root / "shop/.git/hooks" / hook
+        path.write_text(f"#!/bin/sh\ntouch {ran}\n")
+        path.chmod(0o755)
+    mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+    assert not ran.exists()
+
+
 def test_the_cache_stays_out_of_the_repository(tmp_path: Path) -> None:
     root = tmp_path / "r"
     doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))

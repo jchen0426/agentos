@@ -9,6 +9,8 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -81,6 +83,15 @@ def run(*args, **kwargs) -> list[dict]:
         raise
 
 
+def open_files(pid: int) -> set[str]:
+    """The paths a process has open: /proc on Linux, lsof on macOS."""
+    fds = Path(f"/proc/{pid}/fd")
+    if fds.exists():
+        return {os.path.realpath(fd) for fd in fds.iterdir()}
+    out = subprocess.run(["lsof", "-n", "-P", "-p", str(pid), "-Fn"], capture_output=True, text=True).stdout
+    return {os.path.realpath(line[1:]) for line in out.splitlines() if line.startswith("n/")}
+
+
 def ledger(state: Path, profile: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{state / profile / 'stack/agentd/data/ledger.db'}?mode=ro", uri=True)
 
@@ -142,13 +153,36 @@ def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() ->
         [call("both", [primary, fallback]),  # the model declined, the fallback answered: both billed
          call("one", [fallback]),  # billed as one entry, under the fallback's name
          call("tier", ["openai/gpt-6.1-sol@flex"], "openai", "gpt-6.1-sol"),  # another tier, the same model
+         call("answerer", [primary]),  # billed as the model asked, answered by another
          call("huge", [primary])],
-        {"both": answer(fallback), "one": answer(fallback), "tier": answer("openai/gpt-6.1-sol"), "huge": huge}),
+        {"both": answer(fallback), "one": answer(fallback), "tier": answer("openai/gpt-6.1-sol"),
+         "answerer": answer(fallback), "huge": huge}),
         {"run_id": "r", "temporal_run_id": "t", "profile": "p", "case": "py-sqli", "rep": 1}, "run")
-    assert [a["fallback"] for a in record["answers"]] == [True, True, False, False]
+    assert [a["fallback"] for a in record["answers"]] == [True, True, False, True, False]
     assert record["report"]["findings"] == [{"severity": "high", "cwe": "CWE-89", "file": "app/db.py", "line": None,
                                              "title": "t"}]
     assert not score.void(record) and record["spent_micros"] == 10
+
+
+def test_the_plan_puts_the_runs_never_run_before_the_runs_again(tmp_path: Path) -> None:
+    j = runner.Journal(tmp_path / "journal.jsonl")
+
+    def ended(case: str, rep: int, outcome: str, profile: str = "p") -> None:
+        run_id = f"{profile}-{case}-{rep}"
+        j.append({"event": "start", "profile": profile, "case": case, "rep": rep, "run_id": run_id})
+        j.append({"event": "result", "profile": profile, "case": case, "rep": rep, "run_id": run_id, "outcome": outcome,
+                  "report": {"findings": []} if outcome == "ok" else None})
+    ended("x", 1, "failed: boom")  # void
+    ended("y", 1, "ok")
+    ended("x", 2, "failed: boom", profile="q")  # another profile's
+    j.append({"event": "start", "profile": "p", "case": "y", "rep": 2, "run_id": "flying"})
+    x, y = types.SimpleNamespace(id="x"), types.SimpleNamespace(id="y")
+    todo, resumed = runner.plan(j, "p", [x, y], 3, retry_void=True)
+    assert [(c.id, rep, again) for c, rep, again in todo] == [
+        ("x", 2, False), ("x", 3, False), ("y", 3, False), ("x", 1, True)]
+    assert [e["run_id"] for e in resumed] == ["flying"]
+    assert [(c.id, rep) for c, rep, _ in runner.plan(j, "p", [x, y], 3, retry_void=False)[0]] == [
+        ("x", 2), ("x", 3), ("y", 3)]
 
 
 def fake_ledger(path: Path, runs: dict[str, int], entries: list[tuple]) -> None:
@@ -408,7 +442,7 @@ def test_void_runs_count_on_their_own_and_run_again_when_asked(tmp_path: Path, e
         {"contains": "format_price", "answers": [{"report": eval_fixture.report()}]},
         {"contains": "parse_record", "answers": [{"fault": "429"}] * 10 + [
             {"report": eval_fixture.report(eval_fixture.finding(21, "CWE-787", file="parse.c"))}]}]))
-    a = profiles(modelsim)[0]
+    a = dataclasses.replace(profiles(modelsim)[0], timeout=120)  # a run agentd lacks would wait this long
     state = tmp_path / "state"
     journal = runner.Journal(state / "journal.jsonl")
     both = [cs.case("py-benign"), cs.case("c-oob"), cs.case("py-benign")]  # a case listed twice runs once
@@ -453,6 +487,11 @@ def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Pa
 
     def log(line: str) -> None:
         print(line)
+        if "runs to start" in line:  # Temporal and agentd hold the state's lock, as the runner does
+            lock = os.path.realpath(state / "lock")
+            for name in ("temporal", "agentd"):
+                [pid] = [p for p in descendants(os.getpid()) if Path((command_of(p).split() or [""])[0]).name == name]
+                assert lock in open_files(pid), (name, open_files(pid))
         if "#1:" in line and not killed:  # the first run is done: kill the Worker (and its sandbox)
             for pid in descendants(os.getpid()):
                 if "agentos_worker" in command_of(pid):
@@ -496,6 +535,7 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
     # The sandbox's list of paths the Worker may not read is separated by ':'.
     with pytest.raises(ValueError, match="':'"):
         runner.run(cs, [b], repos, state, deny_read=[tmp_path / "a:b"])
+    assert not (state / "b").exists(), "refused before any stack started"
     monkeypatch.setattr(runner, "SANDBOX", "none")
     with pytest.raises(ValueError, match="sandbox"):
         runner.run(cs, [runner.PROFILES["local"]], repos, state)

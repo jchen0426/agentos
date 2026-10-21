@@ -237,10 +237,12 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
         os.close(lock)
 
 
-def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_void: bool) -> None:
-    log, journal = r.log, r.journal
-    latest = {(e["case"], e["rep"]): e for e in journal.results() if e["profile"] == profile.name}
-    resumed = [e for e in journal.unfinished() if e["profile"] == profile.name]
+def plan(journal: Journal, profile: str, cases: list[Case], runs: int, retry_void: bool) -> tuple[list, list[dict]]:
+    """The profile's runs to start, in order, as (case, rep, run before), and its runs in flight
+    to pick up. Rep by rep, the runs never run come first: the first run goes alone, and a void
+    run may well be void again."""
+    latest = {(e["case"], e["rep"]): e for e in journal.results() if e["profile"] == profile}
+    resumed = [e for e in journal.unfinished() if e["profile"] == profile]
     flying = {(e["case"], e["rep"]) for e in resumed}
     fresh, again = [], []
     for rep in range(1, runs + 1):
@@ -249,8 +251,13 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
             if (c.id, rep) in flying or (last is not None and not (retry_void and void(last))):
                 continue
             (fresh if last is None else again).append((c, rep, last is not None))
-    # The runs never run come first: the first run goes alone, and a void run may well be void again.
-    todo = deque(fresh + again)
+    return fresh + again, resumed
+
+
+def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_void: bool) -> None:
+    log, journal = r.log, r.journal
+    planned, resumed = plan(journal, profile.name, cases, runs, retry_void)
+    todo = deque(planned)
     if not todo and not resumed:
         return
     stack_dir = r.state / profile.name / "stack"
@@ -273,7 +280,8 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
         for gone in unknown:
             wait_for(lambda gone=gone: stack.get_run(gone)["state"] in ENDED, f"run {gone['run_id']} to end",
                      timeout=300, interval=1)
-        log(f"[{profile.name}] {len(todo)} runs to start ({len(again)} again), {len(resumed)} to pick up")
+        log(f"[{profile.name}] {len(todo)} runs to start ({sum(t[2] for t in todo)} again), "
+            f"{len(resumed)} to pick up")
         watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
         confirmed = False  # a run of this profile has got an answer from the model
         while todo or watching:
