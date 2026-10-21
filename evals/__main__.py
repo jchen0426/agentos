@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         meta = {"title": args.title, "date": datetime.date.today().isoformat(), "commit": head,
                 "runs": max((r["rep"] for r in results), default=0),
-                "ledger_spent_usd": runner.spent_in(state) / 1e6}
+                "ledger_spent_usd": runner.spent_in(state) / 1e6, "void_streak": runner.VOID_STREAK}
         report.write(cs, results, args.out, meta, seed=args.seed, replaced=journal.replaced(),
                      unfinished=journal.unfinished())
         print(f"wrote {args.out.with_suffix('.md')} and {args.out.with_suffix('.json')}")

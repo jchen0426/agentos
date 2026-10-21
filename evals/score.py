@@ -164,8 +164,8 @@ def _rate(groups: Sequence[tuple[int, int]]) -> float | None:
 
 
 def rate(groups: list[tuple[int, int]], seed: int) -> dict:
-    return {"hits": sum(g[0] for g in groups), "runs": sum(g[1] for g in groups), "rate": _rate(groups),
-            "ci": bootstrap(groups, _rate, seed)}
+    return {"hits": sum(g[0] for g in groups), "runs": sum(g[1] for g in groups), "cases": len(groups),
+            "rate": _rate(groups), "ci": bootstrap(groups, _rate, seed)}
 
 
 # --- per model ------------------------------------------------------------------------------
@@ -243,7 +243,9 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int, replaced: list[dict]) -> 
     # Money is money: every run's, void or not, replaced or not; per audit, over the runs that
     # count, so that what void runs cost weighs on the audits got.
     spent = [r.get("spent_micros", 0) for r in [*runs, *replaced]]
-    out["cost_usd"] = {"per_audit": (sum(spent) / len(valid) / 1e6) if valid else None, "total": sum(spent) / 1e6}
+    out["cost_usd"] = {"per_audit": (sum(spent) / len(valid) / 1e6) if valid else None, "total": sum(spent) / 1e6,
+                       # what the runs that count cost by themselves
+                       "own": (sum(r.get("spent_micros", 0) for r in valid) / len(valid) / 1e6) if valid else None}
     # Only runs that ended by themselves: a run the runner stopped took longer than it shows, and
     # one picked up by a later runner has the downtime in its seconds.
     timed = [r for r in valid if r.get("seconds") is not None and r.get("ended_by") in (None, "run")

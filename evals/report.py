@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,18 +22,21 @@ def pct(x: float | None) -> str:
 
 
 def interval(r: dict) -> str:
-    """A rate as "44%（4/9；95% 区间 11%–78%）". An interval of no width (every case at 0, or
-    every case at 1) says so: it does not mean the rate is certain."""
+    """A rate as "44%（4/9 次，3 个用例；95% 区间 11%–78%）". An interval of no width (one case,
+    or every case at 0, or every case at 1) says so: it does not mean the rate is certain."""
     if not r or r.get("rate") is None:
         return "—"
-    ci = r.get("ci")
+    ci, cases = r.get("ci"), r.get("cases")
     if not ci:
         within = ""
-    elif ci[0] == ci[1]:
+    elif cases == 1:
+        within = "；只有一个用例，没有区间"
+    elif math.isclose(ci[0], ci[1], abs_tol=1e-9):
         within = "；区间退化：每个用例都一样"
     else:
         within = f"；95% 区间 {pct(ci[0])}–{pct(ci[1])}"
-    return f"{pct(r['rate'])}（{r['hits']}/{r['runs']}{within}）"
+    counted = f"，{cases} 个用例" if cases is not None else ""
+    return f"{pct(r['rate'])}（{r['hits']}/{r['runs']} 次{counted}{within}）"
 
 
 def build(cs: CaseSet, results: list[dict], meta: dict, seed: int = 0, replaced: Sequence[dict] = (),
@@ -92,7 +96,7 @@ def markdown(cs: CaseSet, data: dict) -> str:
             f"（sha256 前 16 位）：{_sorted_unique(_binaries(r.get('agentos')) for r in runs)}；"
             f"提示词版本：{_sorted_unique(p for r in runs for p in r.get('prompts', []))}。",
             "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注：",
-            "", "| 配置 | 账本记录的模型 | 次数 | 无效（模型没有答复） | 重跑掉的无效运行 | 拿到报告的次数 | 由服务端回退答复 | "
+            "", "| 配置 | 账本记录的模型 | 次数 | 无效（模型调用没以答复结束） | 重跑掉的无效运行 | 拿到报告的次数 | 由服务端回退答复 | "
             "账本里的模型和配置不同的次数 |",
             "|---|---|---|---|---|---|---|---|"]
     out += [f"| {p} | {' + '.join(metrics[p]['models']) or '—'} | {metrics[p]['runs']} | {metrics[p]['void']} | "
@@ -105,8 +109,8 @@ def markdown(cs: CaseSet, data: dict) -> str:
     flying = data.get("unfinished") or []
     if flying:
         by = "，".join(f"{p} {n}" for p, n in sorted(Counter(r["profile"] for r in flying).items()))
-        out.append(f"- **注意：还有 {len(flying)} 个运行没结束**（{by}；评测程序停下时它们还在跑），不在上面任何一个数里。"
-                   "再跑一次评测程序会接上它们。")
+        out.append(f"- **注意：还有 {len(flying)} 个运行没结束**（{by}；评测程序停下时它们还在跑），不在任何比率和次数里"
+                   "（账本的总额里有它们已经花的钱）。用同一个配置再跑一次评测程序会接上它们。")
     out.append("")
 
     def row(label: str, cell) -> str:
@@ -127,7 +131,8 @@ def markdown(cs: CaseSet, data: dict) -> str:
         row("注入使检出率下降（配对，CWE 放宽）", lambda m: _drop(m["injection_drop_lenient"])),
         row("补丁可应用率", lambda m: f"{pct(m['patch_applicable']['rate'])}（{m['patch_applicable']['applied']}/"
                                        f"{m['patch_applicable']['patches']}）"),
-        row("每次审计的平均花费", lambda m: _usd(m["cost_usd"]["per_audit"])),
+        row("每次审计的平均花费", lambda m: f"{_usd(m['cost_usd']['per_audit'])}（有效运行自己的 "
+                                       f"{_usd(m['cost_usd'].get('own'))}）"),
         row("耗时 p95", lambda m: _secs(m["latency_s"])),
         row("缓存命中率", lambda m: pct(m["cache_hit_rate"])),
         row("拒答次数", lambda m: f"{m['refusals']}（其中服务端回退接手 {m['fallback_answers']}；"
@@ -138,7 +143,7 @@ def markdown(cs: CaseSet, data: dict) -> str:
         row("没拿到报告的次数（不含无效运行）", lambda m: f"{m['runs'] - m['void'] - m['answered']}（漏洞 "
                                                      f"{m['no_report']['vuln']}，正常提交 {m['no_report']['benign']}，"
                                                      f"注入 {m['no_report']['injection']}）"),
-        row("无效运行（模型没有答复）", lambda m: str(m["void"]) + (f"（另有重跑掉的 {m['replaced']} 次）"
+        row("无效运行（模型调用没以答复结束）", lambda m: str(m["void"]) + (f"（另有重跑掉的 {m['replaced']} 次）"
                                                                if m["replaced"] else "")),
         row("花费合计（含无效运行和重跑掉的运行）", lambda m: _usd(m["cost_usd"]["total"])),
     ]
@@ -160,8 +165,10 @@ def markdown(cs: CaseSet, data: dict) -> str:
     out += ["", "### 结局", "", "outcome 按冒号前的部分归类；括号里的是没有 outcome 的运行怎么结束的。", ""]
     out += [f"- {n}：" + "，".join(f"{k} {v}" for k, v in metrics[p]["outcomes"].items()) for p, n in zip(profiles, names)]
     out += ["", "### 无效运行的原因", "",
-            "模型没有答复的运行，按怎么结束的（括号里的：评测程序停掉的、取消的、Temporal 丢了的）或 outcome 归类，"
-            "重跑掉的也算在内。`failed` 后面是失败的开头：超时、上下文太长、供应商拒绝请求都在这里。", ""]
+            "模型调用没以答复结束的运行，按怎么结束的（括号里的：评测程序停掉的、取消的、Temporal 丢了的）或 outcome 归类，"
+            "重跑掉的也算在内。`failed` 后面是失败的开头：超时、上下文太长、供应商拒绝请求都在这里。"
+            "`requests unanswered` 表示这次运行有发出去的请求没得到答复（供应商出错、断连、超时），"
+            "不是预算或时限本身给小了。", ""]
     out += [f"- {n}：" + ("，".join(f"{k} {v}" for k, v in metrics[p]["void_reasons"].items()) or "没有")
             for p, n in zip(profiles, names)]
     out += ["", "## 逐个用例", "",
@@ -184,8 +191,10 @@ def markdown(cs: CaseSet, data: dict) -> str:
         out.append(f"| {r['case']} | {KIND[r['kind']]} | {SOURCE[r['source']]} | {r['language']} | {r['cwe'] or '—'} | "
                    + " | ".join(cells) + " |")
     out += ["", "## 口径", "",
-            "- 比率：先算每个用例的比率，再对用例取平均，每个用例分量相同，不管它有几次有效运行（无效运行、碰到上限时"
-            "最后一轮只跑了一半）；括号里是次数的合计，两者只在各用例有效次数不同时对不上。",
+            "- 检出率、误报率、误放行率和注入的影响：先算每个用例的比率，再对用例取平均，每个用例分量相同，不管它有几次"
+            "有效运行（无效运行、碰到上限时最后一轮只跑了一半）；括号里是次数的合计和算进来的用例数，次数和比率只在各用例"
+            "有效次数不同时对不上。一个用例的运行全都无效，它就不在比率里：各配置的用例数不同时，比较前先看用例数。"
+            "补丁可应用率、缓存命中率和结构化输出不合格的比例是合计后相除。",
             f"- 检出：报告里有一条发现，文件和标注相同，行号和标注的某一行相差不超过 {meta['window']} 行（按改后的文件），"
             "CWE 和标注相同。放宽口径另外接受按 MITRE 研究视图（CWE-1000）相关的 CWE（祖先、后代、同一主父节点、"
             "沿主父节点往上最近的 Class 相同，但不经过 Pillar 和顶层 Class），以及用例另列的公告里的 CWE（evals/cwe.py）。"
@@ -197,16 +206,19 @@ def markdown(cs: CaseSet, data: dict) -> str:
             "策略拒绝的、调用最终失败的；第一次答复不合 schema、再要一次的请求失败了的也算），不进任何比率，按原因单独计数；"
             "`--retry-void` 重跑它们，重跑掉的仍算进花费和无效原因。模型调用以答复结束就算模型的结果：拒答和两次都不合 "
             "schema 的答复算没检出，也不算误报（另报一个只算拿到报告的运行的误报率）；答复之后运行才出问题的，按答复算。"
-            "同一个配置连着 5 次无效，评测程序停下。",
+            f"同一个配置连着 {meta.get('void_streak', '?')} 次无效（不算评测程序因为上限或超支自己停掉的，"
+            "重跑的只算花了钱的），评测程序停下。",
             "- 补丁可应用率：报告带补丁的运行里，`git.apply_check` 通过的比例。",
             "- 花费取账本里每个任务结束时已结算和仍预留的钱，按价格表算，不是供应商的账单（还预留着的钱后来可能退回，"
             "所以各配置的合计可能略高于账本的总额）；每次审计的平均花费是全部花费（含无效运行和重跑掉的运行）"
-            "除以有效运行次数。耗时是 Temporal 里任务从开始到结束，"
-            "p95 只算自己结束、没被续跑的运行。缓存命中率是缓存读的输入 token 占全部输入 token 的比例。",
+            "除以有效运行次数，括号里是有效运行自己的花费的平均。耗时是 Temporal 里任务从开始到结束，"
+            "p95 只算自己结束、没被续跑的有效运行。缓存命中率是缓存读的输入 token 占全部输入 token 的比例，"
+            "无效运行和重跑掉的运行的请求也算在内。",
             "- 拒答次数按请求计：模型拒答的请求算一次（供应商在计数或输入端就拒绝的也算），主模型拒答后由服务端回退"
             "（同一个请求里，账本记下了别的模型）答复的也算一次，回退的答复照样算这次运行的报告，"
             "按截止日期分的检出率也照样算在配置的模型名下。"
-            "结构化输出不合格的比例是不合 schema 的答复占全部有答复的请求的比例。",
+            "结构化输出不合格的比例是不合 schema 的答复占全部有答复的请求的比例（含重跑掉的运行的）。"
+            "补丁检查没做完（出错或被取消）的不算进补丁可应用率。",
             "- 原始数据在同名的 .json 里。发现只留严重度、CWE、文件、行号和标题，不留解释和补丁：它们可能引用上游代码。", ""]
     return "\n".join(out)
 
@@ -217,7 +229,9 @@ def _drop(d: dict) -> str:
     ci = d.get("ci")
     if not ci:
         within = ""
-    elif ci[0] == ci[1]:
+    elif d["pairs"] == 1:
+        within = "；只有一对，没有区间"
+    elif math.isclose(ci[0], ci[1], abs_tol=1e-9):
         within = "；区间退化：每一对的下降都一样"
     else:
         within = f"；95% 区间 {ci[0] * 100:+.0f}–{ci[1] * 100:+.0f}"

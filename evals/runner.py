@@ -13,8 +13,11 @@ The first run of a profile goes alone: if the model gave it no answer (evals/sco
 the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. After any
 void run, runs go one at a time again until one gets an answer, and VOID_STREAK void runs in a
 row stop the runner (a provider that went away: each of its requests may cost the whole
-reservation). Void runs run again only when asked (--retry-void), after the runs never run; one
-that is void again does not stop the runner as a first run would.
+reservation): not the runs the runner stopped itself (overspent, cap), and a void run run again
+only if it cost money, since a case that is void every time (too long for the model, denied)
+must not keep the others from running again. Void runs run again only when asked
+(--retry-void), after the runs never run; one that is void again does not stop the runner as a
+first run would.
 
 Money: a paid profile needs a cap on what the state directory's runs spend, every runner on it
 together; a new state directory is a new evaluation, with a cap of its own. A run starts only
@@ -66,6 +69,19 @@ TASK = "security-audit"
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ENDED = TERMINAL | {"UNKNOWN"}
 VOID_STREAK = 3  # runs in a row the model gives no answer, after the first, that stop the runner
+STOPPED_BY_CAP = ("overspent", "cap")  # how the runner itself ends runs, for money: no word on the model
+
+
+def _about_the_model(record: dict) -> bool:
+    """Whether a void run says anything about the model or its provider: not one picked up from
+    an earlier runner, nor one the runner stopped itself for money."""
+    return not record["resumed"] and record["ended_by"] not in STOPPED_BY_CAP
+
+
+def _breaks(record: dict, entry: dict) -> bool:
+    """Whether a void run counts towards VOID_STREAK: a run never run before does, and one run
+    again only if it cost money (a provider failing again; not a case void every time)."""
+    return not entry.get("again") or record["spent_micros"] > 0
 
 
 @dataclass(frozen=True)
@@ -310,10 +326,11 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
             f"{len(resumed)} to pick up")
         watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
         confirmed = False  # a run of this profile has got an answer from the model
-        streak = 0  # runs this runner started that ended void, in a row: one at a time until one answers
+        alone = True  # one run at a time: the first, and after a void run until one is answered
+        streak = 0  # void runs in a row that say the provider is failing (_breaks)
         while todo or watching:
             _alive(stack)
-            while todo and len(watching) < (profile.concurrency if confirmed and not streak else 1):
+            while todo and len(watching) < (1 if alone else profile.concurrency):
                 if profile.paid and _overspent(r.state):
                     log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
                     todo.clear()
@@ -345,12 +362,13 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                         other["stopped"] = "overspent"
                         _cancel(stack, other)
                 if not void(record):
-                    confirmed, streak = True, 0
-                elif not record["resumed"]:
-                    streak += 1
+                    confirmed, alone, streak = True, False, 0
+                elif _about_the_model(record):
+                    alone = True
                     if not confirmed and not entry.get("again"):
                         raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
                                            f"{void_reason(record)}")
+                    streak += _breaks(record, entry)
                     if streak >= VOID_STREAK:
                         raise RuntimeError(f"[{profile.name}] {streak} runs in a row ended without the model, the last "
                                            f"{void_reason(record)}: stopping; the next runner picks up the runs in "
@@ -513,7 +531,9 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
         return collect(stack, entry, entry.get("stopped", "run") if state == "CANCELLED" else "run")
     if state == "UNKNOWN":  # Temporal no longer has it
         return collect(stack, entry, "lost")
-    ended_by = {"PAUSED_BUDGET": "budget", "WAITING_APPROVAL": "waiting", "WAITING_RECONCILE": "waiting"}.get(state)
+    # A run the runner has stopped keeps its reason while the cancel takes, whatever it waits for.
+    ended_by = entry.get("stopped") or {"PAUSED_BUDGET": "budget", "WAITING_APPROVAL": "waiting",
+                                        "WAITING_RECONCILE": "waiting"}.get(state)
     if ended_by is None and time.monotonic() - entry["since"] > profile.timeout:
         ended_by = "timeout"
     if ended_by is None:
@@ -545,7 +565,10 @@ def _float(digits: str) -> float | None:
 def _object(raw: str | bytes) -> dict:
     """A JSON object that holds what a model wrote: numbers past any line are None, and so are
     the NaN and Infinity Python's json would take, so that the journal and the report stay JSON."""
-    value = json.loads(raw, parse_int=_int, parse_float=_float, parse_constant=lambda _: None)
+    try:
+        value = json.loads(raw, parse_int=_int, parse_float=_float, parse_constant=lambda _: None)
+    except (ValueError, RecursionError):  # nested deeper than Python reads: an answer unread
+        return {}
     return value if isinstance(value, dict) else {}
 
 
@@ -614,7 +637,8 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
             "spent_micros": int(info.get("budget_spent_micros", 0)) + int(info.get("budget_reserved_micros", 0)),
             "models": list(dict.fromkeys(a["model"] for a in answers)), "answers": answers,
             "accepted_answers": len(accepted), "report": report,
-            "patch_applies": (checks[-1]["outcome"] == "ok") if checks else None}
+            # A check that did not finish (an error, a cancel) recorded no outcome: not known.
+            "patch_applies": (checks[-1]["outcome"] == "ok") if checks and checks[-1]["outcome"] else None}
 
 
 def _line(cs: CaseSet, r: dict) -> str:

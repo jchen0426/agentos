@@ -193,6 +193,7 @@ def test_a_signal_waits_for_the_stack_to_stop_whatever_thread_gets_it() -> None:
 def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Path) -> None:
     raw = '{"line": 1e400, "low": -1e400, "nan": NaN, "inf": Infinity, "ok": 12.0, "n": 7}'
     assert runner._object(raw) == {"line": None, "low": None, "nan": None, "inf": None, "ok": 12.0, "n": 7}
+    assert runner._object('{"a":' * 1500 + "1" + "}" * 1500) == {}  # deeper than Python reads: unread
     with pytest.raises(ValueError):
         runner.Journal(tmp_path / "journal.jsonl").append({"event": "result", "x": float("inf")})
 
@@ -233,6 +234,35 @@ def test_the_runner_stopped_a_run_only_if_it_ended_cancelled() -> None:
     assert runner._watch(Ended("SUCCEEDED"), stopped, a)["ended_by"] == "run"  # it ended before the cancel
     assert runner._watch(Ended("PAUSED_BUDGET", after="CANCELLED"), entry, a)["ended_by"] == "budget"
     assert runner._watch(Ended("PAUSED_BUDGET", after="SUCCEEDED"), entry, a)["ended_by"] == "run"
+    # Stopped for the cap, still paused when polled: the reason stays the runner's.
+    assert runner._watch(Ended("PAUSED_BUDGET", after="CANCELLED"), {**entry, "stopped": "cap"}, a)["ended_by"] == "cap"
+
+
+def test_which_void_runs_stop_the_runner() -> None:
+    fresh, again = {}, {"again": True}
+    void = {"resumed": False, "ended_by": "run", "spent_micros": 0}
+    assert runner._about_the_model(void) and runner._breaks(void, fresh)
+    # A case void every time (too long, denied) costs nothing when run again: it keeps no other
+    # void run from running again. A provider failing again does cost money.
+    assert not runner._breaks(void, again) and runner._breaks({**void, "spent_micros": 1}, again)
+    # Runs the runner stopped itself for money, or picked up from an earlier runner, say nothing.
+    for ended_by in runner.STOPPED_BY_CAP:
+        assert not runner._about_the_model({**void, "ended_by": ended_by})
+    assert not runner._about_the_model({**void, "resumed": True})
+    assert runner._about_the_model({**void, "ended_by": "timeout"})
+
+
+def test_a_patch_check_that_did_not_finish_says_nothing() -> None:
+    class Checked(LedgerOf):
+        def __init__(self, outcome: str | None) -> None:
+            super().__init__([], {})
+            self.outcome = outcome
+
+        def ledger(self, sql: str, *params) -> list[dict]:
+            return [{"outcome": self.outcome}] if "FROM calls" in sql else super().ledger(sql, *params)
+    entry = {"run_id": "r", "temporal_run_id": "t", "profile": "p", "case": "py-sqli", "rep": 1}
+    assert [runner.collect(Checked(o), entry, "run")["patch_applies"] for o in (None, "denied", "ok")] == [
+        None, False, True]
 
 
 def test_the_plan_puts_the_runs_never_run_before_the_runs_again(tmp_path: Path) -> None:
@@ -348,10 +378,10 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     out = tmp_path / "out" / "report"
     assert cli.main(["--cases", str(path), "report", "--state", str(state), "--out", str(out), "--title", "test"]) == 0
     md = out.with_suffix(".md").read_text()
-    assert "44%（4/9；95% 区间" in md, md
-    assert "67%（6/9；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
+    assert "44%（4/9 次，3 个用例；95% 区间" in md, md
+    assert "67%（6/9 次，3 个用例；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
     assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b） |" in md
-    assert "0%（0/3；区间退化：每个用例都一样）" in md and "区间退化：每一对的下降都一样" in md  # model b's
+    assert "0%（0/3 次，1 个用例；只有一个用例，没有区间）" in md and "1 对；只有一对，没有区间" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw

@@ -305,7 +305,8 @@ within it. A run whose model call did not end with the model's answer (one cance
 waited for budget, an approval or a reconciliation, or took longer than its profile allows; a
 policy that denied the call; a provider that kept failing) is void: it is in no rate, the
 report counts it by its reason, and `--retry-void` runs it again. After a void run the runs go
-one at a time until one is answered; three void runs in a row stop the runner. On macOS the
+one at a time until one is answered; three void runs in a row stop the runner (not counting
+runs it stopped itself for the cap, nor void runs run again that cost nothing). On macOS the
 state directory and the cache must be under the home directory (the default) or a temporary
 directory, which the sandboxes deny. The profiles are `config/models.yaml`'s providers,
 one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
