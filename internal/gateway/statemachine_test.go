@@ -67,8 +67,12 @@ var (
 	smSeedsFlag = flag.Int("statemachine.seeds", 0, "walk seeds 1 to N (and regressionSeeds)")
 )
 
-// regressionSeeds each failed once: they are walked on every run, with seeds 1 to smSeeds.
-var regressionSeeds = []uint64{}
+// regressionSeeds failed once, beyond the seeds walked by default: they are walked on every run,
+// with seeds 1 to smSeeds. A seed names a walk of this file's code as it is: change what a walk
+// draws, and find them again (docs/statemachine-notes.md says how).
+var regressionSeeds = []uint64{
+	1189, 1596, // agentd, starting, abandoned a cancelled run's write that may have taken effect
+}
 
 const (
 	smSeeds = 200 // seeds walked by default
