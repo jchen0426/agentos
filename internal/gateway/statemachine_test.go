@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -103,9 +104,13 @@ func TestEffectProtocolStateMachine(t *testing.T) {
 	dir := t.TempDir()
 	failed := 0
 	for _, seed := range seeds {
-		m := newMachine(t, seed, filepath.Join(dir, fmt.Sprintf("ledger-%d.db", seed)))
+		path := filepath.Join(dir, fmt.Sprintf("ledger-%d.db", seed))
+		m := newMachine(t, seed, path)
 		m.walk()
 		m.stop()
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			os.Remove(path + suffix) // the walk's own ledger, done with
+		}
 		switch {
 		case m.violation != "":
 			t.Errorf("seed %d: %s\n\nThe walk:\n%s\nThe ledger:\n%s", seed, m.violation, m.log.String(), m.dump)
@@ -303,6 +308,12 @@ func (m *machine) start(pol map[string]toolPolicy, live bool) *incarnation {
 	}
 	led, err := ledger.Open(m.ctx, m.path)
 	if err != nil {
+		m.fatal(err)
+	}
+	// A walk's ledger needs no durability: without a sync to disk at each commit, walks take as
+	// long where syncing is slow (Linux) as where it is not. One connection holds the setting.
+	led.DB.SetMaxOpenConns(1)
+	if _, err := led.DB.ExecContext(m.ctx, "PRAGMA synchronous = OFF"); err != nil {
 		m.fatal(err)
 	}
 	inc.led, inc.tools = led, m.smTools(inc)
