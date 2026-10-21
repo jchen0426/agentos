@@ -157,7 +157,9 @@ bin/agentctl reconcile resolve <effect-id> --not-executed
 ```
 
 `--not-executed` has the run send the write again under its original idempotency key, unless the
-run has ended or the write's approval has run out by then. `--executed --result '{...}'` records
+run has ended or the write's approval has run out by then. For a write its tool can look up,
+agentd takes `--not-executed` only once no request of it can still take effect, and says when
+that is. `--executed --result '{...}'` records
 what the write produced instead, and `--executed --lookup` lets agentd look it up for tools that
 can.
 
