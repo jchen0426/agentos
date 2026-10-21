@@ -53,6 +53,11 @@
   4. 恶意工作流（`tests/rogue_workflows.py` 的 `SwapsThePatch`）：让审批人修改、批准修改后的补丁，然后不用批准的那份，改用模型自己的补丁再调用：得到 `edited`，什么都没发出去；第二张审批单是 APPROVED 但没被用过。
 - **T6**（`tests/test_t6_concurrent_decisions.py`）：四个任务同时等审批，每张审批单同时起两个 agentctl，一个以 alice 批准、一个以 bob 拒绝。每张都只有一个成功，另一个以非 0 退出，错误里写着先到的决定、谁、何时；账本里的状态就是先到的那个。各自用原来的幂等键再发一次：先到的那个照样成功，后到的照样冲突。之后任务按先到的决定走：批准的开出一个 PR，拒绝的不开 PR，报告里有 bob 的理由。
 - **T14**（`tests/test_t14_doorbell_outbox.py`），两个场景：批准（和追加预算）的门铃扣在 outbox 里，确认它没送出、任务还在睡，kill -9 agentd，再起一个：门铃送达，任务跑完，历史里一个信号，outbox 记 delivered。工作流自己的定时器是 24 小时（预算是 1 小时），测试的等待只有 60 秒，所以唤醒任务的只能是门铃。
+- **真实 GitHub 上带审批的 T2**（`tests/test_t2_live.py` 的第二个测试，要手动跑）：2026-10-21 在测试仓库 jchen0426/agentos-audit-target 上跑通，Worker 在 srt 沙箱里。
+  - 审批单：用真 token 读到的 GitHub 情况都对：base 分支的头就是被审计提交，补丁涉及的文件在提交上、在头上都核对通过，`git apply --check` 通过。
+  - 批准之前：GitHub 上没有任何写。
+  - 批准之后：大约 7 秒开出 draft PR #2。PR 开出后、记录结果之前 kill -9 agentd；新的 agentd 启动时查到这个 PR，记成 SUCCEEDED。
+  - 报告评论：围栏外写着“Approval of github.open_draft_pr: approved”，围栏里有审批人。审批人用 `--as t2-live`，免得把系统用户名写进公开仓库。
 - **一半发出去的写过期**（`tests/test_approval_partial_write.py`）：见第五轮第 3 条。
 - **审批绕不过去**（`tests/test_approval_gate.py`）：agentd 没配 GitHub 时开 PR 的写被记成 PENDING（只能 dry-run，不要审批），在改记 DRY_RUN 之前被故障挂住；kill -9 之后换一个配了 GitHub 的 agentd：那次写改回等审批，有了审批单，任务停在 WAITING_APPROVAL，GitHub 没收到任何写请求；批准后开出一个 PR。
 - **其他黑盒测试的变化**：`test_cancel.py` 等审批时取消，现在还核对审批单不再列出、对它的批准被拒绝；`test_dry_run.py` 加了“dry-run 在需要审批的策略下也不建审批单”。测试框架加了 `approval_policy()`、`restart_temporal()`、扣住门铃的故障（`hold_doorbells_while_exists`）和读模拟 GitHub 评论的辅助函数；模拟 GitHub 的日志记下建树请求里的文件内容，测试才能看出 PR 里是谁的修复。
