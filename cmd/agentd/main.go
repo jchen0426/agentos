@@ -42,6 +42,7 @@ import (
 	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/outbound"
 	"github.com/jchen0426/agentos/internal/outbox"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/pricing"
@@ -80,6 +81,15 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Before any client is made: where agentd's requests go is its configuration's to say.
+	set, err := outbound.IgnoreEnvProxies()
+	if err != nil {
+		return err
+	}
+	if len(set) > 0 {
+		log.Warn("agentd ignores the proxy settings in its environment: its requests go straight to their hosts, "+
+			"and fail where only a proxy reaches them", "variables", set)
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -154,7 +164,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		HostPort:          cfg.Temporal.Address,
 		Namespace:         cfg.Temporal.Namespace,
 		Logger:            tlog.NewStructuredLogger(log.With("component", "temporal-sdk")),
-		ConnectionOptions: client.ConnectionOptions{TLS: tlsConfig},
+		ConnectionOptions: client.ConnectionOptions{TLS: tlsConfig, DialOptions: []grpc.DialOption{grpc.WithNoProxy()}},
 	})
 	if err != nil {
 		return fmt.Errorf("connect to Temporal at %s: %w", cfg.Temporal.Address, err)
@@ -249,7 +259,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		creds = credentials.NewTLS(tlsConfig)
 	}
 	backend, err := grpc.NewClient(cfg.Temporal.Address,
-		append(runtimeproxy.DialOptions(), grpc.WithTransportCredentials(creds))...)
+		append(runtimeproxy.DialOptions(), grpc.WithTransportCredentials(creds), grpc.WithNoProxy())...)
 	if err != nil {
 		return err
 	}

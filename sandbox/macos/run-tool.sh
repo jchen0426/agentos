@@ -3,7 +3,7 @@
 # call, as section 8 of the design doc asks:
 #   - network: none. No destination is allowed and nothing may listen.
 #   - files: the home directory, the shared temporary directories (/private/tmp, where other
-#     calls and the Worker keep their state, and /private/var/folders), and the paths in
+#     calls and the Worker keep their state, /private/var/tmp and /private/var/folders), and the paths in
 #     AGENTOS_SANDBOX_DENY_READ, a JSON array (agentd passes its data directory, its sockets'
 #     directories, the Temporal client certificate and key, and every mirror), are unreadable,
 #     except the call's mirror, the server binary and the call's work directory. (Not the
@@ -54,7 +54,8 @@ node -e '
   console.log(JSON.stringify({
     network: { allowedDomains: [], deniedDomains: [], allowLocalBinding: false },
     filesystem: {
-      denyRead: [...new Set(["/private/tmp", "/private/var/folders", ...denied.flatMap(p => [p, real(p)])])],
+      denyRead: [...new Set(["/private/tmp", "/private/var/tmp", "/private/var/folders",
+        ...denied.flatMap(p => [p, real(p)])])],
       allowRead: [...new Set([mirror, server, real(server), work])],
       allowWrite: [work],
       denyWrite: ["/tmp/claude", "/private/tmp/claude"],
