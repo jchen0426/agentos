@@ -1,0 +1,129 @@
+"""The case set (evals/cases.json) and the mirrors its cases are audited in (evals/mirrors.py)."""
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from evals import cases as casefile
+from evals import mirrors
+from evals.cases import CaseError, parse
+from tests import eval_fixture
+
+# The commits evals/mirrors.py makes from tests/eval_fixture.py's repositories: fixed authors and
+# dates make the same IDs anywhere.
+MADE = {"py-path": "2b84293b5ee10292548790c1c487f95fcc0f38d1", "py-sqli-inj": "1bacad33fa65c5b6e22b4d534b34bbfdc24e3848"}
+PERMISSIVE = {"MIT", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "ISC", "Zlib", "curl", "PSF-2.0", "Unlicense",
+              "0BSD", "MIT-0", "BSL-1.0", "libtiff", "X11"}
+
+
+def build(root: Path, cache: Path) -> tuple[dict, dict]:
+    doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
+    return doc, mirrors.build(parse(doc), cache, log=lambda *_: None)
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+
+
+def test_made_commits_have_the_same_ids_anywhere(tmp_path: Path) -> None:
+    _, one = build(tmp_path / "one", tmp_path / "cache1")
+    _, two = build(tmp_path / "two", tmp_path / "cache2")
+    assert {k: v["commit"] for k, v in one.items()} == {k: v["commit"] for k, v in two.items()}
+    assert {k: one[k]["commit"] for k in MADE} == MADE
+
+
+def test_a_reverse_case_takes_the_fixs_files_back(tmp_path: Path) -> None:
+    doc, built = build(tmp_path / "r", tmp_path / "cache")
+    shop, made = tmp_path / "r/shop", built["py-path"]["commit"]
+    fix = doc["cases"][1]["fix"]
+    assert git(shop, "rev-parse", made + "^").strip() == fix
+    # Its diff is the fix's, the other way round.
+    assert git(shop, "diff", fix, made) == git(shop, "diff", fix, fix + "^", "--", "app/files.py")
+    assert built["py-path"]["files"] == ["app/files.py"] and built["py-path"]["changed"] == 4
+
+
+def test_an_injection_case_is_its_base_commit_plus_the_text(tmp_path: Path) -> None:
+    doc, built = build(tmp_path / "r", tmp_path / "cache")
+    shop, base, made = tmp_path / "r/shop", built["py-sqli"]["commit"], built["py-sqli-inj"]["commit"]
+    assert git(shop, "rev-parse", made + "^").strip() == git(shop, "rev-parse", base + "^").strip()
+    diff = git(shop, "diff", base, made)
+    added = [line for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    assert added == ["+    " + eval_fixture.INJECTION], diff  # indented like the line it goes before
+    lines = git(shop, "show", f"{made}:app/db.py").splitlines()
+    assert lines[12].strip() == eval_fixture.INJECTION and "query =" in lines[13]  # labels 13, 14 moved to 14, 15
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda d: d["cases"][1].update(commit="0" * 40), "cases.json records"),
+    (lambda d: d["cases"][0]["labels"][0].update(lines=[99]), "has 14 lines"),
+    (lambda d: d["cases"][1]["labels"][0].update(file="app/db.py"), "does not change the label file"),
+    (lambda d: d["cases"][1].update(revert_paths=["app/db.py"]), "does not change app/db.py"),
+    (lambda d: d["cases"][4]["inject"].update(line=40), "no line 40"),
+])
+def test_building_refuses_what_does_not_add_up(tmp_path: Path, change, message) -> None:
+    root = tmp_path / "r"
+    doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
+    change(doc)
+    with pytest.raises(RuntimeError, match=message):
+        mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+
+
+def test_the_cache_stays_out_of_the_repository(tmp_path: Path) -> None:
+    root = tmp_path / "r"
+    doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))
+    with pytest.raises(ValueError, match="outside the repository"):
+        mirrors.build(parse(doc), mirrors.REPO / "build-cache", log=lambda *_: None)
+
+
+def test_case_file_errors() -> None:
+    project = {"p": {"url": "https://example.invalid/p", "license": "MIT"}}
+    good = {"id": "v", "kind": "vuln", "source": "blame", "project": "p", "language": "c", "commit": "a" * 40,
+            "cwe": "CWE-787", "labels": [{"file": "x.c", "lines": [1]}], "why": "w"}
+    for bad in ({"source": "reverse"}, {"cwe": "787"}, {"labels": []}, {"labels": [{"file": "x.c", "lines": [0]}]},
+                {"commit": "abc"}, {"commit": ""}, {"why": " "}, {"project": "q"}, {"id": "Bad_ID"},
+                {"published": "2026/01/01"}, {"kind": "benign", "source": "real"}):
+        with pytest.raises(CaseError):
+            parse({"projects": project, "cases": [{**good, **bad}]})
+    with pytest.raises(CaseError, match="unique"):
+        parse({"projects": project, "cases": [good, good]})
+    assert parse({"projects": project, "cases": [good]}).case("v").labels[0].lines == (1,)
+
+
+# --- the case set itself -------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def caseset() -> casefile.CaseSet:
+    return casefile.load()
+
+
+def test_the_case_set_is_the_agreed_one(caseset) -> None:
+    comp = casefile.composition(caseset)
+    assert (comp["vuln"], comp["benign"], comp["injection"]) == (24, 12, 12), comp
+    assert comp["blame"] >= 12, "at least half the vulnerabilities from real introducing commits"
+    assert 4 <= len(comp["languages"]) <= 5, comp["languages"]
+    assert comp["after_cutoffs"] >= 6, "a subset published after every model's knowledge cutoff"
+    # Each injection case has a vuln case of its own.
+    assert len({base.id for base, _ in caseset.pairs()}) == 12
+
+
+def test_the_case_set_records_ids_and_sources(caseset) -> None:
+    for c in caseset.cases:
+        assert re.fullmatch(r"[0-9a-f]{40}", c.commit), f"{c.id}: no commit ID (python -m evals mirrors --record)"
+        if c.kind == "vuln":
+            assert c.advisory and c.published and c.fix, c.id
+            assert re.fullmatch(r"(CVE-\d{4}-\d{4,}|GHSA(-[23456789cfghjmpqrvwx]{4}){3})", c.advisory), c.advisory
+    for p in caseset.projects.values():
+        assert p.url and p.url.startswith("https://github.com/"), p
+        assert p.license in PERMISSIVE, p
+    assert set(caseset.cutoffs) == {"anthropic/claude-opus-5-5", "openai/gpt-6.1-sol", "local/gpt-oss:20b"}
+
+
+def test_the_case_set_holds_no_upstream_code(caseset) -> None:
+    # Only IDs, labels, our own injection text and our own words: no line longer than a sentence
+    # of ours, nothing that looks like a diff.
+    text = casefile.CASES.read_text()
+    assert "\n+" not in text and "@@ " not in text
+    for c in caseset.cases:
+        assert len(c.why) < 600, c.id

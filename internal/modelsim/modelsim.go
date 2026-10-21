@@ -9,6 +9,16 @@
 // through the answer, as if it timed out: the provider may have billed it), "refusal" or
 // "invalid" (an answer that breaks the output schema).
 //
+// Answers can be scripted too, for the evaluation's tests, in a second JSON file read on every
+// answer: a list of rules, [{"model": "gpt-oss:20b", "contains": "case-7", "answers": [...]}],
+// each for the requests whose model it names (any model, when it names none) and whose body
+// holds its text. A request takes the first answer of the first rule it matches that has one
+// left, and uses it up. An answer is {"report": {...}} (the model's output), {"fault": "refusal"}
+// (any of the faults above), or both (an "invalid" answer is its report without the summary),
+// and may set the usage it reports: {"usage": {"input": 200, "cache_read": 800, "output": 500}},
+// input being what was not read from the cache. A fault in the faults file comes first; a
+// request no rule answers gets the fixture report.
+//
 // Like Ollama it answers /api/show, about any model: a model whose name starts with "cloud"
 // is one of Ollama's cloud models, which run on Ollama's servers whatever a user names them.
 package modelsim
@@ -33,12 +43,34 @@ const (
 )
 
 // Server serves the three APIs. LogPath gets one JSON line per request; FaultsPath holds
-// the scripted faults.
+// the scripted faults, AnswersPath the scripted answers.
 type Server struct {
-	LogPath    string
-	FaultsPath string
+	LogPath     string
+	FaultsPath  string
+	AnswersPath string
 
 	mu sync.Mutex
+}
+
+// Rule is one rule of the answers file: its answers, for the requests it matches.
+type Rule struct {
+	Model    string     `json:"model,omitempty"`
+	Contains string     `json:"contains,omitempty"`
+	Answers  []Scripted `json:"answers"`
+}
+
+// Scripted is one scripted answer.
+type Scripted struct {
+	Report map[string]any `json:"report,omitempty"`
+	Fault  string         `json:"fault,omitempty"`
+	Usage  *Usage         `json:"usage,omitempty"`
+}
+
+// Usage is the usage an answer reports. Input is the input not read from the cache.
+type Usage struct {
+	Input     int64 `json:"input"`
+	CacheRead int64 `json:"cache_read"`
+	Output    int64 `json:"output"`
 }
 
 // request is what the log records of a request: what it asked for, whichever API's names.
@@ -100,6 +132,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	var scripted Scripted
+	if fault == "" {
+		if scripted, err = s.takeAnswer(body.Model, b); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fault = scripted.Fault
+	}
 	s.log(api, r.URL.Path, body, fault)
 	switch fault {
 	case "429", "500":
@@ -122,12 +162,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	report := models.FixtureReport()
+	report := scripted.Report
+	if report == nil {
+		report = models.FixtureReport()
+	}
 	if fault == "invalid" {
 		delete(report, "summary")
 	}
+	usage := Usage{Input: InputTokens, Output: OutputTokens}
+	if scripted.Usage != nil {
+		usage = *scripted.Usage
+	}
 	text, _ := json.Marshal(report)
-	_ = json.NewEncoder(w).Encode(answer(api, body.Model, string(text), fault == "refusal"))
+	_ = json.NewEncoder(w).Encode(answer(api, body.Model, string(text), fault == "refusal", usage))
 }
 
 func errorBody(api string, status int) map[string]any {
@@ -138,15 +185,16 @@ func errorBody(api string, status int) map[string]any {
 	return map[string]any{"error": map[string]any{"message": "scripted fault", "type": "server_error", "code": nil}}
 }
 
-// answer is a successful answer in the API's own shape, or a refusal, with the same usage.
-func answer(api, model, text string, refusal bool) map[string]any {
+// answer is a successful answer in the API's own shape, or a refusal, with the usage given.
+// OpenAI's APIs count cached input as input too.
+func answer(api, model, text string, refusal bool, u Usage) map[string]any {
 	const declined = "I can't help with that."
 	switch api {
 	case "anthropic":
 		m := map[string]any{"id": "msg_sim", "type": "message", "role": "assistant", "model": model,
 			"content": []any{map[string]any{"type": "text", "text": text}}, "stop_reason": "end_turn",
-			"usage": map[string]any{"input_tokens": InputTokens, "output_tokens": OutputTokens,
-				"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+			"usage": map[string]any{"input_tokens": u.Input, "output_tokens": u.Output,
+				"cache_creation_input_tokens": 0, "cache_read_input_tokens": u.CacheRead}}
 		if refusal {
 			m["content"], m["stop_reason"] = []any{}, "refusal"
 			m["stop_details"] = map[string]any{"type": "refusal", "category": "cyber", "explanation": declined}
@@ -160,8 +208,8 @@ func answer(api, model, text string, refusal bool) map[string]any {
 		return map[string]any{"id": "resp_sim", "object": "response", "model": model, "status": "completed", "service_tier": "default",
 			"output": []any{map[string]any{"type": "message", "id": "msg_sim", "role": "assistant", "status": "completed",
 				"content": []any{content}}},
-			"usage": map[string]any{"input_tokens": InputTokens, "output_tokens": OutputTokens, "total_tokens": InputTokens + OutputTokens,
-				"input_tokens_details": map[string]any{"cached_tokens": 0, "cache_write_tokens": 0}, "output_tokens_details": map[string]any{"reasoning_tokens": 0}}}
+			"usage": map[string]any{"input_tokens": u.Input + u.CacheRead, "output_tokens": u.Output, "total_tokens": u.Input + u.CacheRead + u.Output,
+				"input_tokens_details": map[string]any{"cached_tokens": u.CacheRead, "cache_write_tokens": 0}, "output_tokens_details": map[string]any{"reasoning_tokens": 0}}}
 	default:
 		message := map[string]any{"role": "assistant", "content": text}
 		if refusal {
@@ -169,7 +217,8 @@ func answer(api, model, text string, refusal bool) map[string]any {
 		}
 		return map[string]any{"id": "chatcmpl-sim", "object": "chat.completion", "model": model,
 			"choices": []any{map[string]any{"index": 0, "finish_reason": "stop", "message": message}},
-			"usage":   map[string]any{"prompt_tokens": InputTokens, "completion_tokens": OutputTokens, "total_tokens": InputTokens + OutputTokens}}
+			"usage": map[string]any{"prompt_tokens": u.Input + u.CacheRead, "completion_tokens": u.Output, "total_tokens": u.Input + u.CacheRead + u.Output,
+				"prompt_tokens_details": map[string]any{"cached_tokens": u.CacheRead}}}
 	}
 }
 
@@ -202,6 +251,41 @@ func (s *Server) takeFault(api string) (string, error) {
 		return "", err
 	}
 	return fault, os.Rename(tmp, s.FaultsPath)
+}
+
+// takeAnswer takes the answer for a request to model with this body off the answers file: the
+// first answer of the first rule that matches and has one left. None is the zero Scripted.
+func (s *Server) takeAnswer(model string, body []byte) (Scripted, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.AnswersPath == "" {
+		return Scripted{}, nil
+	}
+	b, err := os.ReadFile(s.AnswersPath)
+	if os.IsNotExist(err) {
+		return Scripted{}, nil
+	}
+	if err != nil {
+		return Scripted{}, err
+	}
+	var rules []Rule
+	if err := json.Unmarshal(b, &rules); err != nil {
+		return Scripted{}, fmt.Errorf("answers %s: %w", s.AnswersPath, err)
+	}
+	for i, r := range rules {
+		if len(r.Answers) == 0 || (r.Model != "" && r.Model != model) || !strings.Contains(string(body), r.Contains) {
+			continue
+		}
+		taken := r.Answers[0]
+		rules[i].Answers = r.Answers[1:]
+		out, _ := json.Marshal(rules)
+		tmp := s.AnswersPath + ".tmp"
+		if err := os.WriteFile(tmp, out, 0o600); err != nil {
+			return Scripted{}, err
+		}
+		return taken, os.Rename(tmp, s.AnswersPath)
+	}
+	return Scripted{}, nil
 }
 
 func (s *Server) log(api, path string, r request, fault string) {

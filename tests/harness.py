@@ -285,14 +285,17 @@ def make_mirror(path: Path, live_repo: str = "") -> str:
 
 
 class Stack:
-    """One Temporal dev server, one agentd and its Workers, isolated in a temporary directory."""
+    """One Temporal dev server, one agentd and its Workers, isolated in a temporary directory.
+    With fixture=False there is neither the audit fixture's mirror nor the simulated GitHub: the
+    caller names agentd's repositories (start_agentd's repos), and the GitHub tools only dry-run
+    (the evaluation, evals/runner.py)."""
 
     # Set by subclasses that run Temporal with mTLS: the harness's client certificate and
     # the temporal.tls section of agentd.yaml.
     temporal_tls: TLSConfig | None = None
     agentd_tls: dict | None = None
 
-    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False) -> None:
+    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False, fixture: bool = True) -> None:
         self.tmp = tmp
         self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
         # Temporal's dev server keeps everything in memory unless it has a database file: with one,
@@ -303,7 +306,8 @@ class Stack:
         self.procs: list[Proc] = []
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
-        self.commit = make_mirror(tmp / "mirror", live_repo)
+        self.fixture = fixture
+        self.commit = make_mirror(tmp / "mirror", live_repo) if fixture else ""
         self.data_dir = tmp / "agentd" / "data"
         # Separate directories: the Linux sandbox mounts the Runtime socket's directory.
         self.control_socket = self.sock_dir / "control" / "control.sock"
@@ -311,7 +315,8 @@ class Stack:
         self.runtime_socket = self.sock_dir / "runtime" / "runtime.sock"
         self.temporal_address = f"127.0.0.1:{free_port()}"
         self._start_temporal()
-        self._start_github()
+        if fixture:
+            self._start_github()
 
     # --- processes ---------------------------------------------------------------------------
 
@@ -372,8 +377,10 @@ class Stack:
         addr = self.tmp / "modelsim.addr"
         self.modelsim_log = self.tmp / "modelsim.jsonl"
         self.modelsim_faults = self.tmp / "modelsim-faults.json"
+        self.modelsim_answers = self.tmp / "modelsim-answers.json"
         p = Proc("modelsim", [BIN / "modelsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
-                              "--log", self.modelsim_log, "--faults", self.modelsim_faults],
+                              "--log", self.modelsim_log, "--faults", self.modelsim_faults,
+                              "--answers", self.modelsim_answers],
                  self.tmp / "modelsim.log")
         self.procs.append(p)
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated model providers")
@@ -383,6 +390,11 @@ class Stack:
     def model_faults(self, script: dict) -> None:
         """The faults the simulated model providers answer with next, each once, per API."""
         self.modelsim_faults.write_text(json.dumps(script))
+
+    def model_answers(self, rules: list[dict]) -> None:
+        """The answers the simulated model providers give, by model and request body
+        (internal/modelsim's package comment)."""
+        self.modelsim_answers.write_text(json.dumps(rules))
 
     def modelsim_requests(self, api: str) -> list[dict]:
         """The simulated model providers' own record of the requests one API got."""
@@ -426,10 +438,12 @@ class Stack:
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
                      test_tools: bool = False, run_id_delay: str | None = None,
-                     hold_doorbells: Path | None = None) -> Proc:
+                     hold_doorbells: Path | None = None, repos: dict | None = None) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
-        exists, agentd delivers no doorbell: they wait in its outbox."""
+        exists, agentd delivers no doorbell: they wait in its outbox. `repos` replaces the
+        fixture's acme/payments; a stack without the fixture has no GitHub section at all, so
+        the GitHub tools only dry-run."""
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -443,11 +457,13 @@ class Stack:
             "policy_file": "policy.yaml",
             "models_file": "models.yaml",
             "prices_file": "prices.yaml",
-            "repos": {"acme/payments": {"mirror": str(self.tmp / "mirror"), "github": self.live_repo or "acme/payments"}},
+            "repos": repos if repos is not None else
+                     {"acme/payments": {"mirror": str(self.tmp / "mirror"), "github": self.live_repo or "acme/payments"}},
             # The simulated GitHub needs no token, and applies a write as it receives it: a
             # lookup that finds nothing past the request timeout means it never took effect.
-            "github": ({"token": "keyring:agentos-github-test-token"} if self.live_repo
-                       else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"}),
+            **({"github": ({"token": "keyring:agentos-github-test-token"} if self.live_repo
+                           else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"})}
+               if self.fixture else {}),
             **({"git_tools": {"sandbox": [str(TOOL_LAUNCHER[SANDBOX])]}} if SANDBOX in TOOL_LAUNCHER else {}),
             **(extra or {}),
         }
@@ -609,6 +625,14 @@ class Stack:
                                        task_queue="agentos-workflows")
             return h.first_execution_run_id or h.result_run_id or ""
         return self._temporal(start)
+
+    def execution_times(self, run: dict) -> tuple[float, float | None]:
+        """When Temporal started the run's execution and when it closed (None while open), in
+        seconds since the epoch."""
+        async def describe(c: Client) -> tuple[float, float | None]:
+            d = await c.get_workflow_handle(run["run_id"], run_id=run["temporal_run_id"]).describe()
+            return d.start_time.timestamp(), d.close_time.timestamp() if d.close_time else None
+        return self._temporal(describe)
 
     def execution_closed(self, workflow_id: str, run_id: str) -> bool:
         async def describe(c: Client) -> bool:
