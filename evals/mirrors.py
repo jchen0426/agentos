@@ -179,7 +179,10 @@ def _check(mirror: Path, c: Case, commit: str) -> dict:
     changed, files = 0, []
     for line in numstat.splitlines():
         added, deleted, path = line.split("\t", 2)
-        changed += (int(added) if added != "-" else 0) + (int(deleted) if deleted != "-" else 0)
+        if "-" in (added, deleted):
+            # The auditor gets git's diff with --text: a binary file is pages of noise there.
+            raise RuntimeError(f"case {c.id}: {commit} changes a binary file, {path}")
+        changed += int(added) + int(deleted)
         files.append(path)
     if len(text(mirror, "rev-list", "--parents", "-n", "1", commit).split()) != 2:
         raise RuntimeError(f"case {c.id}: {commit} must have exactly one parent")

@@ -72,6 +72,20 @@ def test_building_refuses_what_does_not_add_up(tmp_path: Path, change, message) 
         mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
 
 
+def test_a_case_may_not_change_a_binary_file(tmp_path: Path) -> None:
+    # git diff-tree --text puts a binary file's bytes in the diff the auditor reads.
+    root = tmp_path / "r"
+    commits = eval_fixture.make_repos(root)
+    (root / "shop/logo.png").write_bytes(bytes(range(256)) * 4)
+    subprocess.run(["git", "-C", str(root / "shop"), "add", "logo.png"], check=True)
+    subprocess.run(["git", "-C", str(root / "shop"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "logo"],
+                   check=True)
+    doc = eval_fixture.cases_doc(root, commits)
+    doc["cases"][3]["commit"] = git(root / "shop", "rev-parse", "HEAD").strip()
+    with pytest.raises(RuntimeError, match="changes a binary file, logo.png"):
+        mirrors.build(parse(doc), tmp_path / "cache", log=lambda *_: None)
+
+
 def test_the_cache_stays_out_of_the_repository(tmp_path: Path) -> None:
     root = tmp_path / "r"
     doc = eval_fixture.cases_doc(root, eval_fixture.make_repos(root))

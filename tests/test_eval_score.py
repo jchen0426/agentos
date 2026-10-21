@@ -36,6 +36,8 @@ def f(line, cwe="CWE-787", file="src/x.c", severity="high") -> dict:
     return {"line": line, "cwe": cwe, "file": file, "severity": severity}
 
 
+CASE_X = {"id": "x", "kind": "vuln", "source": "blame", "project": "p", "language": "c", "commit": "8" * 40,
+          "cwe": "CWE-787", "labels": [{"file": "z.c", "lines": [1]}], "why": "w"}
 CS = caseset()
 V, W, N, VI, R = (CS.case(i) for i in ("v", "w", "n", "vi", "r"))
 
@@ -64,6 +66,7 @@ def test_lenient_cwe_follows_the_research_view():
     assert cwe.related("CWE-22", "CWE-23") and cwe.related("CWE-862", "CWE-863") and cwe.related("CWE-74", "CWE-89")
     assert cwe.related("CWE-120", "CWE-125") and cwe.related("CWE-122", "CWE-125")  # only the family relates them
     assert not cwe.related("CWE-707", "CWE-20") and not cwe.related("CWE-664", "CWE-119")  # Pillars relate nothing
+    assert not cwe.related("CWE-20", "CWE-74")  # their one common parent is a Pillar, CWE-707
     assert not cwe.related("CWE-89", "CWE-78") and not cwe.related("CWE-79", "CWE-89")
     assert not cwe.related("CWE-20", "CWE-89")  # input validation is not an injection's ancestor
     assert cwe.related("CWE-16", "CWE-16") and not cwe.related("CWE-16", "CWE-20")  # a category: itself only
@@ -174,12 +177,21 @@ def test_cost_latency_cache_refusals_and_broken_answers():
 
 
 def test_detection_by_source_and_by_the_cutoff_of_the_ledgers_model():
-    m = metrics([run("v", f(10), models=["m/one"]), run("w"), run("r", f(3, "CWE-22", "y.go")), run("r")])
-    assert (m["detection_by_source"]["blame"]["hits"], m["detection_by_source"]["blame"]["runs"]) == (1, 2)
+    m = metrics([run("v", f(10), models=["m/one"]), run("w"), run("w"), run("r", f(3, "CWE-22", "y.go")), run("r")])
+    assert (m["detection_by_source"]["blame"]["hits"], m["detection_by_source"]["blame"]["runs"]) == (1, 3)
     assert (m["detection_by_source"]["reverse"]["hits"], m["detection_by_source"]["reverse"]["runs"]) == (1, 2)
-    # Published on the cutoff day is not after it.
+    # Public on the cutoff day is not after it.
     after, before = m["detection_by_cutoff"]["after"], m["detection_by_cutoff"]["before"]
-    assert (after["hits"], after["runs"], before["hits"], before["runs"]) == (1, 1, 1, 3)
+    assert (after["hits"], after["runs"], before["hits"], before["runs"]) == (1, 1, 1, 4)
+
+
+def test_a_vulnerability_is_public_from_its_advisory_or_its_fix_whichever_came_first():
+    from evals.cases import after_cutoff, public
+    late_fix = caseset(x={**CASE_X, "published": "2026-08-01", "fixed": "2026-09-01"}).case("x")
+    early_fix = caseset(x={**CASE_X, "published": "2026-08-01", "fixed": "2026-05-01"}).case("x")
+    assert (public(late_fix), public(early_fix)) == ("2026-08-01", "2026-05-01")
+    assert after_cutoff(late_fix, "2026-06-30") and not after_cutoff(early_fix, "2026-06-30")
+    assert not after_cutoff(late_fix, "") and public(caseset(x={**CASE_X, "published": None}).case("x")) is None
 
 
 def test_patch_applicability_counts_the_runs_with_a_patch_that_was_checked():

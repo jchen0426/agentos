@@ -62,6 +62,7 @@ class Case:
     advisory: str | None = None  # CVE or GHSA ID
     published: str | None = None  # the advisory's publication date
     fix: str | None = None  # the commit that fixed it upstream
+    fixed: str | None = None  # the fix commit's date: it is public from then on, whatever the advisory says
     revert_paths: tuple[str, ...] = ()  # reverse: the fix's files to take back to before it
     base: str | None = None  # injection: the vuln case it is made from
     inject: Injection | None = None
@@ -152,13 +153,14 @@ def _case(c: dict, raw: dict, projects: dict[str, Project]) -> Case:
                        for lb in base["labels"])
         return Case(id=cid, kind=kind, source=source, project=base["project"], language=base["language"],
                     commit=commit, why=why, cwe=base["cwe"], labels=labels, advisory=base.get("advisory"),
-                    published=base.get("published"), fix=base.get("fix"), base=base["id"], inject=inject)
+                    published=base.get("published"), fix=base.get("fix"), fixed=base.get("fixed"), base=base["id"],
+                    inject=inject)
     project = c.get("project", "")
     if project not in projects:
         raise CaseError(f"{where}: unknown project {project!r}")
     case = Case(id=cid, kind=kind, source=source, project=project, language=c["language"], commit=commit, why=why,
                 cwe=c.get("cwe"), labels=tuple(Label(lb["file"], tuple(lb["lines"])) for lb in c.get("labels", [])),
-                advisory=c.get("advisory"), published=c.get("published"), fix=c.get("fix"),
+                advisory=c.get("advisory"), published=c.get("published"), fix=c.get("fix"), fixed=c.get("fixed"),
                 revert_paths=tuple(c.get("revert_paths", [])))
     if kind == "benign":
         if case.cwe or case.labels or case.fix:
@@ -168,8 +170,8 @@ def _case(c: dict, raw: dict, projects: dict[str, Project]) -> Case:
         raise CaseError(f"{where}: cwe must look like CWE-89")
     if not case.labels or any(not lb.file or not lb.lines or min(lb.lines) < 1 for lb in case.labels):
         raise CaseError(f"{where}: labels need a file and lines from 1")
-    if case.published is not None and not _DATE.match(case.published):
-        raise CaseError(f"{where}: published is YYYY-MM-DD")
+    if any(d is not None and not _DATE.match(d) for d in (case.published, case.fixed)):
+        raise CaseError(f"{where}: published and fixed are YYYY-MM-DD")
     if source == "reverse" and not (case.fix and _SHA.match(case.fix) and case.revert_paths):
         raise CaseError(f"{where}: a reverse case needs its fix commit and the paths to revert")
     return case
@@ -189,6 +191,14 @@ def composition(cs: CaseSet) -> dict:
     }
 
 
+def public(case: Case) -> str | None:
+    """When the case's vulnerability became public: its advisory or its fix, whichever was first
+    (a fix is on GitHub, often months before the advisory)."""
+    dates = [d for d in (case.published, case.fixed) if d]
+    return min(dates) if dates else None
+
+
 def after_cutoff(case: Case, cutoff: str) -> bool:
-    """Whether the case's advisory came out after a knowledge cutoff."""
-    return bool(cutoff and case.published and case.published > cutoff)
+    """Whether the case's vulnerability became public after a knowledge cutoff."""
+    first = public(case)
+    return bool(cutoff and first and first > cutoff)
