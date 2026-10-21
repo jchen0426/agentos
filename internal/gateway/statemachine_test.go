@@ -74,7 +74,7 @@ var (
 // with seeds 1 to smSeeds. A seed names a walk of this file's code as it is: change what a walk
 // draws, and find them again (docs/statemachine-notes.md says how).
 var regressionSeeds = []uint64{
-	1189, 1596, // agentd, starting, abandoned a cancelled run's write that may have taken effect
+	1189, 1596, // agentd, starting, abandoned (or left waiting) a cancelled run's write that may have taken effect
 	306, 779, // recovery on a call sent again a write the policy wants approved, which nobody approved
 }
 
