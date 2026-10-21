@@ -116,9 +116,11 @@ func (t *smTool) Live() bool                            { return t.inc.live }
 func (t *smTool) EditArg() string                       { return "patch_ref" }
 func (t *smTool) DryRun(json.RawMessage) map[string]any { return map[string]any{"dry_run": true} }
 
-// Prepare names the effect in its payload, as a marker a lookup finds.
+// Prepare names the effect in its payload, as a marker a lookup finds; and what this agentd
+// renders differs from what another would (its config, say): what goes out is what was recorded,
+// never one rendered again.
 func (t *smTool) Prepare(_ context.Context, req tools.Request) (json.RawMessage, error) {
-	return json.Marshal(smPayload{EffectID: req.EffectID, Args: req.Args})
+	return json.Marshal(smPayload{EffectID: req.EffectID, Args: req.Args, By: t.inc.name})
 }
 
 func (t *smTool) Execute(ctx context.Context, payload json.RawMessage, key string, proceed tools.Proceed) (map[string]any, error) {
@@ -134,6 +136,7 @@ func (f smFinder) Settle() time.Duration { return smSettle }
 type smPayload struct {
 	EffectID string         `json:"effect_id"`
 	Args     map[string]any `json:"args"`
+	By       string         `json:"by"` // the agentd that rendered it
 }
 
 func payloadEffect(payload json.RawMessage) string {

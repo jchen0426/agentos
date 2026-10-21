@@ -78,9 +78,10 @@ var regressionSeeds = []uint64{
 }
 
 const (
-	smSeeds = 200 // seeds walked by default
-	smSteps = 100 // a walk's steps, besides those taken while a tool waits
-	smDepth = 2   // how deep steps nest in steps taken while a tool waits
+	smSeeds  = 200 // seeds walked by default
+	smSteps  = 100 // a walk's steps, besides those taken while a tool waits
+	smDepth  = 2   // how deep steps nest in steps taken while a tool waits
+	smRounds = 8   // rounds in which a walk lets its writes finish
 )
 
 func TestEffectProtocolStateMachine(t *testing.T) {
@@ -90,7 +91,9 @@ func TestEffectProtocolStateMachine(t *testing.T) {
 		n = *smSeedsFlag
 	}
 	for s := range n {
-		seeds = append(seeds, uint64(s+1))
+		if !slices.Contains(seeds, uint64(s+1)) {
+			seeds = append(seeds, uint64(s+1))
+		}
 	}
 	if *smSeedFlag != 0 {
 		seeds = []uint64{*smSeedFlag}
@@ -164,7 +167,8 @@ type machine struct {
 	ns        []int    // the arguments it calls them with
 	idemFinds bool     // the idempotent tool can be looked up
 
-	cur        *incarnation // the agentd that is up
+	cur        *incarnation               // the agentd that is up
+	ttls       map[string][]time.Duration // the approval times each tool's policy has had
 	incs       []*incarnation
 	fx         map[string]*effectModel          // by effect ID
 	decisions  map[string]Decision              // the decision a person got recorded first, by approval ID
@@ -172,6 +176,7 @@ type machine struct {
 	resolved   map[string][]Resolution          // findings that went through, by effect ID
 	calling    map[*incarnation]map[string]bool // effects an agentd has a call of, which a nested call would join
 	recovering bool                             // recovery at start runs, in goroutines of its own: nothing may draw
+	finishing  bool                             // the walk lets its writes finish: tools work, nothing pauses
 	depth      int
 	step       int
 	keys       int
@@ -230,7 +235,7 @@ func newMachine(t *testing.T, seed uint64, path string) *machine {
 		t: t, ctx: context.Background(), seed: seed, rng: rand.New(rand.NewPCG(seed, 0x5eed)), path: path,
 		fx: map[string]*effectModel{}, decisions: map[string]Decision{}, decided: map[string][]Decision{},
 		resolved: map[string][]Resolution{}, calling: map[*incarnation]map[string]bool{}, names: map[string]string{},
-		named: map[string]int{},
+		named: map[string]int{}, ttls: map[string][]time.Duration{},
 	}
 	m.now = time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 	ledger.Clock = m.Now
@@ -291,6 +296,11 @@ func (m *machine) drawPolicy() toolPolicy {
 // start starts an agentd: a new incarnation, on the same ledger.
 func (m *machine) start(pol map[string]toolPolicy, live bool) *incarnation {
 	inc := &incarnation{name: fmt.Sprintf("agentd%d", len(m.incs)+1), policy: pol, live: live}
+	for name, p := range pol {
+		if !slices.Contains(m.ttls[name], p.ttl) {
+			m.ttls[name] = append(m.ttls[name], p.ttl)
+		}
+	}
 	led, err := ledger.Open(m.ctx, m.path)
 	if err != nil {
 		m.fatal(err)
@@ -327,6 +337,122 @@ func (m *machine) walk() {
 		m.logf("the end, %s later", smSettle)
 		m.check()
 	}
+	if m.violation == "" {
+		m.finish()
+	}
+}
+
+// finish lets the walk's writes finish (liveness): an agentd that reaches the outside world starts
+// and recovers; then, round after round, time passes, approvals nobody decided expire, people
+// settle what waits for them by what the outside world holds and approve what waits for approval,
+// and the workflows of runs that go on call each write that is not over, with tools that work.
+// Every write of a run that goes on ends; a cancelled run's is not left waiting to be sent, or for
+// a person, which nothing would move.
+func (m *machine) finish() {
+	m.finishing = true
+	old := m.cur
+	old.dead = true
+	if err := old.led.Close(); err != nil {
+		m.fatal(err)
+	}
+	m.cur = m.start(maps.Clone(old.policy), true)
+	m.logf("%s dies; %s starts to let the writes finish, policy %s", old.name, m.cur.name, m.policyText(m.cur.policy))
+	m.recoverAtStart()
+	for round := 1; round <= smRounds && m.violation == ""; round++ {
+		m.advance(smSettle)
+		m.logf("round %d of letting the writes finish, %s later", round, smSettle)
+		m.sweep()
+		for _, e := range m.effectsIn(effectUnknown) {
+			if r, ok := m.finding(e); ok {
+				m.resolve(e, r, false)
+			}
+		}
+		for _, a := range m.approvals() {
+			if r := m.run(a.WorkflowID); a.Status == approvalPending && !r.cancelled && !r.ended {
+				m.submit(a, Decision{ApprovalID: a.ApprovalID, PayloadSHA256: a.PayloadSha256, Key: m.key(), By: "alice",
+					Kind: DecisionApprove})
+			}
+		}
+		for _, spec := range m.specs() {
+			if spec.run.cancelled {
+				continue // its workflow calls no more
+			}
+			e, err := m.cur.led.Q.GetEffect(m.ctx, spec.id())
+			switch {
+			case errors.Is(err, sql.ErrNoRows) && spec.edited == "":
+				continue // never asked for: the walk lets what it asked for finish
+			case errors.Is(err, sql.ErrNoRows):
+				if a, err := m.cur.led.Q.GetApprovalByEffect(m.ctx, spec.edited); err != nil || a.Status != approvalEdited {
+					continue
+				}
+			case err != nil:
+				m.fatal(err)
+			case m.over(e):
+				continue
+			}
+			m.callSpec(spec)
+		}
+		m.check()
+		if m.stuck() == nil {
+			return
+		}
+	}
+	if m.violation == "" {
+		var names []string
+		for _, e := range m.stuck() {
+			names = append(names, fmt.Sprintf("%s (%s)", m.name(e.EffectID), e.Status))
+		}
+		m.fail("liveness: after %d rounds of letting them finish, these writes have not: %s", smRounds, strings.Join(names, ", "))
+		m.dumpLedger()
+	}
+}
+
+// recoverAtStart has the agentd that is up recover what the last one claimed, and waits until it is done.
+func (m *machine) recoverAtStart() {
+	m.recovering = true
+	err := m.cur.g.RecoverEffects(m.ctx)
+	drained := m.cur.g.Drain(time.Minute)
+	m.recovering = false
+	if err != nil || !drained {
+		m.t.Fatalf("recovery at start: %v, drained %v", err, drained)
+	}
+}
+
+// over reports whether a write is over for its workflow: settled, or waiting for approval of a call
+// an edit replaced.
+func (m *machine) over(e db.Effect) bool {
+	switch e.Status {
+	case effectSucceeded, effectFailed, effectAbandoned, effectDenied, effectDryRun:
+		return true
+	case effectAwaitingApproval:
+		a, err := m.cur.led.Q.GetApprovalByEffect(m.ctx, e.EffectID)
+		return err == nil && (a.Status == approvalEdited || a.Status == approvalSuperseded)
+	}
+	return false
+}
+
+// stuck are the writes that have not finished: of a run that goes on, not over; of a cancelled
+// one, waiting to be sent or for a person. Those of a run whose workflow ended nobody calls for.
+func (m *machine) stuck() []db.Effect {
+	var out []db.Effect
+	for _, id := range m.effectIDs() {
+		e, err := m.cur.led.Q.GetEffect(m.ctx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		} else if err != nil {
+			m.fatal(err)
+		}
+		switch r := m.effect(id).run; {
+		case r.ended:
+		case r.cancelled:
+			if e.Status == effectPending || e.Status == effectUnknown {
+				out = append(out, e)
+			}
+		case !m.over(e):
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // act takes one step. Nested, it is taken while a tool waits: another call, a decision, the
@@ -380,7 +506,7 @@ func (m *machine) choose(weights ...int) int {
 // pause is where a tool waits on the outside world: the walk may take other steps there, or
 // have the tool's agentd die. Not during recovery at start, which runs in goroutines of its own.
 func (m *machine) pause(inc *incarnation, where string) {
-	if m.recovering || m.violation != "" || m.depth >= smDepth || m.rng.IntN(100) >= m.waits {
+	if m.recovering || m.finishing || m.violation != "" || m.depth >= smDepth || m.rng.IntN(100) >= m.waits {
 		return
 	}
 	m.depth++
@@ -397,16 +523,41 @@ func (m *machine) pause(inc *incarnation, where string) {
 
 // callSpec is a call a workflow may make.
 type callSpec struct {
-	run  *runModel
-	tool string
-	args map[string]any
-	name string
+	run    *runModel
+	tool   string
+	args   map[string]any
+	name   string
+	edited string // for the call an edit asks for: the effect whose approval was edited
 }
 
 // call makes a call of a write, as a workflow does: one of the walk's, or the call an edit
 // asks for (the edited approval's call with the reviewer's patch). Mostly of a write that is
 // not over yet: one waiting for approval, being sent, or for a person; or not made yet.
 func (m *machine) call() {
+	specs := m.specs()
+	if len(specs) == 0 {
+		m.logf("no run calls any more")
+		m.newRun()
+		return
+	}
+	weights := make([]int, len(specs))
+	for i, s := range specs {
+		switch e, err := m.cur.led.Q.GetEffect(m.ctx, s.id()); {
+		case errors.Is(err, sql.ErrNoRows):
+			weights[i] = 4
+		case err != nil:
+			m.fatal(err)
+		case e.Status == effectPending, e.Status == effectAwaitingApproval, e.Status == effectUnknown:
+			weights[i] = 12
+		default:
+			weights[i] = 1
+		}
+	}
+	m.callSpec(specs[m.choose(weights...)])
+}
+
+// specs are the calls the workflows of runs that go on may make: the walk's, and those edits ask for.
+func (m *machine) specs() []callSpec {
 	var specs []callSpec
 	for _, r := range m.runs {
 		if r.ended {
@@ -429,31 +580,13 @@ func (m *machine) call() {
 		}
 		args["patch_ref"] = a.EditedPatchBlob.String
 		specs = append(specs, callSpec{run: m.run(a.WorkflowID), tool: a.Tool, args: args,
-			name: m.name(a.EffectID) + "+" + m.name(a.EditedPatchBlob.String)})
+			name: m.name(a.EffectID) + "+" + m.name(a.EditedPatchBlob.String), edited: a.EffectID})
 	}
-	if len(specs) == 0 {
-		m.logf("no run calls any more")
-		m.newRun()
-		return
-	}
-	weights := make([]int, len(specs))
-	for i, s := range specs {
-		canon, err := encodeCanonical(s.args)
-		if err != nil {
-			m.fatal(err)
-		}
-		switch e, err := m.cur.led.Q.GetEffect(m.ctx, sha256Hex([]byte(s.run.id), []byte(s.tool), canon)); {
-		case errors.Is(err, sql.ErrNoRows):
-			weights[i] = 4
-		case err != nil:
-			m.fatal(err)
-		case e.Status == effectPending, e.Status == effectAwaitingApproval, e.Status == effectUnknown:
-			weights[i] = 12
-		default:
-			weights[i] = 1
-		}
-	}
-	spec := specs[m.choose(weights...)]
+	return specs
+}
+
+// callSpec makes one call, as the agentd that is up dispatches it.
+func (m *machine) callSpec(spec callSpec) {
 	inc := m.cur
 	row, err := inc.led.Q.GetRun(m.ctx, spec.run.id)
 	if err != nil {
@@ -473,7 +606,7 @@ func (m *machine) call() {
 	if err != nil {
 		m.fatal(err)
 	}
-	id := sha256Hex([]byte(spec.run.id), []byte(spec.tool), canon)
+	id := spec.id()
 	m.model(id, spec)
 	if m.calling[inc][id] {
 		m.logf("call %s: %s has a call of it already, which the call would join", m.name(id), inc.name)
@@ -483,6 +616,15 @@ func (m *machine) call() {
 	defer delete(m.calling[inc], id)
 	res, err := inc.g.callTool(m.ctx, activity.Info{}, row, t, class, pol.max, rule, spec.args, canon, faults.Effect{})
 	m.logf("call %s on %s (class %s, approval %v) → %s", m.name(id), inc.name, class, rule != nil, m.outcome(res, err))
+}
+
+// id is the effect of the call.
+func (s callSpec) id() string {
+	canon, err := encodeCanonical(s.args)
+	if err != nil {
+		panic(err)
+	}
+	return sha256Hex([]byte(s.run.id), []byte(s.tool), canon)
 }
 
 // model is the walk's model of the effect of a call, which it names.
@@ -540,8 +682,11 @@ func (m *machine) execute(ctx context.Context, t *smTool, payload json.RawMessag
 			m.mu.Unlock()
 		}
 	}
-	kind := attemptKind(m.choose(m.attempts...))
-	two := kind != attemptUnknownBefore && kind != attemptNotSent && kind != attemptDenied && m.rng.IntN(100) < 30
+	kind, two := attemptOK, false
+	if !m.finishing {
+		kind = attemptKind(m.choose(m.attempts...))
+		two = kind != attemptUnknownBefore && kind != attemptNotSent && kind != attemptDenied && m.rng.IntN(100) < 30
+	}
 	m.logf("%s sends %s: %s%s", inc.name, m.name(id), attemptNames[kind], map[bool]string{true: ", after a request before it"}[two])
 	m.pause(inc, "before its first request")
 	if inc.dead {
@@ -572,6 +717,10 @@ func (m *machine) execute(ctx context.Context, t *smTool, payload json.RawMessag
 	if err := proceed(ctx); err != nil {
 		m.logf("%s: proceed: %v", m.name(id), err)
 		nothing()
+		if two && t.class == policy.EffectLookup && errors.Is(err, tools.ErrStopped) {
+			// As github.open_draft_pr does once it pushed its branch: a person settles it.
+			return nil, &tools.ConflictError{Reason: "its first request went out, and the next was stopped"}
+		}
 		return nil, err
 	}
 	switch kind {
@@ -656,6 +805,14 @@ func (m *machine) checkRequest(inc *incarnation, t *smTool, id, key string, payl
 	if fx.run.cancelled {
 		m.fail("a request of %s went out after its run was cancelled", m.name(id))
 	}
+	e, err := inc.led.Q.GetEffect(m.ctx, id)
+	if err != nil {
+		m.fatal(err)
+	}
+	if sha256Hex(payload) != e.PayloadSha256 {
+		m.fail("a request of %s went out with a payload (sha256 %s) other than the one recorded for it (%s)", m.name(id),
+			sha256Hex(payload), e.PayloadSha256)
+	}
 	pol := inc.policy[t.name]
 	rule := pol.require && inc.live && !fx.run.dryRun
 	a, err := inc.led.Q.GetApprovalByEffect(m.ctx, id)
@@ -681,10 +838,6 @@ func (m *machine) checkRequest(inc *incarnation, t *smTool, id, key string, payl
 	if !rule {
 		return
 	}
-	e, err := inc.led.Q.GetEffect(m.ctx, id)
-	if err != nil {
-		m.fatal(err)
-	}
 	expires, err := time.Parse(time.RFC3339Nano, a.ExpiresAt)
 	if err != nil {
 		m.fatal(err)
@@ -707,7 +860,11 @@ func (m *machine) find(t *smTool, payload json.RawMessage) (map[string]any, bool
 	if inc.dead {
 		return nil, false, errDied
 	}
-	if !m.recovering && m.rng.IntN(100) < 5 {
+	if !inc.live {
+		m.logf("%s: %s cannot reach the outside world to look", m.name(id), inc.name)
+		return nil, false, errors.New("the tool's system is not configured")
+	}
+	if !m.recovering && !m.finishing && m.rng.IntN(100) < 5 {
 		m.logf("%s: the lookup fails", m.name(id))
 		return nil, false, errors.New("the lookup failed")
 	}
@@ -774,6 +931,11 @@ func (m *machine) decide() {
 		d = prev[m.rng.IntN(len(prev))]
 	}
 	d.RunClosed = m.run(a.WorkflowID).ended
+	m.submit(a, d)
+}
+
+// submit sends a person's decision on approval a, and records what went through.
+func (m *machine) submit(a db.Approval, d Decision) {
 	got, err := m.cur.g.Decide(m.ctx, d)
 	what := d.Kind
 	if d.PayloadSHA256 != a.PayloadSha256 {
@@ -796,36 +958,48 @@ func (m *machine) decide() {
 // One whose tool cannot look it up the person settles only once nothing sent can take effect any
 // more; for one it can, agentd says when it is too early.
 func (m *machine) reconcile() {
-	var unknown []db.Effect
-	for _, id := range m.effectIDs() {
-		if e, err := m.cur.led.Q.GetEffect(m.ctx, id); err == nil && e.Status == effectUnknown {
-			unknown = append(unknown, e)
-		}
-	}
+	unknown := m.effectsIn(effectUnknown)
 	if len(unknown) == 0 {
 		m.logf("reconcile: nothing to reconcile")
 		return
 	}
 	e := unknown[m.rng.IntN(len(unknown))]
-	fx := m.effect(e.EffectID)
-	m.mu.Lock()
-	made, pending := m.made(e.EffectID, fx.dedupe) > 0, m.pending(e.EffectID)
-	m.mu.Unlock()
-	r := Resolution{EffectID: e.EffectID, Key: m.key(), Executed: made}
-	switch {
-	case made && fx.finder && m.rng.IntN(2) == 0:
-		r.Lookup = true
-	case made:
-		r.ResultJSON = `{"id": 7}`
-	case pending && !fx.finder:
-		m.logf("reconcile %s: the person cannot tell yet", m.name(e.EffectID))
+	r, ok := m.finding(e)
+	if !ok {
 		return
+	}
+	if r.Executed && m.effect(e.EffectID).finder && m.rng.IntN(2) == 0 {
+		r.ResultJSON, r.Lookup = "", true
 	}
 	replay := false
 	if prev := m.resolved[e.EffectID]; len(prev) > 0 && m.rng.IntN(100) < 15 {
 		r, replay = prev[m.rng.IntN(len(prev))], true
+		r.RunClosed = m.effect(e.EffectID).run.ended
 	}
-	r.RunClosed = fx.run.ended
+	m.resolve(e, r, replay)
+}
+
+// finding is what a person finds of an effect nobody could settle, looking at the outside world now;
+// not ok when the person cannot tell yet.
+func (m *machine) finding(e db.Effect) (Resolution, bool) {
+	fx := m.effect(e.EffectID)
+	m.mu.Lock()
+	made, pending := m.made(e.EffectID, fx.dedupe) > 0, m.pending(e.EffectID)
+	m.mu.Unlock()
+	r := Resolution{EffectID: e.EffectID, Key: m.key(), Executed: made, RunClosed: fx.run.ended}
+	switch {
+	case made:
+		r.ResultJSON = `{"id": 7}`
+	case pending && !fx.finder:
+		m.logf("reconcile %s: the person cannot tell yet", m.name(e.EffectID))
+		return r, false
+	}
+	return r, true
+}
+
+// resolve sends a person's finding (again, when replay), and records what went through.
+func (m *machine) resolve(e db.Effect, r Resolution, replay bool) {
+	fx := m.effect(e.EffectID)
 	status, _, err := m.cur.g.Reconcile(m.ctx, r)
 	if err != nil {
 		m.logf("a person finds %s executed %v: %v", m.name(e.EffectID), r.Executed, m.redact(err.Error()))
@@ -895,15 +1069,8 @@ func (m *machine) restart() {
 	m.cur = m.start(pol, live)
 	atStart := m.rng.IntN(100) < m.recovers
 	m.logf("%s dies; %s starts, live %v, policy %s, recovering at start: %v", old.name, m.cur.name, live, m.policyText(pol), atStart)
-	if !atStart {
-		return
-	}
-	m.recovering = true
-	err := m.cur.g.RecoverEffects(m.ctx)
-	drained := m.cur.g.Drain(time.Minute)
-	m.recovering = false
-	if err != nil || !drained {
-		m.t.Fatalf("recovery at start: %v, drained %v", err, drained)
+	if atStart {
+		m.recoverAtStart()
 	}
 }
 
@@ -944,6 +1111,9 @@ func (m *machine) check() {
 			m.fail("4: %s may have taken effect, but maybe_sent is 0", m.name(id))
 		case e.Status == effectAwaitingApproval && inFlight:
 			m.fail("4: %s may have taken effect, but it awaits approval", m.name(id))
+		case hasApproval && !slices.Contains(m.ttls[e.Tool], span(a.CreatedAt, a.ExpiresAt)):
+			m.fail("2: approval %s of %s was made at %s to expire at %s: no policy of %s had that time (%v)", m.name(a.ApprovalID),
+				m.name(id), a.CreatedAt, a.ExpiresAt, e.Tool, m.ttls[e.Tool])
 		case hasApproval && a.UsedAt.Valid && !before(a.UsedAt.String, a.ExpiresAt):
 			m.fail("approval %s of %s was used at %s, at or after it expired at %s", m.name(a.ApprovalID), m.name(id), a.UsedAt.String, a.ExpiresAt)
 		case hasApproval && a.Status == approvalExpired && a.UsedAt.Valid && wentOut && !strings.Contains(a.Reason.String, "A request of it went out at"):
@@ -1020,6 +1190,16 @@ func (m *machine) checkReport(r *runModel) {
 	}
 }
 
+// span is how long from ledger time a to ledger time b; -1 when one cannot be read.
+func span(a, b string) time.Duration {
+	ta, erra := time.Parse(time.RFC3339Nano, a)
+	tb, errb := time.Parse(time.RFC3339Nano, b)
+	if erra != nil || errb != nil {
+		return -1
+	}
+	return tb.Sub(ta)
+}
+
 // before reports whether ledger time a is before ledger time b.
 func before(a, b string) bool {
 	ta, erra := time.Parse(time.RFC3339Nano, a)
@@ -1043,6 +1223,17 @@ func (m *machine) approvals() []db.Approval {
 	slices.SortFunc(out, func(a, b db.Approval) int { return strings.Compare(a.CreatedAt, b.CreatedAt) })
 	for _, a := range out {
 		m.name(a.ApprovalID)
+	}
+	return out
+}
+
+// effectsIn are the walk's effects in status, in the order of their IDs.
+func (m *machine) effectsIn(status string) []db.Effect {
+	var out []db.Effect
+	for _, id := range m.effectIDs() {
+		if e, err := m.cur.led.Q.GetEffect(m.ctx, id); err == nil && e.Status == status {
+			out = append(out, e)
+		}
 	}
 	return out
 }

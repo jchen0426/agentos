@@ -112,6 +112,18 @@ MUTATIONS = {
         (SQL, "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n"
               "  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.workflow_id = effects.workflow_id AND r.cancelled_at IS NOT NULL)\n",
               "WHERE effect_id = ? AND version = ? AND claimed_by = ? AND status = 'PENDING'\n")],
+    # From the adversarial review of this branch: what goes out, and writes that never finish.
+    "P1 a call sends a payload rendered again, not the one recorded": [
+        (G + "effects.go", "\tpayload, err := g.payload(ctx, e)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tfx.Stall(ctx.Done())",
+         "\tpayload, err := t.Prepare(ctx, req)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tfx.Stall(ctx.Done())")],
+    "L1 a write in flight is held to its approval's time, and stopped at every resend": [
+        (G + "approvals.go", "\tif e.MaybeSent != 0 {\n\t\treturn nil, nil\n\t}\n\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)",
+         "\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)")],
+    "L2 agentd leaves a cancelled run's write in flight waiting, at start": [
+        (G + "effects.go", "\tif n, err := g.Ledger.Q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {",
+         "\tif n, err := int64(0), error(nil); err != nil {")],
+    "L3 gate lets an approved write past its time through, and proceed stops it every time": [
+        (G + "approvals.go", "\tcase approved:\n\t\treturn g.expireUnsent(ctx, e, a)\n", "\tcase approved:\n\t\treturn nil, nil\n")],
     # The bugs this state machine found (the fixes, undone).
     "S1 an approved write that only dry-ran reads as approved": [
         (G + "records.go", "effectDenied: \"not sent\", effectDryRun: \"not sent\",", "effectDenied: \"not sent\",")],
