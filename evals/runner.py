@@ -10,11 +10,11 @@ profile, one rep of every case before the next, and judges each run by its outco
 ledger (evals/score.py). A journal in the state directory records each run as it starts and as
 it ends, so a runner started again on it picks up the runs in flight and skips the ones done.
 The first run of a profile goes alone: if the model gave it no answer (evals/score.py's void),
-the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker, and so
-do VOID_STREAK void runs in a row later on (a provider that went away: each of its requests may
-cost the whole reservation). Void runs run again only when asked (--retry-void), after the runs
-never run; one that is void again does not stop the runner, the run after it goes alone
-instead.
+the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. After any
+void run, runs go one at a time again until one gets an answer, and VOID_STREAK void runs in a
+row stop the runner (a provider that went away: each of its requests may cost the whole
+reservation). Void runs run again only when asked (--retry-void), after the runs never run; one
+that is void again does not stop the runner as a first run would.
 
 Money: a paid profile needs a cap on what the state directory's runs spend, every runner on it
 together; a new state directory is a new evaluation, with a cap of its own. A run starts only
@@ -27,18 +27,26 @@ an earlier one left. A run the ledger has and the journal does not (a runner sto
 starting it and writing it down) is cancelled before the Worker comes up: nobody would watch
 it. The cap counts the price table's prices, not the provider's bill.
 
-One runner at a time uses a state directory, and its lock stays held while anything a runner
-started still runs: Temporal and agentd hold it too. A runner killed with SIGKILL leaves the
-directory locked until they are stopped, rather than to a second Temporal on the same database.
+One runner at a time uses a state directory, and its lock stays held while the Temporal a runner
+started still runs: a runner killed with SIGKILL leaves the directory locked until it is
+stopped, rather than to a second Temporal on the same database. Each stack lists its processes
+in its directory (pids), and the refusal names the ones still running. A signal while a stack
+starts or stops waits until it has (tests/harness.py's signals_deferred).
+
+On macOS the git tool's sandbox denies agentd's directories, the home directory and the
+temporary directories, and allows the rest: the state directory and the cache (deny_read)
+must be in one of those, or the tool could read the journal and the other profiles' ledgers.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import math
 import os
+import pwd
 import re
-import signal
 import sqlite3
 import subprocess
 import time
@@ -50,14 +58,14 @@ from pathlib import Path
 from evals.cases import Case, CaseSet
 from evals.mirrors import inside_repo
 from evals.score import detected, false_positive, void, void_reason
-from tests.harness import SANDBOX, TERMINAL, Stack, wait_for
+from tests.harness import BIN, SANDBOX, TERMINAL, Stack, signals_deferred, wait_for
 
 REPO = Path(__file__).resolve().parents[1]
 BUDGET = 1_500_000  # micros a run may spend: above the gateway's worst-case reservation (section 9)
 TASK = "security-audit"
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ENDED = TERMINAL | {"UNKNOWN"}
-VOID_STREAK = 5  # runs in a row the model gives no answer, after the first, that stop the runner
+VOID_STREAK = 3  # runs in a row the model gives no answer, after the first, that stop the runner
 
 
 @dataclass(frozen=True)
@@ -147,7 +155,7 @@ class Journal:
             if end:
                 f.seek(end - 1)
                 cut = f.read(1) != b"\n"
-            f.write((b"\n" if cut else b"") + json.dumps(entry, sort_keys=True).encode() + b"\n")
+            f.write((b"\n" if cut else b"") + json.dumps(entry, sort_keys=True, allow_nan=False).encode() + b"\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -185,8 +193,8 @@ class _Run:
     deny_read: list[Path]
     budget_micros: int
     cap_micros: int | None
-    lock: int  # the state directory's lock, which Temporal and agentd hold too
-    agentos: str
+    lock: int  # the state directory's lock, which the stacks' Temporal holds too
+    agentos: dict
     log: object
 
 
@@ -215,21 +223,32 @@ def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: P
         raise ValueError(f"the state directory {state} must be outside the repository: the sandboxed Worker reads it")
     mirrors = {name: Path(path).resolve() for name, path in mirrors.items()}
     hidden = [state, *mirrors.values(), *(Path(p).resolve() for p in deny_read)]
+    if SANDBOX == "srt":
+        # Mirrors are denied by agentd itself; the rest only where the tool's sandbox denies anyway.
+        denied = [Path(h).resolve() for h in (os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir)]
+        denied += [Path(d) for d in ("/private/tmp", "/private/var/tmp", "/private/var/folders")]
+        exposed = [p for p in [state, *(Path(d).resolve() for d in deny_read)]
+                   if not any(p.is_relative_to(d) for d in denied)]
+        if exposed:
+            raise ValueError(f"{exposed}: on macOS the state directory and the cache go under the home directory "
+                             "or a temporary directory, which the git tool's sandbox cannot read")
     state.mkdir(parents=True, exist_ok=True)
     lock = os.open(state / "lock", os.O_RDONLY | os.O_CREAT, 0o600)
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError(f"another runner is using {state}, or what is left of one: a Temporal or an agentd "
-                               f"it started (lsof {state / 'lock'} names them)") from None
+            left = "; ".join(f"{name} (process group {pid})" for name, pid in _left_running(state))
+            raise RuntimeError(f"another runner is using {state}, or what is left of one, which holds it until "
+                               f"its Temporal stops: {left or 'lsof ' + str(state / 'lock')}; stop them with "
+                               "kill -TERM -<group> (agentd may take a minute; -KILL does not wait)") from None
         journal = Journal(state / "journal.jsonl")
         gone = sorted(p for p in {e["profile"] for e in journal.entries()} if not _ledger(state, p).exists())
         if gone:
             raise RuntimeError(f"the journal in {state} has runs of {gone}, whose ledgers are gone: what those runs "
                                "spent is unknown, and the cap cannot count it (a new state directory starts afresh)")
         r = _Run(cs, journal, state, {repo_id(n): {"mirror": str(p)} for n, p in mirrors.items()}, hidden,
-                 budget_micros, cap_micros, lock, _agentos(), log)
+                 budget_micros, cap_micros, lock, {"commit": _agentos(), "bin": _binaries()}, log)
         for profile in profiles:
             _run_profile(r, profile, cases, runs, retry_void)
         return journal.results()
@@ -264,18 +283,25 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
     stack_dir.mkdir(parents=True, exist_ok=True)
     stack = None
     try:
-        stack = Stack(stack_dir, temporal_db=True, fixture=False, hold_fds=(r.lock,))
+        with signals_deferred():  # a signal while it starts arrives once it is up, and it stops whole
+            stack = Stack(stack_dir, temporal_db=True, fixture=False, hold_fds=(r.lock,))
         stack.deny_read = r.deny_read  # the journal, the mirrors and the cache, besides agentd's data
         stack.start_agentd(policy=policy(list(r.repos)), models=profile.models, prices=profile.prices, repos=r.repos)
         if not _ledger(r.state, profile.name).exists():
             raise RuntimeError(f"agentd is up, but its ledger is not at {_ledger(r.state, profile.name)}")
         # Before the Worker comes up: agentd refuses the calls of the runs it has cancelled.
         unknown = _cancel_unknown(stack, journal, log)
-        if profile.paid and resumed and _overspent(r.state):
-            log(f"[{profile.name}] a run spent past its budget: the {len(resumed)} paid runs left in flight stop")
-            for e in resumed:
-                e["stopped"] = "overspent"
-                _cancel(stack, e)
+        if profile.paid and resumed:
+            # Started under an earlier runner's cap: they stop if this one's cannot hold them.
+            committed = sum(e["budget_micros"] for e in journal.unfinished() if e["paid"])
+            why = ("overspent" if _overspent(r.state) else
+                   "cap" if r.cap_micros is not None and _spent(r.state) + committed > r.cap_micros else None)
+            if why:
+                log(f"[{profile.name}] the {len(resumed)} paid runs left in flight stop: "
+                    + ("a run spent past its budget" if why == "overspent" else "they could take the spending past the cap"))
+                for e in resumed:
+                    e["stopped"] = why
+                    _cancel(stack, e)
         stack.start_worker()
         for gone in unknown:
             _ended(stack, gone)
@@ -283,10 +309,10 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
             f"{len(resumed)} to pick up")
         watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
         confirmed = False  # a run of this profile has got an answer from the model
-        streak = 0  # runs this runner started that ended void, in a row
+        streak = 0  # runs this runner started that ended void, in a row: one at a time until one answers
         while todo or watching:
             _alive(stack)
-            while todo and len(watching) < (profile.concurrency if confirmed else 1):
+            while todo and len(watching) < (profile.concurrency if confirmed and not streak else 1):
                 if profile.paid and _overspent(r.state):
                     log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
                     todo.clear()
@@ -328,24 +354,32 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                         raise RuntimeError(f"[{profile.name}] {streak} runs in a row ended without the model, the last "
                                            f"{void_reason(record)}: stopping; the next runner picks up the runs in "
                                            "flight, and --retry-void runs the void ones again")
-                    if not confirmed:
-                        log(f"[{profile.name}] {record['case']} #{record['rep']} is void again: "
-                            "the next run goes alone too")
+                    log(f"[{profile.name}] {record['case']} #{record['rep']} is void ({void_reason(record)}): "
+                        "the next run goes alone")
             if watching:
                 time.sleep(1)
     finally:
         if stack is not None:
-            _close(stack)
+            with signals_deferred():  # rather than leave half of it running
+                stack.close()
 
 
-def _close(stack: Stack) -> None:
-    """Stops the stack; a SIGTERM or a Ctrl-C meanwhile waits until it has stopped, rather than
-    leave half of it running."""
-    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
-    try:
-        stack.close()
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+def _left_running(state: Path) -> list[tuple[str, int]]:
+    """The processes the state directory's stacks list that still run: what a runner killed with
+    SIGKILL left behind (or a live runner's)."""
+    out = []
+    for path in sorted(state.glob("*/stack/pids")):
+        try:
+            procs = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        for name, pid in procs:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                continue
+            out.append((name, pid))
+    return out
 
 
 def _alive(stack: Stack) -> None:
@@ -436,13 +470,20 @@ def _cancel_unknown(stack: Stack, journal: Journal, log) -> list[dict]:
     return out
 
 
-def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budget: int, agentos: str) -> dict:
+def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budget: int, agentos: dict) -> dict:
     started = stack.agentctl("runs", "start", TASK, "--repo", repo_id(c.project), "--commit", c.commit,
                              "--base", cs.projects[c.project].base, "--budget-micros", str(budget), "--dry-run")
     return {"event": "start", "profile": profile.name, "case": c.id, "rep": rep, "run_id": started["run_id"],
             "temporal_run_id": started["temporal_run_id"], "budget_micros": budget, "paid": profile.paid,
             "expect": profile.expect, "commit": c.commit, "cases_sha256": cs.sha256, "agentos": agentos,
             "at": time.time()}
+
+
+def _binaries() -> dict[str, str]:
+    """What the runs ran: the binaries make build put in bin/, by sha256 (a checkout's commit
+    does not say whether they were built from it)."""
+    return {name: hashlib.sha256((BIN / name).read_bytes()).hexdigest()[:16]
+            for name in ("agentd", "agentctl", "agentos-mcp-git") if (BIN / name).exists()}
 
 
 def _agentos() -> str:
@@ -494,9 +535,16 @@ def _int(digits: str) -> int | None:
     return int(digits) if len(digits) <= 20 else None
 
 
+def _float(digits: str) -> float | None:
+    """A JSON number with a fraction or an exponent, or None for one past any float (1e400)."""
+    value = float(digits)
+    return value if math.isfinite(value) else None
+
+
 def _object(raw: str | bytes) -> dict:
-    """A JSON object that holds what a model wrote."""
-    value = json.loads(raw, parse_int=_int)
+    """A JSON object that holds what a model wrote: numbers past any line are None, and so are
+    the NaN and Infinity Python's json would take, so that the journal and the report stay JSON."""
+    value = json.loads(raw, parse_int=_int, parse_float=_float, parse_constant=lambda _: None)
     return value if isinstance(value, dict) else {}
 
 

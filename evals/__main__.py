@@ -99,7 +99,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # A terminal closed or a timeout's SIGTERM: unwind, so that the runner stops what it started.
     for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
+        if signal.getsignal(sig) is not signal.SIG_IGN:  # nohup's ignored SIGHUP stays ignored
+            signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
     for name in ("cache", "state", "out"):
         if getattr(args, name, None) is not None:
             setattr(args, name, getattr(args, name).resolve())

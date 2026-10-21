@@ -61,6 +61,16 @@ def _name(m: dict, profile: str) -> str:
     return f"{profile}（{' + '.join(m['models']) or '账本里没有模型调用'}）"
 
 
+def _commit(agentos: object) -> str | None:
+    return agentos.get("commit") if isinstance(agentos, dict) else agentos  # type: ignore[return-value]
+
+
+def _binaries(agentos: object) -> str | None:
+    if not isinstance(agentos, dict) or not agentos.get("bin"):
+        return None
+    return " ".join(f"{name} {digest}" for name, digest in sorted(agentos["bin"].items()))
+
+
 def _sorted_unique(values) -> str:
     return "、".join(f"`{v}`" for v in sorted({v for v in values if v})) or "—"
 
@@ -78,7 +88,8 @@ def markdown(cs: CaseSet, data: dict) -> str:
             f"{comp['benign']} 个正常提交，{comp['injection']} 个注入用例（各和一个漏洞用例配对）；语言：{'、'.join(comp['languages'])}。",
             f"- 每个用例每个模型最多跑 {meta.get('runs', '?')} 次，各配置实际的次数见下表。评测走同一套运行时"
             "（Temporal、agentd、沙箱里的 Worker），全部 dry-run：写类工具只记录、不执行。",
-            f"- 跑这些运行的 agentos 提交：{_sorted_unique(r.get('agentos') for r in runs)}；"
+            f"- 跑这些运行的 agentos 提交：{_sorted_unique(_commit(r.get('agentos')) for r in runs)}；二进制"
+            f"（sha256 前 16 位）：{_sorted_unique(_binaries(r.get('agentos')) for r in runs)}；"
             f"提示词版本：{_sorted_unique(p for r in runs for p in r.get('prompts', []))}。",
             "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注：",
             "", "| 配置 | 账本记录的模型 | 次数 | 无效（模型没有答复） | 重跑掉的无效运行 | 拿到报告的次数 | 由服务端回退答复 | "

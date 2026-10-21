@@ -10,6 +10,8 @@ import os
 import signal
 import sqlite3
 import subprocess
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -18,7 +20,7 @@ import pytest
 from evals import __main__ as cli
 from evals import cases as casefile
 from evals import runner, score
-from tests import eval_fixture
+from tests import eval_fixture, harness
 from tests.harness import AUDIT_SCHEMA, BIN, Proc, Stack, command_of, descendants, wait_for
 
 PRICES = """
@@ -162,6 +164,37 @@ def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() ->
     assert record["report"]["findings"] == [{"severity": "high", "cwe": "CWE-89", "file": "app/db.py", "line": None,
                                              "title": "t"}]
     assert not score.void(record) and record["spent_micros"] == 10
+
+
+def test_a_signal_waits_for_the_stack_to_stop_whatever_thread_gets_it() -> None:
+    class Stopped(Exception):
+        pass
+
+    def stop(signum, frame):
+        raise Stopped(signum)
+    old = signal.signal(signal.SIGTERM, stop)
+    done = []
+    try:
+        with pytest.raises(Stopped):
+            with harness.signals_deferred():
+                # Handed to another thread, as the OS may hand it to one of the Temporal SDK's:
+                # blocking it in this thread would not keep it from cutting the block short.
+                t = threading.Thread(target=lambda: signal.pthread_kill(threading.get_ident(), signal.SIGTERM))
+                t.start()
+                t.join()
+                for _ in range(20):  # what the signal would cut short
+                    time.sleep(0.01)
+                done.append(True)
+        assert done, "the block ran to its end before the signal arrived"
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
+def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Path) -> None:
+    raw = '{"line": 1e400, "low": -1e400, "nan": NaN, "inf": Infinity, "ok": 12.0, "n": 7}'
+    assert runner._object(raw) == {"line": None, "low": None, "nan": None, "inf": None, "ok": 12.0, "n": 7}
+    with pytest.raises(ValueError):
+        runner.Journal(tmp_path / "journal.jsonl").append({"event": "result", "x": float("inf")})
 
 
 def test_a_blank_patch_is_no_patch() -> None:
@@ -356,6 +389,12 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     assert len({r["run_id"] for r in second}) == 6
     assert sum(r["spent_micros"] for r in second) == 6 * ANSWER
 
+    # z's run left in flight is held by no cap now: a runner whose cap cannot hold it stops it
+    # before z's Worker comes up.
+    third = run(cs, [z], repos, state, runs=1, budget_micros=BUDGET, cap_micros=6 * ANSWER, cases=[cs.case("py-sqli")])
+    [stopped] = [r for r in third if r["profile"] == "z"]
+    assert (stopped["run_id"], stopped["ended_by"], score.void_reason(stopped)) == (left["run_id"], "cap", "(cap)")
+
 
 def test_a_run_paused_for_budget_is_stopped_and_a_first_run_that_is_void_stops_the_runner(
         tmp_path: Path, evalset, modelsim: str) -> None:
@@ -404,7 +443,9 @@ def test_a_run_that_spends_past_its_budget_stops_the_paid_runs(tmp_path: Path, e
                   cases=[benign])
     assert [(r["rep"], r["spent_micros"]) for r in results if r["profile"] == "a"] == [(1, 100_000 + 50)], results
     # The next runner on the state remembers, from the ledger; and c's run left in flight stops
-    # before c's Worker comes up, so its provider never hears of it.
+    # before c's Worker comes up. It never had a Worker, so no model call of it was waiting for
+    # agentd to make: its provider never hears of it. (One that was is made before the cancel
+    # lands, within the run's budget, which the cap counts.)
     sent = (tmp_path / "modelsim.jsonl").read_text()
     again = run(cs, [one_at_a_time, c], repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000,
                 cases=[benign])
@@ -543,11 +584,11 @@ def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Pa
 
     def log(line: str) -> None:
         print(line)
-        if "runs to start" in line:  # Temporal and agentd hold the state's lock, as the runner does
+        if "runs to start" in line:  # Temporal holds the state's lock, as the runner does; agentd not
             lock = os.path.realpath(state / "lock")
-            for name in ("temporal", "agentd"):
+            for name, holds in (("temporal", True), ("agentd", False)):
                 [pid] = [p for p in descendants(os.getpid()) if Path((command_of(p).split() or [""])[0]).name == name]
-                assert lock in open_files(pid), (name, open_files(pid))
+                assert (lock in open_files(pid)) == holds, (name, open_files(pid))
         if "#1:" in line and not killed:  # the first run is done: kill the Worker (and its sandbox)
             for pid in descendants(os.getpid()):
                 if "agentos_worker" in command_of(pid):
@@ -572,17 +613,23 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
         fcntl.flock(held, fcntl.LOCK_EX)
         with pytest.raises(RuntimeError, match="another runner"):
             runner.run(cs, [b], repos, state)
-    # A runner killed with SIGKILL leaves its Temporal (and agentd) running: they hold the lock.
+    # A runner killed with SIGKILL leaves its Temporal running, which holds the lock; the refusal
+    # names what its stack listed and still runs.
     held = os.open(state / "lock", os.O_RDONLY)
     fcntl.flock(held, fcntl.LOCK_EX)
-    (tmp_path / "left").mkdir()
-    left = Stack(tmp_path / "left", fixture=False, hold_fds=(held,))
+    (state / "x" / "stack").mkdir(parents=True)
+    left = Stack(state / "x" / "stack", fixture=False, hold_fds=(held,))
     os.close(held)
     try:
-        with pytest.raises(RuntimeError, match="what is left of one"):
+        with pytest.raises(RuntimeError, match=r"what is left of one.*temporal \(process group \d+\)"):
             runner.run(cs, [b], repos, state)
     finally:
         left.close()
+    # On macOS the git tool's sandbox reads what is neither under the home directory nor temporary.
+    monkeypatch.setattr(runner, "SANDBOX", "srt")
+    with pytest.raises(ValueError, match="on macOS the state directory and the cache"):
+        runner.run(cs, [b], repos, Path("/Users/Shared/agentos-eval-test-state"))
+    monkeypatch.setattr(runner, "SANDBOX", "none")
     # A journal with runs of a profile whose ledger is gone: what they spent is unknown.
     runner.Journal(state / "journal.jsonl").append({"event": "start", "profile": "gone", "run_id": "x"})
     with pytest.raises(RuntimeError, match="ledgers are gone"):

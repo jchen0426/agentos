@@ -65,11 +65,14 @@ def void(run: dict) -> bool:
 
 
 def void_reason(run: dict) -> str:
-    """Why a void run is void, in a few words: how it ended, or what its outcome says."""
+    """Why a void run is void, in a few words: how it ended, or what its outcome says. A run
+    stopped with requests that got no answer says so: a run out of budget because a provider
+    kept failing (each failure may cost the whole reservation) is not one with a small budget."""
+    unanswered = ", requests unanswered" if any(a.get("status") is None for a in run.get("answers", [])) else ""
     if run.get("ended_by") not in (None, "run"):
-        return f"({run['ended_by']})"
+        return f"({run['ended_by']}{unanswered})"
     if run.get("state") == "CANCELLED":
-        return "(cancelled)"
+        return f"(cancelled{unanswered})"
     outcome = run.get("outcome") or ""
     kind, _, detail = outcome.partition(":")
     return (kind + (": " + detail.strip()[:60] if detail.strip() else "")) if outcome else f"({run.get('state', '?')})"

@@ -12,6 +12,7 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -22,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -258,6 +260,26 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
+@contextlib.contextmanager
+def signals_deferred(signums: tuple[int, ...] = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)):
+    """SIGTERM, SIGHUP and SIGINT wait until the block is done, then arrive: what they would cut
+    short (starting or stopping a stack) finishes. Python runs signal handlers in the main thread
+    whichever thread the OS hands a signal to (the Temporal SDK's runtime starts many), so this
+    swaps the handlers rather than block the signals."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    got: list[int] = []
+    old = {n: signal.signal(n, lambda signum, _frame: got.append(signum)) for n in signums}
+    try:
+        yield
+    finally:
+        for n, handler in old.items():
+            signal.signal(n, handler)
+        for n in dict.fromkeys(got):
+            signal.raise_signal(n)
+
+
 def command_of(pid: int) -> str:
     return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
 
@@ -355,8 +377,9 @@ class Stack:
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
         self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
-        # Temporal and agentd keep these open, and with them any lock on them: the evaluation's
-        # state directory stays locked while what a killed runner left behind still runs.
+        # Temporal keeps these open, and with them any lock on them: the evaluation's state
+        # directory stays locked while the Temporal a killed runner left behind still runs. Not
+        # agentd: the processes it starts (a sandboxed git tool) would inherit them.
         self.hold_fds = hold_fds
         self.fixture = fixture
         self.commit = make_mirror(tmp / "mirror", live_repo) if fixture else ""
@@ -388,6 +411,7 @@ class Stack:
                                   *(["--db-filename", str(self.temporal_db)] if self.temporal_db else [])],
                      self.tmp / f"temporal{n or ''}.log", pass_fds=self.hold_fds)
             self.procs.append(p)
+            self._remember()
             wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
             if p.alive():
                 return
@@ -422,6 +446,7 @@ class Stack:
                                "--repo", f"acme/payments={self.tmp / 'mirror'}"],
                  self.tmp / "githubsim.log")
         self.procs.append(p)
+        self._remember()
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated GitHub")
         assert p.alive(), p.text()
         self.github_url = f"http://{addr.read_text()}/"
@@ -536,8 +561,9 @@ class Stack:
     def _launch_agentd(self) -> Proc:
         n = sum(p.name.startswith("agentd") for p in self.procs)
         name = "agentd" if n == 0 else f"agentd{n + 1}"
-        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log", pass_fds=self.hold_fds)
+        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log")
         self.procs.append(p)
+        self._remember()
         self.agentd = p
         wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd")
         assert p.alive(), p.text()
@@ -577,15 +603,27 @@ class Stack:
         w = Worker(f"worker{n}", self.worker_command(workflows), self.tmp / f"worker{n}.log",
                    env=self.sandbox_env(), cwd=REPO)
         self.procs.append(w)
+        self._remember()
         self.workers.append(w)
         wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
         assert w.alive(), w.text()
         return w
 
+    def _remember(self) -> None:
+        """The stack's processes, each the leader of its own process group: what to stop when
+        whatever started them was killed (pids, in the stack's directory)."""
+        (self.tmp / "pids").write_text(json.dumps([[p.name, p.popen.pid] for p in self.procs]))
+
     def close(self) -> None:
+        errors = []
         for p in reversed(self.procs):
-            p.stop()
+            try:
+                p.stop()
+            except Exception as e:  # noqa: BLE001 - stop the others first
+                errors.append(e)
         shutil.rmtree(self.sock_dir, ignore_errors=True)
+        if errors:
+            raise errors[0]
 
     def logs(self) -> str:
         return "\n".join(f"===== {p.name} ({p.log})\n{p.text()[-6000:]}" for p in self.procs)

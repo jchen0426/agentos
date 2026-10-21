@@ -2,6 +2,7 @@
 
 import json
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -215,8 +216,13 @@ def test_the_cli_spends_nothing_without_a_cap_or_unsandboxed(tmp_path: Path, mon
     with pytest.raises(SystemExit):
         cli.main(["--cases", str(path), "run", "--profile", "local"])
     assert "AGENTOS_SANDBOX" in capsys.readouterr().err
-    with pytest.raises(SystemExit):  # a state directory no run has ended in: no report
-        cli.main(["--cases", str(path), "report", "--state", str(tmp_path / "state"), "--out", str(tmp_path / "r")])
+    hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup leaves it
+    try:
+        with pytest.raises(SystemExit):  # a state directory no run has ended in: no report
+            cli.main(["--cases", str(path), "report", "--state", str(tmp_path / "state"), "--out", str(tmp_path / "r")])
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, hup)
     assert "no run has ended" in capsys.readouterr().err
 
 

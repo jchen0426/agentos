@@ -250,7 +250,9 @@ def test_a_run_counts_when_the_model_answered_and_is_void_otherwise():
     assert (m["runs"], m["void"], m["answered"]) == (10, 5, 4)
     assert (m["detection"]["hits"], m["detection"]["runs"]) == (3, 4)
     assert (m["false_positive"]["hits"], m["false_positive"]["runs"]) == (1, 1)
-    assert m["void_reasons"] == {"(budget)": 1, "(cancelled)": 1, "(timeout)": 1, "denied": 1, "failed: activity error": 1}
+    # The run stopped at its timeout had asked the model and got nothing back: it says so.
+    assert m["void_reasons"] == {"(budget)": 1, "(cancelled)": 1, "(timeout, requests unanswered)": 1, "denied": 1,
+                                 "failed: activity error": 1}
     by_case = {r["case"]: r["by"]["p1"] for r in score.per_case(CS, runs)}
     assert (by_case["v"]["runs"], by_case["v"]["void"], by_case["n"]["void"]) == (4, 4, 1)
     assert not score.void(run("v", outcome="invalid_output"))
