@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-github/v92/github"
 
 	"github.com/jchen0426/agentos/internal/gitmcp"
+	"github.com/jchen0426/agentos/internal/patch"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -113,7 +114,7 @@ func (t *OpenDraftPR) Prepare(ctx context.Context, req tools.Request) (json.RawM
 	if base := tools.String(req.Args, "base_branch"); !tools.ValidBranch(base) {
 		return nil, &tools.DeniedError{Reason: fmt.Sprintf("%.100q is not a branch name agentd takes", base)}
 	}
-	changes, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, append(slices.Clone(ProtectedPaths), t.DenyPaths...), repo.Mirror, commit)
+	changes, _, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, t.denyPaths(), repo.Mirror, commit)
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +146,11 @@ func (t *OpenDraftPR) Prepare(ctx context.Context, req tools.Request) (json.RawM
 	})
 }
 
+// denyPaths are the paths a patch may not touch: GitHub's own, and the policy's.
+func (t *OpenDraftPR) denyPaths() []string {
+	return append(slices.Clone(ProtectedPaths), t.DenyPaths...)
+}
+
 func (t *OpenDraftPR) author() Author {
 	if t.Client != nil && t.Client.cfg.Author.Name != "" {
 		return t.Client.cfg.Author
@@ -167,10 +173,10 @@ func (t *OpenDraftPR) DryRun(payload json.RawMessage) map[string]any {
 func (*OpenDraftPR) EditArg() string { return "patch_ref" }
 
 // Describe is what the reviewer of a pull request sees besides its payload (design doc, section
-// 10, tools.Describer): the patch as it was written, the files it changes, git's own check of it,
-// and where the base branch stands on GitHub now, with the checks Execute makes on GitHub before
-// it writes, made now (they only read). Each part says what agentd could not find out. Things
-// change before the write is sent; Execute checks again.
+// 10, tools.Describer): the patch as Prepare applied it, with the hunk headers agentd rewrote, the
+// files it changes, git's own check of it, and where the base branch stands on GitHub now, with
+// the checks Execute makes on GitHub before it writes, made now (they only read). Each part says
+// what agentd could not find out. Things change before the write is sent; Execute checks again.
 func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.RawMessage) map[string]any {
 	var p prPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -198,13 +204,40 @@ func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.
 			"Pushing branch " + p.Branch + " runs the repository's workflows that start on a push or on a new branch.",
 		},
 	}
-	if b, err := t.Blobs.GetRunBlob(ctx, req.WorkflowID, tools.String(req.Args, "patch_ref")); err != nil {
-		out["patch_error"] = err.Error()
+	// The patch is applied again: the same patch on the same commit is the same, and the payload's
+	// files are it.
+	repo, ref := tools.String(req.Args, "repo"), tools.String(req.Args, "patch_ref")
+	_, applied, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, t.denyPaths(), t.Repos[repo].Mirror, p.Commit)
+	if err != nil {
+		if b, berr := t.Blobs.GetRunBlob(ctx, req.WorkflowID, ref); berr == nil {
+			out["patch"] = string(b) // as it was written
+		}
+		out["patch_error"] = "agentd could not apply the patch again: " + err.Error()
 	} else {
-		out["patch"] = string(b)
-		out["apply_check"] = t.applyCheck(ctx, tools.String(req.Args, "repo"), p.Commit, b, paths)
+		out["patch"] = string(applied.Text())
+		if rw := applied.Rewritten(); len(rw) > 0 {
+			out["patch_rewritten"] = rewrites(rw)
+			out["notes"] = append(out["notes"].([]string), fmt.Sprintf("agentd rewrote %d hunk headers of the patch, "+
+				"whose counts or places of lines the hunks' own lines contradict (patch_rewritten): the patch shown is the one applied.", len(rw)))
+		}
+		out["apply_check"] = t.applyCheck(ctx, repo, p.Commit, applied.Text(), paths)
 	}
 	out["github"] = t.onGitHub(ctx, p)
+	return out
+}
+
+// maxRewrites is how many rewritten hunk headers a reviewer is shown one by one.
+const maxRewrites = 20
+
+// rewrites lists the hunk headers agentd rewrote, as the patch had them and as applied.
+func rewrites(rw []patch.Rewrite) []any {
+	out := make([]any, 0, min(len(rw), maxRewrites)+1)
+	for _, r := range rw[:min(len(rw), maxRewrites)] {
+		out = append(out, map[string]any{"file": r.Path, "hunk": r.Hunk, "was": r.Was, "now": r.Now})
+	}
+	if len(rw) > maxRewrites {
+		out = append(out, fmt.Sprintf("and %d more", len(rw)-maxRewrites))
+	}
 	return out
 }
 

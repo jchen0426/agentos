@@ -448,16 +448,20 @@ class Stack:
         assert p.alive(), p.text()
         self.github_url = f"http://{addr.read_text()}/"
 
-    def start_modelsim(self) -> str:
+    def start_modelsim(self, answers: list[dict] | None = None) -> str:
         """The simulated model providers T13 injects faults through (internal/modelsim): one
-        server for Anthropic's Messages API, OpenAI's Responses API and Chat Completions.
-        Returns its base URL."""
+        server for Anthropic's Messages API, OpenAI's Responses API and Chat Completions, which
+        answer as `answers` scripts (modelsim's rules), or with the fixture's report. Returns its
+        base URL."""
         addr = self.tmp / "modelsim.addr"
         self.modelsim_log = self.tmp / "modelsim.jsonl"
         self.modelsim_faults = self.tmp / "modelsim-faults.json"
-        p = Proc("modelsim", [BIN / "modelsim", "--listen", "127.0.0.1:0", "--addr-file", addr,
-                              "--log", self.modelsim_log, "--faults", self.modelsim_faults],
-                 self.tmp / "modelsim.log")
+        args = ["--listen", "127.0.0.1:0", "--addr-file", addr, "--log", self.modelsim_log,
+                "--faults", self.modelsim_faults]
+        if answers is not None:
+            (self.tmp / "modelsim-answers.json").write_text(json.dumps(answers))
+            args += ["--answers", self.tmp / "modelsim-answers.json"]
+        p = Proc("modelsim", [BIN / "modelsim", *args], self.tmp / "modelsim.log")
         self.procs.append(p)
         wait_for(lambda: addr.exists() or not p.alive(), "the simulated model providers")
         assert p.alive(), p.text()

@@ -2338,6 +2338,48 @@ func TestDescribeShowsWhatAgentdObserved(t *testing.T) {
 	}
 }
 
+// A patch whose hunk headers its lines contradict, as a model writes one: the pull request's files
+// are what the lines say, and the reviewer sees the patch as applied, and which headers agentd
+// rewrote.
+func TestDescribeShowsThePatchAsApplied(t *testing.T) {
+	f := setup(t)
+	miscounted := strings.Replace(fix, "@@ -1,2 +1,2 @@", "@@ -2,4 +2,5 @@", 1)
+	tool, payload := f.prepare(t, f.git, miscounted)
+	_, right := f.prepare(t, f.git, fix)
+	var got, want prPayload
+	_ = json.Unmarshal(payload, &got)
+	_ = json.Unmarshal(right, &want)
+	if g, w := mustJSON(t, got.Files), mustJSON(t, want.Files); g != w {
+		t.Fatalf("files:\n got %s\nwant %s", g, w)
+	}
+	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(miscounted))
+	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
+	d := tool.Describe(context.Background(), req, payload)
+	if d["patch"] != fix || mustJSON(t, d["patch_rewritten"]) != `[{"file":"app/db.py","hunk":1,"now":"@@ -1,2 +1,2 @@","was":"@@ -2,4 +2,5 @@"}]` ||
+		mustJSON(t, d["apply_check"]) != `{"applies":true}` {
+		t.Fatalf("described %v", d)
+	}
+	if notes := mustJSON(t, d["notes"]); !strings.Contains(notes, "agentd rewrote 1 hunk headers of the patch") {
+		t.Fatalf("notes %s", notes)
+	}
+	// A patch whose headers are right is shown as it was written, and nothing is said of headers.
+	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
+	req.Args["patch_ref"] = ref
+	d = tool.Describe(context.Background(), req, right)
+	if _, ok := d["patch_rewritten"]; ok || d["patch"] != fix || strings.Contains(mustJSON(t, d["notes"]), "rewrote") {
+		t.Fatalf("described %v", d)
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 // The report shows how each approval of the run ended: the status, which agentd records itself,
 // outside the fence; who decided, and a rejection's reason, inside it, where links and mentions
 // do nothing.
