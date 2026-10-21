@@ -286,19 +286,23 @@ uv run python -m evals mirrors                          # fetch, make, check eve
 uv run python -m evals table --out docs/eval/cases.md   # the case table, for spot checks
 ```
 
-A run needs `make build`, and, like any run with a real model, the Worker in its sandbox. A paid
-profile needs a cap: a run starts only while what the runs have spent, plus the budgets of the
-paid runs in flight, plus its own budget (`--budget-usd`, $1.50 by default: room for the
-gateway's worst-case reservation) stay within it. A run that waits for budget, an approval or a
-reconciliation, or takes longer than its profile allows, is cancelled and counts as finding
-nothing. The state directory keeps the journal, Temporal's database and agentd's ledger:
-`--state` picks up a run that was stopped. The profiles are `config/models.yaml`'s providers, one
-at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
+A run needs `make build`, and, like any run with a real model, the Worker in its sandbox. The
+state directory (`<cache>/state/default`, or `--state`) keeps the journal, and each profile's
+Temporal database and agentd ledger; a runner on it picks up where the last one stopped. A paid
+profile needs a cap on what the state directory's runs spend, every runner on it together (a
+new state directory is a new evaluation, with a cap of its own): a run starts only while what
+the ledgers say the runs have spent, plus the budgets of the paid runs in flight, plus its own
+budget (`--budget-usd`, $1.50 by default: room for the gateway's worst-case reservation) stay
+within it. A run the model gave no answer (one cancelled while it waited for budget, an
+approval or a reconciliation, or took longer than its profile allows; a policy that denied the
+call; a provider that kept failing) is void: it is in no rate, the report counts it by its
+reason, and `--retry-void` runs it again. The profiles are `config/models.yaml`'s providers,
+one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
 Ollama server above with gpt-oss:20b.
 
 ```bash
 AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 50
-uv run python -m evals report --state ~/.cache/agentos-eval/state/<when> --out docs/eval/<name>
+uv run python -m evals report --out docs/eval/<name>
 ```
 
 ## License

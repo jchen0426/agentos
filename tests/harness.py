@@ -219,11 +219,11 @@ class Proc:
     """A child process with its output in a log file."""
 
     def __init__(self, name: str, args: list[str], log: Path, env: dict[str, str] | None = None,
-                 cwd: Path | None = None) -> None:
+                 cwd: Path | None = None, pass_fds: tuple[int, ...] = ()) -> None:
         self.name, self.log = name, log
         self._out = open(log, "w")
         self.popen = subprocess.Popen([str(a) for a in args], stdout=self._out, stderr=subprocess.STDOUT,
-                                      env=env, cwd=cwd, start_new_session=True)
+                                      env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
 
     def text(self) -> str:
         return self.log.read_text(errors="replace")
@@ -295,7 +295,8 @@ class Stack:
     temporal_tls: TLSConfig | None = None
     agentd_tls: dict | None = None
 
-    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False, fixture: bool = True) -> None:
+    def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False, fixture: bool = True,
+                 hold_fds: tuple[int, ...] = ()) -> None:
         self.tmp = tmp
         self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
         # Temporal's dev server keeps everything in memory unless it has a database file: with one,
@@ -307,6 +308,9 @@ class Stack:
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
         self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
+        # Temporal and agentd keep these open, and with them any lock on them: the evaluation's
+        # state directory stays locked while what a killed runner left behind still runs.
+        self.hold_fds = hold_fds
         self.fixture = fixture
         self.commit = make_mirror(tmp / "mirror", live_repo) if fixture else ""
         self.data_dir = tmp / "agentd" / "data"
@@ -315,9 +319,13 @@ class Stack:
         self.runtime_port = free_port()
         self.runtime_socket = self.sock_dir / "runtime" / "runtime.sock"
         self.temporal_address = f"127.0.0.1:{free_port()}"
-        self._start_temporal()
-        if fixture:
-            self._start_github()
+        try:
+            self._start_temporal()
+            if fixture:
+                self._start_github()
+        except BaseException:  # a signal while Temporal starts, too: nothing is left running
+            self.close()
+            raise
 
     # --- processes ---------------------------------------------------------------------------
 
@@ -331,7 +339,7 @@ class Stack:
                                   "--ui-port", str(free_port()), "--headless", "--log-level", "warn",
                                   "--search-attribute", "AgentState=Keyword",
                                   *(["--db-filename", str(self.temporal_db)] if self.temporal_db else [])],
-                     self.tmp / f"temporal{n or ''}.log")
+                     self.tmp / f"temporal{n or ''}.log", pass_fds=self.hold_fds)
             self.procs.append(p)
             wait_for(lambda: self._temporal_ready() or not p.alive(), "the Temporal dev server", timeout=60)
             if p.alive():
@@ -481,7 +489,7 @@ class Stack:
     def _launch_agentd(self) -> Proc:
         n = sum(p.name.startswith("agentd") for p in self.procs)
         name = "agentd" if n == 0 else f"agentd{n + 1}"
-        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log")
+        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log", pass_fds=self.hold_fds)
         self.procs.append(p)
         self.agentd = p
         wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd")
@@ -514,7 +522,10 @@ class Stack:
     def sandbox_env(self) -> dict[str, str]:
         # In production agentd's data lives under the home directory, which the macOS sandbox
         # cannot read. Test data lives elsewhere, so keep it out of reach explicitly.
-        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": ":".join(map(str, [self.tmp, *self.deny_read]))}
+        denied = [str(p) for p in [self.tmp, *self.deny_read]]
+        if any(":" in p for p in denied):  # the list is separated by ':'
+            raise ValueError(f"a path the Worker may not read has a ':' in it: {denied}")
+        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": ":".join(denied)}
 
     def start_worker(self, workflows: str | None = None) -> Worker:
         n = len(self.workers) + 1
@@ -640,7 +651,7 @@ class Stack:
     # --- agentd's ledger and logs ------------------------------------------------------------
 
     def ledger(self, sql: str, *params: Any) -> list[sqlite3.Row]:
-        db = sqlite3.connect(f"file:{self.data_dir / 'ledger.db'}?mode=ro", uri=True)
+        db = sqlite3.connect((self.data_dir / "ledger.db").absolute().as_uri() + "?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         try:
             return db.execute(sql, params).fetchall()

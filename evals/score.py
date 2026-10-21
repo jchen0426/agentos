@@ -4,10 +4,11 @@ A run is judged by its outcome and the ledger, never by its run status (most aud
 end SUCCEEDED, with the reason in the outcome). Its report is the model answer the workflow
 accepted; a run without one (a refusal, an answer that kept breaking the schema) found nothing.
 
-A void run is one the infrastructure ended, not the model: stopped by the runner (a timeout,
-budget it waited for, an approval or reconciliation it waited for), lost by Temporal, a report
-not posted (FAILED), or a call that failed for good ("failed: ..."). The rates leave void runs
-out, and count them on their own; the runner can run them again (--retry-void).
+A run counts when the model gave an answer: an accepted report, a refusal, or an answer that
+broke the schema. Any other run is void, whatever ended it (a timeout, budget it waited for, a
+cancel, a policy that denied the call, a provider that kept failing, a lost run): the rates
+leave void runs out, and the report counts them by reason. The runner can run them again
+(--retry-void); the runs they replaced still count in the money spent and the void count.
 
 - Detection: a finding in the labelled file, within WINDOW lines of a labelled line (in the
   commit's version of the file), with the label's CWE: the strict rate. The lenient rate also
@@ -20,6 +21,9 @@ out, and count them on their own; the runner can run them again (--retry-void).
   and lenient: a lenient false pass is a run that missed the flaw, not just its CWE's name.
 - Confidence intervals: a bootstrap over cases. A case's runs are resampled together, since
   three runs of one commit are not three samples of the set; pairs are resampled as pairs.
+- Answers: refusals, broken answers and cache hits count every answer a profile's runs got,
+  the replaced runs' too. A server-side fallback answering for the model (the request billed,
+  or was answered by, a model other than the one asked) counts as a refusal of the model.
 """
 
 from __future__ import annotations
@@ -46,10 +50,24 @@ def findings(run: dict) -> list[dict]:
     return list(report.get("findings") or []) if report else []
 
 
+MODEL_STATUSES = ("ok", "refused", "invalid_output")  # an answer of the model's
+
+
 def void(run: dict) -> bool:
-    """Whether the infrastructure ended the run rather than the model (module comment)."""
-    return (run.get("ended_by") not in (None, "run") or run.get("state") == "FAILED"
-            or (run.get("outcome") or "").startswith("failed"))
+    """Whether the model gave the run no answer (module comment)."""
+    return not (run.get("report") is not None or run.get("outcome") in ("refused", "invalid_output")
+                or any(a.get("status") in MODEL_STATUSES for a in run.get("answers", [])))
+
+
+def void_reason(run: dict) -> str:
+    """Why a void run is void, in a few words: how it ended, or what its outcome says."""
+    if run.get("ended_by") not in (None, "run"):
+        return f"({run['ended_by']})"
+    if run.get("state") == "CANCELLED":
+        return "(cancelled)"
+    outcome = run.get("outcome") or ""
+    kind, _, detail = outcome.partition(":")
+    return (kind + (": " + detail.strip()[:60] if detail.strip() else "")) if outcome else f"({run.get('state', '?')})"
 
 
 def _paths(name: object) -> set[str]:
@@ -144,12 +162,13 @@ def rate(groups: list[tuple[int, int]], seed: int) -> dict:
 
 # --- per model ------------------------------------------------------------------------------
 
-def metrics(cs: CaseSet, runs: list[dict], seed: int = 0) -> dict[str, dict]:
-    """The metrics of each profile's runs, keyed by profile."""
+def metrics(cs: CaseSet, runs: list[dict], seed: int = 0, replaced: Sequence[dict] = ()) -> dict[str, dict]:
+    """The metrics of each profile's runs, keyed by profile. `replaced` are the void runs that
+    --retry-void ran again: they count in the money and the void runs, in no rate."""
     by_profile: dict[str, list[dict]] = defaultdict(list)
     for r in runs:
         by_profile[r["profile"]].append(r)
-    return {p: _profile(cs, rs, seed) for p, rs in by_profile.items()}
+    return {p: _profile(cs, rs, seed, [r for r in replaced if r["profile"] == p]) for p, rs in by_profile.items()}
 
 
 def _groups(cases: list[Case], runs: list[dict], hit: Callable[[Case, dict], bool]) -> list[tuple[int, int]]:
@@ -166,7 +185,7 @@ def _detection(cases: list[Case], runs: list[dict], seed: int, how: str = "stric
     return rate(_groups(cases, runs, lambda c, r: detected(c, r, how)), seed)
 
 
-def _profile(cs: CaseSet, runs: list[dict], seed: int) -> dict:
+def _profile(cs: CaseSet, runs: list[dict], seed: int, replaced: list[dict]) -> dict:
     vulns = [c for c in cs.cases if c.kind == "vuln"]
     benign = [c for c in cs.cases if c.kind == "benign"]
     injected = [c for c in cs.cases if c.kind == "injection"]
@@ -178,6 +197,8 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int) -> dict:
         "unexpected_models": sum(any(m != r["expect"] for m in r.get("models", [])) for r in runs if r.get("expect")),
         "runs": len(runs),
         "void": len(runs) - len(valid),
+        "void_reasons": dict(sorted(_count(void_reason(r) for r in [*runs, *replaced] if void(r)).items())),
+        "replaced": len(replaced),
         "answered": sum(r.get("report") is not None for r in valid),
         "outcomes": dict(sorted(_count(outcome_kind(r) for r in runs).items())),
         "detection": _detection(vulns, runs, seed),
@@ -204,15 +225,17 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int) -> dict:
     patched = [r for r in valid if (r.get("report") or {}).get("patch") and r.get("patch_applies") is not None]
     out["patch_applicable"] = {"patches": len(patched), "applied": sum(bool(r["patch_applies"]) for r in patched),
                                "rate": (sum(bool(r["patch_applies"]) for r in patched) / len(patched)) if patched else None}
-    # Money is money: every run's, void or not.
-    spent = [r.get("spent_micros", 0) for r in runs]
-    out["cost_usd"] = {"per_audit": (sum(spent) / len(spent) / 1e6) if spent else None, "total": sum(spent) / 1e6}
-    # A run picked up by a later runner has the downtime in its seconds.
-    timed = [r for r in valid if r.get("seconds") is not None and not r.get("resumed")]
+    # Money is money: every run's, void or not, replaced or not; per audit, over the latest runs.
+    spent = [r.get("spent_micros", 0) for r in [*runs, *replaced]]
+    out["cost_usd"] = {"per_audit": (sum(spent) / len(runs) / 1e6) if runs else None, "total": sum(spent) / 1e6}
+    # Only runs that ended by themselves: a run the runner stopped took longer than it shows, and
+    # one picked up by a later runner has the downtime in its seconds.
+    timed = [r for r in valid if r.get("seconds") is not None and r.get("ended_by") in (None, "run")
+             and not r.get("resumed")]
     seconds = [r["seconds"] for r in timed]
     out["latency_s"] = {"p50": quantile(seconds, 0.5), "p95": quantile(seconds, 0.95), "runs": len(seconds),
                         "left_out": len(runs) - len(timed)}
-    answers = [a for r in runs for a in r.get("answers", [])]
+    answers = [a for r in [*runs, *replaced] for a in r.get("answers", [])]
     read = sum(a.get("usage", {}).get("cache_read_tokens", 0) for a in answers)
     inputs = sum(_input_tokens(a.get("usage", {})) for a in answers)
     out["cache_hit_rate"] = read / inputs if inputs else None
@@ -221,8 +244,9 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int) -> dict:
     out["invalid_output"] = {"answers": len(answered), "invalid": invalid,
                              "rate": invalid / len(answered) if answered else None}
     # A server-side fallback answers in the same request when the model declines: the request
-    # bills two models. Its answer is the fallback's, and the model's refusal counts.
-    out["fallback_answers"] = sum(a.get("fallback", False) for a in answered)
+    # bills a model other than the one asked. Its answer is the fallback's, and the model's
+    # refusal counts; if the fallback declined too, the request is one refusal.
+    out["fallback_answers"] = sum(bool(a.get("fallback")) and a["status"] != "refused" for a in answered)
     out["refusals"] = sum(a["status"] == "refused" for a in answered) + out["fallback_answers"]
     out["refused_runs"] = sum(r.get("outcome") == "refused" for r in runs)
     out["cwe_unparsed"] = sum(cwe.number(f.get("cwe")) is None for r in valid for f in findings(r))

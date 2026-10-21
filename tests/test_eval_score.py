@@ -209,8 +209,8 @@ def test_cost_latency_cache_refusals_and_broken_answers():
     assert m["unexpected_models"] == 0
     assert metrics([run("v", models=["m/one", "m/two"], expect="m/one"), run("v", models=["m/one"], expect="m/one"),
                     run("v", models=[], expect="m/one")])["unexpected_models"] == 1
-    # The run the runner stopped at its timeout is void: in no rate.
-    assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 2
+    # The run the runner stopped at its timeout holds the model's refusal: it counts.
+    assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 3
 
 
 def test_detection_by_source_and_by_the_cutoff_of_the_ledgers_model():
@@ -231,28 +231,43 @@ def test_a_vulnerability_is_public_from_its_advisory_or_its_fix_whichever_came_f
     assert not after_cutoff(late_fix, "") and public(caseset(x={**CASE_X, "published": None}).case("x")) is None
 
 
-def test_void_runs_count_on_their_own_and_in_no_rate():
-    runs = [run("v", f(10)), run("v", outcome="", ended_by="timeout", state="CANCELLED"),
-            run("v", outcome="failed: activity error", state="SUCCEEDED"), run("v", f(10), state="FAILED"),
-            run("v", outcome="", ended_by="lost", state="UNKNOWN"), run("n", f(1, severity="high")),
-            run("n", outcome="", ended_by="budget", state="CANCELLED")]
+def test_a_run_counts_when_the_model_answered_and_is_void_otherwise():
+    asked = {"status": None, "model": "m/one", "usage": {}}  # a request with no answer: a 429, a cut
+    runs = [run("v", f(10)),
+            run("v", f(10), state="FAILED"),  # the report was not posted, but the model answered
+            run("v", f(10), state="CANCELLED"),  # cancelled after the answer
+            run("v", outcome="refused"),
+            run("v", outcome="", ended_by="timeout", state="CANCELLED", answers=[asked]),
+            run("v", outcome="failed: activity error", answers=[asked]),
+            run("v", outcome="denied"),  # a policy that does not let the provider have the data
+            run("v", outcome="", state="CANCELLED"),
+            run("n", f(1, severity="high")), run("n", outcome="", ended_by="budget", state="CANCELLED")]
     m = metrics(runs)
-    assert m["void"] == 5 and m["runs"] == 7 and m["answered"] == 2
-    assert (m["detection"]["hits"], m["detection"]["runs"]) == (1, 1)
+    assert (m["runs"], m["void"], m["answered"]) == (10, 5, 4)
+    assert (m["detection"]["hits"], m["detection"]["runs"]) == (3, 4)
     assert (m["false_positive"]["hits"], m["false_positive"]["runs"]) == (1, 1)
-    assert m["outcomes"] == {"(budget)": 1, "(lost)": 1, "(timeout)": 1, "failed": 1, "ok": 3}
+    assert m["void_reasons"] == {"(budget)": 1, "(cancelled)": 1, "(timeout)": 1, "denied": 1, "failed: activity error": 1}
     by_case = {r["case"]: r["by"]["p1"] for r in score.per_case(CS, runs)}
-    assert (by_case["v"]["runs"], by_case["v"]["void"], by_case["n"]["void"]) == (1, 4, 1)
-    # A refusal and a broken answer are the model's: not void.
-    assert not score.void(run("v", outcome="refused")) and not score.void(run("v", outcome="invalid_output"))
+    assert (by_case["v"]["runs"], by_case["v"]["void"], by_case["n"]["void"]) == (4, 4, 1)
+    assert not score.void(run("v", outcome="invalid_output"))
+
+
+def test_void_runs_run_again_still_count_in_the_money_and_the_void_runs():
+    replaced = [run("w", outcome="failed: boom", spent_micros=7000)]
+    m = score.metrics(CS, [run("w", spent_micros=1000)], seed=7, replaced=replaced)["p1"]
+    assert (m["replaced"], m["void"], m["void_reasons"]) == (1, 0, {"failed: boom": 1})
+    assert m["cost_usd"] == {"per_audit": pytest.approx(8000 / 1e6), "total": pytest.approx(8000 / 1e6)}
+    assert (m["detection"]["runs"]) == 1
 
 
 def test_a_server_side_fallback_answer_is_a_refusal_of_the_model():
     fallback = {"status": "ok", "model": "m/one", "fallback": True, "billed": ["m/one", "m/two"], "usage": {}}
     unanswered = {"status": None, "model": "m/one", "usage": {}}  # a 429: no answer, no invalid one either
-    m = metrics([run("w", answers=[fallback]), run("w", answers=[unanswered, {**fallback, "fallback": False}])])
-    assert (m["fallback_answers"], m["refusals"], m["refused_runs"]) == (1, 1, 0)
-    assert m["invalid_output"] == {"answers": 2, "invalid": 0, "rate": 0.0}
+    both_declined = {"status": "refused", "model": "m/one", "fallback": True, "usage": {}}
+    m = metrics([run("w", answers=[fallback]), run("w", answers=[unanswered, {**fallback, "fallback": False}]),
+                 run("w", outcome="refused", answers=[both_declined])])
+    assert (m["fallback_answers"], m["refusals"], m["refused_runs"]) == (1, 2, 1)
+    assert m["invalid_output"] == {"answers": 3, "invalid": 0, "rate": 0.0}
 
 
 def test_resumed_runs_leave_latency_and_unreadable_cwes_are_counted():
@@ -272,6 +287,9 @@ def test_a_degenerate_interval_says_so():
     from evals import report
     assert report.interval({"hits": 0, "runs": 36, "rate": 0.0, "ci": [0.0, 0.0]}) == "0%（0/36；区间退化：每个用例都一样）"
     assert report.interval({"hits": 9, "runs": 36, "rate": 0.25, "ci": [0.1, 0.4]}) == "25%（9/36；95% 区间 10%–40%）"
+    same = {"pairs": 12, "base": 0.5, "injected": 0.5, "drop": 0.0, "ci": [0.0, 0.0]}
+    assert report._drop(same) == "+0 个百分点（50% → 50%，12 对；区间退化：每一对都一样）"
+    assert report._drop({**same, "drop": 0.25, "ci": [0.1, 0.4]}).endswith("12 对；95% 区间 +10–+40）")
 
 
 def test_patch_applicability_counts_the_runs_with_a_patch_that_was_checked():
@@ -323,6 +341,7 @@ def test_a_journals_results_are_the_latest_of_each_profile_case_and_rep(tmp_path
               {"event": "result", "profile": "q", "case": "v", "rep": 1, "run_id": "c", "outcome": "ok"}]:
         j.append(e)
     assert sorted(e["run_id"] for e in j.results()) == ["b", "c"]
+    assert [e["run_id"] for e in j.replaced()] == ["a"]  # run again: its money and its void still count
 
 
 def test_a_journal_line_cut_short_is_skipped_and_the_next_one_starts_fresh(tmp_path):

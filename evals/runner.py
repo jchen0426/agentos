@@ -9,17 +9,25 @@ a runner is stopped and started again. The runner runs every case `runs` times u
 profile, one rep of every case before the next, and judges each run by its outcome and the
 ledger (evals/score.py). A journal in the state directory records each run as it starts and as
 it ends, so a runner started again on it picks up the runs in flight and skips the ones done.
-The first run of a profile goes alone: if the infrastructure ends it (evals/score.py's void),
-the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker.
+The first run of a profile goes alone: if the model gave it no answer (evals/score.py's void),
+the runner stops rather than spend the rest. So does a dead Temporal, agentd or Worker. Void
+runs run again only when asked (--retry-void), after the runs never run; one that is void again
+does not stop the runner, the run after it goes alone instead.
 
-Money: a paid profile needs a cap. A run starts only if what the ledgers say the state
-directory's runs have spent (settled, or reserved and not yet settled), plus the budgets of the
-paid runs not yet ended, plus its own budget stay within the cap. agentd never lets a run spend
-past its budget, so the runs never spend past the cap; if one ever did (a reservation bound
-that is wrong, which agentd logs as an error), no paid run starts from then on and the ones in
-flight are cancelled. A run the ledger has and the journal does not (a runner stopped between
+Money: a paid profile needs a cap on what the state directory's runs spend, every runner on it
+together; a new state directory is a new evaluation, with a cap of its own. A run starts only
+if what the ledgers say the state directory's runs have spent (settled, or reserved and not yet
+settled), plus the budgets of the paid runs not yet ended, plus its own budget stay within the
+cap. agentd never lets a run spend past its budget, so the runs never spend past the cap; if
+one ever did (a reservation bound that is wrong, which agentd logs as an error), no paid run
+starts from then on, and every paid run still in flight is cancelled, this runner's and those
+an earlier one left. A run the ledger has and the journal does not (a runner stopped between
 starting it and writing it down) is cancelled before the Worker comes up: nobody would watch
 it. The cap counts the price table's prices, not the provider's bill.
+
+One runner at a time uses a state directory, and its lock stays held while anything a runner
+started still runs: Temporal and agentd hold it too. A runner killed with SIGKILL leaves the
+directory locked until they are stopped, rather than to a second Temporal on the same database.
 """
 
 from __future__ import annotations
@@ -28,22 +36,24 @@ import fcntl
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from evals.cases import Case, CaseSet
 from evals.mirrors import inside_repo
-from evals.score import detected, false_positive, void
+from evals.score import detected, false_positive, void, void_reason
 from tests.harness import SANDBOX, TERMINAL, Stack, wait_for
 
 REPO = Path(__file__).resolve().parents[1]
 BUDGET = 1_500_000  # micros a run may spend: above the gateway's worst-case reservation (section 9)
 TASK = "security-audit"
-_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ENDED = TERMINAL | {"UNKNOWN"}
 
 
@@ -138,13 +148,24 @@ class Journal:
             f.flush()
             os.fsync(f.fileno())
 
-    def results(self) -> list[dict]:
-        """Each (profile, case, rep)'s latest result: a void run run again is superseded."""
+    def _results(self) -> tuple[list[dict], list[dict]]:
         latest: dict = {}
+        replaced = []
         for e in self.entries():
             if e["event"] == "result":
-                latest[(e["profile"], e["case"], e["rep"])] = e
-        return list(latest.values())
+                key = (e["profile"], e["case"], e["rep"])
+                if key in latest:
+                    replaced.append(latest[key])
+                latest[key] = e
+        return list(latest.values()), replaced
+
+    def results(self) -> list[dict]:
+        """Each (profile, case, rep)'s latest result."""
+        return self._results()[0]
+
+    def replaced(self) -> list[dict]:
+        """The results a later one of the same (profile, case, rep) replaced: void runs run again."""
+        return self._results()[1]
 
     def unfinished(self) -> list[dict]:
         ended = {e["run_id"] for e in self.entries() if e["event"] == "result"}
@@ -161,81 +182,104 @@ class _Run:
     deny_read: list[Path]
     budget_micros: int
     cap_micros: int | None
+    lock: int  # the state directory's lock, which Temporal and agentd hold too
+    agentos: str
     log: object
-    overspent: bool = False
 
 
 def run(cs: CaseSet, profiles: list[Profile], mirrors: dict[str, Path], state: Path, runs: int = 3,
         budget_micros: int = BUDGET, cap_micros: int | None = None, cases: list[Case] | None = None,
-        retry_void: bool = False, log=print) -> list[dict]:
+        retry_void: bool = False, deny_read: Sequence[Path] = (), log=print) -> list[dict]:
     """Runs each of `cases` (all of the set's, by default) `runs` times under each profile, and
     returns the journal's latest results: these runs' and any an earlier runner on `state`
     finished. `mirrors` names every project's mirror, whatever cases this runner runs: runs in
-    flight from an earlier runner may audit others. With retry_void, void runs run again."""
+    flight from an earlier runner may audit others. With retry_void, void runs run again. The
+    sandboxed Worker reads none of the state directory, the mirrors and `deny_read`."""
     if any(p.paid for p in profiles) and cap_micros is None:
         raise ValueError("a paid profile needs a cap on what the runs may spend")
     if budget_micros <= 0:  # agentd takes 0 for its default budget, which the cap would not see
         raise ValueError("each run needs a budget above 0")
     if any(p.real for p in profiles) and SANDBOX == "none":
         raise ValueError("real models run with the Worker in a sandbox: set AGENTOS_SANDBOX")
-    if any(not _NAME.match(p.name) for p in profiles) or len({p.name for p in profiles}) != len(profiles):
+    if any(not _NAME.fullmatch(p.name) for p in profiles) or len({p.name for p in profiles}) != len(profiles):
         raise ValueError("profile names are distinct, lowercase letters, digits and dashes")
-    cases = list(cs.cases if cases is None else cases)
+    cases = list({c.id: c for c in (cs.cases if cases is None else cases)}.values())  # each case once
     missing = [c.id for c in cases if not c.commit]
     if missing:
         raise ValueError(f"cases without a commit ID (build their mirrors first): {missing}")
     state = state.resolve()
     if inside_repo(state):
         raise ValueError(f"the state directory {state} must be outside the repository: the sandboxed Worker reads it")
+    mirrors = {name: Path(path).resolve() for name, path in mirrors.items()}
+    hidden = [state, *mirrors.values(), *(Path(p).resolve() for p in deny_read)]
+    if any(":" in str(p) for p in hidden):
+        raise ValueError(f"no ':' in the paths of the state directory, the mirrors and the cache, please: the "
+                         f"sandbox's list of paths it denies the Worker is separated by ':' ({hidden})")
     state.mkdir(parents=True, exist_ok=True)
-    with open(state / "lock", "w") as lock:
+    lock = os.open(state / "lock", os.O_RDONLY | os.O_CREAT, 0o600)
+    try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError(f"another runner is using {state}") from None
-        mirrors = {name: Path(path).resolve() for name, path in mirrors.items()}
-        r = _Run(cs, Journal(state / "journal.jsonl"), state, {repo_id(n): {"mirror": str(p)} for n, p in mirrors.items()},
-                 [state, *mirrors.values()], budget_micros, cap_micros, log)
+            raise RuntimeError(f"another runner is using {state}, or what is left of one: a Temporal or an agentd "
+                               f"it started (lsof {state / 'lock'} names them)") from None
+        journal = Journal(state / "journal.jsonl")
+        gone = sorted(p for p in {e["profile"] for e in journal.entries()} if not _ledger(state, p).exists())
+        if gone:
+            raise RuntimeError(f"the journal in {state} has runs of {gone}, whose ledgers are gone: what those runs "
+                               "spent is unknown, and the cap cannot count it (a new state directory starts afresh)")
+        r = _Run(cs, journal, state, {repo_id(n): {"mirror": str(p)} for n, p in mirrors.items()}, hidden,
+                 budget_micros, cap_micros, lock, _agentos(), log)
         for profile in profiles:
             _run_profile(r, profile, cases, runs, retry_void)
-        return r.journal.results()
-
-
-def _overspent(journal: Journal) -> bool:
-    budgets = {e["run_id"]: e["budget_micros"] for e in journal.entries() if e["event"] == "start"}
-    return any(e["spent_micros"] > budgets.get(e["run_id"], e["spent_micros"]) for e in journal.results())
+        return journal.results()
+    finally:
+        os.close(lock)
 
 
 def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_void: bool) -> None:
     log, journal = r.log, r.journal
-    r.overspent = r.overspent or _overspent(journal)
-    done = {(e["case"], e["rep"]) for e in journal.results()
-            if e["profile"] == profile.name and not (retry_void and void(e))}
+    latest = {(e["case"], e["rep"]): e for e in journal.results() if e["profile"] == profile.name}
     resumed = [e for e in journal.unfinished() if e["profile"] == profile.name]
-    todo = deque((c, rep) for rep in range(1, runs + 1) for c in cases
-                 if (c.id, rep) not in done and not any(e["case"] == c.id and e["rep"] == rep for e in resumed))
+    flying = {(e["case"], e["rep"]) for e in resumed}
+    fresh, again = [], []
+    for rep in range(1, runs + 1):
+        for c in cases:
+            last = latest.get((c.id, rep))
+            if (c.id, rep) in flying or (last is not None and not (retry_void and void(last))):
+                continue
+            (fresh if last is None else again).append((c, rep, last is not None))
+    # The runs never run come first: the first run goes alone, and a void run may well be void again.
+    todo = deque(fresh + again)
     if not todo and not resumed:
         return
     stack_dir = r.state / profile.name / "stack"
     stack_dir.mkdir(parents=True, exist_ok=True)
-    stack = Stack(stack_dir, temporal_db=True, fixture=False)
-    stack.deny_read = r.deny_read  # the journal and the mirrors, besides agentd's data
+    stack = None
     try:
+        stack = Stack(stack_dir, temporal_db=True, fixture=False, hold_fds=(r.lock,))
+        stack.deny_read = r.deny_read  # the journal, the mirrors and the cache, besides agentd's data
         stack.start_agentd(policy=policy(list(r.repos)), models=profile.models, prices=profile.prices, repos=r.repos)
-        if not (stack.data_dir / "ledger.db").exists():
-            raise RuntimeError(f"agentd is up, but its ledger is not at {stack.data_dir / 'ledger.db'}")
-        unknown = _cancel_unknown(stack, journal, log)  # before the Worker: agentd refuses their calls
+        if not _ledger(r.state, profile.name).exists():
+            raise RuntimeError(f"agentd is up, but its ledger is not at {_ledger(r.state, profile.name)}")
+        # Before the Worker comes up: agentd refuses the calls of the runs it has cancelled.
+        unknown = _cancel_unknown(stack, journal, log)
+        if profile.paid and resumed and _overspent(r.state):
+            log(f"[{profile.name}] a run spent past its budget: the {len(resumed)} paid runs left in flight stop")
+            for e in resumed:
+                e["stopped"] = "overspent"
+                _cancel(stack, e)
         stack.start_worker()
         for gone in unknown:
             wait_for(lambda gone=gone: stack.get_run(gone)["state"] in ENDED, f"run {gone['run_id']} to end",
                      timeout=300, interval=1)
-        log(f"[{profile.name}] {len(todo)} runs to start, {len(resumed)} to pick up")
+        log(f"[{profile.name}] {len(todo)} runs to start ({len(again)} again), {len(resumed)} to pick up")
         watching = {e["run_id"]: {**e, "since": time.monotonic(), "resumed": True} for e in resumed}
-        confirmed = False  # a run of this profile has ended without the infrastructure ending it
+        confirmed = False  # a run of this profile has got an answer from the model
         while todo or watching:
             _alive(stack)
             while todo and len(watching) < (profile.concurrency if confirmed else 1):
-                if profile.paid and r.overspent:
+                if profile.paid and _overspent(r.state):
                     log(f"[{profile.name}] {len(todo)} runs not started: a run spent past its budget")
                     todo.clear()
                     break
@@ -247,10 +291,10 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                                 f"spending past the cap of ${r.cap_micros / 1e6:.2f}")
                             todo.clear()
                         break
-                c, rep = todo.popleft()
-                entry = _start(stack, r.cs, c, rep, profile, r.budget_micros)
+                c, rep, retry = todo.popleft()
+                entry = _start(stack, r.cs, c, rep, profile, r.budget_micros, r.agentos)
                 journal.append(entry)
-                watching[entry["run_id"]] = {**entry, "since": time.monotonic()}
+                watching[entry["run_id"]] = {**entry, "since": time.monotonic(), "again": retry}
             for run_id, entry in list(watching.items()):
                 record = _watch(stack, entry, profile)
                 if record is None:
@@ -258,22 +302,35 @@ def _run_profile(r: _Run, profile: Profile, cases: list[Case], runs: int, retry_
                 journal.append(record)
                 del watching[run_id]
                 log(_line(r.cs, record))
-                if record["spent_micros"] > entry["budget_micros"]:
-                    r.overspent = True
-                    log(f"[{profile.name}] run {run_id} spent ${record['spent_micros'] / 1e6:.4f}, past its budget "
-                        f"of ${entry['budget_micros'] / 1e6:.4f}: no more paid runs, and the ones in flight stop")
-                    if profile.paid:
-                        for other in watching.values():
-                            _cancel(stack, other)
+                stopping = [e for e in watching.values() if "stopped" not in e]
+                if profile.paid and stopping and _overspent(r.state):
+                    log(f"[{profile.name}] a run spent past its budget: no more paid runs, and the "
+                        f"{len(stopping)} in flight stop")
+                    for other in stopping:
+                        other["stopped"] = "overspent"
+                        _cancel(stack, other)
                 if not void(record):
                     confirmed = True
                 elif not confirmed and not record["resumed"]:
-                    raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
-                                       f"{record['outcome'] or record['ended_by']} {record['failure']}".rstrip())
+                    if not entry.get("again"):
+                        raise RuntimeError(f"[{profile.name}] the first run ended without the model: "
+                                           f"{void_reason(record)}")
+                    log(f"[{profile.name}] {record['case']} #{record['rep']} is void again: the next run goes alone too")
             if watching:
                 time.sleep(1)
     finally:
+        if stack is not None:
+            _close(stack)
+
+
+def _close(stack: Stack) -> None:
+    """Stops the stack; a SIGTERM or a Ctrl-C meanwhile waits until it has stopped, rather than
+    leave half of it running."""
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    try:
         stack.close()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
 def _alive(stack: Stack) -> None:
@@ -287,19 +344,44 @@ def _alive(stack: Stack) -> None:
 SPENT = ("SELECT (SELECT COALESCE(SUM(amount_micros), 0) FROM budget_entries WHERE kind = 'SETTLE') + "
          "(SELECT COALESCE(SUM(r.amount_micros), 0) FROM budget_entries r WHERE r.kind = 'RESERVE' AND NOT EXISTS "
          "(SELECT 1 FROM budget_entries c WHERE c.request_id = r.request_id AND c.kind IN ('SETTLE', 'RELEASE')))")
+# The runs that settled and still hold more than their limit and its extensions: agentd's own
+# totals (internal/ledger/queries' GetBudgetTotals), for every run.
+OVERSPENT = """
+SELECT r.workflow_id FROM runs r WHERE
+  COALESCE((SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'SETTLE'), 0)
+  + COALESCE((SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'RESERVE'
+              AND NOT EXISTS (SELECT 1 FROM budget_entries c WHERE c.request_id = e.request_id
+                              AND c.kind IN ('SETTLE', 'RELEASE'))), 0)
+  > r.budget_limit_micros
+    + COALESCE((SELECT SUM(e.amount_micros) FROM budget_entries e WHERE e.workflow_id = r.workflow_id AND e.kind = 'EXTEND'), 0)
+"""
+
+
+def _ledger(state: Path, profile: str) -> Path:
+    return state / profile / "stack" / "agentd" / "data" / "ledger.db"
+
+
+def _query(ledger: Path, sql: str) -> list[tuple]:
+    db = sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True)
+    try:
+        return db.execute(sql).fetchall()
+    finally:
+        db.close()
+
+
+def _ledgers(state: Path) -> list[Path]:
+    return sorted(state.glob("*/stack/agentd/data/ledger.db"))
 
 
 def _spent(state: Path) -> int:
     """What every run in the state directory's ledgers has spent, or may have: settled, and
     reserved but not yet settled or released."""
-    total = 0
-    for path in sorted(state.glob("*/stack/agentd/data/ledger.db")):
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            total += db.execute(SPENT).fetchone()[0]
-        finally:
-            db.close()
-    return total
+    return sum(_query(path, SPENT)[0][0] for path in _ledgers(state))
+
+
+def _overspent(state: Path) -> bool:
+    """Whether a run in the state directory's ledgers has spent past its budget, journal or not."""
+    return any(_query(path, OVERSPENT) for path in _ledgers(state))
 
 
 def spent_in(state: Path) -> int:
@@ -331,35 +413,39 @@ def _cancel_unknown(stack: Stack, journal: Journal, log) -> list[dict]:
     return out
 
 
-def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budget: int) -> dict:
+def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budget: int, agentos: str) -> dict:
     started = stack.agentctl("runs", "start", TASK, "--repo", repo_id(c.project), "--commit", c.commit,
                              "--base", cs.projects[c.project].base, "--budget-micros", str(budget), "--dry-run")
     return {"event": "start", "profile": profile.name, "case": c.id, "rep": rep, "run_id": started["run_id"],
             "temporal_run_id": started["temporal_run_id"], "budget_micros": budget, "paid": profile.paid,
-            "expect": profile.expect, "commit": c.commit, "cases_sha256": cs.sha256, "agentos": _agentos(),
+            "expect": profile.expect, "commit": c.commit, "cases_sha256": cs.sha256, "agentos": agentos,
             "at": time.time()}
 
 
 def _agentos() -> str:
-    """The agentos commit the runs ran with, and whether the checkout had changes."""
+    """The agentos commit the runs ran with, and whether the checkout had changes, files git does
+    not track but does not ignore either among them."""
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
+    dirty = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain"],
                            capture_output=True, text=True).stdout.strip()
     return head + ("+changes" if dirty else "")
 
 
 def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
     """The run's result once it has ended; None while it runs. A run waiting for budget, an
-    approval or a reconciliation, or past the profile's timeout, is cancelled and ended."""
+    approval or a reconciliation, or past the profile's timeout, is cancelled and ended. A run
+    agentd does not have (someone else's ledger in its place) is lost."""
     run = {"run_id": entry["run_id"], "temporal_run_id": entry["temporal_run_id"]}
-    try:
-        state = stack.get_run(run)["state"]
-    except AssertionError:  # agentctl failed: ask again on the next poll, until the timeout
+    got = stack.agentctl_run("runs", "get", run["run_id"])
+    if got.returncode != 0:
+        if "code = NotFound" in got.stderr:
+            return collect(stack, entry, "lost", {"state": "NOT_FOUND", "failure": "agentd has no such run"})
         if time.monotonic() - entry["since"] > profile.timeout:
-            raise
-        return None
+            raise AssertionError(f"agentctl runs get {run['run_id']} failed: {got.stderr.strip()}")
+        return None  # ask again on the next poll, until the timeout
+    state = json.loads(got.stdout)["state"]
     if state in TERMINAL:
-        return collect(stack, entry, "run")
+        return collect(stack, entry, entry.get("stopped", "run"))
     if state == "UNKNOWN":  # Temporal no longer has it
         return collect(stack, entry, "lost")
     ended_by = {"PAUSED_BUDGET": "budget", "WAITING_APPROVAL": "waiting", "WAITING_RECONCILE": "waiting"}.get(state)
@@ -373,16 +459,29 @@ def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
 
 
 def _cut(value: object, n: int) -> object:
-    """A model's string, cut to n characters: it may be anything, of any length."""
-    return value[:n] if isinstance(value, str) else value
+    """A model's string, without the spaces around it and cut to n characters: it may be
+    anything, of any length."""
+    return value.strip()[:n] if isinstance(value, str) else value
 
 
-def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
-    """What a run that has ended did, from agentctl, Temporal and agentd's ledger. The report
-    keeps each finding's severity, CWE, file, line and title, cut short; not its explanation,
-    nor the patch, which may quote the project's code."""
+def _int(digits: str) -> int | None:
+    """A JSON integer, or None for one longer than any line number: Python refuses to read one
+    of over 4300 digits, and a model may well write one."""
+    return int(digits) if len(digits) <= 20 else None
+
+
+def _object(raw: str | bytes) -> dict:
+    """A JSON object that holds what a model wrote."""
+    value = json.loads(raw, parse_int=_int)
+    return value if isinstance(value, dict) else {}
+
+
+def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) -> dict:
+    """What a run that has ended did, from agentctl (or `info`, for a run agentd does not have),
+    Temporal and agentd's ledger. The report keeps each finding's severity, CWE, file, line and
+    title, cut short; not its explanation, nor the patch, which may quote the project's code."""
     run = {"run_id": entry["run_id"], "temporal_run_id": entry["temporal_run_id"]}
-    info = stack.get_run(run)
+    info = info if info is not None else stack.get_run(run)
     try:
         started, closed = stack.execution_times(run)
     except Exception:  # noqa: BLE001 - Temporal no longer has it
@@ -399,15 +498,19 @@ def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
             for k, v in b.items():
                 if k.endswith("_tokens"):
                     usage[k] = usage.get(k, 0) + v
-        # A server-side fallback bills a second model in the same request (section 9).
         answer = {"model": model, "status": None, "answered_by": None, "usage": usage,
-                  "billed": [b.get("model") for b in billed], "fallback": len(billed) > 1}
+                  "billed": [b.get("model") for b in billed]}
         if row["response_blob"]:
             [blob] = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
-            resp = json.loads(blob["bytes"])
+            resp = _object(blob["bytes"])
             answer["status"], answer["answered_by"] = resp.get("status"), resp.get("model")
             if resp.get("status") == "ok":
-                accepted.append(resp.get("value") or {})
+                value = resp.get("value")
+                accepted.append(value if isinstance(value, dict) else {})
+        # A server-side fallback (section 9) answers in the same request: the request billed, or
+        # was answered by, a model other than the one asked. A service tier ("@flex") is no other.
+        answer["fallback"] = any(n.split("@", 1)[0] != model for n in [*answer["billed"], answer["answered_by"]]
+                                 if isinstance(n, str))
         answers.append(answer)
     report = None
     if accepted:
@@ -419,14 +522,14 @@ def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
                   "patch": bool(value.get("patch_ref"))}
     checks = stack.ledger("SELECT outcome FROM calls WHERE workflow_id = ? AND name = 'git.apply_check' "
                           "ORDER BY created_at", entry["run_id"])
-    result = json.loads(info.get("result_json") or "{}")
+    result = _object(info.get("result_json") or "{}")
     return {"event": "result", "profile": entry["profile"], "case": entry["case"], "rep": entry["rep"],
             "commit": entry.get("commit"), "cases_sha256": entry.get("cases_sha256"), "expect": entry.get("expect"),
             "agentos": entry.get("agentos"), "prompts": sorted(prompts), "resumed": entry.get("resumed", False),
             "run_id": entry["run_id"], "state": info["state"], "outcome": result.get("outcome", ""),
             "failure": (info.get("failure") or "")[:500], "ended_by": ended_by,
             "seconds": (closed - started) if started is not None and closed is not None else None,
-            "spent_micros": int(info["budget_spent_micros"]) + int(info["budget_reserved_micros"]),
+            "spent_micros": int(info.get("budget_spent_micros", 0)) + int(info.get("budget_reserved_micros", 0)),
             "models": list(dict.fromkeys(a["model"] for a in answers)), "answers": answers,
             "accepted_answers": len(accepted), "report": report,
             "patch_applies": (checks[-1]["outcome"] == "ok") if checks else None}
@@ -436,7 +539,7 @@ def _line(cs: CaseSet, r: dict) -> str:
     c = cs.case(r["case"])
     found = len((r["report"] or {}).get("findings", [])) if r["report"] else "-"
     if void(r):
-        verdict = "void"
+        verdict = f"void, {void_reason(r)}"
     elif c.vulnerable:
         verdict = "detected" if detected(c, r) else "missed"
     else:

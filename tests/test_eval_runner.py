@@ -2,6 +2,7 @@
 up Temporal, agentd and a sandboxed Worker, audits a tiny case set (tests/eval_fixture.py) in
 dry-run under two profiles, and the metrics come out as the scripted answers make them."""
 
+import collections
 import dataclasses
 import fcntl
 import json
@@ -104,6 +105,78 @@ def stranded_run(state: Path, profile: runner.Profile, repos: dict, case, budget
         stack.close()
 
 
+class LedgerOf:
+    """agentctl and agentd's ledger as runner.collect reads them, for one run that succeeded."""
+
+    def __init__(self, calls: list[dict], blobs: dict[str, bytes]) -> None:
+        self.calls, self.blobs = calls, blobs
+
+    def get_run(self, run: dict) -> dict:
+        return {"state": "SUCCEEDED", "result_json": '{"outcome": "ok"}', "budget_spent_micros": "10",
+                "budget_reserved_micros": "0"}
+
+    def execution_times(self, run: dict) -> tuple[float, float]:
+        return 100.0, 110.0
+
+    def ledger(self, sql: str, *params) -> list[dict]:
+        if "FROM model_calls" in sql:
+            return self.calls
+        return [{"bytes": self.blobs[params[0]]}] if "FROM blobs" in sql else []
+
+
+def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() -> None:
+    primary, fallback = "anthropic/claude-opus-5-5", "anthropic/claude-opus-4-8"
+
+    def call(blob: str, billed: list[str], provider: str = "anthropic", model: str = "claude-opus-5-5") -> dict:
+        return {"provider": provider, "model": model, "prompt_version": "audit_v1", "response_blob": "sha256:" + blob,
+                "usage_json": json.dumps([{"model": b, "input_tokens": 10} for b in billed])}
+
+    def answer(model: str) -> bytes:
+        return json.dumps({"status": "ok", "model": model, "value": {"findings": []}}).encode()
+
+    # A line of 5000 digits, which Python's json refuses to read as an int; a CWE after 70 spaces.
+    huge = (b'{"status": "ok", "model": "anthropic/claude-opus-5-5", "value": {"findings": [{"severity": " high ", '
+            b'"cwe": "' + b" " * 70 + b'CWE-89", "file": "app/db.py", "line": ' + b"9" * 5000 +
+            b', "title": "t"}], "patch_ref": null}}')
+    record = runner.collect(LedgerOf(
+        [call("both", [primary, fallback]),  # the model declined, the fallback answered: both billed
+         call("one", [fallback]),  # billed as one entry, under the fallback's name
+         call("tier", ["openai/gpt-6.1-sol@flex"], "openai", "gpt-6.1-sol"),  # another tier, the same model
+         call("huge", [primary])],
+        {"both": answer(fallback), "one": answer(fallback), "tier": answer("openai/gpt-6.1-sol"), "huge": huge}),
+        {"run_id": "r", "temporal_run_id": "t", "profile": "p", "case": "py-sqli", "rep": 1}, "run")
+    assert [a["fallback"] for a in record["answers"]] == [True, True, False, False]
+    assert record["report"]["findings"] == [{"severity": "high", "cwe": "CWE-89", "file": "app/db.py", "line": None,
+                                             "title": "t"}]
+    assert not score.void(record) and record["spent_micros"] == 10
+
+
+def fake_ledger(path: Path, runs: dict[str, int], entries: list[tuple]) -> None:
+    """The two tables of agentd's ledger that hold the money."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE IF NOT EXISTS runs (workflow_id TEXT, budget_limit_micros INTEGER);"
+                     "CREATE TABLE IF NOT EXISTS budget_entries (workflow_id TEXT, kind TEXT, amount_micros INTEGER,"
+                     " request_id TEXT);")
+    db.executemany("INSERT INTO runs VALUES (?, ?)", runs.items())
+    db.executemany("INSERT INTO budget_entries VALUES (?, ?, ?, ?)", entries)
+    db.commit()
+    db.close()
+
+
+def test_spending_and_overspending_come_from_every_profiles_ledger(tmp_path: Path) -> None:
+    state = tmp_path / "state #1?%"  # what a file: URI must escape
+    fake_ledger(runner._ledger(state, "a"), {"r1": 100},
+                [("r1", "RESERVE", 60, "q1"), ("r1", "SETTLE", 50, "q1"), ("r1", "RESERVE", 40, "q2")])
+    fake_ledger(runner._ledger(state, "b"), {"r2": 100}, [("r2", "RESERVE", 100, "q3"), ("r2", "RELEASE", 0, "q3")])
+    assert runner._spent(state) == 50 + 40 and not runner._overspent(state)
+    # A settlement past its reservation: run r2 has spent past its limit, journal or not.
+    fake_ledger(runner._ledger(state, "b"), {}, [("r2", "RESERVE", 50, "q4"), ("r2", "SETTLE", 120, "q4")])
+    assert runner._spent(state) == 90 + 120 and runner._overspent(state)
+    fake_ledger(runner._ledger(state, "b"), {}, [("r2", "EXTEND", 20, None)])  # a budget extended
+    assert not runner._overspent(state)
+
+
 def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, modelsim: str) -> None:
     cs, repos, path = evalset
     (tmp_path / "answers.json").write_text(json.dumps(eval_fixture.answers()))
@@ -172,7 +245,8 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     md = out.with_suffix(".md").read_text()
     assert "44%（4/9；95% 区间" in md, md
     assert "67%（6/9；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
-    assert "| anthropic/claude-opus-5-5 | local/gpt-oss:20b |" in md
+    assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b） |" in md
+    assert "0%（0/3；区间退化：每个用例都一样）" in md and "区间退化：每一对都一样" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
     assert "explanation" not in raw and "search_orders" not in raw
@@ -190,10 +264,11 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     state = tmp_path / "state"
     # A paid run another profile left unfinished: it spends up to its budget when its profile
     # runs again, so it counts against the cap until then.
-    state.mkdir()
-    (state / "journal.jsonl").write_text(json.dumps({"event": "start", "profile": "z", "case": "py-sqli", "rep": 1,
-                                                     "run_id": "left-behind", "temporal_run_id": "x",
-                                                     "budget_micros": BUDGET, "paid": True}) + "\n")
+    z = dataclasses.replace(a, name="z")
+    left = stranded_run(state, z, repos, cs.case("py-sqli"))
+    runner.Journal(state / "journal.jsonl").append({
+        "event": "start", "profile": "z", "case": "py-sqli", "rep": 1, "run_id": left["run_id"],
+        "temporal_run_id": left["temporal_run_id"], "budget_micros": BUDGET, "paid": True})
     # Room for one run in flight at a time, with what the runs before it spent: exactly three
     # (the third's budget fills the cap to the micro).
     first = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=2 * BUDGET + 2 * ANSWER, cases=benign)
@@ -205,6 +280,7 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     # Again on the same state, with room for the rest: only the three runs not done.
     second = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=1_000_000, cases=benign)
     assert sorted(r["rep"] for r in second) == [1, 2, 3, 4, 5, 6]
+    assert {r["rep"]: r["run_id"] for r in second if r["rep"] <= 3} == {r["rep"]: r["run_id"] for r in first}
     assert len({r["run_id"] for r in second}) == 6
     assert sum(r["spent_micros"] for r in second) == 6 * ANSWER
 
@@ -218,7 +294,7 @@ def test_a_run_paused_for_budget_is_stopped_and_a_first_run_that_is_void_stops_t
     state = tmp_path / "state"
     # Less than one request's reservation: the run waits for more budget, and the runner stops it.
     # The first run of a profile goes alone: void, it stops the runner before the others start.
-    with pytest.raises(RuntimeError, match="the first run ended without the model: budget"):
+    with pytest.raises(RuntimeError, match=r"the first run ended without the model: \(budget\)"):
         run(cs, [a], repos, state, runs=3, budget_micros=10_000, cap_micros=1_000_000, cases=[cs.case("py-benign")])
     [r] = runner.Journal(state / "journal.jsonl").results()
     assert (r["ended_by"], r["state"], r["outcome"], r["report"], r["spent_micros"]) == ("budget", "CANCELLED", "", None, 0)
@@ -244,12 +320,27 @@ def test_a_run_that_spends_past_its_budget_stops_the_paid_runs(tmp_path: Path, e
     (tmp_path / "answers.json").write_text(json.dumps([{"contains": "format_price", "answers": [
         {"report": eval_fixture.report(), "usage": {"input": 100_000, "cache_read": 0, "output": 10}}] * 3}]))
     one_at_a_time = dataclasses.replace(profiles(modelsim)[0], concurrency=1)  # runs in flight carry on
-    results = run(cs, [one_at_a_time], repos, tmp_path / "state", runs=3, budget_micros=BUDGET,
-                  cap_micros=1_000_000, cases=[cs.case("py-benign")])
-    assert [(r["rep"], r["spent_micros"]) for r in results] == [(1, 100_000 + 50)], results
-    # The next runner on the state remembers.
-    assert run(cs, [one_at_a_time], repos, tmp_path / "state", runs=3, budget_micros=BUDGET, cap_micros=1_000_000,
-               cases=[cs.case("py-benign")]) == results
+    state, benign = tmp_path / "state", cs.case("py-benign")
+    # Another paid profile's run, left in flight by a runner that stopped before the overspend.
+    c = dataclasses.replace(one_at_a_time, name="c")
+    left = stranded_run(state, c, repos, benign)
+    runner.Journal(state / "journal.jsonl").append({
+        "event": "start", "profile": "c", "case": "py-benign", "rep": 1, "run_id": left["run_id"],
+        "temporal_run_id": left["temporal_run_id"], "budget_micros": BUDGET, "paid": True, "expect": c.expect,
+        "commit": benign.commit, "cases_sha256": cs.sha256, "at": 0})
+    results = run(cs, [one_at_a_time], repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000,
+                  cases=[benign])
+    assert [(r["rep"], r["spent_micros"]) for r in results if r["profile"] == "a"] == [(1, 100_000 + 50)], results
+    # The next runner on the state remembers, from the ledger; and c's run left in flight stops
+    # before c's Worker comes up, so its provider never hears of it.
+    sent = (tmp_path / "modelsim.jsonl").read_text()
+    again = run(cs, [one_at_a_time, c], repos, state, runs=3, budget_micros=BUDGET, cap_micros=1_000_000,
+                cases=[benign])
+    assert [r for r in again if r["profile"] == "a"] == results
+    [stopped] = [r for r in again if r["profile"] == "c"]
+    assert (stopped["run_id"], stopped["ended_by"], stopped["state"]) == (left["run_id"], "overspent", "CANCELLED")
+    assert score.void(stopped) and score.void_reason(stopped) == "(overspent)"
+    assert (tmp_path / "modelsim.jsonl").read_text() == sent
 
 
 def test_runs_the_journal_never_saw_count_against_the_cap_and_are_cancelled(tmp_path: Path, evalset,
@@ -311,26 +402,45 @@ def test_a_run_left_in_flight_is_only_ever_answered_by_its_own_profile(tmp_path:
 
 def test_void_runs_count_on_their_own_and_run_again_when_asked(tmp_path: Path, evalset, modelsim: str) -> None:
     cs, repos, _ = evalset
-    # c-oob's provider answers 429 to every attempt (5), then a report: the first run is void.
+    # c-oob's provider answers 429 to every attempt (5) of two runs, then a report: c-oob's
+    # first run is void, and so is the first run again.
     (tmp_path / "answers.json").write_text(json.dumps([
         {"contains": "format_price", "answers": [{"report": eval_fixture.report()}]},
-        {"contains": "parse_record", "answers": [{"fault": "429"}] * 5 + [
+        {"contains": "parse_record", "answers": [{"fault": "429"}] * 10 + [
             {"report": eval_fixture.report(eval_fixture.finding(21, "CWE-787", file="parse.c"))}]}]))
     a = profiles(modelsim)[0]
     state = tmp_path / "state"
-    both = [cs.case("py-benign"), cs.case("c-oob")]
+    journal = runner.Journal(state / "journal.jsonl")
+    both = [cs.case("py-benign"), cs.case("c-oob"), cs.case("py-benign")]  # a case listed twice runs once
     first = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both)
+    assert sorted(e["case"] for e in journal.entries() if e["event"] == "start") == ["c-oob", "py-benign"]
     [failed] = [r for r in first if r["case"] == "c-oob"]
     assert score.void(failed) and failed["outcome"].startswith("failed") and failed["spent_micros"] == 0
     m = score.metrics(cs, first)["a"]
-    assert (m["void"], m["detection"]["runs"]) == (1, 0)
+    assert (m["void"], m["detection"]["runs"], list(m["void_reasons"])) == (1, 0, [score.void_reason(failed)])
 
-    # Without --retry-void the runner has nothing to do; with it, the void run runs again.
-    assert run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both) == first
+    # Without --retry-void the runner only picks up what is in flight: here a run the journal
+    # has and agentd does not (a ledger not the one that started it), which is lost.
+    journal.append({"event": "start", "profile": "a", "case": "py-benign", "rep": 2, "run_id": "not-in-the-ledger",
+                    "temporal_run_id": "x", "budget_micros": BUDGET, "paid": True})
+    picked = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both)
+    [lost] = [r for r in picked if r["run_id"] == "not-in-the-ledger"]
+    assert (lost["ended_by"], lost["state"], score.void_reason(lost)) == ("lost", "NOT_FOUND", "(lost)")
+    assert [r for r in picked if r["run_id"] != "not-in-the-ledger"] == first
+
+    # With --retry-void the void run runs again: void again, it does not stop the runner as a
+    # first run would; the next time it is answered.
     second = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both, retry_void=True)
-    [again] = [r for r in second if r["case"] == "c-oob"]
-    assert again["run_id"] != failed["run_id"] and not score.void(again) and score.detected(cs.case("c-oob"), again)
-    assert score.metrics(cs, second)["a"]["void"] == 0
+    [still] = [r for r in second if r["case"] == "c-oob"]
+    assert still["run_id"] != failed["run_id"] and score.void(still)
+    third = run(cs, [a], repos, state, runs=1, budget_micros=BUDGET, cap_micros=1_000_000, cases=both, retry_void=True)
+    [again] = [r for r in third if r["case"] == "c-oob"]
+    assert again["run_id"] != still["run_id"] and not score.void(again) and score.detected(cs.case("c-oob"), again)
+    # The runs run again still count: in the money, and among the void runs by their reasons.
+    m = score.metrics(cs, third, replaced=journal.replaced())["a"]
+    reasons = collections.Counter(score.void_reason(r) for r in (failed, still, lost))
+    assert (m["void"], m["replaced"], m["void_reasons"]) == (1, 2, dict(reasons))
+    assert m["cost_usd"]["total"] == pytest.approx(sum(r["spent_micros"] for r in [*third, failed, still]) / 1e6)
 
 
 def test_a_dead_worker_stops_the_runner_and_the_next_one_carries_on(tmp_path: Path, evalset, modelsim: str) -> None:
@@ -362,10 +472,30 @@ def test_one_runner_per_state_and_real_models_only_in_a_sandbox(tmp_path: Path, 
     cs, repos, _ = evalset
     state = tmp_path / "state"
     state.mkdir()
+    b = profiles("http://127.0.0.1:9")[1]
     with open(state / "lock", "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         with pytest.raises(RuntimeError, match="another runner"):
-            runner.run(cs, [profiles("http://127.0.0.1:9")[1]], repos, state)
+            runner.run(cs, [b], repos, state)
+    # A runner killed with SIGKILL leaves its Temporal (and agentd) running: they hold the lock.
+    held = os.open(state / "lock", os.O_RDONLY)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    (tmp_path / "left").mkdir()
+    left = Stack(tmp_path / "left", fixture=False, hold_fds=(held,))
+    os.close(held)
+    try:
+        with pytest.raises(RuntimeError, match="what is left of one"):
+            runner.run(cs, [b], repos, state)
+    finally:
+        left.close()
+    # A journal with runs of a profile whose ledger is gone: what they spent is unknown.
+    runner.Journal(state / "journal.jsonl").append({"event": "start", "profile": "gone", "run_id": "x"})
+    with pytest.raises(RuntimeError, match="ledgers are gone"):
+        runner.run(cs, [b], repos, state)
+    (state / "journal.jsonl").unlink()
+    # The sandbox's list of paths the Worker may not read is separated by ':'.
+    with pytest.raises(ValueError, match="':'"):
+        runner.run(cs, [b], repos, state, deny_read=[tmp_path / "a:b"])
     monkeypatch.setattr(runner, "SANDBOX", "none")
     with pytest.raises(ValueError, match="sandbox"):
         runner.run(cs, [runner.PROFILES["local"]], repos, state)

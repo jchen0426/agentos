@@ -3,8 +3,9 @@
   python -m evals mirrors [--record]           fetch the projects, make our commits, check the cases
   python -m evals table [--out FILE]           the case table, for spot checks before a real run
   python -m evals run --profile claude --cap-usd 50 [--state DIR]
-                                               run the cases (make build first); --state resumes
-  python -m evals report --state DIR --out docs/eval/NAME
+                                               run the cases (make build first); a runner on a state
+                                               directory picks up where the last one stopped
+  python -m evals report [--state DIR] --out docs/eval/NAME
   python -m evals cwe cwec_vX.Y.xml            regenerate evals/cwe1000.json
 """
 
@@ -74,15 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--out", type=Path)
     r = sub.add_parser("run", help="run the cases under each profile (make build first)")
     r.add_argument("--profile", action="append", choices=sorted(runner.PROFILES), required=True)
-    r.add_argument("--cap-usd", type=float, help="the most all runs together may spend; needed for paid profiles")
+    r.add_argument("--cap-usd", type=float, help="the most the state directory's runs may spend, every runner on it "
+                   "together; needed for paid profiles")
     r.add_argument("--budget-usd", type=float, default=runner.BUDGET / 1e6, help="each run's budget")
     r.add_argument("--runs", type=int, default=3, help="runs of each case under each profile")
     r.add_argument("--case", action="append", help="only these cases")
-    r.add_argument("--retry-void", action="store_true", help="run again the runs the infrastructure ended")
-    r.add_argument("--state", type=Path, help="the state directory: a new one by default; an old one resumes")
+    r.add_argument("--retry-void", action="store_true", help="run again the runs the model gave no answer")
+    r.add_argument("--state", type=Path, help="the state directory (default: CACHE/state/default); a new one is a "
+                   "new evaluation, with a cap of its own")
     r.add_argument("--cache", type=Path, default=mirrors.default_cache())
     p = sub.add_parser("report", help="the report of a state directory's runs")
-    p.add_argument("--state", type=Path, required=True)
+    p.add_argument("--state", type=Path, help="default: CACHE/state/default")
+    p.add_argument("--cache", type=Path, default=mirrors.default_cache())
     p.add_argument("--out", type=Path, required=True, help="docs/eval/NAME: writes NAME.md and NAME.json")
     p.add_argument("--title", default="")
     p.add_argument("--seed", type=int, default=0)
@@ -124,17 +128,22 @@ def main(argv: list[str] | None = None) -> int:
         built = mirrors.build(cs, args.cache)
         if any(built[case.id]["commit"] != case.commit for case in cs.cases):
             ap.error("cases.json lacks the IDs of commits we make: python -m evals mirrors --record")
-        chosen = [cs.case(i) for i in args.case] if args.case else None
-        state = args.state or args.cache / "state" / datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
-        print(f"state: {state} (pass --state {state} to pick it up again)")
-        # Every project's mirror: runs in flight from an earlier runner may audit any of them.
+        chosen = [cs.case(i) for i in dict.fromkeys(args.case)] if args.case else None
+        state = args.state or args.cache / "state" / "default"
+        print(f"state: {state}; its runs have spent ${runner.spent_in(state) / 1e6:.4f} so far")
+        # Every project's mirror: runs in flight from an earlier runner may audit any of them. The
+        # Worker reads nothing of the cache: other state directories, other mirrors.
         runner.run(cs, profiles, {name: mirrors.mirror_of(cs, name, args.cache) for name in cs.projects}, state,
                    runs=args.runs, budget_micros=round(args.budget_usd * 1e6),
                    cap_micros=round(args.cap_usd * 1e6) if args.cap_usd is not None else None, cases=chosen,
-                   retry_void=args.retry_void)
+                   retry_void=args.retry_void, deny_read=[args.cache])
         return 0
     if args.cmd == "report":
-        results = runner.Journal(args.state / "journal.jsonl").results()
+        state = args.state or args.cache / "state" / "default"
+        journal = runner.Journal(state / "journal.jsonl")
+        results = journal.results()
+        if not results:
+            ap.error(f"no run has ended in {state}")
         # Each run is scored with today's labels, so it must have audited today's commit of its
         # case; a set changed elsewhere (a description, a label line) needs no new runs.
         ids = {c.id: c.commit for c in cs.cases}
@@ -144,8 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         meta = {"title": args.title, "date": datetime.date.today().isoformat(), "commit": head,
                 "runs": max((r["rep"] for r in results), default=0),
-                "ledger_spent_usd": runner.spent_in(args.state) / 1e6}
-        report.write(cs, results, args.out, meta, seed=args.seed)
+                "ledger_spent_usd": runner.spent_in(state) / 1e6}
+        report.write(cs, results, args.out, meta, seed=args.seed, replaced=journal.replaced())
         print(f"wrote {args.out.with_suffix('.md')} and {args.out.with_suffix('.json')}")
         return 0
     return 2

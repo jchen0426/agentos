@@ -168,7 +168,8 @@ def test_a_project_url_is_github_and_nothing_else() -> None:
     good = {"id": "n", "kind": "benign", "source": "real", "project": "p", "language": "c", "commit": "a" * 40,
             "why": "w"}
     for url in ("--upload-pack=touch /tmp/x;true", "https://github.com/a/b --x", "http://github.com/a/b",
-                "https://github.com/a/b/c", "ext::sh -c x", "https://evil.example/a/b", "file:///tmp/r"):
+                "https://github.com/a/b/c", "ext::sh -c x", "https://evil.example/a/b", "file:///tmp/r",
+                "https://github.com/a/b\n"):
         with pytest.raises(CaseError, match="url"):
             parse({"projects": {"p": {"url": url, "license": "MIT"}}, "cases": [good]})
     assert parse({"projects": {"p": {"url": "https://github.com/a-b/c.d_e", "license": "MIT"}}, "cases": [good]})
@@ -201,6 +202,9 @@ def test_the_cli_spends_nothing_without_a_cap_or_unsandboxed(tmp_path: Path, mon
     with pytest.raises(SystemExit):
         cli.main(["--cases", str(path), "run", "--profile", "local"])
     assert "AGENTOS_SANDBOX" in capsys.readouterr().err
+    with pytest.raises(SystemExit):  # a state directory no run has ended in: no report
+        cli.main(["--cases", str(path), "report", "--state", str(tmp_path / "state"), "--out", str(tmp_path / "r")])
+    assert "no run has ended" in capsys.readouterr().err
 
 
 def test_case_file_errors() -> None:
@@ -209,7 +213,8 @@ def test_case_file_errors() -> None:
             "cwe": "CWE-787", "labels": [{"file": "x.c", "lines": [1]}], "why": "w"}
     for bad in ({"source": "reverse"}, {"cwe": "787"}, {"labels": []}, {"labels": [{"file": "x.c", "lines": [0]}]},
                 {"commit": "abc"}, {"commit": ""}, {"why": " "}, {"project": "q"}, {"id": "Bad_ID"},
-                {"published": "2026/01/01"}, {"kind": "benign", "source": "real"}):
+                {"published": "2026/01/01"}, {"kind": "benign", "source": "real"}, {"id": "v\n"},
+                {"commit": "a" * 40 + "\n"}, {"cwe": "CWE-787\n"}, {"published": "2026-01-01\n"}):
         with pytest.raises(CaseError):
             parse({"projects": project, "cases": [{**good, **bad}]})
     with pytest.raises(CaseError, match="unique"):

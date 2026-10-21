@@ -26,12 +26,12 @@ from pathlib import Path
 
 CASES = Path(__file__).with_name("cases.json")
 SOURCES = {"vuln": {"blame", "reverse"}, "benign": {"real"}, "injection": {"injection"}}
-_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_SHA = re.compile(r"^[0-9a-f]{40}$")
-_CWE = re.compile(r"^CWE-[1-9][0-9]*$")
-_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+_SHA = re.compile(r"[0-9a-f]{40}")
+_CWE = re.compile(r"CWE-[1-9][0-9]*")
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # A project is fetched from GitHub by URL: nothing else may reach git fetch's command line.
-_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
 @dataclass(frozen=True)
@@ -113,9 +113,9 @@ def load(path: Path = CASES) -> CaseSet:
 def parse(doc: dict, sha256: str = "") -> CaseSet:
     projects = {}
     for name, p in doc["projects"].items():
-        if not _ID.match(name) or bool(p.get("url")) == bool(p.get("path")):
+        if not _ID.fullmatch(name) or bool(p.get("url")) == bool(p.get("path")):
             raise CaseError(f"project {name!r}: a lowercase name, and either a url or a path")
-        if p.get("url") and not _URL.match(p["url"]):
+        if p.get("url") and not _URL.fullmatch(p["url"]):
             raise CaseError(f"project {name!r}: the url must be https://github.com/<owner>/<repo>")
         projects[name] = Project(name=name, license=p["license"], base=p.get("base", "main"),
                                  url=p.get("url"), path=p.get("path"))
@@ -132,12 +132,12 @@ def parse(doc: dict, sha256: str = "") -> CaseSet:
 def _case(c: dict, raw: dict, projects: dict[str, Project]) -> Case:
     cid, kind, source = c["id"], c["kind"], c.get("source", "")
     where = f"case {cid!r}"
-    if not _ID.match(cid):
+    if not _ID.fullmatch(cid):
         raise CaseError(f"{where}: IDs are lowercase letters, digits and dashes")
     if source not in SOURCES.get(kind, ()):
         raise CaseError(f"{where}: kind {kind!r} takes sources {sorted(SOURCES.get(kind, ()))}, not {source!r}")
     commit = c.get("commit", "")
-    if commit and not _SHA.match(commit):
+    if commit and not _SHA.fullmatch(commit):
         raise CaseError(f"{where}: commit must be a full 40-character SHA")
     if not commit and source not in ("reverse", "injection"):
         raise CaseError(f"{where}: only a commit we make may be missing its ID")
@@ -174,13 +174,13 @@ def _case(c: dict, raw: dict, projects: dict[str, Project]) -> Case:
         if case.cwe or case.cwe_also or case.labels or case.fix:
             raise CaseError(f"{where}: a benign case has no CWE, labels or fix")
         return case
-    if not (case.cwe and _CWE.match(case.cwe)) or not all(_CWE.match(x) for x in case.cwe_also):
+    if not (case.cwe and _CWE.fullmatch(case.cwe)) or not all(_CWE.fullmatch(x) for x in case.cwe_also):
         raise CaseError(f"{where}: cwe and cwe_also must look like CWE-89")
     if not case.labels or any(not lb.file or not lb.lines or min(lb.lines) < 1 for lb in case.labels):
         raise CaseError(f"{where}: labels need a file and lines from 1")
-    if any(d is not None and not _DATE.match(d) for d in (case.published, case.fixed)):
+    if any(d is not None and not _DATE.fullmatch(d) for d in (case.published, case.fixed)):
         raise CaseError(f"{where}: published and fixed are YYYY-MM-DD")
-    if source == "reverse" and not (case.fix and _SHA.match(case.fix) and case.revert_paths):
+    if source == "reverse" and not (case.fix and _SHA.fullmatch(case.fix) and case.revert_paths):
         raise CaseError(f"{where}: a reverse case needs its fix commit and the paths to revert")
     return case
 

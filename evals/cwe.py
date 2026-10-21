@@ -2,16 +2,18 @@
 
 The strict rate wants the finding's CWE to be the label's. The lenient one also takes a CWE
 related to it in MITRE's research view (CWE-1000): an ancestor or a descendant of it (Pillars
-left out), a sibling (the same parent), or one of the same family, the nearest Class at or above
-a weakness. Siblings and families do not go through a broad node: a Pillar, or a top-level
-Class (one right under the Pillars, such as CWE-74 Injection or CWE-610). So CWE-787, CWE-125,
-CWE-120 and CWE-119 go together (CWE-119 is under another Class), and CWE-22 and CWE-23 do
-(ancestry); CWE-89 and CWE-78 do not, nor CWE-79 and CWE-77 (only CWE-74 joins them), CWE-611
-and CWE-601, or CWE-862 and CWE-863 (siblings under the top-level CWE-285). A CWE outside the
-view (a category, a view, an ID that does not exist) relates only to itself.
+left out), a sibling (the same primary parent), or one of the same family, the nearest Class
+up the chain of primary parents (MITRE marks one parent of most weaknesses primary; a weakness
+with several parents is otherwise tied to unrelated families). Siblings and families do not go
+through a broad node: a Pillar, or a top-level Class (one right under the Pillars, such as
+CWE-74 Injection or CWE-610). So CWE-787, CWE-125, CWE-120 and CWE-119 go together (CWE-119 is
+under another Class), and CWE-22 and CWE-23 do (ancestry); CWE-89 and CWE-78 do not, nor
+CWE-79 and CWE-77 (only CWE-74 joins them), CWE-611 and CWE-601, or CWE-862 and CWE-863
+(siblings under the top-level CWE-285). A CWE outside the view (a category, a view, an ID that
+does not exist) relates only to itself.
 
-cwe1000.json holds each weakness's abstraction and parents in the view, extracted from MITRE's
-CWE list by `python -m evals cwe <cwec_vX.Y.xml>`.
+cwe1000.json holds each weakness's abstraction, parents and primary parents in the view,
+extracted from MITRE's CWE list by `python -m evals cwe <cwec_vX.Y.xml>`.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ NOTICE = ("Extracted from the CWE List (https://cwe.mitre.org/). Copyright (c) 2
           "CWE, CWSS, CWRAF, and the CWE logo are trademarks of The MITRE Corporation. Used under the CWE Terms of Use "
           "(https://cwe.mitre.org/about/termsofuse.html), which allow use and copies for research, development and "
           "commercial purposes provided MITRE's copyright designation and the license are reproduced.")
-_BARE = re.compile(r"^0*([1-9][0-9]{0,5})$")
+_BARE = re.compile(r"0*([1-9][0-9]{0,5})")
 # The first "CWE-89" in a string, with any dash (Unicode's too), colon, underscore or space.
 _FIRST = re.compile(r"CWE\s?[-_:\u2010-\u2015\u2212 ]?\s?0*([1-9][0-9]{0,5})(?![0-9])", re.IGNORECASE)
 
@@ -43,7 +45,7 @@ def number(value: object) -> int | None:
     if not isinstance(value, str):
         return None
     s = value.strip()[:64]
-    m = _BARE.match(s) or _FIRST.search(s)
+    m = _BARE.fullmatch(s) or _FIRST.search(s)
     return int(m.group(1)) if m else None
 
 
@@ -57,9 +59,11 @@ def generate(xml_path: Path) -> dict:
     root = ElementTree.fromstring(raw)
     weaknesses = {}
     for w in root.iterfind("c:Weaknesses/c:Weakness", ns):
-        parents = sorted({int(r.get("CWE_ID")) for r in w.iterfind("c:Related_Weaknesses/c:Related_Weakness", ns)
-                          if r.get("Nature") == "ChildOf" and r.get("View_ID") == "1000"})
-        weaknesses[w.get("ID")] = {"abstraction": w.get("Abstraction"), "parents": parents}
+        links = [r for r in w.iterfind("c:Related_Weaknesses/c:Related_Weakness", ns)
+                 if r.get("Nature") == "ChildOf" and r.get("View_ID") == "1000"]
+        parents = sorted({int(r.get("CWE_ID")) for r in links})
+        primary = sorted({int(r.get("CWE_ID")) for r in links if r.get("Ordinal") == "Primary"}) or parents
+        weaknesses[w.get("ID")] = {"abstraction": w.get("Abstraction"), "parents": parents, "primary": primary}
     return {"version": root.get("Version"), "date": root.get("Date"), "notice": NOTICE,
             "weaknesses": dict(sorted(weaknesses.items(), key=lambda kv: int(kv[0])))}
 
@@ -68,6 +72,12 @@ def generate(xml_path: Path) -> dict:
 def _view() -> dict[int, tuple[str, tuple[int, ...]]]:
     data = json.loads(DATA.read_text())
     return {int(k): (v["abstraction"], tuple(v["parents"])) for k, v in data["weaknesses"].items()}
+
+
+@functools.cache
+def _primary() -> dict[int, tuple[int, ...]]:
+    data = json.loads(DATA.read_text())
+    return {int(k): tuple(v["primary"]) for k, v in data["weaknesses"].items()}
 
 
 def _broad(n: int) -> bool:
@@ -89,21 +99,22 @@ def _ancestors(n: int) -> set[int]:
 
 
 def _parents(n: int) -> set[int]:
-    return {p for p in _view().get(n, ("", ()))[1] if not _broad(p)}
+    """n's primary parents, unless they are broad."""
+    return {p for p in _primary().get(n, ()) if not _broad(p)}
 
 
 def _family(n: int) -> set[int]:
-    """The nearest Classes at or above n, unless they are broad; n itself when there is none."""
-    view = _view()
+    """The nearest Classes up the primary parents from n, unless they are broad; n itself when
+    there is none."""
+    view, primary = _view(), _primary()
     found, todo, seen = set(), [n], {n}
     while todo:
         m = todo.pop()
-        kind, parents = view.get(m, ("", ()))
-        if kind == "Class":
+        if view.get(m, ("",))[0] == "Class":
             if not _broad(m):
                 found.add(m)
             continue
-        for p in parents:  # a Pillar has no parents: the walk ends there without a Class
+        for p in primary.get(m, ()):  # a Pillar has no parents: the walk ends there without a Class
             if p not in seen:
                 seen.add(p)
                 todo.append(p)

@@ -5,8 +5,8 @@ what the cases need, each upstream commit and its parent, fetched shallowly by I
 we make carry a fixed author, committer and date, as scripts/make-audit-target.sh's do, so
 making them anywhere gives the same IDs; cases.json records the IDs and building checks them.
 Fetched repositories are data: git only reads and writes objects in them, nothing in them runs,
-and git runs with no configuration of the user's or the system's, no attributes, and https as
-its only protocol.
+and git runs with no configuration of the user's or the system's, no attributes, no hooks, and
+https as its only protocol.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ MESSAGE = "update"  # of every commit we make: the auditor sees no message, and 
 _CONFIG = {  # for every git command here, besides no user or system configuration at all
     "core.attributesFile": os.devnull,  # the XDG attributes file is read even without a config
     "protocol.allow": "never", "protocol.https.allow": "always",
+    # A project's local path is someone's repository: none of its hooks or monitors run.
+    "core.hooksPath": os.devnull, "core.fsmonitor": "false",
 }
 
 
