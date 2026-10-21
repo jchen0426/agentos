@@ -153,6 +153,9 @@ def test_cost_latency_cache_refusals_and_broken_answers():
     assert (m["refusals"], m["refused_runs"]) == (1, 1)
     assert m["invalid_output"] == {"answers": 4, "invalid": 1, "rate": 0.25}
     assert m["models"] == ["m/one"] and m["detection_by_cutoff"]["cutoff"] == "2026-06-30"
+    assert m["unexpected_models"] == 0
+    assert metrics([run("v", models=["m/one", "m/two"], expect="m/one"), run("v", models=["m/one"], expect="m/one"),
+                    run("v", models=[], expect="m/one")])["unexpected_models"] == 1
     assert m["detection_by_cutoff"]["after"]["runs"] == 1 and m["detection_by_cutoff"]["before"]["runs"] == 3
 
 

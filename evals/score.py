@@ -139,6 +139,8 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int) -> dict:
     models = sorted({m for r in runs for m in r.get("models", [])})
     out: dict = {
         "models": models,  # as the ledger recorded them
+        # Runs whose ledger names a model other than the one their profile configures.
+        "unexpected_models": sum(any(m != r["expect"] for m in r.get("models", [])) for r in runs if r.get("expect")),
         "runs": len(runs),
         "answered": sum(r.get("report") is not None for r in runs),
         "outcomes": dict(sorted(_count(outcome_kind(r) for r in runs).items())),

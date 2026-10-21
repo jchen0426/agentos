@@ -61,8 +61,9 @@ def markdown(cs: CaseSet, data: dict) -> str:
             f"- 每个用例每个模型跑 {meta.get('runs', '?')} 次。评测走同一套运行时（Temporal、agentd、沙箱里的 Worker），"
             "全部 dry-run：写类工具只记录、不执行。",
             "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注："]
-    out += ["", "| 配置 | 账本记录的模型 | 次数 | 拿到报告的次数 |", "|---|---|---|---|"]
-    out += [f"| {p} | {n} | {metrics[p]['runs']} | {metrics[p]['answered']} |" for p, n in zip(profiles, names)]
+    out += ["", "| 配置 | 账本记录的模型 | 次数 | 拿到报告的次数 | 账本里的模型和配置不同的次数 |", "|---|---|---|---|---|"]
+    out += [f"| {p} | {n} | {metrics[p]['runs']} | {metrics[p]['answered']} | {metrics[p]['unexpected_models']} |"
+            for p, n in zip(profiles, names)]
     out += ["", f"- 置信区间：按用例 bootstrap（{meta['resamples']} 次，种子 {meta['seed']}），同一用例的几次运行一起抽；"
             "注入的影响按配对抽。", ""]
 

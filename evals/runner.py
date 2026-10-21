@@ -180,7 +180,7 @@ def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budge
                        "--base", cs.projects[c.project].base, "--budget-micros", str(budget), "--dry-run")
     return {"event": "start", "profile": profile.name, "case": c.id, "rep": rep, "run_id": r["run_id"],
             "temporal_run_id": r["temporal_run_id"], "budget_micros": budget, "paid": profile.paid,
-            "commit": c.commit, "cases_sha256": cs.sha256, "at": time.time()}
+            "expect": profile.expect, "commit": c.commit, "cases_sha256": cs.sha256, "at": time.time()}
 
 
 def _watch(stack: Stack, entry: dict, profile: Profile) -> dict | None:
@@ -216,7 +216,7 @@ def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
     answers, accepted = [], []
     for row in stack.ledger("SELECT provider, model, response_blob, usage_json FROM model_calls WHERE workflow_id = ? "
                             "ORDER BY started_at, activity_id, attempt, request_seq", entry["run_id"]):
-        model = row["model"] if "/" in row["model"] else f"{row['provider']}/{row['model']}"
+        model = row["model"] if row["model"].startswith(row["provider"] + "/") else f"{row['provider']}/{row['model']}"
         billed = json.loads(row["usage_json"] or "[]")
         usage: dict[str, int] = {}
         for b in billed:
@@ -242,7 +242,7 @@ def collect(stack: Stack, entry: dict, ended_by: str) -> dict:
     result = json.loads(info.get("result_json") or "{}")
     models = list(dict.fromkeys(a["model"] for a in answers))
     return {"event": "result", "profile": entry["profile"], "case": entry["case"], "rep": entry["rep"],
-            "commit": entry.get("commit"), "cases_sha256": entry.get("cases_sha256"),
+            "commit": entry.get("commit"), "cases_sha256": entry.get("cases_sha256"), "expect": entry.get("expect"),
             "run_id": entry["run_id"], "state": info["state"], "outcome": result.get("outcome", ""),
             "failure": (info.get("failure") or "")[:500], "ended_by": ended_by,
             "seconds": (closed - started) if started is not None and closed is not None else None,

@@ -103,6 +103,7 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     hits = lambda r: (r["hits"], r["runs"])  # noqa: E731
     # The labels are the ledger's, call by call.
     assert a["models"] == ["anthropic/claude-opus-5-5"] and b["models"] == ["local/gpt-oss:20b"]
+    assert a["unexpected_models"] == b["unexpected_models"] == 0
 
     # Model a: py-sqli 2 of 3, py-path 1 (2 lenient), c-oob 1 (2 lenient).
     assert hits(a["detection"]) == (4, 9) and hits(a["detection_lenient"]) == (6, 9)
@@ -153,8 +154,9 @@ def test_the_cap_stops_paid_runs_and_a_runner_picks_up_where_it_stopped(tmp_path
     benign = [cs.case("py-benign")]
     a = profiles(modelsim)[0]
     state = tmp_path / "state"
-    # Room for one run in flight at a time, with what the runs before it spent: three.
-    first = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=BUDGET + 3 * ANSWER - 1, cases=benign)
+    # Room for one run in flight at a time, with what the runs before it spent: exactly three
+    # (the third's budget fills the cap to the micro).
+    first = run(cs, [a], repos, state, runs=6, budget_micros=BUDGET, cap_micros=BUDGET + 2 * ANSWER, cases=benign)
     assert [r["rep"] for r in first] == [1, 2, 3], first
     assert sum(r["spent_micros"] for r in first) == 3 * ANSWER
     with pytest.raises(ValueError, match="cap"):
