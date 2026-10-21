@@ -193,7 +193,7 @@ def test_a_signal_waits_for_the_stack_to_stop_whatever_thread_gets_it() -> None:
 def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Path) -> None:
     raw = '{"line": 1e400, "low": -1e400, "nan": NaN, "inf": Infinity, "ok": 12.0, "n": 7}'
     assert runner._object(raw) == {"line": None, "low": None, "nan": None, "inf": None, "ok": 12.0, "n": 7}
-    assert runner._object('{"a":' * 1500 + "1" + "}" * 1500) == {}  # deeper than Python reads: unread
+    assert runner._object('{"a":' * 100_000 + "1" + "}" * 100_000) == {}  # deeper than Python reads: unread
     with pytest.raises(ValueError):
         runner.Journal(tmp_path / "journal.jsonl").append({"event": "result", "x": float("inf")})
 
