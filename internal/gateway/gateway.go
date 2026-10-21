@@ -83,6 +83,10 @@ type Gateway struct {
 
 	sendMu  sync.Mutex      // makes claiming an effect and marking it sent one step
 	sending map[string]bool // effect IDs this process has claimed and is sending
+
+	// wait is how recovery waits for a request that may still take effect (sleep); nil is the
+	// system's clock. A test that moves ledger.Clock sets it.
+	wait func(ctx context.Context, d time.Duration) error
 }
 
 // LoopLimits cap the logical calls of one run, and the attempts of one call; 0 is no limit.

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
@@ -230,7 +231,7 @@ func TestProceedStopsOnceTheRunIsCancelled(t *testing.T) {
 	if !ok || err != nil {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	proceed := f.g.proceed(e)
+	proceed := f.g.proceed(e, nil)
 	if err := proceed(ctx); err != nil {
 		t.Fatalf("before the cancel: %v", err)
 	}
@@ -458,22 +459,64 @@ func TestReconcile(t *testing.T) {
 			t.Fatalf("the key reused for another finding: %v", err)
 		}
 	})
-	t.Run("too early to say a lookup tool's write never happened", func(t *testing.T) {
-		f := newFixture(t, false)
-		w := &finder{writer: writer{class: policy.EffectLookup}, findErr: errors.New("rate limited"), settle: time.Hour}
-		f.g.Tools.Add(w)
+}
+
+// A person's finding that a lookup tool's write never happened waits until no request of it can
+// take effect any more (Settle after the last one went out), whatever becomes of the write then:
+// also when its run was cancelled or has ended, which abandons it, and when it was given back,
+// which leaves no claim to hold the time of its last request (its record does).
+func TestAFindingThatAWriteNeverHappenedWaits(t *testing.T) {
+	ctx := context.Background()
+	unknown := func(t *testing.T, f *fixture, w *finder) {
 		f.claimElsewhere(t, w)
-		if status, err := f.do(t, w); err != nil || status != StatusNeedsReconcile {
+		if status, err := f.do(t, w); err != nil || status != StatusNeedsReconcile { // the lookup fails
 			t.Fatalf("status %s, err %v", status, err)
 		}
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "a"}); !errors.Is(err, ErrTooEarly) {
-			t.Fatalf("got %v, want too early", err)
-		}
-		status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "b", RunClosed: true})
-		if err != nil || status != effectAbandoned {
-			t.Fatalf("an ended run's effect: %s %v", status, err)
-		}
-	})
+	}
+	for _, c := range []struct {
+		name  string
+		class string
+		setup func(t *testing.T, f *fixture, w *finder) // leaves the write to a person
+		r     Resolution
+		want  string
+	}{
+		{"the run goes on", policy.EffectLookup, unknown, Resolution{}, effectPending},
+		{"the run was cancelled", policy.EffectLookup, func(t *testing.T, f *fixture, w *finder) {
+			unknown(t, f, w)
+			f.cancel(t)
+		}, Resolution{}, effectAbandoned},
+		{"the run has ended", policy.EffectLookup, unknown, Resolution{RunClosed: true}, effectAbandoned},
+		{"the write was given back", policy.EffectIdempotent, func(t *testing.T, f *fixture, w *finder) {
+			// A request of it went out, and it was given back unsettled; the policy asks for approval
+			// now, and nobody approved it.
+			if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil); res != nil || err != nil {
+				t.Fatalf("record: %v %v", res, err)
+			}
+			f.sentThenGivenBack(t, f.req().EffectID)
+			res, err := f.g.effect(ctx, f.run, w, w.Class(), 1, &approvalRule{ttl: time.Hour}, f.req(), nil, faults.Effect{})
+			if err != nil || res.GetStatus() != StatusNeedsReconcile {
+				t.Fatalf("%v %v", res.GetStatus(), err)
+			}
+		}, Resolution{}, effectPending},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			clock := useClock(t)
+			f := newFixture(t, false)
+			w := &finder{writer: writer{class: c.class}, findErr: errors.New("rate limited"), settle: time.Hour}
+			f.g.Tools.Add(w)
+			c.setup(t, f, w)
+			r := c.r
+			r.EffectID, r.Key = f.req().EffectID, "a"
+			if _, _, err := f.g.Reconcile(ctx, r); !errors.Is(err, ErrTooEarly) {
+				t.Fatalf("got %v, want too early", err)
+			}
+			clock.advance(time.Hour)
+			r.Key = "b"
+			if status, _, err := f.g.Reconcile(ctx, r); err != nil || status != c.want {
+				t.Fatalf("once it is not: %s %v", status, err)
+			}
+		})
+	}
 }
 
 func TestOneWritePerRunByDefault(t *testing.T) {
@@ -517,5 +560,125 @@ func TestEffectClassComesFromTheTool(t *testing.T) {
 		if (err != nil) != c.refused || got != c.want {
 			t.Errorf("%T stated %q: got %q, %v", c.tool, c.stated, got, err)
 		}
+	}
+}
+
+// A write that may have taken effect (a request of it went out, and nothing since showed that it did
+// not take effect: maybe_sent) is never recorded as one that did not, whatever stops the attempt at
+// hand: the tool denies it, the outside world refuses it for good, agentd only dry-runs, the run was
+// cancelled. An earlier attempt may have made it: a person settles it.
+func TestAWriteThatMayHaveTakenEffectIsNeverRecordedAsNotSent(t *testing.T) {
+	ctx := context.Background()
+	call := func(f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+		return f.g.effect(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil, faults.Effect{})
+	}
+	idempotent := func(w *writer) (tools.Writer, *writer) {
+		w.class = policy.EffectIdempotent
+		return w, w
+	}
+	for _, c := range []struct {
+		name string
+		w    func() (tools.Writer, *writer) // the tool, and what it sent
+		do   func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error)
+	}{
+		{"the tool denies it", func() (tools.Writer, *writer) { return idempotent(&writer{deny: "not what GitHub holds"}) }, nil},
+		{"the outside world refuses it for good", func() (tools.Writer, *writer) {
+			return idempotent(&writer{after: &tools.RefusedError{Reason: "unprocessable"}})
+		}, nil},
+		{"agentd only dry-runs", func() (tools.Writer, *writer) {
+			w := &offline{writer{class: policy.EffectIdempotent}}
+			return w, &w.writer
+		}, nil},
+		{"the run was cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				f.cancel(t)
+				return call(f, w)
+			}},
+		{"the run was cancelled while the tool sent nothing", func() (tools.Writer, *writer) {
+			return idempotent(&writer{release: make(chan struct{}), unsent: true})
+		}, func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+			type answer struct {
+				res *agentosv1.Result
+				err error
+			}
+			done := make(chan answer)
+			go func() {
+				res, err := call(f, w)
+				done <- answer{res, err}
+			}()
+			f.waitClaimed(t)
+			f.cancel(t)
+			close(w.(*writer).release)
+			a := <-done
+			return a.res, a.err
+		}},
+		{"agentd starts after the run was cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				f.cancel(t)
+				return nil, f.g.RecoverEffects(ctx)
+			}},
+		{"a resend finds the run cancelled", func() (tools.Writer, *writer) { return idempotent(&writer{}) },
+			func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) {
+				payload, err := f.g.payload(ctx, f.status(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.cancel(t)
+				return f.g.resend(ctx, f.run, w, f.status(t), payload, nil)
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, false)
+			w, sent := c.w()
+			if res, err := f.g.record(ctx, f.run, w, w.Class(), 1, nil, f.req(), nil); res != nil || err != nil {
+				t.Fatalf("record: %v %v", res, err)
+			}
+			f.sentThenGivenBack(t, f.req().EffectID)
+			do := c.do
+			if do == nil {
+				do = func(t *testing.T, f *fixture, w tools.Writer) (*agentosv1.Result, error) { return call(f, w) }
+			}
+			res, err := do(t, f, w)
+			if e := f.status(t); err != nil || res != nil && res.GetStatus() != StatusNeedsReconcile || e.Status != effectUnknown ||
+				sent.sent.Load() != 0 {
+				t.Fatalf("%v %v: effect %s %q, sent %d", res.GetStatus(), err, e.Status, e.Reason.String, sent.sent.Load())
+			}
+		})
+	}
+}
+
+// rerendering is a write whose payload, rendered again, differs (what it is rendered from changed:
+// agentd's config, a blob). It keeps the payload it was asked to send.
+type rerendering struct {
+	writer
+	renders atomic.Int64
+	got     json.RawMessage
+}
+
+func (w *rerendering) Prepare(_ context.Context, req tools.Request) (json.RawMessage, error) {
+	return json.Marshal(map[string]any{"args": req.Args, "render": w.renders.Add(1)})
+}
+
+func (w *rerendering) Execute(ctx context.Context, payload json.RawMessage, key string, proceed tools.Proceed) (map[string]any, error) {
+	w.got = payload
+	return w.writer.Execute(ctx, payload, key, proceed)
+}
+
+// What goes out, on every attempt, is the payload recorded for the write when it was first asked
+// for (design doc, section 10): never one rendered again, which nobody approved, and a lookup
+// would not find.
+func TestTheRecordedPayloadGoesOut(t *testing.T) {
+	f := newFixture(t, false)
+	w := &rerendering{writer: writer{class: policy.EffectUnsafe, unsent: true}}
+	if _, err := f.do(t, w); err == nil {
+		t.Fatal("the attempt that sent nothing did not fail the call")
+	}
+	w.unsent = false
+	if status, err := f.do(t, w); err != nil || status != StatusOK {
+		t.Fatalf("%s %v", status, err)
+	}
+	recorded, err := f.g.payload(context.Background(), f.status(t))
+	if err != nil || string(w.got) != string(recorded) || w.renders.Load() != 1 {
+		t.Fatalf("sent %s, recorded %s (%v), rendered %d times", w.got, recorded, err, w.renders.Load())
 	}
 }

@@ -318,7 +318,9 @@ func reconcileResolveCmd(g *globals) *cobra.Command {
 		Long: "--executed records the write as done, with what it produced (--result), or with what\n" +
 			"agentd finds when it looks (--lookup, for tools that can look). --not-executed has the\n" +
 			"run send it again under its original idempotency key; it is dropped instead if the run was\n" +
-			"cancelled or has ended, or if the write's approval has run out by then.",
+			"cancelled or has ended, or if the write's approval has run out by then. For a write its\n" +
+			"tool can look up, agentd takes --not-executed only once no request of it can still take\n" +
+			"effect, and says when that is.",
 		Example: "  agentctl reconcile resolve 3c1f... --executed --result '{\"written\": true}'\n" +
 			"  agentctl reconcile resolve 3c1f... --not-executed",
 		Args: cobra.ExactArgs(1),

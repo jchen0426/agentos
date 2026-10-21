@@ -105,7 +105,7 @@ func (f *fixture) sentThenGivenBack(t *testing.T, effectID string) {
 	if !ok || err != nil {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	if err := f.g.proceed(claimed)(ctx); err != nil {
+	if err := f.g.proceed(claimed, nil)(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.g.release(ctx, claimed, false); !errors.Is(err, errEffectReleased) {
@@ -1153,4 +1153,117 @@ func TestAnAttemptThatMadeNoRequestIsNotInFlight(t *testing.T) {
 	if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusExpired || w.sent.Load() != 0 {
 		t.Fatalf("%v %v, sent %d", res.GetStatus(), err, w.sent.Load())
 	}
+}
+
+// testClock is ledger.Clock for a test that moves time itself.
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+// useClock has the test move ledger.Clock itself, until it ends.
+func useClock(t *testing.T) *testClock {
+	c := &testClock{now: time.Now()}
+	prev := ledger.Clock
+	ledger.Clock = c.Now
+	t.Cleanup(func() { ledger.Clock = prev })
+	return c
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// preparing is a write of several requests, the last of which makes it; before each, its tool
+// prepares (the reads it makes first), and the test sees it there (before).
+type preparing struct {
+	writer
+	requests int
+	before   func(i int)
+	made     atomic.Int64 // requests that went out
+}
+
+func (w *preparing) Execute(ctx context.Context, _ json.RawMessage, _ string, proceed tools.Proceed) (map[string]any, error) {
+	for i := range w.requests {
+		if w.before != nil {
+			w.before(i)
+		}
+		if err := proceed(ctx); err != nil {
+			return nil, err
+		}
+		w.made.Add(1)
+	}
+	return map[string]any{"id": 1}, nil
+}
+
+// An approval holds until its write takes effect, to the request: one whose time runs out while
+// the tool prepares a request (the reads it makes first), the write's first or one after, stops
+// the requests that would go out after it; the next call voids it, and its record says what went
+// out. A write in flight (it may have taken effect) goes out again under its key whatever the time.
+func TestAnApprovalThatRunsOutWhileTheToolPrepares(t *testing.T) {
+	args := map[string]any{"n": 1}
+	for _, c := range []struct {
+		name     string
+		requests int
+		late     int // the request before which the approval runs out
+	}{
+		{"before its first request", 1, 0},
+		{"between its requests", 2, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			clock := useClock(t)
+			f := newFixture(t, false)
+			w := &preparing{writer: writer{class: policy.EffectLookup}, requests: c.requests}
+			if _, err := f.ask(t, w, args, 1, time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove}); err != nil {
+				t.Fatal(err)
+			}
+			w.before = func(i int) {
+				if i == c.late {
+					clock.advance(time.Hour)
+				}
+			}
+			if res, err := f.ask(t, w, args, 1, time.Hour); err == nil || w.made.Load() != int64(c.late) {
+				t.Fatalf("%v %v, %d requests went out", res.GetStatus(), err, w.made.Load())
+			}
+			w.before = nil
+			res, err := f.ask(t, w, args, 1, time.Hour)
+			if err != nil || res.GetStatus() != StatusExpired || w.made.Load() != int64(c.late) {
+				t.Fatalf("%v %v, %d requests went out", res.GetStatus(), err, w.made.Load())
+			}
+			if a := f.one(t); a.Status != approvalExpired || (c.late > 0) != strings.Contains(a.Reason.String, "A request of it went out at") {
+				t.Fatalf("approval %+v", a)
+			}
+		})
+	}
+	t.Run("in flight", func(t *testing.T) {
+		clock := useClock(t)
+		f := newFixture(t, false)
+		w := &preparing{writer: writer{class: policy.EffectIdempotent}, requests: 1}
+		if _, err := f.ask(t, w, args, 1, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		a, err := f.decide(t, f.one(t), Decision{Kind: DecisionApprove})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
+			t.Fatalf("approved: %v %v", res, err)
+		}
+		f.sentThenGivenBack(t, a.EffectID)
+		w.before = func(int) { clock.advance(2 * time.Hour) }
+		if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusOK || w.made.Load() != 1 {
+			t.Fatalf("%v %v, %d requests went out", res.GetStatus(), err, w.made.Load())
+		}
+	})
 }

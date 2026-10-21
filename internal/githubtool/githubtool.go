@@ -59,9 +59,14 @@ func New(cfg Config) (*Client, error) {
 
 func (c *Client) live() bool { return c != nil }
 
+// unconfiguredSettle is the settle of an agentd without GitHub's config. It sends nothing, but may
+// find a request another agentd sent, as a person reconciles it, and cannot know that one's settle:
+// it waits well past the default config's (30s requests, a 60s settle).
+const unconfiguredSettle = 10 * time.Minute
+
 func (c *Client) settle() time.Duration {
 	if c == nil {
-		return 0
+		return unconfiguredSettle
 	}
 	return c.cfg.Settle
 }
