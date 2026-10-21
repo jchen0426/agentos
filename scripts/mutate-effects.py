@@ -183,8 +183,8 @@ def main():
             run = subprocess.run(["go", "test", "./internal/gateway", "-run", "TestEffectProtocolStateMachine", "-count=1"],
                                  capture_output=True, text=True, timeout=900)
             out = run.stdout + run.stderr
-            failures = re.findall(r"seed (\d+): (\S.*)", out)
-            first = [f for f in failures if re.match(r"\d", f[1]) or f[1].startswith(("approval", "recovery"))]
+            # Each failing seed: "seed N: <what broke>" (the walk's own first line is "seed N: tools ...").
+            first = [f for f in re.findall(r"seed (\d+): (\S.*)", out) if not f[1].startswith("tools ")]
             if run.returncode == 0:
                 print(f"SURVIVED  {name}")
             elif first:
