@@ -425,6 +425,7 @@ func (m *machine) call() {
 	}
 	if len(specs) == 0 {
 		m.logf("no run calls any more")
+		m.newRun()
 		return
 	}
 	weights := make([]int, len(specs))
