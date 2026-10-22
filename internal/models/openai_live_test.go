@@ -56,6 +56,10 @@ func TestLiveOpenAI(t *testing.T) {
 	}
 	req := Request{WorkflowID: "wf", RequestID: "live", Route: route, Args: map[string]any{"diff_ref": blobs.put("wf", []byte(diff))}}
 	tokens, err := a.CountTokens(context.Background(), req)
+	if err != nil && secrets.MayBeCut(key) {
+		t.Fatalf("%v: the key is exactly %d characters, as many as security's prompt keeps, so it was likely cut "+
+			"when it was stored; store it again as the README says", err, secrets.PromptLimit)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

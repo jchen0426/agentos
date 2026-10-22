@@ -164,15 +164,20 @@ that is. `--executed --result '{...}'` records
 what the write produced instead, and `--executed --lookup` lets agentd look it up for tools that
 can.
 
-To send the audit to Claude instead of the fake model, store an API key in the login keychain
-(the command asks for it, so it stays out of your shell history), then start agentd with
-`config/dev/agentd-claude.yaml`. Every run then costs money; the budget caps each run.
+To send the audit to Claude instead of the fake model, store an API key in the login keychain,
+then start agentd with `config/dev/agentd-claude.yaml`. Every run then costs money; the budget
+caps each run. Copy the key, run the command below, then empty the clipboard with
+`pbcopy </dev/null`. The shell's own `printf` hands the key to `security` through a pipe, so it
+stays out of your shell history and out of every process's arguments. Don't let `security`
+prompt for it (`-w` last): the prompt reads with getpass(3), which keeps the first 128
+characters and drops the rest without a word, and OpenAI's keys are longer. A key cut there is
+refused (401); agentd warns at start when a key in the keychain is exactly 128 characters.
 Run the Worker in its sandbox whenever agentd holds a real key: an unsandboxed Worker runs as
 you and could read the key from the keychain with `security`. Under the sandbox the keychain is
 out of its reach, which `tests/test_t9_isolation.py` checks.
 
 ```bash
-security add-generic-password -U -s agentos-anthropic-api-key -a "$USER" -w
+printf 'add-generic-password -U -s agentos-anthropic-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
 
 ```bash
@@ -199,7 +204,7 @@ Point a task at either with `model`. Or list them in `cross_provider_fallback`, 
 asked, each in a request of its own, when the model declines.
 
 ```bash
-security add-generic-password -U -s agentos-openai-api-key -a "$USER" -w
+printf 'add-generic-password -U -s agentos-openai-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
 
 ```bash

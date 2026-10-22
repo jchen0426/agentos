@@ -1,6 +1,6 @@
 """T1: kill -9 the Worker at different points; the run finishes and every model call appears
-exactly once in the gateway's log (the model_calls ledger). Runs on the fake model, or on
-Claude with AGENTOS_MODEL=claude."""
+exactly once in the gateway's log (the model_calls ledger). Runs on the fake model, or on a
+real one with AGENTOS_MODEL (tests/harness.py)."""
 
 import json
 

@@ -21,7 +21,9 @@ type Rule struct {
 	HoldWhileExists string   `json:"hold_while_exists"` // the execution blocks while this file exists
 	Delay           Duration `json:"delay"`             // the execution sleeps this long first
 	// Later points of the same execution: a write claimed but not sent yet; after the provider
-	// or tool answered but before the ledger records it; and right after it is recorded.
+	// or tool answered but before the ledger records it; and right after it is recorded (for a
+	// model call, the answer it returns, not one that broke the output schema and is asked
+	// for again).
 	HoldAfterClaimWhileExists   string `json:"hold_after_claim_while_exists"`
 	HoldBeforeRecordWhileExists string `json:"hold_before_record_while_exists"`
 	HoldAfterRecordWhileExists  string `json:"hold_after_record_while_exists"`
