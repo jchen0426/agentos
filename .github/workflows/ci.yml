@@ -26,14 +26,16 @@ env:
 # Pinned to Ubuntu 24.04 rather than ubuntu-latest: the bubblewrap setup below (AppArmor,
 # the system Python under /usr) is what M1 verified on 24.04.
 jobs:
-  # Whether a pull request changes only documentation: files under docs/ and the top-level
-  # README.md, which no build, test or prompt reads. Not every Markdown file is documentation:
-  # config/prompts/audit_v1/claude.md is the model's prompt. The jobs below skip such a pull
+  # Whether a pull request changes only documentation: Markdown files under docs/ and the
+  # top-level README.md, which no build, test or prompt reads. Not every Markdown file is
+  # documentation (config/prompts/audit_v1/claude.md is the model's prompt), and not every file
+  # under docs/ is (go test ./... would build a .go file there). The jobs below skip such a pull
   # request, and a job skipped by its if satisfies a required check. A push to main always runs
-  # everything, so this job runs only for pull requests.
+  # everything. So does a pull request into another branch: retargeted to main later, it gets no
+  # new run, and its checks would stand for a comparison with the wrong base.
   changes:
     name: Docs-only check
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -54,17 +56,24 @@ jobs:
           fi
           # --no-renames lists both sides of a rename: moving code into docs/ changes code.
           changed=$(git -c core.quotePath=false diff --no-renames --name-only 'HEAD^1' HEAD)
-          # A prefix on each name: a line that starts with :: is a workflow command.
-          sed 's/^/changed: /' <<<"$changed"
-          if [[ -n $changed ]] && ! grep -qvE '^(docs/.+|README\.md)$' <<<"$changed"; then
-            echo "docs-only=true" >> "$GITHUB_OUTPUT"
-          fi
+          # The pull request names these files, and the runner finds workflow commands such as
+          # ##[set-output ...] anywhere in a line: commands stay off while the names print.
+          token=$(openssl rand -hex 16)
+          echo "::stop-commands::$token"
+          printf '%s\n' "$changed"
+          echo "::$token::"
+          docs_only=true
+          docs='^(docs/.+\.md|README\.md)$'
+          while IFS= read -r path; do
+            [[ $path =~ $docs ]] || docs_only=false
+          done <<<"$changed"
+          echo "docs-only=$docs_only" >> "$GITHUB_OUTPUT"
 
   go:
     name: Go (gofmt, vet, test)
     needs: changes
-    # Runs unless the changes job found only documentation: also when it was skipped (a push) or
-    # failed.
+    # Runs unless the changes job found only documentation: also when it was skipped (a push, or
+    # a pull request into another branch) or failed.
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
