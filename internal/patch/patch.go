@@ -45,10 +45,9 @@ func violation(format string, args ...any) error {
 
 // Patch is a parsed patch.
 type Patch struct {
-	files []*gitdiff.File
-	lines []string // the patch's own
-	hunks []hunk   // one for each text fragment of files, in order
-	text  []byte   // the patch, its hunk headers as the hunks' lines say
+	files []*gitdiff.File // as parsed: their hunks' headers count the hunks' lines (see hunks.go)
+	hunks []hunk          // one for each hunk of files, in order
+	text  []byte          // the patch as applied (Text)
 }
 
 // Change is what a patch does to one file.
@@ -73,11 +72,7 @@ func Parse(b []byte) (*Patch, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := render(lines, hunks)
-	if len(text) > MaxBytes {
-		return nil, violation("the patch is %d bytes once its hunk headers are rewritten, over the limit of %d", len(text), MaxBytes)
-	}
-	files, err := parse(text)
+	files, err := parse(render(lines, hunks))
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +89,11 @@ func Parse(b []byte) (*Patch, error) {
 	if n != len(hunks) {
 		return nil, violation("the patch reads as %d hunks one way and %d another", len(hunks), n)
 	}
-	return &Patch{files: files, lines: lines, hunks: hunks, text: text}, nil
+	text := format(files)
+	if len(text) > MaxBytes {
+		return nil, violation("the patch is %d bytes as agentd writes it, over the limit of %d", len(text), MaxBytes)
+	}
+	return &Patch{files: files, hunks: hunks, text: text}, nil
 }
 
 // parse is go-gitdiff's reading of a patch.
@@ -232,8 +231,10 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		return nil, fmt.Errorf("read the files at the commit: %w", err)
 	}
 	changes := make([]Change, 0, len(p.files))
+	placed := make([]*gitdiff.File, 0, len(p.files))
 	hunks, moved := p.hunks, 0
-	for _, f := range p.files {
+	for _, parsed := range p.files {
+		f := clone(parsed)
 		n := name(f)
 		orig, exists := files[n]
 		switch {
@@ -248,6 +249,7 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 			return nil, err
 		}
 		hunks = hunks[len(f.TextFragments):]
+		placed = append(placed, f)
 		var out bytes.Buffer
 		if err := gitdiff.Apply(&out, bytes.NewReader(orig), f); err != nil {
 			return nil, violation("%s: the patch does not apply: %v", n, err)
@@ -271,22 +273,23 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		changes = append(changes, c)
 	}
 	// go-gitdiff reads the patch as applied as the hunks were applied, or it is not the patch.
-	text := render(p.lines, p.hunks)
+	text := format(placed)
 	switch read, err := parse(text); {
 	case len(text) > MaxBytes:
-		return nil, violation("the patch is %d bytes once its hunk headers are rewritten, over the limit of %d", len(text), MaxBytes)
+		return nil, violation("the patch is %d bytes as agentd writes it, over the limit of %d", len(text), MaxBytes)
 	case err != nil:
 		return nil, violation("the patch as applied does not read as applied: %v", err)
-	case !same(read, p.files):
+	case !same(read, placed):
 		return nil, violation("the patch as applied does not read as applied")
 	}
 	p.text = text
 	return changes, nil
 }
 
-// Text is the patch as Apply last applied it, its hunk headers counted from their lines and
-// placed where the lines are in the file (before Apply, only counted): what git checks, what a
-// reviewer reads, and what the changes are.
+// Text is the patch as Apply last applied it (before Apply, as Parse counted it), written anew from
+// its files and hunks alone: what git checks, what a reviewer reads, and what the changes are. Its
+// hunk headers say what the hunks' lines do; nothing of the patch outside its files' headers and
+// hunks is in it.
 func (p *Patch) Text() []byte { return p.text }
 
 // Rewritten lists the hunk headers Text has anew.
@@ -296,7 +299,7 @@ func (p *Patch) Rewritten() []Rewrite {
 	for _, f := range p.files {
 		for i := range f.TextFragments {
 			if h := p.hunks[k]; h.now != h.was {
-				out = append(out, Rewrite{Path: name(f), Hunk: i + 1, Was: h.was.String(), Now: h.now.String()})
+				out = append(out, Rewrite{Path: name(f), Hunk: i + 1, Was: h.header, Now: h.now.String()})
 			}
 			k++
 		}

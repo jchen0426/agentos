@@ -94,7 +94,7 @@ func (t *ApplyCheck) Read(ctx context.Context, req Request) (map[string]any, err
 	for _, c := range changes {
 		paths = append(paths, c.Path)
 	}
-	if err := GitApplyCheck(ctx, t.Git, mirror, commit, applied.Text(), paths); err != nil {
+	if err := GitApplyCheck(ctx, t.Git, mirror, commit, applied.Text(), changes); err != nil {
 		return nil, err
 	}
 	files := make([]any, 0, len(paths))
@@ -108,19 +108,44 @@ func (t *ApplyCheck) Read(ctx context.Context, req Request) (map[string]any, err
 	return out, nil
 }
 
-// GitApplyCheck is git's own check of a patch (git apply --check), run by the git MCP server in
-// its sandbox on the commit in the mirror, with a temporary index. A patch git refuses is a
-// *DeniedError; the server failing is any other error.
-func GitApplyCheck(ctx context.Context, git gitmcp.Caller, mirror, commit string, patch []byte, paths []string) error {
+// GitApplyCheck is git's own check of a patch, run by the git MCP server in its sandbox on the
+// commit in the mirror, with a temporary index: git apply takes the patch, and makes of the files
+// what changes are, agentd's application of it. A patch git refuses, or makes another change of,
+// is a *DeniedError; the server failing is any other error.
+func GitApplyCheck(ctx context.Context, git gitmcp.Caller, mirror, commit string, text []byte, changes []patch.Change) error {
+	paths := make([]string, 0, len(changes))
+	for _, c := range changes {
+		paths = append(paths, c.Path)
+	}
 	var out gitmcp.ApplyCheckOut
-	if err := git.Call(ctx, mirror, "apply_check", gitmcp.ApplyCheckIn{Commit: commit, Patch: string(patch), Paths: paths}, &out); err != nil {
+	if err := git.Call(ctx, mirror, "apply_check", gitmcp.ApplyCheckIn{Commit: commit, Patch: string(text), Paths: paths}, &out); err != nil {
 		if gitmcp.IsToolError(err) {
 			return &DeniedError{Reason: err.Error()}
 		}
 		return err
 	}
-	if !out.Applies {
+	switch {
+	case !out.Applies:
 		return &DeniedError{Reason: gitmcp.Reason(mirror, out.Reason)}
+	case out.Index == nil:
+		return errors.New("the git tool server did not say what git apply made of the patch")
+	}
+	made := map[string]gitmcp.IndexEntry{}
+	for _, e := range *out.Index {
+		if _, twice := made[e.Path]; twice {
+			return &DeniedError{Reason: fmt.Sprintf("git apply makes %.200q twice of the patch", e.Path)}
+		}
+		made[e.Path] = e
+	}
+	for _, c := range changes {
+		e, ok := made[c.Path]
+		delete(made, c.Path)
+		if ok == c.Delete || ok && (e.Mode != "100644" || e.Stage != 0 || e.Object != patch.BlobID(c.Content)) {
+			return &DeniedError{Reason: fmt.Sprintf("%s: git apply makes another file of the patch than agentd does: the patch reads two ways", c.Path)}
+		}
+	}
+	for p := range made {
+		return &DeniedError{Reason: fmt.Sprintf("%.200q: git apply makes a file of the patch that agentd does not: the patch reads two ways", p)}
 	}
 	return nil
 }

@@ -39,12 +39,17 @@ MISCOUNTED = """--- a/app/db.py
 +print('the audit fixed app/db.py')
 +print('bye')
 """
-AS_APPLIED = MISCOUNTED.replace("@@ -3,7 +3,5 @@", "@@ -1,2 +1,3 @@").replace("@@ -1 +1,2 @@", "@@ -1 +1,3 @@")
+# The patch as agentd applies it, which the reviewer reads: git's file headers, and the hunks'
+# headers as their lines say (the heading of the hunk that moved is the model's, and goes).
+AS_APPLIED = ("diff --git a/app/db.py b/app/db.py\n" + MISCOUNTED.split("--- a/app.py\n")[0]
+              .replace("@@ -3,7 +3,5 @@ def find_user(conn, name):", "@@ -1,2 +1,3 @@")
+              + "diff --git a/app.py b/app.py\n--- a/app.py\n" + MISCOUNTED.split("--- a/app.py\n")[1]
+              .replace("@@ -1 +1,2 @@", "@@ -1,1 +1,3 @@"))
 DB = ("def find_user(conn, name):\n    # Bind the name: never format it into the SQL text.\n"
       '    return conn.execute("SELECT * FROM users WHERE name = ?", (name,))\n')
 APP = "print('hello')\nprint('the audit fixed app/db.py')\nprint('bye')\n"
 REWRITTEN = [{"file": "app/db.py", "hunk": 1, "was": "@@ -3,7 +3,5 @@", "now": "@@ -1,2 +1,3 @@"},
-             {"file": "app.py", "hunk": 1, "was": "@@ -1 +1,2 @@", "now": "@@ -1 +1,3 @@"}]
+             {"file": "app.py", "hunk": 1, "was": "@@ -1 +1,2 @@", "now": "@@ -1,1 +1,3 @@"}]
 
 
 def report(patch: str) -> dict:
@@ -132,7 +137,7 @@ def test_the_reviewer_sees_approves_and_edits_the_patch_as_applied(stack: Stack)
     second = stack.wait_approval(run, count=2)
     card = stack.approval(second["id"])
     write = card["context"]["write"]
-    assert write["patch"] == edited.replace("@@ -1,2 +1,2 @@", "@@ -1,2 +1,3 @@"), write
+    assert write["patch"] == "diff --git a/app/db.py b/app/db.py\n" + edited.replace("@@ -1,2 +1,2 @@", "@@ -1,2 +1,3 @@"), write
     assert write["patch_rewritten"] == [{"file": "app/db.py", "hunk": 1, "was": "@@ -1,2 +1,2 @@", "now": "@@ -1,2 +1,3 @@"}]
     want = ("def find_user(conn, name):\n    # Never format the name into the SQL text.\n"
             '    return conn.execute("SELECT * FROM users WHERE name = :name", {"name": name})\n')

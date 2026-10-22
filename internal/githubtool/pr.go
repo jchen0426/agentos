@@ -204,15 +204,19 @@ func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.
 			"Pushing branch " + p.Branch + " runs the repository's workflows that start on a push or on a new branch.",
 		},
 	}
-	// The patch is applied again: the same patch on the same commit is the same, and the payload's
-	// files are it.
+	// The patch is applied again, and shown as applied only if that makes the payload's files: the
+	// same patch on the same commit always does, unless agentd changed in between.
 	repo, ref := tools.String(req.Args, "repo"), tools.String(req.Args, "patch_ref")
-	_, applied, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, t.denyPaths(), t.Repos[repo].Mirror, p.Commit)
+	changes, applied, err := tools.CheckedPatch(ctx, t.Git, t.Blobs, req.WorkflowID, ref, t.denyPaths(), t.Repos[repo].Mirror, p.Commit)
+	if err == nil && !sameFiles(changes, p.Files) {
+		err = errors.New("applied again, it makes other files than the payload holds")
+	}
 	if err != nil {
 		if b, berr := t.Blobs.GetRunBlob(ctx, req.WorkflowID, ref); berr == nil {
-			out["patch"] = string(b) // as it was written
+			out["patch_as_written"] = string(b)
 		}
-		out["patch_error"] = "agentd could not apply the patch again: " + err.Error()
+		out["patch_error"] = "agentd could not show the patch as it applied it (" + err.Error() + "): the patch as written is not " +
+			"what the payload's files are, where its hunk headers are wrong. The payload is."
 	} else {
 		out["patch"] = string(applied.Text())
 		if rw := applied.Rewritten(); len(rw) > 0 {
@@ -220,10 +224,19 @@ func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.
 			out["notes"] = append(out["notes"].([]string), fmt.Sprintf("agentd rewrote %d hunk headers of the patch, "+
 				"whose counts or places of lines the hunks' own lines contradict (patch_rewritten): the patch shown is the one applied.", len(rw)))
 		}
-		out["apply_check"] = t.applyCheck(ctx, repo, p.Commit, applied.Text(), paths)
+		out["apply_check"] = t.applyCheck(ctx, repo, p.Commit, applied.Text(), changes)
 	}
 	out["github"] = t.onGitHub(ctx, p)
 	return out
+}
+
+// sameFiles reports whether changes are the files a payload holds: the same paths, in the same
+// order, each the same content made of the same blob.
+func sameFiles(changes []patch.Change, files []prFile) bool {
+	return slices.EqualFunc(changes, files, func(c patch.Change, f prFile) bool {
+		return c.Path == f.Path && c.OldBlob == f.OldBlob && c.Delete == (f.Content == nil) &&
+			(f.Content == nil || string(c.Content) == *f.Content)
+	})
 }
 
 // maxRewrites is how many rewritten hunk headers a reviewer is shown one by one.
@@ -241,13 +254,14 @@ func rewrites(rw []patch.Rewrite) []any {
 	return out
 }
 
-// applyCheck is git's own check of the patch (git apply --check), for the reviewer.
-func (t *OpenDraftPR) applyCheck(ctx context.Context, repo, commit string, patch []byte, paths []string) map[string]any {
+// applyCheck is git's own check of the patch as applied, for the reviewer: git apply takes it, and
+// makes the same files of it.
+func (t *OpenDraftPR) applyCheck(ctx context.Context, repo, commit string, text []byte, changes []patch.Change) map[string]any {
 	r, ok := t.Repos[repo]
 	if !ok || t.Git == nil {
 		return map[string]any{"error": "no git tool server for " + repo}
 	}
-	err := tools.GitApplyCheck(ctx, t.Git, r.Mirror, commit, patch, paths)
+	err := tools.GitApplyCheck(ctx, t.Git, r.Mirror, commit, text, changes)
 	var denied *tools.DeniedError
 	switch {
 	case err == nil:

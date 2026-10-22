@@ -2369,6 +2369,18 @@ func TestDescribeShowsThePatchAsApplied(t *testing.T) {
 	if _, ok := d["patch_rewritten"]; ok || d["patch"] != fix || strings.Contains(mustJSON(t, d["notes"]), "rewrote") {
 		t.Fatalf("described %v", d)
 	}
+	// Applied again, the patch makes other files than the payload holds (an agentd of another
+	// version made the payload): it is not shown as the patch applied, but as written, and why.
+	other := strings.Replace(fix, `= ?", (name,))`, `= :n", {"n": name})`, 1)
+	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte(other))
+	req.Args["patch_ref"] = ref
+	d = tool.Describe(context.Background(), req, right)
+	if _, ok := d["patch"]; ok || d["patch_as_written"] != other || !strings.Contains(d["patch_error"].(string), "other files than the payload holds") {
+		t.Fatalf("described %v", d)
+	}
+	if _, ok := d["apply_check"]; ok {
+		t.Fatalf("git's check of a patch that is not the payload's: %v", d["apply_check"])
+	}
 }
 
 func mustJSON(t *testing.T, v any) string {
