@@ -45,7 +45,7 @@ def profiles(url: str) -> list[runner.Profile]:
     b = runner.Profile("b", json.dumps({"providers": {"local": {"adapter": "openai_compat", "api": "chat",
                                                                 "base_url": url + "/v1", "context_tokens": 65536}},
                                         "tasks": {"audit_v1": task("local/gpt-oss:20b")}}),
-                       PRICES, "local/gpt-oss:20b", paid=False)
+                       PRICES, "local/gpt-oss:20b", paid=False, differs=(("effort", "medium", "high"),))
     return [a, b]
 
 
@@ -291,6 +291,32 @@ def test_a_patch_check_that_did_not_finish_says_nothing() -> None:
         None, False, True]
 
 
+def test_the_profiles_are_the_products_audit_v1_but_where_they_say(tmp_path: Path) -> None:
+    # config/models.yaml's audit_v1, read as the flat block it is (no YAML parser here).
+    product, inside = {}, False
+    for line in (runner.REPO / "config/models.yaml").read_text().splitlines():
+        if line.startswith("  audit_v1:"):
+            inside = True
+        elif inside and line.startswith("    ") and ":" in line and not line.strip().startswith("#"):
+            key, value = line.split("#", 1)[0].strip().split(":", 1)
+            product[key] = value.strip()
+        elif inside and line.strip() and not line.startswith("    "):
+            break
+    base = runner._task(product["model"])
+    assert (str(base["max_tokens"]), base["effort"]) == (product["max_tokens"], product["effort"])
+    assert base["prompt"].endswith(product["prompt"]) and base["output_schema"].endswith(product["output_schema"])
+    assert product["blobs"] == "[" + ", ".join(base["blobs"]) + "]"
+    for p in runner.PROFILES.values():
+        task = json.loads(p.models)["tasks"]["audit_v1"]
+        product_task = runner._task(task["model"])
+        # The server-side fallback is Anthropic's alone (models.yaml lists it with the Claude model).
+        assert task.get("fallback") == ([product["fallback"].strip("[]")] if task["model"] == product["model"] else None)
+        differ = {k: [task.get(k), product_task.get(k)] for k in task.keys() | product_task.keys()
+                  if k != "fallback" and task.get(k) != product_task.get(k)}
+        assert differ == {name: [its, prod] for name, its, prod in p.differs}, p.name
+    assert runner.PROFILES["local"].differs == (("effort", "medium", "high"),)
+
+
 def test_the_plan_puts_the_runs_never_run_before_the_runs_again(tmp_path: Path) -> None:
     j = runner.Journal(tmp_path / "journal.jsonl")
 
@@ -407,6 +433,10 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     assert "44%（4/9 次，3 个用例；95% 区间" in md, md
     assert "67%（6/9 次，3 个用例；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
     assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b） |" in md
+    # Each run of b says how b is not the product as configured, and so does the report; a is it.
+    assert {json.dumps(r["differs"]) for r in results if r["profile"] == "b"} == {'{"effort": ["medium", "high"]}'}
+    assert "- 配置 b 和产品配置（config/models.yaml 的 audit_v1）不同：effort 用 medium（产品是 high）。" in md
+    assert "配置 a 和产品配置" not in md
     assert "0%（0/3 次，1 个用例；只有一个用例，没有区间）" in md and "1 对；只有一对，没有区间" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()

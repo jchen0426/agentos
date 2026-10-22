@@ -311,7 +311,9 @@ earlier runner, nor void runs run again that cost nothing). On macOS the
 state directory and the cache must be under the home directory (the default) or a temporary
 directory, which the sandboxes deny. The profiles are `config/models.yaml`'s providers,
 one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
-Ollama server above with gpt-oss:20b.
+Ollama server above with gpt-oss:20b, at effort medium: at the product's high it spends its
+output tokens reasoning and writes no answer on most cases, and the report says the profile
+differs there.
 
 ```bash
 AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 50

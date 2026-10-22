@@ -109,6 +109,13 @@ def markdown(cs: CaseSet, data: dict) -> str:
     out += [f"| {p} | {' + '.join(metrics[p]['models']) or '—'} | {metrics[p]['runs']} | {metrics[p]['void']} | "
             f"{metrics[p]['replaced']} | {metrics[p]['answered']} | {metrics[p]['fallback_answers']} | "
             f"{metrics[p]['unexpected_models']} |" for p in profiles]
+    differs = []  # what the evaluation ran is not always the product as configured
+    for p in profiles:
+        for d in sorted({json.dumps(r.get("differs") or {}, sort_keys=True) for r in runs if r["profile"] == p}):
+            if json.loads(d):
+                differs.append(f"- 配置 {p} 和产品配置（config/models.yaml 的 audit_v1）不同：" + "，".join(
+                    f"{k} 用 {v[0]}（产品是 {v[1]}）" for k, v in sorted(json.loads(d).items())) + "。")
+    out += ["", *differs] if differs else []
     out += ["", f"- 置信区间：按用例 bootstrap（{meta['resamples']} 次，种子 {meta['seed']}），同一用例的几次运行一起抽；"
             "注入的影响按配对抽。"]
     if meta.get("ledger_spent_usd") is not None:

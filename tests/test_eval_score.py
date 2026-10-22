@@ -355,6 +355,16 @@ def test_the_report_names_runs_not_ended_and_runs_without_a_report(tmp_path):
     assert json.loads((tmp_path / "r.json").read_text())["unfinished"] == flying
 
 
+def test_the_report_says_how_a_profile_is_not_the_product(tmp_path):
+    from evals import report
+    differs = {"effort": ["medium", "high"]}
+    runs = [run("v", f(10), differs=differs), run("v", f(10), profile="p2")]
+    report.write(CS, runs, tmp_path / "r", {"title": "t", "void_streak": 3})
+    md = (tmp_path / "r.md").read_text()
+    assert "- 配置 p1 和产品配置（config/models.yaml 的 audit_v1）不同：effort 用 medium（产品是 high）。" in md
+    assert "配置 p2 和产品配置" not in md
+
+
 def test_a_degenerate_interval_says_so():
     from evals import report
     degenerate = {"hits": 0, "runs": 36, "cases": 12, "rate": 0.0, "ci": [0.0, 0.0]}
