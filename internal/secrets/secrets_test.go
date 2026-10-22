@@ -37,3 +37,11 @@ func TestResolve(t *testing.T) {
 		}
 	}
 }
+
+func TestMayBeCut(t *testing.T) {
+	for length, want := range map[int]bool{PromptLimit - 1: false, PromptLimit: true, PromptLimit + 1: false, 164: false} {
+		if got := MayBeCut(strings.Repeat("k", length)); got != want {
+			t.Errorf("MayBeCut of %d characters = %v", length, got)
+		}
+	}
+}

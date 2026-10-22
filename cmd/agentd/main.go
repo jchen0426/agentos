@@ -171,7 +171,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	}
 	defer tc.Close()
 
-	adapters, err := modelAdapters(mods, led, cfg.DataDir)
+	adapters, err := modelAdapters(mods, led, cfg.DataDir, log)
 	if err != nil {
 		return err
 	}
@@ -386,6 +386,7 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 			if token, err = secrets.Resolve(g.Token); err != nil {
 				return nil, fmt.Errorf("github token: %w", err)
 			}
+			warnIfCut(log, token, "github token")
 		}
 		var err error
 		gh, err = githubtool.New(githubtool.Config{APIURL: g.APIURL, Token: token, RequestTimeout: g.RequestTimeout,
@@ -502,7 +503,7 @@ func temporalTLS(c *config.TLS) (*tls.Config, error) {
 // machine; a Chat Completions server (Ollama, vLLM) needs one only when models.yaml names it.
 // A provider elsewhere is reached over https only: the requests carry the task's data, and
 // the key.
-func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string) (map[string]models.Adapter, error) {
+func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string, log *slog.Logger) (map[string]models.Adapter, error) {
 	adapters := map[string]models.Adapter{}
 	for name, p := range mods.Providers {
 		if !mods.Uses(name) {
@@ -518,6 +519,7 @@ func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string) 
 			if key, err = secrets.Resolve(p.Key); err != nil {
 				return nil, fmt.Errorf("provider %s: %w", name, err)
 			}
+			warnIfCut(log, key, "provider "+name)
 		}
 		switch p.Adapter {
 		case "fake":
@@ -539,6 +541,16 @@ func modelAdapters(mods *models.Config, blobs models.BlobStore, dataDir string) 
 		}
 	}
 	return adapters, nil
+}
+
+// warnIfCut warns when the secret of what (a provider, the GitHub token) may have been cut as
+// it was stored (secrets.MayBeCut): nothing else says so before its first 401.
+func warnIfCut(log *slog.Logger, secret, what string) {
+	if secrets.MayBeCut(secret) {
+		log.Warn(fmt.Sprintf("the keychain item holds exactly %d characters, as many as security's prompt keeps: "+
+			"a longer key stored through the prompt was cut there, and will be refused; store it again as the README says",
+			secrets.PromptLimit), "secret", what)
+	}
 }
 
 // safetyIdentifier names this agentd to OpenAI's safeguards, and nothing else about it: a
