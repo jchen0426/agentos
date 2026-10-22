@@ -152,6 +152,8 @@ func (p *Patch) Check(denyPaths []string) error {
 			return err
 		}
 		switch {
+		case f.IsNew && f.IsDelete:
+			return violation("%s: the patch both creates and deletes it", n)
 		case f.IsBinary:
 			return violation("%s: binary changes are not accepted", n)
 		case f.IsRename || f.IsCopy || (!f.IsNew && !f.IsDelete && f.OldName != f.NewName):
@@ -237,7 +239,7 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 	}
 	changes := make([]Change, 0, len(p.files))
 	placed := make([]*gitdiff.File, 0, len(p.files))
-	hunks, moved := p.hunks, 0
+	hunks, searches := p.hunks, 0
 	for _, parsed := range p.files {
 		f := clone(parsed)
 		n := name(f)
@@ -250,7 +252,7 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		case len(orig) > MaxFileBytes:
 			return nil, violation("%s: %d bytes, over the limit of %d", n, len(orig), MaxFileBytes)
 		}
-		if err := place(n, f, orig, hunks[:len(f.TextFragments)], &moved); err != nil {
+		if err := place(n, f, orig, hunks[:len(f.TextFragments)], &searches); err != nil {
 			return nil, err
 		}
 		hunks = hunks[len(f.TextFragments):]

@@ -249,6 +249,14 @@ func TestAHunkIsItsLines(t *testing.T) {
 			"diff --git a/tests/test_db.py b/tests/test_db.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_db.py\n@@ -0,0 +1,1 @@\n+assert True\n",
 		files: map[string]string{"gone.txt": "x\ny\n"}, after: map[string]string{"tests/test_db.py": "assert True\n"},
 	}, {
+		// GNU diff -N marks a file that is not there by the epoch for its time, not /dev/null.
+		name: "a new file and a deleted one, with GNU diff -N's headers, and blank lines after",
+		patch: "--- a/gone.txt\t2026-10-01 00:00:00.000000000 +0000\n+++ b/gone.txt\t1970-01-01 00:00:00.000000000 +0000\n@@ -1,2 +0,0 @@\n-x\n-y\n\n" +
+			"--- a/n.txt\t1970-01-01 00:00:00.000000000 +00:00\n+++ b/n.txt\t2026-10-01 00:00:00.000000000 +0000\n@@ -0,0 +1 @@\n+x\n\n",
+		want: "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n" +
+			"diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,1 @@\n+x\n",
+		files: map[string]string{"gone.txt": "x\ny\n"}, after: map[string]string{"n.txt": "x\n"},
+	}, {
 		// A new file's hunk holds no line of the file before, a deleted file's none after: a blank
 		// line after either is no empty line of the file.
 		name: "blank lines after a deleted file's hunk and a new file's",
@@ -469,24 +477,31 @@ func TestAHunkGoesWhereItsLinesAre(t *testing.T) {
 	}
 }
 
-// Looking for a hunk's lines costs a pass over the file: a patch may have only so many hunks
-// that are not where their headers put them.
-func TestOnlySoManyHunksAreLookedFor(t *testing.T) {
+// Looking for a hunk's lines costs a pass over the file: a patch may make Apply look only so often,
+// for hunks that are not where their headers put them, and for hunks whose counts would put them
+// elsewhere (they end with a blank line the counts take for the file's, which it has not there).
+func TestOnlySoManySearchesAreMade(t *testing.T) {
 	f := numbered(1, 1000)
-	patch := func(n int) string {
+	patch := func(n int, misplaced bool) string {
 		var b strings.Builder
 		b.WriteString("--- a/f.txt\n+++ b/f.txt\n")
 		for i := range n {
 			at := 10 + 20*i
-			fmt.Fprintf(&b, "@@ -%d,3 +%d,3 @@\n %d\n-%d\n+changed\n %d\n", at+5, at+5, at, at+1, at+2)
+			if misplaced {
+				fmt.Fprintf(&b, "@@ -%d,3 +%d,3 @@\n %d\n-%d\n+changed\n %d\n", at+5, at+5, at, at+1, at+2)
+			} else {
+				fmt.Fprintf(&b, "@@ -%d,4 +%d,4 @@\n %d\n-%d\n+changed\n %d\n\n", at, at, at, at+1, at+2)
+			}
 		}
 		return b.String()
 	}
-	if _, _, err := applied(t, patch(MaxMoved), map[string]string{"f.txt": f}); err != nil {
-		t.Fatalf("%d hunks out of place: %v", MaxMoved, err)
+	for _, misplaced := range []bool{true, false} {
+		if _, _, err := applied(t, patch(MaxSearches, misplaced), map[string]string{"f.txt": f}); err != nil {
+			t.Fatalf("%d searches (misplaced %v): %v", MaxSearches, misplaced, err)
+		}
+		_, _, err := applied(t, patch(MaxSearches+1, misplaced), map[string]string{"f.txt": f})
+		refused(t, err, fmt.Sprintf("more than %d hunks of the patch would have to be looked for elsewhere in their files", MaxSearches))
 	}
-	_, _, err := applied(t, patch(MaxMoved+1), map[string]string{"f.txt": f})
-	refused(t, err, fmt.Sprintf("more than %d hunks of the patch are not where their headers put them", MaxMoved))
 }
 
 // A line that reads as a hunk's, but that no hunk holds, would read two ways: a patch with one is

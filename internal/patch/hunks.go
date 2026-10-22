@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
@@ -16,9 +17,10 @@ import (
 // what was applied, its file headers and hunks and nothing else, so that what a reviewer reads, what
 // git checks and what is committed are one patch, which git apply and go-gitdiff read alike.
 
-// MaxMoved is how many hunks of a patch Apply looks for in their files when their lines are not
-// where their headers put them: each look is a pass over the file.
-const MaxMoved = 32
+// MaxSearches is how many times, in all a patch's files, Apply looks through a file for a hunk's
+// lines: for a hunk that is not where its header puts it, and for one whose counts would put it
+// elsewhere. Each look is a pass over the file.
+const MaxSearches = 32
 
 // hunk is a hunk header of the patch and what it is made to say.
 type hunk struct {
@@ -254,10 +256,21 @@ func count(b []byte) ([]string, []hunk, error) {
 	return lines, hunks, nil
 }
 
-// devNull reports whether a "--- " or "+++ " line names no file, as a new or a deleted file's does.
+// devNull reports whether a "--- " or "+++ " line names no file, as a new or a deleted file's does:
+// as go-gitdiff reads it, /dev/null, or any name with the epoch for its time (GNU diff -N).
 func devNull(l string) bool {
-	name, _, _ := strings.Cut(strings.TrimSuffix(l[min(len(l), 4):], "\n"), "\t")
-	return (strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ")) && strings.TrimSpace(name) == "/dev/null"
+	if !strings.HasPrefix(l, "--- ") && !strings.HasPrefix(l, "+++ ") {
+		return false
+	}
+	name, ts, timed := strings.Cut(strings.TrimSuffix(l[4:], "\n"), "\t")
+	if strings.TrimSpace(name) == "/dev/null" {
+		return true
+	}
+	if len(ts) >= 3 && ts[len(ts)-3] == ':' { // a zone written +00:00
+		ts = ts[:len(ts)-3] + ts[len(ts)-2:]
+	}
+	t, err := time.Parse("2006-01-02 15:04:05.9 -0700", ts)
+	return timed && err == nil && t.Equal(time.Unix(0, 0))
 }
 
 // render is the patch with the header of each hunk whose numbers changed rewritten: for go-gitdiff
@@ -287,7 +300,7 @@ func render(lines []string, hunks []hunk) []byte {
 // the hunk's other lines are, it holds as many of them as the file has empty lines there. A file's
 // hunks go in the file's order. A line without its newline, which go-gitdiff joins to the next one,
 // must be the file's last.
-func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) error {
+func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, searches *int) error {
 	lines := splitLines(string(orig))
 	var empties []int // empties[j]: how many empty lines there are from lines[j] on, once a hunk needs it
 	for i, frag := range f.TextFragments {
@@ -329,6 +342,12 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 		fits := func(pos int64) bool {
 			return tail+int64(keep(pos)) > 0 || pos-1+int64(len(base)) == int64(len(lines))
 		}
+		search := func() error {
+			if *searches++; *searches > MaxSearches {
+				return violation("more than %d hunks of the patch would have to be looked for elsewhere in their files", MaxSearches)
+			}
+			return nil
+		}
 		// counted is how many of the blank lines the header's counts take for the hunk's own, when
 		// they take some: counts are a model's guess, so they decide no place, but they can make one
 		// read two ways.
@@ -341,6 +360,9 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 		switch {
 		case at(lines, base, stated) && fits(stated):
 			if k := int64(keep(stated)); counted > k {
+				if err := search(); err != nil {
+					return err
+				}
 				if other := find(lines, base, 1, func(p int64) bool { return p != stated && int64(keep(p)) >= counted }); len(other) > 0 {
 					return violation("%s: the patch does not apply: hunk %d reads two ways: its header puts it at line %d, but its counts take "+
 						"the blank lines it ends with for the file's own, which the file has after the hunk's other lines at line %d", path, i+1, stated, other[0])
@@ -350,6 +372,9 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 			return violation("%s: the patch does not apply: hunk %d has no context after its last change, so git apply puts it at the file's end, "+
 				"and its header at line %d, where its lines are too", path, i+1, stated)
 		default:
+			if err := search(); err != nil {
+				return err
+			}
 			found := find(lines, base, 2, fits)
 			switch {
 			case len(found) == 0 && tail == 0 && len(find(lines, base, 1, nil)) > 0:
@@ -361,9 +386,6 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 			case len(found) > 1:
 				return violation("%s: the patch does not apply: the lines of hunk %d are at lines %d and %d of the file at the commit, not at line %d, where its header puts them",
 					path, i+1, found[0], found[1], stated)
-			}
-			if *moved++; *moved > MaxMoved {
-				return violation("more than %d hunks of the patch are not where their headers put them", MaxMoved)
 			}
 			pos = found[0]
 		}
