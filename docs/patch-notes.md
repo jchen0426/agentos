@@ -203,7 +203,18 @@
 
 ## 三种环境
 
-（待补）
+在最后的代码（04c4463）上跑全套测试：
+
+| 环境 | 通过 | 跳过 |
+|---|---|---|
+| macOS 不加沙箱 | 214 | 28 |
+| macOS srt | 237 | 5 |
+| Linux 虚拟机 bwrap | 226 | 16 |
+
+- 跳过的都是别的环境的用例，以及需要真实 GitHub 的 T2。
+- `go test ./...`、`go vet`、gofmt 都通过。
+- 中间几轮（aef4caf、88e3d7c）的三种环境也都过了。只有 aef4caf 那一轮 srt 失败一次 `test_agentd_takes_no_proxy_from_its_environment`：当时机器负载 17 到 21，agentd 5 秒内没连上 Temporal；单独重跑通过，04c4463 上也通过。
+- 沙箱里 git 写临时对象目录的那一步，两种沙箱都放行。agentd 启动时的自检会核对 git 打出来的 blob，所以沙箱不放行的话，agentd 起不来，会立刻看到。
 
 ## 审查
 
@@ -274,6 +285,10 @@
   - 模型数不清行号，这次是在 agentd 这边兜底。
   - 更根本的做法是改补丁的格式，让模型给“把这几行换成那几行”（搜索、替换块），行号由 agentd 算，补丁也由 agentd 生成。
   - 要改提示词和输出 schema，评测的版本也跟着变，另做。
+- **本地模型（gpt-oss:20b）的补丁是另一回事**（m5-eval 会话 2026-10-22 的冒烟运行）：
+  - 4 个补丁全被拒，原因不是 hunk 头的数字。3 个是 OpenAI 的 apply_patch 格式（`*** Begin Patch`、`*** Update File:`、光秃秃的 `@@`），1 个有 `---`、`+++` 头，但 `@@` 后面没有行号。
+  - git 加不加 `--recount` 都说 “No valid patches in input”，这次的改法也帮不了。
+  - 没有行号的 `@@` 可以按这里的规则接受：只按行找，必须唯一。apply_patch 格式要转换，或者给 gpt-oss 单独的提示词。这由你定，另做。
 - **评测报告可以按 `rewritten_hunks` 分开列**：头写错但打得上的比例，看哪个模型更马虎（`evals/` 归 m5-eval 会话）。
 - **补上的最后换行不算“改写”**：`patch_rewritten` 不列，载荷里看得到。
 - **git 的核对只在 apply_check 里**（两个审查都提到）：open_draft_pr 的 Prepare 不跑 git，跳过 apply_check 的工作流开出的 PR 就只有 agentd 的读法。和卡片一致，只是少了 git 的旁证。要在 Prepare 里也跑，githubtool 里“谎报文件的工具服务器”那几个测试也要让它在 apply_check 里一起撒谎，另做。
