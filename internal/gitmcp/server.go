@@ -92,6 +92,18 @@ type ApplyCheckIn struct {
 type ApplyCheckOut struct {
 	Applies bool   `json:"applies"`
 	Reason  string `json:"reason,omitempty" jsonschema:"why git apply refuses the patch"`
+	// Index is what git apply made of the files the patch touches: the throwaway index's entries
+	// once the patch is applied to it. A file the patch deletes is not there. Whoever applies the
+	// patch another way can check that it makes the same files.
+	Index *[]IndexEntry `json:"index,omitempty" jsonschema:"the files the patch leaves, as git apply makes them"`
+}
+
+// IndexEntry is one entry of an index, as git ls-files -s shows it.
+type IndexEntry struct {
+	Path   string `json:"path"`
+	Mode   string `json:"mode"`
+	Object string `json:"object" jsonschema:"the file's blob"`
+	Stage  int    `json:"stage"`
 }
 
 type ResolveCommitIn struct {
@@ -134,7 +146,7 @@ func (s *Server) MCP() *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{Name: "show_diff",
 		Description: "The changes a commit makes against its first parent, as a patch."}, s.showDiff)
 	mcp.AddTool(srv, &mcp.Tool{Name: "apply_check",
-		Description: "Whether git apply accepts a patch on top of a commit, without changing anything."}, s.applyCheck)
+		Description: "Whether git apply accepts a patch on top of a commit, and what it makes of the files, without changing anything."}, s.applyCheck)
 	mcp.AddTool(srv, &mcp.Tool{Name: "resolve_commit",
 		Description: "The one commit that the first digits of its SHA name."}, s.resolveCommit)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_files",
@@ -209,10 +221,24 @@ func (s *Server) applyCheck(ctx context.Context, _ *mcp.CallToolRequest, in Appl
 		return nil, ApplyCheckOut{}, unavailable(err)
 	}
 	defer os.RemoveAll(dir)
+	// The blobs of the files the patch makes go to a throwaway object directory, which reads the
+	// mirror's through it: the mirror is never written.
+	objects, err := s.git(ctx, nil, nil, 1<<16, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil {
+		return nil, ApplyCheckOut{}, failed(err)
+	}
+	mirrorObjects := strings.TrimSuffix(string(objects), "\n")
+	if strings.ContainsAny(mirrorObjects, ":\"\n") {
+		return nil, ApplyCheckOut{}, unavailable(errors.New("the mirror's object directory is not a path git takes as an alternate"))
+	}
+	if err := os.Mkdir(filepath.Join(dir, "objects"), 0o700); err != nil {
+		return nil, ApplyCheckOut{}, unavailable(err)
+	}
 	// A throwaway index holding only the files the patch touches, as the commit has them: the
 	// rest of the tree, however large, is never read, and neither the mirror nor any worktree
 	// changes.
-	env := []string{"GIT_INDEX_FILE=" + filepath.Join(dir, "index")}
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(dir, "index"), "GIT_OBJECT_DIRECTORY=" + filepath.Join(dir, "objects"),
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES=" + mirrorObjects}
 	entries, err := s.git(ctx, nil, nil, 1<<20, append([]string{"ls-tree", "-z", "--full-tree", in.Commit, "--"}, in.Paths...)...)
 	if err != nil {
 		return nil, ApplyCheckOut{}, failed(err)
@@ -220,17 +246,46 @@ func (s *Server) applyCheck(ctx context.Context, _ *mcp.CallToolRequest, in Appl
 	if _, err := s.git(ctx, env, bytes.NewReader(entries), 0, "update-index", "-z", "--index-info"); err != nil {
 		return nil, ApplyCheckOut{}, failed(err)
 	}
-	_, err = s.git(ctx, env, strings.NewReader(in.Patch), 0, "apply", "--cached", "--check", "-")
+	_, err = s.git(ctx, env, strings.NewReader(in.Patch), 0, "apply", "--cached", "-")
 	var refused *gitError
 	switch {
-	case err == nil:
-		return result("the patch applies"), ApplyCheckOut{Applies: true}, nil
 	case errors.As(err, &refused) && (refused.code == 1 || refused.code == 128) && !gitenv.TooLarge(refused.msg):
 		// git apply's own "no": the patch does not fit the commit (1), or is not a patch git
 		// can apply at all (128). The index was just built, so neither is about the mirror.
 		return result("the patch does not apply"), ApplyCheckOut{Applies: false, Reason: refused.Error()}, nil
+	case err != nil:
+		return nil, ApplyCheckOut{}, failed(err)
 	}
-	return nil, ApplyCheckOut{}, failed(err)
+	listing, err := s.git(ctx, env, nil, 1<<20, "ls-files", "-s", "-z")
+	if err != nil {
+		return nil, ApplyCheckOut{}, failed(err)
+	}
+	index, err := indexEntries(listing)
+	if err != nil {
+		return nil, ApplyCheckOut{}, unavailable(err)
+	}
+	return result("the patch applies"), ApplyCheckOut{Applies: true, Index: &index}, nil
+}
+
+// indexEntries reads git ls-files -s -z: "<mode> <object> <stage>\t<path>", each ending in NUL.
+func indexEntries(listing []byte) ([]IndexEntry, error) {
+	entries := []IndexEntry{}
+	for line := range bytes.SplitSeq(listing, []byte{0}) {
+		if len(line) == 0 {
+			continue
+		}
+		meta, path, ok := bytes.Cut(line, []byte{'\t'})
+		f := strings.Fields(string(meta))
+		if !ok || len(f) != 3 || !fullSHA.MatchString(f[1]) {
+			return nil, fmt.Errorf("git ls-files: unexpected entry %.200q", line)
+		}
+		stage, err := strconv.Atoi(f[2])
+		if err != nil {
+			return nil, fmt.Errorf("git ls-files: unexpected entry %.200q", line)
+		}
+		entries = append(entries, IndexEntry{Path: string(path), Mode: f[0], Object: f[1], Stage: stage})
+	}
+	return entries, nil
 }
 
 // resolveCommit finds the one commit some digits name, from object headers alone: git reads a

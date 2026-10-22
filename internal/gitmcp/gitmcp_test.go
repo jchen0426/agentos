@@ -694,6 +694,19 @@ func TestApplyCheck(t *testing.T) {
 	if msg, err := call(t, cs, "apply_check", ApplyCheckIn{Commit: head, Patch: fix, Paths: paths}, &out); msg != "" || err != nil || !out.Applies {
 		t.Fatalf("the fix: %+v %q %v", out, msg, err)
 	}
+	// What git made of the file: the safe version, as a blob git names.
+	if want := []IndexEntry{{Path: "app/db.py", Mode: "100644", Object: blobID([]byte(safe))}}; out.Index == nil || !slices.Equal(*out.Index, want) {
+		t.Fatalf("the fix made %+v, want %+v", out.Index, want)
+	}
+	// A patch that deletes the file leaves nothing in the index; one that adds a file adds it.
+	out = ApplyCheckOut{}
+	gone := "diff --git a/app/db.py b/app/db.py\ndeleted file mode 100644\n--- a/app/db.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n" +
+		"-def find_user(conn, name):\n-    return conn.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)\n" +
+		"diff --git a/app/new.py b/app/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/app/new.py\n@@ -0,0 +1 @@\n+x = 1\n"
+	if msg, err := call(t, cs, "apply_check", ApplyCheckIn{Commit: head, Patch: gone, Paths: []string{"app/db.py", "app/new.py"}}, &out); msg != "" ||
+		err != nil || !out.Applies || out.Index == nil || !slices.Equal(*out.Index, []IndexEntry{{Path: "app/new.py", Mode: "100644", Object: blobID([]byte("x = 1\n"))}}) {
+		t.Fatalf("a deletion and a new file: %+v %+v %q %v", out, out.Index, msg, err)
+	}
 	// The fix does not apply to the commit before the injection: git's own "no".
 	out = ApplyCheckOut{}
 	if msg, err := call(t, cs, "apply_check", ApplyCheckIn{Commit: first, Patch: fix, Paths: paths}, &out); msg != "" || err != nil ||
@@ -714,6 +727,10 @@ func TestApplyCheck(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Error("apply_check changed the mirror's index")
 	}
+	// The blobs git made went to the throwaway object directory, not the mirror's.
+	if out, err := exec.Command("git", "-C", dir, "cat-file", "-e", blobID([]byte("x = 1\n"))).CombinedOutput(); err == nil {
+		t.Errorf("apply_check wrote a blob to the mirror: %s", out)
+	}
 	if status, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output(); err != nil || len(status) != 0 {
 		t.Errorf("the mirror changed: %q %v", status, err)
 	}
@@ -723,6 +740,20 @@ func TestApplyCheck(t *testing.T) {
 	broken := connect(t, &Server{Mirror: dir, TempDir: filepath.Join(t.TempDir(), "missing")})
 	if msg, err := call(t, broken, "apply_check", ApplyCheckIn{Commit: head, Patch: fix, Paths: paths}, &out); msg != "" || err == nil {
 		t.Fatalf("no temporary directory: %q %v, want a protocol error", msg, err)
+	}
+}
+
+// What git ls-files -s says of the index is read whole, or not at all.
+func TestIndexEntries(t *testing.T) {
+	blob := blobID([]byte("x\n"))
+	got, err := indexEntries([]byte("100644 " + blob + " 0\ta/b.txt\x00100644 " + blob + " 2\tc\td.txt\x00"))
+	if err != nil || !slices.Equal(got, []IndexEntry{{Path: "a/b.txt", Mode: "100644", Object: blob}, {Path: "c\td.txt", Mode: "100644", Object: blob, Stage: 2}}) {
+		t.Fatalf("%+v %v", got, err)
+	}
+	for _, bad := range []string{"100644 abc 0\tx\x00", "100644 " + blob + "\tx\x00", "100644 " + blob + " zero\tx\x00", "100644 " + blob + " 0 x\x00"} {
+		if _, err := indexEntries([]byte(bad)); err == nil {
+			t.Errorf("%q: read", bad)
+		}
 	}
 }
 

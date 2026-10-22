@@ -44,7 +44,11 @@ func violation(format string, args ...any) error {
 }
 
 // Patch is a parsed patch.
-type Patch struct{ files []*gitdiff.File }
+type Patch struct {
+	files []*gitdiff.File // as parsed: their hunks' headers count the hunks' lines (see hunks.go)
+	hunks []hunk          // one for each hunk of files, in order
+	text  []byte          // the patch as applied (Text)
+}
 
 // Change is what a patch does to one file.
 type Change struct {
@@ -58,14 +62,19 @@ type Change struct {
 }
 
 // Parse reads a unified diff, git's or a plain one. A plain one names its files with a
-// leading component ("a/app.py", "b/app.py") that is dropped, as git apply does.
+// leading component ("a/app.py", "b/app.py") that is dropped, as git apply does. The counts in
+// its hunk headers are the hunks' lines', whatever the headers say (see hunks.go).
 func Parse(b []byte) (*Patch, error) {
 	if len(b) > MaxBytes {
 		return nil, violation("the patch is %d bytes, over the limit of %d", len(b), MaxBytes)
 	}
-	files, _, err := gitdiff.Parse(bytes.NewReader(b))
+	lines, hunks, err := count(b)
 	if err != nil {
-		return nil, violation("the patch does not parse: %v", err)
+		return nil, err
+	}
+	files, err := parse(render(lines, hunks))
+	if err != nil {
+		return nil, err
 	}
 	if len(files) == 0 {
 		return nil, violation("the patch changes no file")
@@ -73,12 +82,37 @@ func Parse(b []byte) (*Patch, error) {
 	if len(files) > MaxFiles {
 		return nil, violation("the patch changes %d files, over the limit of %d", len(files), MaxFiles)
 	}
-	if !gitHeader.Match(b) {
+	n := 0
+	for _, f := range files {
+		n += len(f.TextFragments)
+	}
+	if n != len(hunks) {
+		return nil, violation("the patch reads as %d hunks one way and %d another", len(hunks), n)
+	}
+	shown := make([]*gitdiff.File, len(files))
+	for i, f := range files {
+		shown[i] = clone(f)
+		canonical(shown[i])
+	}
+	text := format(shown)
+	if len(text) > MaxBytes {
+		return nil, violation("the patch is %d bytes as agentd writes it, over the limit of %d", len(text), MaxBytes)
+	}
+	return &Patch{files: files, hunks: hunks, text: text}, nil
+}
+
+// parse is go-gitdiff's reading of a patch.
+func parse(text []byte) ([]*gitdiff.File, error) {
+	files, _, err := gitdiff.Parse(bytes.NewReader(text))
+	if err != nil {
+		return nil, violation("the patch does not parse: %v", err)
+	}
+	if !gitHeader.Match(text) {
 		for _, f := range files {
 			f.OldName, f.NewName = dropComponent(f.OldName), dropComponent(f.NewName)
 		}
 	}
-	return &Patch{files: files}, nil
+	return files, nil
 }
 
 var gitHeader = regexp.MustCompile(`(?m)^diff --git `)
@@ -118,6 +152,8 @@ func (p *Patch) Check(denyPaths []string) error {
 			return err
 		}
 		switch {
+		case f.IsNew && f.IsDelete:
+			return violation("%s: the patch both creates and deletes it", n)
 		case f.IsBinary:
 			return violation("%s: binary changes are not accepted", n)
 		case f.IsRename || f.IsCopy || (!f.IsNew && !f.IsDelete && f.OldName != f.NewName):
@@ -193,15 +229,19 @@ func checkPath(n string) error {
 // each path the commit has a file at. A path it has nothing at is left out.
 type Source func(paths []string) (map[string][]byte, error)
 
-// Apply applies the patch to the files src reads, exactly where its hunks say: a hunk whose
-// context does not match is a violation, not something to fuzz.
+// Apply applies the patch to the files src reads, each hunk where its lines are (see place): a
+// hunk whose context does not match exactly is a violation, not something to fuzz. Text is then
+// the patch as applied.
 func (p *Patch) Apply(src Source) ([]Change, error) {
 	files, err := src(p.Paths())
 	if err != nil {
 		return nil, fmt.Errorf("read the files at the commit: %w", err)
 	}
 	changes := make([]Change, 0, len(p.files))
-	for _, f := range p.files {
+	placed := make([]*gitdiff.File, 0, len(p.files))
+	hunks, searches := p.hunks, 0
+	for _, parsed := range p.files {
+		f := clone(parsed)
 		n := name(f)
 		orig, exists := files[n]
 		switch {
@@ -212,6 +252,12 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		case len(orig) > MaxFileBytes:
 			return nil, violation("%s: %d bytes, over the limit of %d", n, len(orig), MaxFileBytes)
 		}
+		if err := place(n, f, orig, hunks[:len(f.TextFragments)], &searches); err != nil {
+			return nil, err
+		}
+		hunks = hunks[len(f.TextFragments):]
+		canonical(f)
+		placed = append(placed, f)
 		var out bytes.Buffer
 		if err := gitdiff.Apply(&out, bytes.NewReader(orig), f); err != nil {
 			return nil, violation("%s: the patch does not apply: %v", n, err)
@@ -234,7 +280,39 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 		c.Content = out.Bytes()
 		changes = append(changes, c)
 	}
+	// go-gitdiff reads the patch as applied as the hunks were applied, or it is not the patch.
+	text := format(placed)
+	switch read, err := parse(text); {
+	case len(text) > MaxBytes:
+		return nil, violation("the patch is %d bytes as agentd writes it, over the limit of %d", len(text), MaxBytes)
+	case err != nil:
+		return nil, violation("the patch as applied does not read as applied: %v", err)
+	case !same(read, placed):
+		return nil, violation("the patch as applied does not read as applied")
+	}
+	p.text = text
 	return changes, nil
+}
+
+// Text is the patch as Apply last applied it (before Apply, as Parse counted it), written anew from
+// its files and hunks alone: what git checks, what a reviewer reads, and what the changes are. Its
+// hunk headers say what the hunks' lines do; nothing of the patch outside its files' headers and
+// hunks is in it.
+func (p *Patch) Text() []byte { return p.text }
+
+// Rewritten lists the hunk headers Text has anew.
+func (p *Patch) Rewritten() []Rewrite {
+	var out []Rewrite
+	k := 0
+	for _, f := range p.files {
+		for i := range f.TextFragments {
+			if h := p.hunks[k]; h.now != h.was {
+				out = append(out, Rewrite{Path: name(f), Hunk: i + 1, Was: h.header, Now: h.now.String()})
+			}
+			k++
+		}
+	}
+	return out
 }
 
 // BlobID is the name git gives a file of content b: the SHA-1 of its blob object.
