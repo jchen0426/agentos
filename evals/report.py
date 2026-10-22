@@ -39,10 +39,26 @@ def interval(r: dict) -> str:
     return f"{pct(r['rate'])}（{r['hits']}/{r['runs']} 次{counted}{within}）"
 
 
+def prompt_version(version: str) -> str:
+    """A prompt version as agentd records it, "<path>@sha256:<hex>", with the path from the
+    repository's root. The evaluation names its prompts by absolute path, which says where the
+    checkout was (the user's name among it), not which prompt; the report is published."""
+    path, at, digest = version.rpartition("@")
+    marker = "/config/prompts/"
+    if at and marker in path:
+        path = path[path.index(marker) + 1:]
+    return f"{path}{at}{digest}"
+
+
+def _published(runs: Sequence[dict]) -> list[dict]:
+    return [{**r, "prompts": [prompt_version(p) for p in r["prompts"]]} if r.get("prompts") else r for r in runs]
+
+
 def build(cs: CaseSet, results: list[dict], meta: dict, seed: int = 0, replaced: Sequence[dict] = (),
           unfinished: Sequence[dict] = ()) -> dict:
     """Everything the report shows, as JSON. `replaced` are the void runs run again; `unfinished`
     the runs started and not ended (a runner stopped while they ran): in no number but their own."""
+    results, replaced, unfinished = _published(results), _published(replaced), _published(unfinished)
     return {"meta": {**meta, "cases_sha256": cs.sha256, "seed": seed, "resamples": score.RESAMPLES,
                      "window": score.WINDOW, "fp_severity": score.FP_SEVERITY},
             "composition": composition(cs), "metrics": score.metrics(cs, results, seed, replaced),

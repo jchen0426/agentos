@@ -371,6 +371,19 @@ def test_the_report_names_the_efforts_the_ledger_recorded(tmp_path):
     assert "p1（m/one，effort medium）" in md and "p2（m/two，effort high）" in md and "p3（m/three）" in md
 
 
+def test_the_report_names_prompts_from_the_repository_root(tmp_path):
+    from evals import report
+    absolute = "/Users/someone/src/agent-os/config/prompts/audit_v1/claude.md@sha256:483116ba4caf"
+    runs = [run("v", f(10), prompts=[absolute]), run("v", f(10), prompts=["prompts/x.md@sha256:1"])]
+    report.write(CS, runs, tmp_path / "r", {"title": "t", "void_streak": 3},
+                 replaced=[run("v", outcome="failed: boom", prompts=[absolute])])
+    for out in ("r.md", "r.json"):
+        text = (tmp_path / out).read_text()
+        assert "/Users/" not in text and "config/prompts/audit_v1/claude.md@sha256:483116ba4caf" in text, out
+    assert "prompts/x.md@sha256:1" in (tmp_path / "r.md").read_text()  # a relative path stays as it is
+    assert report.prompt_version("no-digest") == "no-digest"
+
+
 def test_a_degenerate_interval_says_so():
     from evals import report
     degenerate = {"hits": 0, "runs": 36, "cases": 12, "rate": 0.0, "ci": [0.0, 0.0]}
