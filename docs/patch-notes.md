@@ -203,7 +203,7 @@
 
 ## 三种环境
 
-在最后的代码（04c4463）上跑全套测试：
+在最后的代码（c89b0bf）上跑全套测试：
 
 | 环境 | 通过 | 跳过 |
 |---|---|---|
@@ -213,7 +213,7 @@
 
 - 跳过的都是别的环境的用例，以及需要真实 GitHub 的 T2。
 - `go test ./...`、`go vet`、gofmt 都通过。
-- 中间几轮（aef4caf、88e3d7c）的三种环境也都过了。只有 aef4caf 那一轮 srt 失败一次 `test_agentd_takes_no_proxy_from_its_environment`：当时机器负载 17 到 21，agentd 5 秒内没连上 Temporal；单独重跑通过，04c4463 上也通过。
+- 中间几轮（aef4caf、88e3d7c、04c4463）的三种环境也都过了。只有 aef4caf 那一轮 srt 失败一次 `test_agentd_takes_no_proxy_from_its_environment`：当时机器负载 17 到 21，agentd 5 秒内没连上 Temporal；单独重跑通过，之后几轮也都通过。
 - 沙箱里 git 写临时对象目录的那一步，两种沙箱都放行。agentd 启动时的自检会核对 git 打出来的 blob，所以沙箱不放行的话，agentd 起不来，会立刻看到。
 
 ## 审查
