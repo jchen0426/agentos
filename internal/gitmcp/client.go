@@ -3,7 +3,9 @@ package gitmcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -461,7 +463,7 @@ func (c *Client) SelfCheck(ctx context.Context) error {
 	if f := files[0]; f.Mode != "100644" || f.Type != "blob" || string(f.Content) != "ok\n" {
 		return fmt.Errorf("the git tool server read check.txt as %s %s %q", f.Mode, f.Type, f.Content)
 	}
-	// apply_check writes its throwaway index to the one directory the server may write.
+	// apply_check writes its throwaway index and objects to the one directory the server may write.
 	var check ApplyCheckOut
 	patch := "--- a/check.txt\n+++ b/check.txt\n@@ -1 +1 @@\n-ok\n+checked\n"
 	if err := c.Call(ctx, dir, "apply_check", ApplyCheckIn{Commit: commit, Patch: patch, Paths: []string{"check.txt"}}, &check); err != nil {
@@ -470,7 +472,20 @@ func (c *Client) SelfCheck(ctx context.Context) error {
 	if !check.Applies {
 		return fmt.Errorf("the git tool server refused a patch that applies: %s", check.Reason)
 	}
+	if want := (IndexEntry{Path: "check.txt", Mode: "100644", Object: blobID([]byte("checked\n"))}); check.Index == nil ||
+		len(*check.Index) != 1 || (*check.Index)[0] != want {
+		return fmt.Errorf("the git tool server said git made %+v of a patch that makes %+v", check.Index, want)
+	}
 	return nil
+}
+
+// blobID is the name git gives a file of content b (as internal/patch.BlobID, which this package
+// cannot import).
+func blobID(b []byte) string {
+	h := sha1.New()
+	fmt.Fprintf(h, "blob %d\x00", len(b))
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // failedOn is the error of a call that did not get an answer. What went wrong goes to agentd's

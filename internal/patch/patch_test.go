@@ -119,6 +119,7 @@ func TestCheckRefuses(t *testing.T) {
 		{"diff --git a/app/db.py b/app/db.py\n", "changes nothing"},
 		{"diff --git a/app/db.py b/app/db.py\nindex 1111111..2222222 100644\n", "changes nothing"},
 		{newFile(strings.Repeat("d/", MaxDepth)+"f.txt", "100644"), "33 parts deep, over the limit of 32"},
+		{"diff --git a/x b/x\nnew file mode 100644\ndeleted file mode 100644\n", "both creates and deletes it"},
 	} {
 		p, err := Parse([]byte(tc.patch))
 		if err == nil {

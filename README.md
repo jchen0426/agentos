@@ -45,7 +45,7 @@ wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement, model patches whose hunk headers are wrong |
 | `evals/`, `docs/eval/` | the first task's evaluation: the case set, its mirrors, the runner, the scoring and the per-model report (`python -m evals`); the reports |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
@@ -139,9 +139,15 @@ bin/agentctl approvals list
 bin/agentctl approvals show <approval-id>
 ```
 
-`show` prints what agentd itself observed (the patch in full, the files it changes, `git apply
---check`, the findings, where the base branch stands on GitHub, what the run has spent), exactly
-what GitHub will receive, and the sha256 of that payload, which every decision names:
+`show` prints what agentd itself observed (the patch in full, the files it changes, git's own
+check of it, the findings, where the base branch stands on GitHub, what the run has spent), exactly
+what GitHub will receive, and the sha256 of that payload, which every decision names. The patch is
+shown as agentd applies it: models get the numbers in hunk headers wrong, so agentd counts each
+hunk's lines and finds them in the file (where the header says if they are there, else the one
+place they are; never a line that differs), and writes the patch anew, in git's format, with the
+headers to match and nothing outside its files' headers and hunks (no index lines or headings: the
+patch's own claims); `patch_rewritten` lists the headers it rewrote. git checks that patch, and must
+make the same files of it.
 
 ```bash
 bin/agentctl approvals approve <approval-id> --payload-sha256 <sha256>
@@ -149,7 +155,7 @@ bin/agentctl approvals approve <approval-id> --payload-sha256 <sha256>
 
 `reject ... --reason '...'` stops the pull request; the reason goes into the run's report. `edit
 ... --patch-file fix.diff` sends your patch back to the run, which checks it again and asks for
-approval of the result. The first decision counts: a second, from you or anyone, is told who
+approval of the result; its hunk headers need not count right, as above. The first decision counts: a second, from you or anyone, is told who
 decided what, and when. An approval nobody decides in time (`approval_ttl` in the policy, 24 hours
 by default) expires as a rejection. Decisions are recorded under your user name; `--as` names
 someone else.
