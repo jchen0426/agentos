@@ -272,6 +272,37 @@ func TestAHunkIsItsLines(t *testing.T) {
 		want:  diff("b.txt") + "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n \n",
 		files: map[string]string{"b.txt": "1\n2\n\n3\n"}, after: map[string]string{"b.txt": "1\ntwo\n\n3\n"},
 	}, {
+		// The hunk's only line of the file is its empty line 3, written bare; one more blank line
+		// sets it off. At line 3 the file has one empty line, and elsewhere two.
+		name:  "a hunk whose only line of the file is an empty one, then one more blank line",
+		patch: "--- a/i.py\n+++ b/i.py\n@@ -3,1 +3,2 @@\n+import re\n\n\n",
+		want:  diff("i.py") + "@@ -3,1 +3,2 @@\n+import re\n \n",
+		files: map[string]string{"i.py": imports},
+		after: map[string]string{"i.py": strings.Replace(imports, "sys\n", "sys\nimport re\n", 1)},
+	}, {
+		name: "the same, then a blank line and another file",
+		patch: "--- a/i.py\n+++ b/i.py\n@@ -3,1 +3,2 @@\n+import re\n\n\n" +
+			"--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n",
+		want:  diff("i.py") + "@@ -3,1 +3,2 @@\n+import re\n \n" + diff("g.txt") + "@@ -1,2 +1,2 @@\n-a\n+A\n b\n",
+		files: map[string]string{"i.py": imports, "g.txt": "a\nb\n"},
+		after: map[string]string{"i.py": strings.Replace(imports, "sys\n", "sys\nimport re\n", 1), "g.txt": "A\nb\n"},
+	}, {
+		// Counted, the blank line would be the file's on the old side (4 lines), but not on the new
+		// side (3): the counts take it for nothing, and the hunk stays in a().
+		name:  "counts that disagree about the blank line",
+		patch: "--- a/m.py\n+++ b/m.py\n@@ -2,4 +2,3 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n\n",
+		want:  diff("m.py") + "@@ -2,3 +2,3 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n",
+		files: map[string]string{"m.py": twoFuncs},
+		after: map[string]string{"m.py": strings.Replace(twoFuncs, "conn.cursor()", "conn.cursor(buffered=True)", 1)},
+	}, {
+		// The counts take two blank lines for the file's; b() has one after the same lines: not
+		// enough for the counts' reading, so there is only one reading.
+		name:  "counts that take more blank lines than the file has anywhere",
+		patch: "--- a/m.py\n+++ b/m.py\n@@ -2,5 +2,5 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n\n\n",
+		want:  diff("m.py") + "@@ -2,3 +2,3 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n",
+		files: map[string]string{"m.py": twoFuncs},
+		after: map[string]string{"m.py": strings.Replace(twoFuncs, "conn.cursor()", "conn.cursor(buffered=True)", 1)},
+	}, {
 		// svn itself names files without a/ and b/: as a plain diff's, they would lose their first
 		// component, as git apply -p1 does.
 		name: "svn's Index lines, and text between files",
@@ -295,6 +326,40 @@ func TestAHunkIsItsLines(t *testing.T) {
 				t.Errorf("after the patch:\n%q\nwant\n%q", after, tc.after)
 			}
 		})
+	}
+}
+
+// twoFuncs is a file of two functions alike, the second followed by an empty line; imports, one
+// with one empty line after its imports, and two between its functions.
+const (
+	twoFuncs = "def a():\n    conn = db()\n    cur = conn.cursor()\n    return cur\ndef b():\n    conn = db()\n    cur = conn.cursor()\n    return cur\n\nX = 1\n"
+	imports  = "import os\nimport sys\n\ndef main():\n    pass\n\n\ndef helper():\n    pass\n"
+)
+
+// After a new or a deleted file, the next file's hunks hold their blank lines again (from the
+// adversarial review's mutation pass).
+func TestTheNextFileAfterANewOrDeletedOne(t *testing.T) {
+	mod := "@@ -1,3 +1,3 @@\n a\n-b\n+B\n\n" // its only context after its change: the file's empty line, written bare
+	newFile := "--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n"
+	for name, patch := range map[string]string{
+		"a git new file, then a git modified file": "diff --git a/n.txt b/n.txt\nnew file mode 100644\n" + newFile +
+			"diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n" + mod,
+		"a plain new file, then a plain modified file":  newFile + "--- a/g.txt\n+++ b/g.txt\n" + mod,
+		"a plain new file, a blank line, the next file": newFile + "\n--- a/g.txt\n+++ b/g.txt\n" + mod,
+		"a timestamped /dev/null, a blank line, the next file": strings.Replace(newFile, "/dev/null", "/dev/null\t1970-01-01 00:00:00.000000000 +0000", 1) +
+			"\n--- a/g.txt\n+++ b/g.txt\n" + mod,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, after, err := applied(t, patch, map[string]string{"g.txt": "a\nb\n\nc\n"})
+			if err != nil || !equal(after, map[string]string{"g.txt": "a\nB\n\nc\n", "n.txt": "n\n"}) {
+				t.Fatalf("%v %q", err, after)
+			}
+		})
+	}
+	_, after, err := applied(t, "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n\n--- a/g.txt\n+++ b/g.txt\n"+mod,
+		map[string]string{"g.txt": "a\nb\n\nc\n", "gone.txt": "x\n"})
+	if err != nil || !equal(after, map[string]string{"g.txt": "a\nB\n\nc\n"}) {
+		t.Fatalf("a plain deleted file, a blank line, the next file: %v %q", err, after)
 	}
 }
 
@@ -463,6 +528,11 @@ func TestAHunkGoesWhereItsLinesAre(t *testing.T) {
 		patch: "--- a/m.py\n+++ b/m.py\n@@ -2,4 +2,4 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n\n",
 		want:  "m.py: the patch does not apply: hunk 1 reads two ways: its header puts it at line 2, but its counts take the blank lines it ends with for the file's own, which the file has after the hunk's other lines at line 6",
 	}, {
+		// Its only line of the file is an empty one, which says nothing of where it goes.
+		name:  "it holds only empty lines of the file, not where its header puts it",
+		patch: "--- a/i.py\n+++ b/i.py\n@@ -1,1 +1,2 @@\n+import re\n\n\n",
+		want:  "i.py: the patch does not apply: hunk 1 holds only empty lines of the file, which do not say where it goes, and they are not where its header puts it",
+	}, {
 		// "-- " before a blank line is no signature: it removes "- ", which the file does not have.
 		name:  "\"-- \", then a blank line",
 		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n-- \n\n",
@@ -471,7 +541,7 @@ func TestAHunkGoesWhereItsLinesAre(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := applied(t, tc.patch, map[string]string{"f.txt": f, "t.txt": twice, "c.ini": conf, "e.txt": "",
 				"o.txt": "b1\nb2\np\nq\np\nq\nend\n", "r.txt": "a\nb\nc\n\nx\na\nb\nc\ny\n", "v.txt": "top\n}\n\n}\n\n}\nend\n",
-				"m.py": "def a():\n    conn = db()\n    cur = conn.cursor()\n    return cur\ndef b():\n    conn = db()\n    cur = conn.cursor()\n    return cur\n\nX = 1\n"})
+				"m.py": twoFuncs, "i.py": imports})
 			refused(t, err, tc.want)
 		})
 	}

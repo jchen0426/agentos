@@ -297,7 +297,8 @@ func render(lines []string, hunks []hunk) []byte {
 // one hunk that gives an empty or a new file its first lines: nothing says where it goes. As git
 // apply reads a hunk with no context after its last change, it must end the file. The blank lines
 // that end a hunk may be empty lines of the file, or set the hunk off from what follows: wherever
-// the hunk's other lines are, it holds as many of them as the file has empty lines there. A file's
+// the hunk's other lines are, it holds as many of them as the file has empty lines there. A hunk
+// that holds nothing but empty lines of the file goes only where its header puts it. A file's
 // hunks go in the file's order. A line without its newline, which go-gitdiff joins to the next one,
 // must be the file's last.
 func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, searches *int) error {
@@ -319,9 +320,12 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, searches *in
 		}
 		blanks := hunks[i].blanks
 		if blanks == len(old) {
-			blanks = 0 // all the hunk holds of the file: they are its own
+			blanks-- // all the hunk holds of the file: the first, at least, is its own
 		}
 		base, tail := old[:len(old)-blanks], frag.TrailingContext-int64(blanks)
+		// Empty lines alone do not say where a hunk goes: a hunk anchored by nothing else goes only
+		// where its header puts it.
+		anchored := slices.ContainsFunc(base, func(l string) bool { return l != "\n" })
 		if blanks > 0 && empties == nil {
 			empties = make([]int, len(lines)+1)
 			for j := len(lines) - 1; j >= 0; j-- {
@@ -359,7 +363,7 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, searches *in
 		stated, pos := frag.OldPosition, frag.OldPosition
 		switch {
 		case at(lines, base, stated) && fits(stated):
-			if k := int64(keep(stated)); counted > k {
+			if k := int64(keep(stated)); counted > k && anchored {
 				if err := search(); err != nil {
 					return err
 				}
@@ -371,6 +375,9 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, searches *in
 		case at(lines, base, stated):
 			return violation("%s: the patch does not apply: hunk %d has no context after its last change, so git apply puts it at the file's end, "+
 				"and its header at line %d, where its lines are too", path, i+1, stated)
+		case !anchored:
+			return violation("%s: the patch does not apply: hunk %d holds only empty lines of the file, which do not say where it goes, "+
+				"and they are not where its header puts it", path, i+1)
 		default:
 			if err := search(); err != nil {
 				return err

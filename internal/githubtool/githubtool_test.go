@@ -2374,7 +2374,8 @@ func TestDescribeShowsThePatchAsApplied(t *testing.T) {
 	// version made the payload): it is not shown as the patch applied, but as agentd reads it
 	// (nothing outside its files' headers and hunks), and why.
 	other := strings.Replace(fix, `= ?", (name,))`, `= :n", {"n": name})`, 1)
-	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte("A note that nothing applies.\n+decoy\n\n"+other))
+	claims := strings.NewReplacer("--- a/", "index 1111111..2222222 100755\n--- a/", "@@ -1,2 +1,2 @@", "@@ -1,2 +1,2 @@ a heading").Replace(other)
+	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte("A note that nothing applies.\n+decoy\n\n"+claims))
 	req.Args["patch_ref"] = ref
 	d = tool.Describe(context.Background(), req, right)
 	if _, ok := d["patch"]; ok || d["patch_as_read"] != other || !strings.Contains(d["patch_error"].(string), "other files than the payload holds") {
