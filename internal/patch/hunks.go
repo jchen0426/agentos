@@ -289,6 +289,7 @@ func render(lines []string, hunks []hunk) []byte {
 // must be the file's last.
 func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) error {
 	lines := splitLines(string(orig))
+	var empties []int // empties[j]: how many empty lines there are from lines[j] on, once a hunk needs it
 	for i, frag := range f.TextFragments {
 		var old []string
 		for _, l := range frag.Lines {
@@ -308,14 +309,21 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 			blanks = 0 // all the hunk holds of the file: they are its own
 		}
 		base, tail := old[:len(old)-blanks], frag.TrailingContext-int64(blanks)
-		// keep is how many of the blank lines the hunk holds where its other lines start at pos: the
-		// empty lines the file has after them.
-		keep := func(pos int64) int {
-			k, next := 0, pos-1+int64(len(base))
-			for k < blanks && next+int64(k) < int64(len(lines)) && lines[next+int64(k)] == "\n" {
-				k++
+		if blanks > 0 && empties == nil {
+			empties = make([]int, len(lines)+1)
+			for j := len(lines) - 1; j >= 0; j-- {
+				if lines[j] == "\n" {
+					empties[j] = empties[j+1] + 1
+				}
 			}
-			return k
+		}
+		// keep is how many of the blank lines the hunk holds where its other lines start at pos: the
+		// empty lines the file has after them. Looked up, not counted: find asks at every match.
+		keep := func(pos int64) int {
+			if blanks == 0 {
+				return 0
+			}
+			return min(blanks, empties[pos-1+int64(len(base))])
 		}
 		// fits reports whether the hunk can go where its other lines start at pos (they are there).
 		fits := func(pos int64) bool {
