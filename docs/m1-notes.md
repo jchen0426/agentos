@@ -346,6 +346,11 @@ CI 偶尔在测试一开头失败：Temporal 开发服务器答应了测试框�
 
 ## 后续（不在 M1 范围）
 
-- CI 已由 PR #1 配好（`.github/workflows/ci.yml`：Go 检查，加上无沙箱和 bwrap 两套黑盒测试）。2026-10-17 起这三个检查是 main 的必需检查；PR 打开自动合并后，全绿即合并。
+- CI 已由 PR #1 配好（`.github/workflows/ci.yml`：Go 检查，加上无沙箱和 bwrap 两套黑盒测试）。2026-10-17 起这三个检查是 main 的必需检查；PR 打开自动合并后，全绿即合并。2026-10-22 起（PR #41）：
+  - push 只在 main 上触发：PR 的分支每次推送只跑一遍（`pull_request`，测的是它和 main 的合并），原来 push 和 pull_request 各跑一遍；没开 PR 的分支不跑。
+  - 进 main 的 PR 只改 `docs/` 下的 Markdown 和根目录 `README.md` 时，跳过这三个检查，合并进 main 后照跑。判定由 `changes` job 做：拿 GitHub 要测的合并提交和 main 的头比，改名的两边都算；判定 job 失败或被跳过（push 到 main、进别的分支的 PR）时照常全跑。被 `if:` 跳过的 job 也满足必需检查。不是所有 `.md` 都是文档（`config/prompts/audit_v1/claude.md` 是模型的提示词），`docs/` 下也不全是文档（`go test ./...` 会编译那里的 `.go` 文件）。进别的分支的 PR 不跳：它之后改成进 main 时不会重跑，跳过的检查就顶着和错的 base 比出来的结果。
+  - 文件名由 PR 决定，而 runner 在一行里任何位置都认 `##[set-output ...]` 这样的命令。审查时在一次性 PR #44 上实测过：只加一个名叫 `##[set-output name=docs-only;]true` 的非文档文件，三个检查就全被跳过。现在打印文件名时用 `::stop-commands::` 关掉命令解析，结果无论真假都写进 `GITHUB_OUTPUT`（步骤结束后处理，盖过中途设的值）。
+  - 黑盒测试为此从 matrix 拆成两个 job，步骤用 YAML 锚点共用。matrix 的 job 被 `if:` 跳过时，GitHub 只报一个检查，名字里留着字面量 `${{ matrix.sandbox }}`，两个必需检查就永远等不到（在一次性分支上实测过）。
+  - 设计文档 rev 347–348 按你批准的清单改了：第 11 节“故障注入测试”一句（rev 347）、第 12 节 M1 一条的最后一句（rev 348）。
 - 按副作用类别恢复 PENDING 的记录，以及核对的两个出口（M3）；审批表、EDITED 和 outbox（M4）。
 - Worker 由谁拉起：M1 由启动脚本拉起，“沙箱起不来就拒绝启动”和 `--insecure-dev` 开关留到 M5 沙箱定稿时放进 agentd。
