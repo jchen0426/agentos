@@ -52,7 +52,8 @@ jobs:
   blackbox:
     name: Black-box tests (AGENTOS_SANDBOX=${{ matrix.sandbox }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The suite took about 16 minutes before the audit log's tests; it now runs past 20.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
