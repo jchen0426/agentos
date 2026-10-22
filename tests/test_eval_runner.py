@@ -37,14 +37,16 @@ BUDGET = 50_000
 
 def profiles(url: str) -> list[runner.Profile]:
     """Model a, over Anthropic's API and priced; model b, a local server on Chat Completions."""
-    def task(model: str) -> dict:
-        return {"model": model, "max_tokens": 4096, "output_schema": str(AUDIT_SCHEMA), "blobs": ["patch"]}
+    def task(model: str, **extra) -> dict:
+        return {"model": model, "max_tokens": 4096, "output_schema": str(AUDIT_SCHEMA), "blobs": ["patch"], **extra}
     a = runner.Profile("a", json.dumps({"providers": {"anthropic": {"adapter": "anthropic", "base_url": url}},
                                         "tasks": {"audit_v1": task("anthropic/claude-opus-5-5")}}),
                        PRICES, "anthropic/claude-opus-5-5", paid=True)
+    # Model b's provider lists efforts up to medium: asked for high, it is sent medium.
     b = runner.Profile("b", json.dumps({"providers": {"local": {"adapter": "openai_compat", "api": "chat",
-                                                                "base_url": url + "/v1", "context_tokens": 65536}},
-                                        "tasks": {"audit_v1": task("local/gpt-oss:20b")}}),
+                                                                "base_url": url + "/v1", "context_tokens": 65536,
+                                                                "efforts": ["low", "medium"]}},
+                                        "tasks": {"audit_v1": task("local/gpt-oss:20b", effort="high")}}),
                        PRICES, "local/gpt-oss:20b", paid=False)
     return [a, b]
 
@@ -141,7 +143,7 @@ def test_collect_tells_a_fallback_by_the_models_billed_and_reads_any_number() ->
     primary, fallback = "anthropic/claude-opus-5-5", "anthropic/claude-opus-4-8"
 
     def call(blob: str, billed: list[str], provider: str = "anthropic", model: str = "claude-opus-5-5") -> dict:
-        return {"provider": provider, "model": model, "prompt_version": "audit_v1", "response_blob": "sha256:" + blob,
+        return {"provider": provider, "model": model, "prompt_version": "audit_v1", "request_blob": None, "response_blob": "sha256:" + blob,
                 "usage_json": json.dumps([{"model": b, "input_tokens": 10} for b in billed])}
 
     def answer(model: str) -> bytes:
@@ -217,7 +219,7 @@ def test_numbers_past_any_line_are_none_and_the_journal_stays_json(tmp_path: Pat
 
 def test_an_answer_too_deep_to_read_keeps_the_status_agentd_gave_it() -> None:
     deep = '{"status": "invalid_output", "output": ' + "[" * 100_000 + "]" * 100_000 + "}"
-    call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "response_blob": "sha256:d",
+    call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "request_blob": None, "response_blob": "sha256:d",
             "usage_json": "[]", "stop_reason": "invalid_output"}
     record = runner.collect(LedgerOf([call], {"d": deep.encode()}), {"run_id": "r", "temporal_run_id": "t",
                                                                      "profile": "p", "case": "py-sqli", "rep": 1}, "run")
@@ -227,7 +229,7 @@ def test_an_answer_too_deep_to_read_keeps_the_status_agentd_gave_it() -> None:
 def test_a_blank_patch_is_no_patch() -> None:
     def record(patch: bytes) -> dict:
         value = {"findings": [], "patch_ref": "sha256:patch"}
-        call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "response_blob": "sha256:a",
+        call = {"provider": "local", "model": "gpt-oss:20b", "prompt_version": "audit_v1", "request_blob": None, "response_blob": "sha256:a",
                 "usage_json": json.dumps([{"model": "local/gpt-oss:20b"}])}
         blobs = {"a": json.dumps({"status": "ok", "model": "local/gpt-oss:20b", "value": value}).encode(), "patch": patch}
         return runner.collect(LedgerOf([call], blobs), {"run_id": "r", "temporal_run_id": "t", "profile": "p",
@@ -289,6 +291,68 @@ def test_a_patch_check_that_did_not_finish_says_nothing() -> None:
     entry = {"run_id": "r", "temporal_run_id": "t", "profile": "p", "case": "py-sqli", "rep": 1}
     assert [runner.collect(Checked(o), entry, "run")["patch_applies"] for o in (None, "denied", "ok")] == [
         None, False, True]
+
+
+def _flow(text: str) -> object:
+    """A YAML flow value as config/models.yaml writes them: "s", 20, [a, b], {k: v, ...}."""
+    text = text.strip()
+    if text.startswith("{") or text.startswith("["):
+        parts, depth, cur = [], 0, ""
+        for ch in text[1:-1]:
+            depth += ch in "[{"
+            depth -= ch in "]}"
+            if ch == "," and depth == 0:
+                parts.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        parts = [part for part in [*parts, cur] if part.strip()]
+        if text.startswith("["):
+            return [_flow(part) for part in parts]
+        return {k.strip(): _flow(v) for k, v in (part.split(":", 1) for part in parts)}
+    if text.startswith('"'):
+        return text.strip('"')
+    return int(text) if text.isdigit() else text
+
+
+def _product() -> tuple[dict, dict]:
+    """config/models.yaml's providers and its audit_v1, read as the simple YAML they are."""
+    providers, task, block, name, entry = {}, {}, None, None, ""
+    for line in (runner.REPO / "config/models.yaml").read_text().splitlines():
+        code = line.split(" #", 1)[0].rstrip() if not line.lstrip().startswith("#") else ""
+        if not code:
+            continue
+        if not code.startswith(" "):
+            block = code.rstrip(":")
+        elif block == "providers":
+            entry = (entry + " " + code.strip()) if entry else code.strip()
+            if entry.count("{") == entry.count("}"):
+                provider, value = entry.split(":", 1)
+                providers[provider.strip()] = _flow(value)
+                entry = ""
+        elif block == "tasks" and not code.startswith("    "):
+            name = code.strip().rstrip(":")
+        elif block == "tasks" and name == "audit_v1":
+            key, value = code.strip().split(":", 1)
+            task[key] = _flow(value)
+    return providers, task
+
+
+def test_the_profiles_are_the_products_configuration() -> None:
+    providers, product = _product()
+    assert set(product) == {"model", "max_tokens", "effort", "prompt", "output_schema", "blobs", "fallback"}
+    assert providers["local"]["efforts"] == ["low", "medium"]  # gpt-oss at medium (the pilot)
+    for p in runner.PROFILES.values():
+        config = json.loads(p.models)
+        # Each profile lists one provider, exactly as the product does.
+        assert config["providers"] == {k: providers[k] for k in config["providers"]}, p.name
+        task = config["tasks"]["audit_v1"]
+        # The product's audit_v1 with the profile's model; the server-side fallback is Claude's alone.
+        want = {**product, "model": task["model"], "prompt": str(runner.REPO / "config" / product["prompt"]),
+                "output_schema": str(runner.REPO / "config" / product["output_schema"])}
+        if task["model"] != product["model"]:
+            del want["fallback"]
+        assert task == want, p.name
 
 
 def test_the_plan_puts_the_runs_never_run_before_the_runs_again(tmp_path: Path) -> None:
@@ -406,7 +470,13 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     md = out.with_suffix(".md").read_text()
     assert "44%（4/9 次，3 个用例；95% 区间" in md, md
     assert "67%（6/9 次，3 个用例；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
-    assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b） |" in md
+    # The effort each request was sent, as the ledger says: b's capped to medium; a's task has none.
+    assert {a["effort"] for r in results if r["profile"] == "b" for a in r["answers"]} == {"medium"}
+    sent_a = [a["effort"] for r in results if r["profile"] == "a" for a in r["answers"]]
+    assert set(sent_a) == {""}
+    assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b，effort medium） |" in md
+    assert f"| a | anthropic/claude-opus-5-5 | 不发（{len(sent_a)}） |" in md
+    assert "| b | local/gpt-oss:20b | medium（15） |" in md
     assert "0%（0/3 次，1 个用例；只有一个用例，没有区间）" in md and "1 对；只有一对，没有区间" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md
     raw = out.with_suffix(".json").read_text()
@@ -764,9 +834,9 @@ class FakeStack:
             if case == FakeStack.OVERSPEND_AFTER:
                 fake_ledger(self.data_dir / "ledger.db", {"over": 1}, [("over", "SETTLE", 2, "q")])
             if params[0] in self.cancelled or FakeStack.SCRIPT.get(case) == "void":
-                return [{"provider": "local", "model": "m", "prompt_version": "p", "response_blob": None,
+                return [{"provider": "local", "model": "m", "prompt_version": "p", "request_blob": None, "response_blob": None,
                          "usage_json": "[]", "stop_reason": None}]
-            return [{"provider": "local", "model": "m", "prompt_version": "p", "response_blob": "sha256:ok",
+            return [{"provider": "local", "model": "m", "prompt_version": "p", "request_blob": None, "response_blob": "sha256:ok",
                      "usage_json": "[]", "stop_reason": "end_turn"}]
         if "FROM blobs" in sql:
             return [{"bytes": json.dumps({"status": "ok", "model": "local/m", "value": {"findings": []}}).encode()}]

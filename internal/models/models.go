@@ -34,10 +34,10 @@ type Provider struct {
 	Key     string `yaml:"key"` // a secrets reference: keyring:<service>[/<account>]
 	// Requests per minute the gateway sends this provider, across all runs; 0 is no limit.
 	RequestsPerMinute int `yaml:"requests_per_minute"`
-	// The reasoning efforts the provider's models take (none, minimal, low, medium, high,
-	// xhigh, max). A task's effort is sent as the highest of these not above it, or the lowest
-	// of them when all are; with none listed, no effort is sent. openai_compat only: Claude
-	// takes every effort.
+	// The reasoning efforts the provider's models are sent (none, minimal, low, medium, high,
+	// xhigh, max): those they take, or fewer to cap them. A task's effort is sent as the highest
+	// of these not above it, or the lowest of them when all are; with none listed, no effort is
+	// sent. openai_compat only: Claude takes every effort.
 	Efforts []string `yaml:"efforts"`
 	// api chat only: the context window the server runs with (Ollama's OLLAMA_CONTEXT_LENGTH).
 	// Ollama drops what does not fit without a word, so a request whose input and max_tokens

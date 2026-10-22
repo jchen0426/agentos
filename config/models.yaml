@@ -7,9 +7,13 @@ providers:
               key: "keyring:agentos-openai-api-key", requests_per_minute: 20, efforts: [low, medium, high, xhigh, max]}
   # Ollama, on Chat Completions; vLLM uses the same adapter. Start Ollama with
   # OLLAMA_CONTEXT_LENGTH=65536, the context_tokens here: it cuts longer input without a word.
-  # gpt-oss takes efforts low to high.
+  # gpt-oss takes efforts low to high. Listed only to medium, which caps what any model here is
+  # sent: at high, gpt-oss:20b spends all its output tokens reasoning and writes no answer to most
+  # audits (the evaluation's pilot, docs/m5-notes.md, section D). A call resumed under a changed
+  # list still counts the refusals and broken answers it got before (the gateway matches them by
+  # the task's effort, not the one sent).
   local:     {adapter: openai_compat, api: chat, base_url: "http://127.0.0.1:11434/v1", context_tokens: 65536,
-              efforts: [low, medium, high]}
+              efforts: [low, medium]}
 tasks:
   audit_v1:
     model: anthropic/claude-opus-5-5
