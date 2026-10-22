@@ -346,6 +346,6 @@ CI 偶尔在测试一开头失败：Temporal 开发服务器答应了测试框�
 
 ## 后续（不在 M1 范围）
 
-- CI 已由 PR #1 配好（`.github/workflows/ci.yml`：Go 检查，加上无沙箱和 bwrap 两套黑盒测试）。2026-10-17 起这三个检查是 main 的必需检查；PR 打开自动合并后，全绿即合并。
+- CI 已由 PR #1 配好（`.github/workflows/ci.yml`：Go 检查，加上无沙箱和 bwrap 两套黑盒测试）。2026-10-17 起这三个检查是 main 的必需检查；PR 打开自动合并后，全绿即合并。2026-10-22 起 push 只在 main 上触发：PR 的分支每次推送只跑一遍（`pull_request`，测的是它和 main 的合并），原来 push 和 pull_request 各跑一遍；没开 PR 的分支不跑。
 - 按副作用类别恢复 PENDING 的记录，以及核对的两个出口（M3）；审批表、EDITED 和 outbox（M4）。
 - Worker 由谁拉起：M1 由启动脚本拉起，“沙箱起不来就拒绝启动”和 `--insecure-dev` 开关留到 M5 沙箱定稿时放进 agentd。

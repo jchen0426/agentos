@@ -1,11 +1,15 @@
 # The Go checks, and the black-box suite (T1, T8, T10, the replay gate, mTLS, ...) with
-# Workers unsandboxed and under bubblewrap, on every push and pull request. The design doc
-# wants the fault-injection tests on every commit, and T10 relies on the replay gate
+# Workers unsandboxed and under bubblewrap, on every push to main and every pull request. The
+# design doc wants the fault-injection tests on every commit, and T10 relies on the replay gate
 # (tests/test_replay.py) stopping incompatible workflow changes here.
 name: CI
 
 on:
+  # Push only on main: a push to a pull request's branch runs once, as pull_request, which tests
+  # the branch merged with main. Push on every branch ran each job twice there. A branch without
+  # a pull request gets no run.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
