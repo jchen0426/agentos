@@ -252,6 +252,8 @@ M2 拆成三段（设计文档第 12 节）：M2a 预算、M2b Claude 适配器�
 
 范围：设计文档第 12 节的 M2c-b 只要求在这两家上各跑一遍 T1。T1 在 Claude 上 M2b 已经通过（2026-10-18）。第 11 节开头说 T7 也要对三家各跑一遍，这一条没有落到任何里程碑里，见本节末尾。
 
+合并为 PR #37。合并后，设计文档 rev 345–346 按你批准的清单改了：第 11 节开头一段（rev 345：T1 对三家各跑一遍；T7 用假供应商，因为预算逻辑和供应商无关，真供应商上的预留由 T1 的真模型运行顺带检查，结算不超过预留）、第 12 节（rev 346：M2c-b 一条的完成记录）。
+
 ### 怎么跑的
 
 - 代码：main 7cd8a4b，加上这个 PR 对测试框架的修正（见下）。本机 macOS，Worker 跑在 srt 沙箱里。
@@ -259,7 +261,7 @@ M2 拆成三段（设计文档第 12 节）：M2a 预算、M2b Claude 适配器�
 - 先查后端：
   - `LiveOllama` 通过：Ollama 0.40.8，gpt-oss:20b 在本机跑，窗口 65536，和 `context_tokens` 一致。
   - `LiveOpenAI` 回 401：key 存进钥匙串时被截断了，见下面“key 被截断”。
-- 本地模型的 effort 是 medium，这是测试框架（`tests/harness.py`）的设定，不是 `config/models.yaml`。M5-D 发现 effort high 时 gpt-oss:20b 常把输出预算全花在推理上，这次没碰到。
+- 本地模型的 effort 是 medium，这是测试框架（`tests/harness.py`）的设定，不是 `config/models.yaml`。M5-D 发现 effort high 时 gpt-oss:20b 常把输出预算全花在推理上，这次没碰到。#38 之后产品配置也只列到 medium，这次的结果照样适用。
 
 ### 本地模型第一轮（main 原样）：2 过 2 败，都是测试的假设不成立
 
@@ -327,6 +329,14 @@ M2 拆成三段（设计文档第 12 节）：M2a 预算、M2b Claude 适配器�
 | 合计 | $0.0995，在 $2 的上限之内 |
 
 账本之外还有两笔零头：确认额度到账的一个最小请求 $0.000068；`LiveOpenAI` 的计数请求，收不收费官方没写，按输入价算也不到 $0.002。OpenAI 实际收的钱约 $0.02。
+
+### 结算没有超过预留
+
+你批第 11 节的改动时要我先核对：两家的真模型运行里，有没有结算超过预留的错误。M2a 说过，这种情况账本照实记，另记一条错误日志，原文是 `a request cost more than its reservation`。
+
+- 四轮运行（本地两轮、OpenAI 两轮）的 agentd 日志一共 242 行，这条一次都没有。同一处的另外三条也没有：`an answer came without usage`、`cannot price an answer`、`could not close a reservation`。除了 Temporal SDK 记的活动失败（杀进程和 429 时本来就有），没有别的 ERROR。
+- 账本逐笔核对：21 笔结算，没有一笔超过它的预留。
+- 有分量的只有 OpenAI。本地模型单价是 0，预留和结算都是 0，这项检查在它身上是空的。OpenAI 的 4 笔按用量结算（3,780–4,980 micros）只用了预留（81,968 micros）的 5–6%，另一笔 open_at_start 等于预留。所以它能抓住单价或计数的大错，抓不到只在长输出、接近 max_tokens 时才露出来的、偏低一点的上限。
 
 ### key 被截断
 
