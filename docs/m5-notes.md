@@ -262,6 +262,7 @@ M5 按设计文档第 12 节分成几个 PR，各自合并：沙箱定稿（C1�
 - **按这个估算**：Claude 全量 144 次约 $9。上限还要留出在途运行的预算（4 × $1.5，再加一次的 $1.5）。用户把 PR E 的总上限定为 $25。OpenAI 还没量：gpt-6.1-sol 在 high 下的推理 token 也按输出计费，要是也耗满 16000 token，单这一家就可能撞到 $25，所以用户要在 PR E 之前先用同样 6 个用例试跑一次（等用户把 key 存进钥匙串）。
 - **本地模型（gpt-oss:20b，Ollama 0.40.8）**：按产品配置（effort high、max_tokens 16000），6 个用例 4 个是 `invalid_output`：每个 7–8 分钟，把 16000 个输出 token 全用在推理上，没写出 JSON；只有 2 行和 14 行的两个答完了。同两个失败用例改用 effort medium：63 秒和 118 秒答完（输出 2.7k、4.6k token），都没检出。全量估算：high 约 13 小时（按试跑 6 次平均 327 秒算），大部分是 `invalid_output`（算没检出，不是无效运行）；medium 约 3–4 小时。用户定：改产品配置，`config/models.yaml` 里本地 provider 的 efforts 只列到 medium（audit_v1 仍是 high，Claude 不受影响），评测照抄产品配置，不另设例外。
 - 按 provider 设 effort 本来就能做：provider 的 `efforts` 列表给它封顶（agentd 发出的是 provider 列出的、不高于任务要求的最高一档），不用改代码。给推理模型更多输出 token 那条路走不通：瓶颈不在窗口，在单次尝试的 10 分钟上限（16000 token 已经要 7–8 分钟）。
+- **改了产品配置之后的冒烟跑**（复审的建议，免费）：按仓库里的配置原样跑本地模型，同样 6 个用例各一次，状态目录 `state/smoke-local-cap`。账本里 6 个请求的任务 effort 都是 high，请求记录的 effort_sent 都是 medium，报告设置表那一格是“medium（6）”。6 个都答完了（结束原因都是 stop，没有 `invalid_output`），耗时中位 114 秒、p95 134 秒，输出 0.5k–5.4k token；全量 144 次约 4 小时（按这 6 次平均 95 秒算）。检出 0/5（3 个漏洞、2 个注入），正常提交没有误报。补丁 4 个都打不上，原因和 Claude 的不一样：gpt-oss 写的不是 unified diff，3 个是 OpenAI apply_patch 的格式（`*** Begin Patch`、`*** Update File:`），1 个有 `---`/`+++` 文件头、hunk 头却只有 `@@`、没有行号；`git apply --recount` 也读不了（No valid patches in input）。提示词和 schema 都写明要 unified diff。
 
 ### 推送前审查
 
@@ -434,8 +435,10 @@ M5 按设计文档第 12 节分成几个 PR，各自合并：沙箱定稿（C1�
 
 ### 留到后面
 
-- **第一份真实报告（PR E）**：总上限 $25 已定；gpt-oss:20b 已下载（Ollama 0.40.8，按 `OLLAMA_CONTEXT_LENGTH`、`OLLAMA_NO_CLOUD=1` 启动）。还等：OpenAI 的 key 和它的试跑；M2c-b 的 T1 在 OpenAI 和本地模型上通过；补丁 hunk 行数那个任务（model 写错行数的补丁现在打不上，补丁可应用率会严重偏低）。
+- **第一份真实报告（PR E）**：总上限 $25 已定；gpt-oss:20b 已下载（Ollama 0.40.8，按 `OLLAMA_CONTEXT_LENGTH`、`OLLAMA_NO_CLOUD=1` 启动）。还等：OpenAI 的 key 和它的试跑（第一次存进钥匙串时被 `security` 自己的提示截成 128 个字符，OpenAI 回 401；M2c-b 改了 README 的存法）；M2c-b 的 T1 在 OpenAI 和本地模型上通过；补丁 hunk 行数那个任务（model 写错行数的补丁现在打不上，补丁可应用率会严重偏低）。
 - **gpt-6.1-sol 的知识截止**只有第三方页面写 2026-04-30，跑 PR E 之前对照 OpenAI 的模型页核实。
+- **gpt-oss 的补丁格式**（冒烟跑发现，产品的事）：它写 OpenAI apply_patch 格式或者不带行号的 hunk，补丁检查一个都过不了，`--recount` 那个任务也救不了；PR E 报告里本地模型的补丁可应用率会接近 0，原因在格式，不在模型改得对不对。产品是认这种格式、转换它，还是给本地模型一份自己的提示词，要用户定。
+- **发出的 effort 只在请求记录里**（复审的提示，产品的事）：账本 `model_calls` 表的 effort 列记的是任务的 effort，发出的那个只在请求的 blob 里（`effort_sent`），评测逐个读 blob。网关接着跑一个调用时按任务的 effort 认以前的拒答和不合格答复：改了 provider 的 `efforts` 再接着跑，另一档 effort 下的拒答也照样算数。改法：`model_calls` 加一列 effort_sent，接着跑时按它比；agentd 启动时打一行日志，说哪个 provider 把哪档 effort 封顶成了哪档。
 - **回退靠模型名认**：账本里每个答复的模型名和请求的不一样，就算服务端回退、记一次拒答。Anthropic 答复里的模型名现在是请求的完整 ID（M2b 实测），哪天改成带日期的 ID，每个答复都会被当成回退。PR E 第一个运行之后先核对设置表里“由服务端回退答复”那一列是不是 0。
 - **回归门槛**：现在只出数字和区间。以后改提示词或换模型时，在同一批用例上做配对比较（每个用例前后的检出次数），比较两个模型也一样，不要只看两个区间重不重叠。
 - **上限放进 agentd**（安全审查的建议）：现在的上限是评测程序在 agentd 外面根据账本算的；在 agentd 里加一个“所有任务合计”的上限，每次预留前查一次，几个时间窗口就一并关掉了。这要改产品，留给以后。
