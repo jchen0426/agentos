@@ -329,9 +329,23 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 		fits := func(pos int64) bool {
 			return tail+int64(keep(pos)) > 0 || pos-1+int64(len(base)) == int64(len(lines))
 		}
+		// counted is how many of the blank lines the header's counts take for the hunk's own, when
+		// they take some: counts are a model's guess, so they decide no place, but they can make one
+		// read two ways.
+		counted := int64(0)
+		if d := hunks[i].was.oldLines - (frag.OldLines - int64(blanks)); blanks > 0 && d > 0 && d <= int64(blanks) &&
+			hunks[i].was.newLines-(frag.NewLines-int64(blanks)) == d {
+			counted = d
+		}
 		stated, pos := frag.OldPosition, frag.OldPosition
 		switch {
 		case at(lines, base, stated) && fits(stated):
+			if k := int64(keep(stated)); counted > k {
+				if other := find(lines, base, 1, func(p int64) bool { return p != stated && int64(keep(p)) >= counted }); len(other) > 0 {
+					return violation("%s: the patch does not apply: hunk %d reads two ways: its header puts it at line %d, but its counts take "+
+						"the blank lines it ends with for the file's own, which the file has after the hunk's other lines at line %d", path, i+1, stated, other[0])
+				}
+			}
 		case at(lines, base, stated):
 			return violation("%s: the patch does not apply: hunk %d has no context after its last change, so git apply puts it at the file's end, "+
 				"and its header at line %d, where its lines are too", path, i+1, stated)

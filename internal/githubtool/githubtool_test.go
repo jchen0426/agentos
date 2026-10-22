@@ -2360,7 +2360,7 @@ func TestDescribeShowsThePatchAsApplied(t *testing.T) {
 		mustJSON(t, d["apply_check"]) != `{"applies":true}` {
 		t.Fatalf("described %v", d)
 	}
-	if notes := mustJSON(t, d["notes"]); !strings.Contains(notes, "agentd rewrote 1 hunk headers of the patch") {
+	if notes := mustJSON(t, d["notes"]); !strings.Contains(notes, "agentd rewrote 1 of the patch's hunk headers") {
 		t.Fatalf("notes %s", notes)
 	}
 	// A patch whose headers are right is shown as it was written, and nothing is said of headers.
@@ -2382,6 +2382,17 @@ func TestDescribeShowsThePatchAsApplied(t *testing.T) {
 	}
 	if _, ok := d["apply_check"]; ok {
 		t.Fatalf("git's check of a patch that is not the payload's: %v", d["apply_check"])
+	}
+	// So too when the payload names another file than the patch was applied to.
+	req.Args["patch_ref"] = ref
+	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
+	req.Args["patch_ref"] = ref
+	var stale prPayload
+	_ = json.Unmarshal(right, &stale)
+	stale.Files[0].OldBlob = strings.Repeat("0", 40)
+	b, _ := json.Marshal(stale)
+	if d = tool.Describe(context.Background(), req, b); d["patch"] != nil || d["patch_as_read"] != fix {
+		t.Fatalf("a payload of another old blob: %v", d)
 	}
 }
 

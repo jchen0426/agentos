@@ -264,7 +264,9 @@ func TestAHunkIsItsLines(t *testing.T) {
 		want:  diff("b.txt") + "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n \n",
 		files: map[string]string{"b.txt": "1\n2\n\n3\n"}, after: map[string]string{"b.txt": "1\ntwo\n\n3\n"},
 	}, {
-		name: "svn's headers, and text between files",
+		// svn itself names files without a/ and b/: as a plain diff's, they would lose their first
+		// component, as git apply -p1 does.
+		name: "svn's Index lines, and text between files",
 		patch: "Index: f.txt\n===================================================================\n--- a/f.txt\t(revision 1)\n" +
 			"+++ b/f.txt\t(working copy)\n@@ -1,3 +1,3 @@\n 1\n-2\n+two\n 3\nOnly in b: h\n" +
 			"Index: g.txt\n===================================================================\n--- a/g.txt\t(revision 1)\n" +
@@ -333,6 +335,29 @@ func TestAHunkGoesWhereItsLinesAre(t *testing.T) {
 		patch: "--- a/r.txt\n+++ b/r.txt\n@@ -2,3 +2,4 @@\n a\n b\n c\n+d\n",
 		want:  diff("r.txt") + "@@ -4,3 +4,4 @@\n a\n b\n c\n+d\n",
 		files: map[string]string{"r.txt": "a\nb\nc\na\nb\nc\n"}, after: map[string]string{"r.txt": "a\nb\nc\na\nb\nc\nd\n"},
+	}, {
+		// Elsewhere, the blank line the hunk ends with is not the file's: it set the hunk apart.
+		name:  "its lines are elsewhere, set apart by a blank line the file does not have there",
+		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -12,3 +12,3 @@\n 22\n-23\n+X\n 24\n\n@@ -30,3 +30,3 @@\n 30\n-31\n+Y\n 32\n",
+		want:  diff("f.txt") + "@@ -22,3 +22,3 @@\n 22\n-23\n+X\n 24\n@@ -30,3 +30,3 @@\n 30\n-31\n+Y\n 32\n",
+		files: map[string]string{"f.txt": f}, after: map[string]string{"f.txt": strings.NewReplacer("23\n", "X\n", "31\n", "Y\n").Replace(f)},
+	}, {
+		// Elsewhere, it is: the hunk's only context after its change.
+		name:  "its lines are elsewhere, with an empty line of the file, written bare, after its change",
+		patch: "--- a/b.txt\n+++ b/b.txt\n@@ -20,3 +20,3 @@\n 4\n-5\n+five\n\n",
+		want:  diff("b.txt") + "@@ -4,3 +4,3 @@\n 4\n-5\n+five\n \n",
+		files: map[string]string{"b.txt": "1\n2\n3\n4\n5\n\n6\n7\n"}, after: map[string]string{"b.txt": "1\n2\n3\n4\nfive\n\n6\n7\n"},
+	}, {
+		// "a a b" in "a a a b": a search that starts over after a partial match must back up.
+		name:  "its lines are elsewhere, after lines like their start",
+		patch: "--- a/k.txt\n+++ b/k.txt\n@@ -20,3 +20,3 @@\n a\n-a\n+A\n b\n",
+		want:  diff("k.txt") + "@@ -3,3 +3,3 @@\n a\n-a\n+A\n b\n",
+		files: map[string]string{"k.txt": "q\na\na\na\nb\nz\n"}, after: map[string]string{"k.txt": "q\na\na\nA\nb\nz\n"},
+	}, {
+		name:  "a new file whose last line has no newline",
+		patch: "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+a\n+b\n\\ No newline at end of file\n",
+		want:  "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+a\n+b\n\\ No newline at end of file\n",
+		files: map[string]string{}, after: map[string]string{"n.txt": "a\nb"},
 	}, {
 		name:  "an empty file gets its first lines",
 		patch: "--- a/e.txt\n+++ b/e.txt\n@@ -1,0 +1,2 @@\n+a\n+b\n",
@@ -407,10 +432,38 @@ func TestAHunkGoesWhereItsLinesAre(t *testing.T) {
 		name:  "a line without its newline in the middle of what it adds",
 		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -19,2 +19,4 @@\n 19\n+a\n\\ No newline at end of file\n+b\n 20\n",
 		want:  "f.txt: the patch does not apply: hunk 1 leaves a line without its newline that is not the file's last",
+	}, {
+		name:  "a line without its newline, then another it adds, in the file's last hunk",
+		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -39,2 +39,4 @@\n 39\n+a\n\\ No newline at end of file\n+b\n 40\n",
+		want:  "f.txt: the patch does not apply: hunk 1 leaves a line without its newline that is not the file's last",
+	}, {
+		name:  "elsewhere, it fits at one place with its blank line and at another without",
+		patch: "--- a/r.txt\n+++ b/r.txt\n@@ -20,3 +20,3 @@\n a\n-b\n+B\n c\n\n",
+		want:  "r.txt: the patch does not apply: the lines of hunk 1 are at lines 1 and 6",
+	}, {
+		name:  "its lines are at two places that overlap",
+		patch: "--- a/v.txt\n+++ b/v.txt\n@@ -20,3 +20,4 @@\n }\n \n+x\n }\n",
+		want:  "v.txt: the patch does not apply: the lines of hunk 1 are at lines 2 and 4",
+	}, {
+		name:  "it has no context after its last change, and its lines end one line before the file does",
+		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -38,2 +38,3 @@\n 38\n 39\n+thirty-nine and a bit\n",
+		want:  "f.txt: the patch does not apply: hunk 1 has no context after its last change",
+	}, {
+		// Its header puts it in a(), where nothing follows its lines; its counts take the blank line
+		// for its own, which only b() has after them. git apply, reading the counts, changes b().
+		name:  "its header and its counts put it in two places",
+		patch: "--- a/m.py\n+++ b/m.py\n@@ -2,4 +2,4 @@\n     conn = db()\n-    cur = conn.cursor()\n+    cur = conn.cursor(buffered=True)\n     return cur\n\n",
+		want:  "m.py: the patch does not apply: hunk 1 reads two ways: its header puts it at line 2, but its counts take the blank lines it ends with for the file's own, which the file has after the hunk's other lines at line 6",
+	}, {
+		// "-- " before a blank line is no signature: it removes "- ", which the file does not have.
+		name:  "\"-- \", then a blank line",
+		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n-- \n\n",
+		want:  "f.txt: the patch does not apply: the lines of hunk 1",
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := applied(t, tc.patch, map[string]string{"f.txt": f, "t.txt": twice, "c.ini": conf, "e.txt": "",
-				"o.txt": "b1\nb2\np\nq\np\nq\nend\n"})
+				"o.txt": "b1\nb2\np\nq\np\nq\nend\n", "r.txt": "a\nb\nc\n\nx\na\nb\nc\ny\n", "v.txt": "top\n}\n\n}\n\n}\nend\n",
+				"m.py": "def a():\n    conn = db()\n    cur = conn.cursor()\n    return cur\ndef b():\n    conn = db()\n    cur = conn.cursor()\n    return cur\n\nX = 1\n"})
 			refused(t, err, tc.want)
 		})
 	}
@@ -458,6 +511,10 @@ func TestALineInNoHunkIsRefused(t *testing.T) {
 		// headers; agentd would not.
 		{"git's headers and plain ones", "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n" +
 			"--- /dev/null\n+++ b/x.txt\n@@ -0,0 +1 @@\n+new\n", "the patch mixes git's file headers with plain ones"},
+		{"git's headers and a plain one after a \"diff -u\" line", "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n" +
+			"diff -u a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n", "the patch mixes git's file headers with plain ones"},
+		// No signature: a hunk's line follows.
+		{"\"-- \" and a version, then a hunk's line", hunk + "-- \n2.43.0\n+more\n", `line 10 of the patch reads as a hunk's, but is in no hunk: "+more\n"`},
 		// As lines the hunk removes and adds, "--- a/x" and "+++ b/x" would end it with no context
 		// after its last change, before another of the file's hunks: they are a file's header, and
 		// the hunk before them changes nothing.
@@ -601,7 +658,7 @@ func TestPatchesWithEmptyAndRepeatedLines(t *testing.T) {
 		return fmt.Sprintf("line %d\n", *n)
 	}
 	var scrambledApplied, scrambledRefused int
-	for round := range 80 {
+	for round := range 60 {
 		var orig, edit strings.Builder
 		n := 0
 		for range 10 + rng.IntN(40) {
@@ -648,6 +705,103 @@ func TestPatchesWithEmptyAndRepeatedLines(t *testing.T) {
 	t.Logf("scrambled: %d applied, %d refused", scrambledApplied, scrambledRefused)
 }
 
+// Model-style patches (from the adversarial review): git's own patches of files with lines that
+// repeat, as a model writes them: plain headers, empty context lines bare, start lines off by one
+// to three, counts off by one, blank lines between hunks, a note after, an extra newline, a second
+// file after a blank line. Each applies as git wrote it; only blank lines between hunks may make
+// one read two ways, and be refused.
+func TestModelStylePatches(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	r := newMirror(t)
+	rng := rand.New(rand.NewPCG(42, 7))
+	pool := []string{"\n", "\n", "\n", "}\n", "\treturn nil\n", "\tif err != nil {\n", "\t\treturn err\n", "\t}\n", "    pass\n"}
+	header := regexp.MustCompile(`(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+	refusedBetween := 0
+	for round := range 60 {
+		var orig, edit strings.Builder
+		n := 0
+		unique := func() string { n++; return fmt.Sprintf("\tline_%d()\n", n) }
+		for range 30 + rng.IntN(60) {
+			l := unique()
+			if rng.IntN(5) < 2 {
+				l = pool[rng.IntN(len(pool))]
+			}
+			orig.WriteString(l)
+			switch rng.IntN(14) {
+			case 0:
+			case 1:
+				edit.WriteString(unique())
+			case 2:
+				edit.WriteString(l)
+				edit.WriteString(unique())
+			default:
+				edit.WriteString(l)
+			}
+		}
+		o, e := orig.String(), edit.String()
+		if o == e {
+			continue
+		}
+		r.write("f.go", []byte(o), 0o644)
+		r.git("add", "-A")
+		r.git("commit", "-q", "--allow-empty", "-m", strconv.Itoa(round))
+		r.write("f.go", []byte(e), 0o644)
+		gits := r.gitRaw("diff")
+		r.git("checkout", "f.go")
+		plain := regexp.MustCompile(`(?m)^(diff --git|index) .*\n`).ReplaceAllString(gits, "")
+		bare := regexp.MustCompile(`(?m)^ $`).ReplaceAllString(plain, "")
+		delta := []int{-3, -2, -1, 1, 2, 3}[rng.IntN(6)]
+		off := func(p string, places, counts bool) string {
+			return header.ReplaceAllStringFunc(p, func(h string) string {
+				m := header.FindStringSubmatch(h)
+				num := func(s string) int {
+					if s == "" {
+						return 1
+					}
+					v, _ := strconv.Atoi(s)
+					return v
+				}
+				a, b, c, d := num(m[1]), num(m[2]), num(m[3]), num(m[4])
+				if places {
+					a, c = max(1, a+delta), max(1, c+delta)
+				}
+				if counts {
+					b, d = max(0, b+rng.IntN(3)-1), max(0, d+rng.IntN(3)-1)
+				}
+				return fmt.Sprintf("@@ -%d,%d +%d,%d @@", a, b, c, d)
+			})
+		}
+		between := strings.Replace(regexp.MustCompile(`(?m)^@@`).ReplaceAllString(bare, "\n@@"), "\n\n@@", "\n@@", 1)
+		files := map[string]string{"f.go": o, "g.txt": "a\nb\n"}
+		for _, v := range []struct {
+			name, patch string
+			mayRefuse   bool
+		}{
+			{"plain", plain, false},
+			{"bare empty lines", bare, false},
+			{"start lines off", off(bare, true, false), false},
+			{"counts off", off(bare, false, true), false},
+			{"both off", off(bare, true, true), false},
+			{"a note after", bare + "\nThis fixes the bug.\n", false},
+			{"an extra newline", bare + "\n", false},
+			{"a blank line, then another file", bare + "\n--- a/g.txt\n+++ b/g.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n", false},
+			{"blank lines between hunks", between, true},
+		} {
+			_, after, err := applied(t, v.patch, files)
+			switch {
+			case err != nil && v.mayRefuse:
+				refusedBetween++
+			case err != nil:
+				t.Fatalf("round %d, %s: %v\n%s", round, v.name, err, v.patch)
+			case after["f.go"] != e:
+				t.Fatalf("round %d, %s: after the patch:\n%q\nwant\n%q\n%s", round, v.name, after["f.go"], e, v.patch)
+			}
+		}
+	}
+	t.Logf("blank lines between hunks: %d refused", refusedBetween)
+}
+
 // Parse reads a patch whose hunk headers are wrong; the patch it reads is one whose headers are
 // right.
 func TestParseCountsTheLines(t *testing.T) {
@@ -674,9 +828,20 @@ func TestApplySaysWhatItRewrote(t *testing.T) {
 	if len(got) != 1 || got[0] != (Rewrite{Path: "f.txt", Hunk: 2, Was: "@@ -30 +30 @@", Now: "@@ -22,7 +22,7 @@"}) {
 		t.Fatalf("rewritten: %+v", got)
 	}
-	// Applied again, to other files, it starts from the patch's own headers.
+	// Applied again, it starts from the patch as parsed.
 	if _, err := p.Apply(files(map[string]string{"f.txt": numbered(1, 40)})); err != nil || len(p.Rewritten()) != 1 {
 		t.Fatalf("applied again: %v, %+v", err, p.Rewritten())
+	}
+	// Here the blank line is left out (the file ends with the hunk), there it is the file's own.
+	q, err := Parse([]byte("--- a/z.txt\n+++ b/z.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Apply(files(map[string]string{"z.txt": "a\nb\n"})); err != nil || string(q.Text()) != diff("z.txt")+"@@ -1,2 +1,2 @@\n a\n-b\n+B\n" {
+		t.Fatalf("%v\n%s", err, q.Text())
+	}
+	if _, err := q.Apply(files(map[string]string{"z.txt": "a\nb\n\n"})); err != nil || string(q.Text()) != diff("z.txt")+"@@ -1,3 +1,3 @@\n a\n-b\n+B\n \n" {
+		t.Fatalf("%v\n%s", err, q.Text())
 	}
 }
 

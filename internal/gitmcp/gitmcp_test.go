@@ -743,6 +743,20 @@ func TestApplyCheck(t *testing.T) {
 	}
 }
 
+// What git ls-files -s says of the index is read whole, or not at all.
+func TestIndexEntries(t *testing.T) {
+	blob := blobID([]byte("x\n"))
+	got, err := indexEntries([]byte("100644 " + blob + " 0\ta/b.txt\x00100644 " + blob + " 2\tc\td.txt\x00"))
+	if err != nil || !slices.Equal(got, []IndexEntry{{Path: "a/b.txt", Mode: "100644", Object: blob}, {Path: "c\td.txt", Mode: "100644", Object: blob, Stage: 2}}) {
+		t.Fatalf("%+v %v", got, err)
+	}
+	for _, bad := range []string{"100644 abc 0\tx\x00", "100644 " + blob + "\tx\x00", "100644 " + blob + " zero\tx\x00", "100644 " + blob + " 0 x\x00"} {
+		if _, err := indexEntries([]byte(bad)); err == nil {
+			t.Errorf("%q: read", bad)
+		}
+	}
+}
+
 // The client runs the real binary, as agentd does, here without a sandbox.
 func TestClientRunsTheServerPerCall(t *testing.T) {
 	bin := gitmcptest.Server(t)

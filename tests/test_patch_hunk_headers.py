@@ -120,7 +120,7 @@ def test_the_reviewer_sees_approves_and_edits_the_patch_as_applied(stack: Stack)
     write = card["context"]["write"]
     assert write["patch"] == AS_APPLIED and write["patch_rewritten"] == REWRITTEN, write
     assert write["apply_check"] == {"applies": True}, write
-    assert any("agentd rewrote 2 hunk headers" in n for n in write["notes"]), write["notes"]
+    assert any("agentd rewrote 2 of the patch's hunk headers" in n for n in write["notes"]), write["notes"]
     # What the payload holds, and what the approval is bound to, is the patch as applied.
     files = {f["path"]: f["content"] for f in card["payload"]["files"]}
     assert files == {"app/db.py": DB, "app.py": APP}, files

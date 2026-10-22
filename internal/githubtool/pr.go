@@ -225,7 +225,7 @@ func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.
 		out["patch"] = string(applied.Text())
 		if rw := applied.Rewritten(); len(rw) > 0 {
 			out["patch_rewritten"] = rewrites(rw)
-			out["notes"] = append(out["notes"].([]string), fmt.Sprintf("agentd rewrote %d hunk headers of the patch, "+
+			out["notes"] = append(out["notes"].([]string), fmt.Sprintf("agentd rewrote %d of the patch's hunk headers, "+
 				"whose counts or places of lines the hunks' own lines contradict (patch_rewritten): the patch shown is the one applied.", len(rw)))
 		}
 		out["apply_check"] = t.applyCheck(ctx, repo, p.Commit, applied.Text(), changes)
