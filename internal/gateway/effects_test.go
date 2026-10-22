@@ -14,6 +14,7 @@ import (
 	"time"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
@@ -87,6 +88,9 @@ func (f *finder) Settle() time.Duration { return f.settle }
 type fixture struct {
 	g   *Gateway
 	run db.Run
+	// direct: the test wrote the ledger itself, which the audit log does not say, and its end
+	// does not check the log.
+	direct bool
 }
 
 func newFixture(t *testing.T, dryRun bool) *fixture {
@@ -109,8 +113,15 @@ func newFixture(t *testing.T, dryRun bool) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{run: run, g: &Gateway{Ledger: l, Tools: tools.Registry{}, Incarnation: "this-agentd",
+	f := &fixture{run: run, g: &Gateway{Ledger: l, Tools: tools.Registry{}, Incarnation: "this-agentd",
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	// Whatever the test did, the audit log says it, and its chain is whole (audit_test.go).
+	t.Cleanup(func() {
+		if !f.direct {
+			checkAudit(t, l)
+		}
+	})
+	return f
 }
 
 func (f *fixture) req() tools.Request {
@@ -414,17 +425,17 @@ func TestReconcile(t *testing.T) {
 	}
 	t.Run("executed", func(t *testing.T) {
 		f, w := unknown(t)
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": "x"}`, Key: "a"}); !errors.Is(err, ErrBadResult) {
+		if _, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": "x"}`, Key: "a"}); !errors.Is(err, ErrBadResult) {
 			t.Fatalf("a result that breaks the tool's schema: %v", err)
 		}
-		status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 3}`, Key: "b"})
+		status, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 3}`, Key: "b"})
 		if err != nil || status != effectSucceeded {
 			t.Fatalf("status %s, err %v", status, err)
 		}
-		if status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 3}`, Key: "b"}); err != nil || status != effectSucceeded {
+		if status, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 3}`, Key: "b"}); err != nil || status != effectSucceeded {
 			t.Fatalf("the same resolution sent again: %s, %v", status, err)
 		}
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "c"}); !errors.Is(err, ErrNotUnknown) {
+		if _, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: false, Key: "c"}); !errors.Is(err, ErrNotUnknown) {
 			t.Fatalf("a second, different resolution: %v", err)
 		}
 		res, err := f.g.effect(ctx, f.run, w, w.class, 1, nil, f.req(), nil, faults.Effect{})
@@ -434,7 +445,7 @@ func TestReconcile(t *testing.T) {
 	})
 	t.Run("not executed", func(t *testing.T) {
 		f, w := unknown(t)
-		status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "a"})
+		status, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: false, Key: "a"})
 		if err != nil || status != effectPending {
 			t.Fatalf("status %s, err %v", status, err)
 		}
@@ -444,18 +455,18 @@ func TestReconcile(t *testing.T) {
 	})
 	t.Run("a finding sent again applies once, even after the effect moved on", func(t *testing.T) {
 		f, w := unknown(t)
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "a"}); err != nil {
+		if _, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: false, Key: "a"}); err != nil {
 			t.Fatal(err)
 		}
 		w.err = errors.New("connection reset") // sent again, and again nobody knows
 		if status, err := f.do(t, w); err != nil || status != StatusNeedsReconcile || w.sent.Load() != 1 {
 			t.Fatalf("the call after: %s %v, sent %d", status, err, w.sent.Load())
 		}
-		status, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: false, Key: "a"})
+		status, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: false, Key: "a"})
 		if err != nil || status != effectPending || f.status(t).Status != effectUnknown {
 			t.Fatalf("the replay: %s %v, effect %s", status, err, f.status(t).Status)
 		}
-		if _, _, err := f.g.Reconcile(ctx, Resolution{EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 1}`, Key: "a"}); !errors.Is(err, ErrKeyReused) {
+		if _, _, err := f.g.Reconcile(ctx, Resolution{By: operator, EffectID: f.req().EffectID, Executed: true, ResultJSON: `{"id": 1}`, Key: "a"}); !errors.Is(err, ErrKeyReused) {
 			t.Fatalf("the key reused for another finding: %v", err)
 		}
 	})
@@ -480,12 +491,12 @@ func TestAFindingThatAWriteNeverHappenedWaits(t *testing.T) {
 		r     Resolution
 		want  string
 	}{
-		{"the run goes on", policy.EffectLookup, unknown, Resolution{}, effectPending},
+		{"the run goes on", policy.EffectLookup, unknown, Resolution{By: operator}, effectPending},
 		{"the run was cancelled", policy.EffectLookup, func(t *testing.T, f *fixture, w *finder) {
 			unknown(t, f, w)
 			f.cancel(t)
-		}, Resolution{}, effectAbandoned},
-		{"the run has ended", policy.EffectLookup, unknown, Resolution{RunClosed: true}, effectAbandoned},
+		}, Resolution{By: operator}, effectAbandoned},
+		{"the run has ended", policy.EffectLookup, unknown, Resolution{By: operator, RunClosed: true}, effectAbandoned},
 		{"the write was given back", policy.EffectIdempotent, func(t *testing.T, f *fixture, w *finder) {
 			// A request of it went out, and it was given back unsettled; the policy asks for approval
 			// now, and nobody approved it.
@@ -497,7 +508,7 @@ func TestAFindingThatAWriteNeverHappenedWaits(t *testing.T) {
 			if err != nil || res.GetStatus() != StatusNeedsReconcile {
 				t.Fatalf("%v %v", res.GetStatus(), err)
 			}
-		}, Resolution{}, effectPending},
+		}, Resolution{By: operator}, effectPending},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			clock := useClock(t)
@@ -682,3 +693,6 @@ func TestTheRecordedPayloadGoesOut(t *testing.T) {
 		t.Fatalf("sent %s, recorded %s (%v), rendered %d times", w.got, recorded, err, w.renders.Load())
 	}
 }
+
+// operator is who the tests' findings and decisions are by.
+var operator = audit.Who{Actor: audit.Operator("tester")}

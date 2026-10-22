@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gateway"
@@ -44,12 +45,26 @@ var runningStates = map[string]bool{
 type Server struct {
 	agentosv1.UnimplementedControlServer
 
-	Ledger      *ledger.Ledger
-	Budget      *budget.Budget
-	Effects     Reconciler
-	Approvals   Approver
-	Doorbells   interface{ Poke() } // the outbox: rings the doorbells the server's changes wrote
-	Temporal    client.Client
+	Ledger    *ledger.Ledger
+	Budget    *budget.Budget
+	Effects   Reconciler
+	Approvals Approver
+	Doorbells interface{ Poke() } // the outbox: rings the doorbells the server's changes wrote
+	Temporal  client.Client
+	Namespace string // agentd's, in Temporal
+	// AnchorEvery is how often agentd pushes the chain's head to Temporal, and StartedAt when this
+	// agentd started: VerifyAudit expects a pushed head to cover every record older than twice the
+	// interval, once agentd has run that long. Zero AnchorEvery expects none.
+	AnchorEvery time.Duration
+	StartedAt   time.Time
+	// AnchorIdentity is this agentd's in the heads it pushes (audit.Identity), and StartRecord the
+	// record of its start (agentd.started): the audit log holds that record as long as this agentd
+	// runs, whatever else was done to it. Zero when unknown.
+	AnchorIdentity string
+	StartRecord    audit.Head
+	// Attempts is the gateway: what it knows of its attempts that the ledger does not say (verify
+	// asks it of a call.started left open). Nil in tests that have no gateway.
+	Attempts    Attempts
 	Tasks       tasks.Registry
 	TaskQueue   string         // where the Python Worker polls
 	CancelGrace time.Duration  // how long a cancelled run may keep running before it is terminated
@@ -69,22 +84,39 @@ type Approver interface {
 }
 
 func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (*agentosv1.Run, error) {
+	who, err := operator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A start refused is a decision too: its record says who asked for what, and why not.
+	refuse := func(err error) error {
+		params := map[string]string{}
+		for k, v := range req.GetParams() {
+			params[audit.Text(k)] = audit.Text(v)
+		}
+		if _, rerr := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{Type: "run.refused", Actor: who.Actor,
+			PeerUID: who.PeerUID, Payload: map[string]any{"task": audit.Text(req.GetTask()), "params": params,
+				"why": audit.Text(status.Convert(err).Message())}}); rerr != nil {
+			s.Log.Error("could not record a refused start", "error", rerr)
+		}
+		return err
+	}
 	t, ok := s.Tasks[req.GetTask()]
 	if !ok {
-		return nil, status.Errorf(codes.InvalidArgument, "unknown task %q", req.GetTask())
+		return nil, refuse(status.Errorf(codes.InvalidArgument, "unknown task %q", req.GetTask()))
 	}
 	input, params, err := t.Resolve(ctx, req.GetParams())
 	var unavailable *tasks.Unavailable
 	switch {
 	case errors.As(err, &unavailable):
-		return nil, status.Error(codes.Unavailable, err.Error()) // the start may work later
+		return nil, refuse(status.Error(codes.Unavailable, err.Error())) // the start may work later
 	case err != nil:
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, refuse(status.Error(codes.InvalidArgument, err.Error()))
 	}
 	budget := req.GetBudgetLimitMicros()
 	switch {
 	case budget < 0:
-		return nil, status.Error(codes.InvalidArgument, "budget must not be negative")
+		return nil, refuse(status.Error(codes.InvalidArgument, "budget must not be negative"))
 	case budget == 0:
 		budget = t.DefaultBudget
 	}
@@ -100,9 +132,15 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 	if req.GetDryRun() {
 		dryRun = 1
 	}
-	if err := s.Ledger.Q.InsertRun(ctx, db.InsertRunParams{
-		WorkflowID: workflowID, Task: t.Name, ParamsJson: string(paramsJSON),
-		BudgetLimitMicros: budget, DryRun: dryRun, CreatedAt: createdAt,
+	if err := s.Ledger.Tx(ctx, func(q *db.Queries) error {
+		if err := q.InsertRun(ctx, db.InsertRunParams{
+			WorkflowID: workflowID, Task: t.Name, ParamsJson: string(paramsJSON),
+			BudgetLimitMicros: budget, DryRun: dryRun, CreatedAt: createdAt,
+		}); err != nil {
+			return err
+		}
+		return note(ctx, q, workflowID, "run.created", who, map[string]any{"task": t.Name, "params": params,
+			"budget_limit_micros": budget, "dry_run": req.GetDryRun()})
 	}); err != nil {
 		return nil, err
 	}
@@ -114,7 +152,7 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 		TypedSearchAttributes:    temporal.NewSearchAttributes(AgentState.ValueSet("RUNNING")),
 	}, t.WorkflowType, input)
 	if err != nil {
-		if derr := s.Ledger.Q.DeleteRun(context.WithoutCancel(ctx), workflowID); derr != nil {
+		if derr := s.discard(context.WithoutCancel(ctx), workflowID, who, "the start failed: "+err.Error()); derr != nil {
 			s.Log.Error("could not remove the run that failed to start", "workflow_id", workflowID, "error", derr)
 		}
 		return nil, status.Errorf(codes.Unavailable, "start workflow: %v", err)
@@ -122,12 +160,10 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 	// The run exists in Temporal now: finish the bookkeeping even if agentctl goes away.
 	ctx = context.WithoutCancel(ctx)
 	s.Faults.DelayRunID()
-	if _, err := s.Ledger.Q.SetRunID(ctx, db.SetRunIDParams{
-		RunID: sql.NullString{String: we.GetRunID(), Valid: true}, WorkflowID: workflowID,
-	}); err != nil {
+	if err := s.started(ctx, workflowID, we.GetRunID(), who); err != nil {
 		// Without its run ID the gateway refuses every call of this run: stop it now
 		// rather than let it fail step by step.
-		if terr := s.Temporal.TerminateWorkflow(ctx, workflowID, we.GetRunID(), "agentd could not record the run"); terr != nil {
+		if terr := s.terminate(ctx, workflowID, we.GetRunID(), "agentd could not record the run"); terr != nil {
 			s.Log.Error("could not terminate a run agentd failed to record", "workflow_id", workflowID, "error", terr)
 		}
 		return nil, status.Errorf(codes.Internal, "record run: %v", err)
@@ -144,8 +180,12 @@ func (s *Server) StartRun(ctx context.Context, req *agentosv1.StartRunRequest) (
 // RecoverStarts settles runs whose start was interrupted: agentd stopped after starting the
 // workflow but before recording its run ID, or the start never reached Temporal.
 func (s *Server) RecoverStarts(ctx context.Context) error {
-	rows, err := s.Ledger.Q.ListStartingRuns(ctx)
-	if err != nil {
+	var rows []db.Run
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		rows, err = q.ListStartingRuns(ctx)
+		return err
+	}); err != nil {
 		return err
 	}
 	for _, r := range rows {
@@ -154,7 +194,7 @@ func (s *Server) RecoverStarts(ctx context.Context) error {
 		switch {
 		case errors.As(err, &notFound):
 			s.Log.Warn("dropping a run that never started", "workflow_id", r.WorkflowID)
-			if err := s.Ledger.Q.DeleteRun(ctx, r.WorkflowID); err != nil {
+			if err := s.discard(ctx, r.WorkflowID, agentd, "the start never reached Temporal"); err != nil {
 				return err
 			}
 		case err != nil:
@@ -165,14 +205,82 @@ func (s *Server) RecoverStarts(ctx context.Context) error {
 		default:
 			runID := d.GetWorkflowExecutionInfo().GetExecution().GetRunId()
 			s.Log.Warn("recording the run ID of an interrupted start", "workflow_id", r.WorkflowID, "run_id", runID)
-			if _, err := s.Ledger.Q.SetRunID(ctx, db.SetRunIDParams{
-				RunID: sql.NullString{String: runID, Valid: true}, WorkflowID: r.WorkflowID,
-			}); err != nil {
+			if err := s.started(ctx, r.WorkflowID, runID, agentd); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// terminate has Temporal end an execution, and records it. The change is Temporal's, so its records
+// have transactions of their own: run.terminating before agentd asks, run.terminated after.
+// verify takes every terminated execution for agentd's only with a run.terminating of it, and an
+// agentd killed between the two leaves that one behind, which the next agentd.started closes. A
+// termination is the cancel's last resort: one whose run.terminating cannot be written goes ahead
+// all the same, and verify reports it.
+func (s *Server) terminate(ctx context.Context, workflowID, runID, why string) error {
+	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminating",
+		Actor: audit.Agentd, Payload: map[string]any{"temporal_run_id": runID, "why": audit.Text(why)}}); err != nil {
+		s.Log.Error("terminating a run without its record", "workflow_id", workflowID, "error", err)
+	}
+	if err := s.Temporal.TerminateWorkflow(ctx, workflowID, runID, why); err != nil {
+		return err
+	}
+	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminated",
+		Actor: audit.Agentd, Payload: map[string]any{"temporal_run_id": runID, "why": why}}); err != nil {
+		s.Log.Error("could not record a termination", "workflow_id", workflowID, "error", err)
+	}
+	return nil
+}
+
+// agentd is who agentd's own changes are by.
+var agentd = audit.Who{Actor: audit.Agentd}
+
+// note appends a record through q, the transaction of the change it records (internal/audit).
+func note(ctx context.Context, q *db.Queries, workflowID, typ string, who audit.Who, payload map[string]any) error {
+	_, err := audit.Append(ctx, q, audit.Event{WorkflowID: workflowID, Type: typ, Actor: who.Actor, PeerUID: who.PeerUID,
+		Payload: payload})
+	return err
+}
+
+// started records the execution Temporal started for a run, unless one is recorded already.
+func (s *Server) started(ctx context.Context, workflowID, runID string, who audit.Who) error {
+	return s.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.SetRunID(ctx, db.SetRunIDParams{RunID: sql.NullString{String: runID, Valid: true}, WorkflowID: workflowID})
+		if err != nil {
+			return err
+		}
+		if n == 0 { // recorded already: the run has its execution, or the write was dropped
+			r, err := q.GetRun(ctx, workflowID)
+			if err == nil && !r.RunID.Valid {
+				err = fmt.Errorf("%w: the execution of run %s", ledger.ErrWriteDropped, workflowID)
+			}
+			return err
+		}
+		return note(ctx, q, workflowID, "run.started", who, map[string]any{"temporal_run_id": runID})
+	})
+}
+
+// discard removes a run Temporal never started.
+func (s *Server) discard(ctx context.Context, workflowID string, who audit.Who, why string) error {
+	return s.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.DeleteRun(ctx, workflowID)
+		if err != nil {
+			return err
+		}
+		if n == 0 { // gone already, or started meanwhile: it is not there with no execution; or the write was dropped
+			r, err := q.GetRun(ctx, workflowID)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return nil
+			case err == nil && !r.RunID.Valid:
+				return fmt.Errorf("%w: the discard of run %s", ledger.ErrWriteDropped, workflowID)
+			}
+			return err
+		}
+		return note(ctx, q, workflowID, "run.discarded", who, map[string]any{"why": audit.Text(why)})
+	})
 }
 
 func (s *Server) GetRun(ctx context.Context, req *agentosv1.GetRunRequest) (*agentosv1.Run, error) {
@@ -184,13 +292,27 @@ func (s *Server) ListRuns(ctx context.Context, req *agentosv1.ListRunsRequest) (
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := s.Ledger.Q.ListRuns(ctx, limit)
-	if err != nil {
+	var rows []db.Run
+	var totals []budget.Totals
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		if rows, err = q.ListRuns(ctx, limit); err != nil {
+			return err
+		}
+		for _, r := range rows {
+			t, err := budget.TotalsIn(ctx, q, r.WorkflowID)
+			if err != nil {
+				return err
+			}
+			totals = append(totals, t)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	resp := &agentosv1.ListRunsResponse{}
-	for _, r := range rows {
-		run, err := s.describe(ctx, r)
+	for i, r := range rows {
+		run, err := s.describeWith(ctx, r, totals[i])
 		if err != nil {
 			return nil, err
 		}
@@ -204,6 +326,10 @@ func (s *Server) ListRuns(ctx context.Context, req *agentosv1.ListRunsRequest) (
 // ignore, so a run still going after CancelGrace is terminated. Requests already sent are not
 // undone; they finish or go to reconciliation.
 func (s *Server) CancelRun(ctx context.Context, req *agentosv1.CancelRunRequest) (*agentosv1.Run, error) {
+	who, err := operator(ctx)
+	if err != nil {
+		return nil, err
+	}
 	r, err := s.lookup(ctx, req.GetRunId())
 	if err != nil {
 		return nil, err
@@ -220,8 +346,21 @@ func (s *Server) CancelRun(ctx context.Context, req *agentosv1.CancelRunRequest)
 	}
 	ctx = context.WithoutCancel(ctx) // once recorded, the cancel must reach Temporal
 	at := time.Now().UTC()
-	if _, err := s.Ledger.Q.MarkRunCancelled(ctx, db.MarkRunCancelledParams{
-		CancelledAt: sql.NullString{String: at.Format(time.RFC3339Nano), Valid: true}, WorkflowID: r.WorkflowID,
+	if err := s.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.MarkRunCancelled(ctx, db.MarkRunCancelledParams{
+			CancelledAt: sql.NullString{String: at.Format(time.RFC3339Nano), Valid: true}, WorkflowID: r.WorkflowID,
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 { // cancelled already: the run has its cancel, or the write was dropped
+			cur, err := q.GetRun(ctx, r.WorkflowID)
+			if err == nil && !cur.CancelledAt.Valid {
+				err = fmt.Errorf("%w: the cancel of run %s", ledger.ErrWriteDropped, r.WorkflowID)
+			}
+			return err
+		}
+		return note(ctx, q, r.WorkflowID, "run.cancelled", who, map[string]any{"cancelled_at": at.Format(time.RFC3339Nano)})
 	}); err != nil {
 		return nil, err
 	}
@@ -237,8 +376,12 @@ func (s *Server) CancelRun(ctx context.Context, req *agentosv1.CancelRunRequest)
 // RecoverCancels re-arms the deadline of every cancelled run that is still going, after an
 // agentd restart.
 func (s *Server) RecoverCancels(ctx context.Context) error {
-	rows, err := s.Ledger.Q.ListCancelledRuns(ctx)
-	if err != nil {
+	var rows []db.Run
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		rows, err = q.ListCancelledRuns(ctx)
+		return err
+	}); err != nil {
 		return err
 	}
 	for _, r := range rows {
@@ -273,7 +416,7 @@ func (s *Server) enforceCancel(workflowID, runID string, deadline time.Time) {
 			return
 		}
 		reason := fmt.Sprintf("cancel not honoured within %s", s.CancelGrace)
-		if err := s.Temporal.TerminateWorkflow(ctx, workflowID, runID, reason); err != nil {
+		if err := s.terminate(ctx, workflowID, runID, reason); err != nil {
 			s.Log.Error("cancel deadline: terminate failed", "workflow_id", workflowID, "error", err)
 			return
 		}
@@ -295,9 +438,16 @@ func closed(state string) bool {
 // world: neither leaves with raw control characters.
 func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingRequest) (*agentosv1.ListPendingResponse, error) {
 	resp := &agentosv1.ListPendingResponse{}
-	approvals, err := s.Ledger.Q.ListPendingApprovals(ctx)
-	if err != nil {
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error { return s.listPending(ctx, q, resp) }); err != nil {
 		return nil, err
+	}
+	return resp, nil
+}
+
+func (s *Server) listPending(ctx context.Context, q *db.Queries, resp *agentosv1.ListPendingResponse) error {
+	approvals, err := q.ListPendingApprovals(ctx)
+	if err != nil {
+		return err
 	}
 	for _, a := range approvals {
 		if at, err := time.Parse(time.RFC3339Nano, a.ExpiresAt); err == nil && !time.Now().Before(at) {
@@ -308,39 +458,46 @@ func (s *Server) ListPending(ctx context.Context, _ *agentosv1.ListPendingReques
 		resp.Items = append(resp.Items, &agentosv1.PendingItem{Kind: "approval", Id: a.ApprovalID, RunId: a.WorkflowID,
 			ExpiresAt: a.ExpiresAt, Tool: a.Tool, Since: a.CreatedAt, PayloadSha256: a.PayloadSha256})
 	}
-	rows, err := s.Ledger.Q.ListEffectsByStatus(ctx, "UNKNOWN")
+	rows, err := q.ListEffectsByStatus(ctx, "UNKNOWN")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, e := range rows {
 		item := &agentosv1.PendingItem{Kind: "reconciliation", Id: e.EffectID, RunId: e.WorkflowID, Tool: e.Tool,
 			Reason: safetext.Line(e.Reason.String), Since: e.UpdatedAt}
 		if e.PayloadBlob.Valid {
-			b, err := s.Ledger.GetBlob(ctx, e.PayloadBlob.String)
-			if err != nil {
-				return nil, err
+			b, err := ledger.BlobIn(ctx, q, e.PayloadBlob.String)
+			switch {
+			case errors.Is(err, ledger.ErrBadBlob):
+				// Listed all the same, without the bytes: a person settles it from what it did.
+				item.Reason = safetext.Line(e.Reason.String + "; its recorded payload has changed since, and is not shown")
+			case err != nil:
+				return err
+			default:
+				item.PayloadJson = string(safetext.JSON(b))
 			}
-			item.PayloadJson = string(safetext.JSON(b))
 		}
 		resp.Items = append(resp.Items, item)
 	}
-	return resp, nil
+	return nil
 }
 
 // errPayloadChanged: the payload recorded for an approval no longer hashes to the one it holds.
 var errPayloadChanged = errors.New("changed since it was recorded")
 
 // approvalPayload is the payload an approval holds the hash of: its effect's, as recorded.
-func (s *Server) approvalPayload(ctx context.Context, a db.Approval) ([]byte, error) {
-	e, err := s.Ledger.Q.GetEffect(ctx, a.EffectID)
+func approvalPayload(ctx context.Context, q *db.Queries, a db.Approval) ([]byte, error) {
+	e, err := q.GetEffect(ctx, a.EffectID)
 	if err != nil {
 		return nil, err
 	}
-	b, err := s.Ledger.GetBlob(ctx, e.PayloadBlob.String)
-	if err != nil {
+	b, err := ledger.BlobIn(ctx, q, e.PayloadBlob.String)
+	if err != nil && !errors.Is(err, ledger.ErrBadBlob) {
 		return nil, err
 	}
-	if sum := sha256.Sum256(b); hex.EncodeToString(sum[:]) != a.PayloadSha256 {
+	// Bytes changed under their key (ErrBadBlob), or a key that is not the approval's: either way not
+	// the payload the approval holds the hash of.
+	if sum := sha256.Sum256(b); err != nil || hex.EncodeToString(sum[:]) != a.PayloadSha256 {
 		return nil, fmt.Errorf("the payload recorded for approval %s does not hash to %s: it %w; do not approve it",
 			a.ApprovalID, a.PayloadSha256, errPayloadChanged)
 	}
@@ -350,21 +507,31 @@ func (s *Server) approvalPayload(ctx context.Context, a db.Approval) ([]byte, er
 // GetApproval shows one approval (design doc, section 10): exactly what will be sent and its hash,
 // what agentd observed when it made the approval, how it was decided, and what the run has spent.
 func (s *Server) GetApproval(ctx context.Context, req *agentosv1.GetApprovalRequest) (*agentosv1.Approval, error) {
-	a, err := s.Ledger.Q.GetApproval(ctx, req.GetApprovalId())
+	var out *agentosv1.Approval
+	err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		out, err = getApproval(ctx, q, req.GetApprovalId())
+		return err
+	})
+	return out, err
+}
+
+func getApproval(ctx context.Context, q *db.Queries, id string) (*agentosv1.Approval, error) {
+	a, err := q.GetApproval(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, status.Errorf(codes.NotFound, "no approval %q", req.GetApprovalId())
+		return nil, status.Errorf(codes.NotFound, "no approval %q", id)
 	}
 	if err != nil {
 		return nil, err
 	}
-	payload, err := s.approvalPayload(ctx, a)
+	payload, err := approvalPayload(ctx, q, a)
 	switch {
 	case errors.Is(err, errPayloadChanged):
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	case err != nil:
 		return nil, err
 	}
-	card, err := s.Ledger.GetBlob(ctx, a.ContextBlob)
+	card, err := ledger.BlobIn(ctx, q, a.ContextBlob)
 	if err != nil {
 		return nil, err
 	}
@@ -376,13 +543,13 @@ func (s *Server) GetApproval(ctx context.Context, req *agentosv1.GetApprovalRequ
 		SupersededBy: a.SupersededBy.String,
 	}
 	if a.EditedPatchBlob.Valid {
-		b, err := s.Ledger.GetBlob(ctx, a.EditedPatchBlob.String)
+		b, err := ledger.BlobIn(ctx, q, a.EditedPatchBlob.String)
 		if err != nil {
 			return nil, err
 		}
 		out.EditedPatch = safetext.Text(string(b))
 	}
-	t, err := s.Budget.Totals(ctx, a.WorkflowID)
+	t, err := budget.TotalsIn(ctx, q, a.WorkflowID)
 	if err != nil {
 		return nil, err
 	}
@@ -395,8 +562,14 @@ func (s *Server) GetApproval(ctx context.Context, req *agentosv1.GetApprovalRequ
 // after another is told who decided what, and when. The decision and the run's doorbell are
 // written together, and the outbox rings it.
 func (s *Server) ResolveApproval(ctx context.Context, req *agentosv1.ResolveApprovalRequest) (*agentosv1.ResolveApprovalResponse, error) {
+	// The record of the decision is by the user of the connection, as every operator record is; the
+	// name agentctl gives for the reviewer goes in it, and on the approval.
+	who, err := operator(ctx)
+	if err != nil {
+		return nil, err
+	}
 	d := gateway.Decision{ApprovalID: req.GetApprovalId(), PayloadSHA256: req.GetPayloadSha256(),
-		Key: req.GetIdempotencyKey(), By: req.GetDecidedBy()}
+		Key: req.GetIdempotencyKey(), By: req.GetDecidedBy(), Who: who}
 	switch x := req.GetDecision().(type) {
 	case *agentosv1.ResolveApprovalRequest_Approve:
 		d.Kind = gateway.DecisionApprove
@@ -407,7 +580,12 @@ func (s *Server) ResolveApproval(ctx context.Context, req *agentosv1.ResolveAppr
 	default:
 		return nil, status.Error(codes.InvalidArgument, "a decision is required: approve, approve_with_edits or reject")
 	}
-	a, err := s.Ledger.Q.GetApproval(ctx, d.ApprovalID)
+	var a db.Approval
+	err = s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		a, err = q.GetApproval(ctx, d.ApprovalID)
+		return err
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, status.Errorf(codes.NotFound, "no approval %q", d.ApprovalID)
 	}
@@ -444,13 +622,22 @@ func (s *Server) ResolveApproval(ctx context.Context, req *agentosv1.ResolveAppr
 // (design doc, section 6), with the run's doorbell: its call waiting in WAITING_RECONCILE asks
 // again and gets the result, or sends the effect again.
 func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.ResolveReconciliationRequest) (*agentosv1.ResolveReconciliationResponse, error) {
+	who, err := operator(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if req.GetIdempotencyKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key is required")
 	}
 	if !req.GetExecuted() && (req.GetLookup() || req.GetResultJson() != "") {
 		return nil, status.Error(codes.InvalidArgument, "a result or a lookup only goes with executed")
 	}
-	e, err := s.Ledger.Q.GetEffect(ctx, req.GetEffectId())
+	var e db.Effect
+	err = s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		e, err = q.GetEffect(ctx, req.GetEffectId())
+		return err
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, status.Errorf(codes.NotFound, "no effect %q", req.GetEffectId())
 	}
@@ -469,7 +656,7 @@ func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.Resol
 	ctx = context.WithoutCancel(ctx) // the finding and its doorbell are written together
 	st, _, err := s.Effects.Reconcile(ctx, gateway.Resolution{
 		EffectID: req.GetEffectId(), Executed: req.GetExecuted(), ResultJSON: req.GetResultJson(),
-		Lookup: req.GetLookup(), Key: req.GetIdempotencyKey(), RunClosed: closed(current.GetState()),
+		Lookup: req.GetLookup(), Key: req.GetIdempotencyKey(), RunClosed: closed(current.GetState()), By: who,
 	})
 	switch {
 	case errors.Is(err, gateway.ErrNoSuchEffect):
@@ -487,6 +674,10 @@ func (s *Server) ResolveReconciliation(ctx context.Context, req *agentosv1.Resol
 // ExtendBudget raises a run's budget, with its doorbell: calls paused in PAUSED_BUDGET ask again.
 // The outbox rings it until Temporal has it.
 func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRequest) (*agentosv1.Run, error) {
+	who, err := operator(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if req.GetAmountMicros() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "amount must be positive")
 	}
@@ -508,7 +699,7 @@ func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRe
 		return nil, status.Errorf(codes.FailedPrecondition, "the run has already ended: %s", current.GetState())
 	}
 	ctx = context.WithoutCancel(ctx) // the extension and its doorbell are written together
-	added, err := s.Budget.Extend(ctx, r.WorkflowID, req.GetAmountMicros(), req.GetIdempotencyKey())
+	added, err := s.Budget.Extend(ctx, r.WorkflowID, req.GetAmountMicros(), req.GetIdempotencyKey(), who)
 	if err != nil {
 		return nil, err
 	}
@@ -525,8 +716,20 @@ func (s *Server) ExplainRun(context.Context, *agentosv1.ExplainRunRequest) (*age
 	return nil, status.Error(codes.Unimplemented, "runs explain arrives in M5")
 }
 
+// lookup is the run's row, as one of the ledger's read transactions reads it (ledger.Read checks the
+// schema first): Control shows the operator nothing a connection read through another schema.
 func (s *Server) lookup(ctx context.Context, workflowID string) (db.Run, error) {
-	r, err := s.Ledger.Q.GetRun(ctx, workflowID)
+	var r db.Run
+	err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		r, err = lookupIn(ctx, q, workflowID)
+		return err
+	})
+	return r, err
+}
+
+func lookupIn(ctx context.Context, q *db.Queries, workflowID string) (db.Run, error) {
+	r, err := q.GetRun(ctx, workflowID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return db.Run{}, status.Errorf(codes.NotFound, "no run %q", workflowID)
 	}
@@ -534,24 +737,43 @@ func (s *Server) lookup(ctx context.Context, workflowID string) (db.Run, error) 
 }
 
 func (s *Server) getRun(ctx context.Context, workflowID string) (*agentosv1.Run, error) {
-	r, err := s.lookup(ctx, workflowID)
-	if err != nil {
+	var r db.Run
+	var t budget.Totals
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		if r, err = lookupIn(ctx, q, workflowID); err != nil {
+			return err
+		}
+		t, err = budget.TotalsIn(ctx, q, workflowID)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	return s.describe(ctx, r)
+	return s.describeWith(ctx, r, t)
 }
 
-// describe combines the ledger row with the execution's state in Temporal. The result and
-// the failure message come from the Worker: neither leaves here with raw control characters.
+// describe combines the ledger row with the run's budget, in a read transaction of its own, and the
+// execution's state in Temporal.
 func (s *Server) describe(ctx context.Context, r db.Run) (*agentosv1.Run, error) {
+	var t budget.Totals
+	if err := s.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		t, err = budget.TotalsIn(ctx, q, r.WorkflowID)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return s.describeWith(ctx, r, t)
+}
+
+// describeWith combines the ledger row and the run's budget, read together, with the execution's
+// state in Temporal, which it asks outside any transaction. The result and the failure message come
+// from the Worker: neither leaves here with raw control characters.
+func (s *Server) describeWith(ctx context.Context, r db.Run, b budget.Totals) (*agentosv1.Run, error) {
 	out := &agentosv1.Run{
 		RunId: r.WorkflowID, TemporalRunId: r.RunID.String, Task: r.Task, CreatedAt: r.CreatedAt, DryRun: r.DryRun != 0,
 	}
 	if err := json.Unmarshal([]byte(r.ParamsJson), &out.Params); err != nil {
-		return nil, err
-	}
-	b, err := s.Budget.Totals(ctx, r.WorkflowID)
-	if err != nil {
 		return nil, err
 	}
 	out.BudgetLimitMicros, out.BudgetSpentMicros, out.BudgetReservedMicros = b.Limit, b.Spent, b.Held

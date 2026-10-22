@@ -84,6 +84,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
+      # A build output or a dump committed by a broad `git add` (GitHub refuses files over
+      # 100 MB, and this repository is public): no tracked file may be over 5 MB.
+      - name: No tracked file over 5 MB
+        run: |
+          git ls-files -z | xargs -0 -r stat --format=$'%s\t%n' |
+            awk -F'\t' '$1 > 5 * 1024 * 1024 { printf "::error::%s is %d bytes, over 5 MB\n", $2, $1; big = 1 } END { exit big }'
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -103,7 +109,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The suite took about 16 minutes before the audit log's tests; it now runs past 20.
+    timeout-minutes: 40
     env:
       AGENTOS_SANDBOX: none
       # The system Python: bubblewrap mounts /usr and the virtualenv into the sandbox, but
@@ -186,7 +193,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40 # as blackbox-none's
     env:
       AGENTOS_SANDBOX: bwrap
       UV_PYTHON: /usr/bin/python3

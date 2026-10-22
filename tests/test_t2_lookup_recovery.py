@@ -39,6 +39,15 @@ def test_t2_the_pr_was_opened_before_the_result_was_recorded(stack: Stack) -> No
     recovered = [e for e in stack.agentd_log() if e["msg"] == "effect recovered" and e.get("effect_id") == effect["effect_id"]]
     assert recovered and recovered[0]["status"] == "ok", recovered
     assert not [e for e in stack.agentd_log() if e["msg"] == "sending an effect again"]
+    # agentd's lookup has its record before it went to GitHub, and what it found is in the records
+    # after: the record of the lookup's request, then the effect's settlement.
+    rows = [{**dict(r), "data": json.loads(r["payload"])} for r in stack.ledger("SELECT * FROM audit_log ORDER BY seq")]
+    mine = [r for r in rows if r["data"].get("effect_id") == effect["effect_id"]]
+    reads = [r for r in mine if r["type"] == "agentd.read" and r["data"]["purpose"] == "lookup"]
+    settled = [r for r in mine if r["type"] == "effect.settled"]
+    assert reads and settled and reads[0]["seq"] < settled[-1]["seq"], mine
+    assert {(r["actor"], r["data"]["tool"], r["data"]["method"], r["data"]["path"]) for r in reads} == {
+        ("agentd", PR, "GET", "/repos/acme/payments/pulls")}, reads
 
 
 def test_t2_agentd_stopped_after_claiming_before_sending(stack: Stack) -> None:

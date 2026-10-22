@@ -134,7 +134,7 @@ func TestLoopGuard(t *testing.T) {
 			scheduled[activityID] = time.Now()
 		}
 		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf"}, activity.Info{ActivityID: activityID, ScheduledTime: scheduled[activityID]},
-			&agentosv1.Call{Kind: kind, Name: name}, []byte(args))
+			&agentosv1.Call{Kind: kind, Name: name}, []byte(args), &callRecord{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -170,7 +170,7 @@ func TestLoopGuard(t *testing.T) {
 	waited := func(activityID, outcome string) string {
 		at := time.Now()
 		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf3"}, activity.Info{ActivityID: activityID, ScheduledTime: at},
-			&agentosv1.Call{Kind: "tool", Name: "github.open_draft_pr"}, []byte(`{}`))
+			&agentosv1.Call{Kind: "tool", Name: "github.open_draft_pr"}, []byte(`{}`), &callRecord{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -198,7 +198,7 @@ func TestLoopGuard(t *testing.T) {
 	}
 	reused := func(at time.Time) string {
 		reason, err := g.guard(ctx, db.Run{WorkflowID: "wf2"}, activity.Info{ActivityID: "1:x", ScheduledTime: at},
-			&agentosv1.Call{Kind: "tool", Name: "git.show_diff"}, []byte(`{}`))
+			&agentosv1.Call{Kind: "tool", Name: "git.show_diff"}, []byte(`{}`), &callRecord{})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -66,12 +66,15 @@ def start(stack: Stack, patch: str, policy: str = TEST_POLICY) -> dict:
 
 
 def results(stack: Stack, run: dict, name: str) -> list[dict]:
-    """What the run's calls of a tool returned: status and value."""
+    """What the run's calls of a tool returned: status and value, less the anchor every result
+    carries (_audit, the call's record in agentd's audit log)."""
     out = []
     for c in gateway_calls(stack.history(run)):
         if c["name"] == name and c["completed"] is not None:
             r = json.loads(c["completed"].activity_task_completed_event_attributes.result.payloads[0].data)
-            out.append({"status": r.get("status"), "value": json.loads(r.get("valueJson") or "{}")})
+            value = json.loads(r.get("valueJson") or "{}")
+            assert value.pop("_audit")["seq"] > 0, value
+            out.append({"status": r.get("status"), "value": value})
     return out
 
 

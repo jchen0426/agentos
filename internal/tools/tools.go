@@ -69,7 +69,7 @@ type Writer interface {
 // Describer is a write whose reviewer needs to see more than its payload: what agentd can find
 // out about the write before a person approves it (design doc, section 10), such as whether the
 // patch applies and where the target stands now. It is best-effort: what it cannot find out, it
-// says in its answer rather than failing the call.
+// says in its answer rather than failing the call. Its requests go through ReadsOf(ctx).
 type Describer interface {
 	Writer
 	Describe(ctx context.Context, req Request, payload json.RawMessage) map[string]any
@@ -91,7 +91,27 @@ type Editable interface {
 // out: a lookup's wait for a request in flight counts from the last one.
 type Proceed func(ctx context.Context) error
 
-// Finder is a Writer whose effect can be looked up afterwards.
+// Reads records one of agentd's own reads of an effect's target before it goes out (the audit log,
+// design doc, section 8): a lookup of an effect, an approval card's requests. Find and Describe send
+// each of their requests through it, when ctx has one (WithReads): it names the request's method and
+// path, never its headers or query, and the request does not go out when it fails.
+type Reads func(ctx context.Context, method, path string) error
+
+type readsKey struct{}
+
+// WithReads is ctx for a Find or a Describe whose requests r records first.
+func WithReads(ctx context.Context, r Reads) context.Context {
+	return context.WithValue(ctx, readsKey{}, r)
+}
+
+// ReadsOf is ctx's Reads; nil when the requests made with ctx are not agentd's own reads.
+func ReadsOf(ctx context.Context) Reads {
+	r, _ := ctx.Value(readsKey{}).(Reads)
+	return r
+}
+
+// Finder is a Writer whose effect can be looked up afterwards. Find's requests go through
+// ReadsOf(ctx).
 type Finder interface {
 	Writer
 	Find(ctx context.Context, payload json.RawMessage) (value map[string]any, found bool, err error)

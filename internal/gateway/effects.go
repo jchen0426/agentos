@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
@@ -288,12 +290,26 @@ func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class 
 		switch {
 		case err != nil:
 			return err
-		case inserted == 0:
-			return errChanged // recorded meanwhile: the caller reads it
-		case approval != nil:
-			return q.InsertApproval(ctx, *approval)
+		case inserted == 0: // recorded meanwhile: the caller reads it; or the write was dropped
+			if _, err := q.GetEffect(ctx, req.EffectID); errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: effect %s", ledger.ErrWriteDropped, req.EffectID)
+			} else if err != nil {
+				return err
+			}
+			return errChanged
 		}
-		return nil
+		if err := note(ctx, q, run.WorkflowID, "effect.recorded", audit.Run, map[string]any{"effect_id": req.EffectID,
+			"tool": t.Name(), "class": class, "payload_sha256": sha256Hex(payload), "status": status,
+			"idempotency_key": "agentos-" + req.EffectID[:32]}); err != nil {
+			return err
+		}
+		if approval == nil {
+			return nil
+		}
+		if err := q.InsertApproval(ctx, *approval); err != nil {
+			return err
+		}
+		return noteApproval(ctx, q, *approval, audit.Run)
 	})
 	switch {
 	case errors.Is(err, errAtLimit):
@@ -334,10 +350,18 @@ func (g *Gateway) payload(ctx context.Context, e db.Effect) (json.RawMessage, er
 // cancelled. It returns e as claimed.
 func (g *Gateway) claim(ctx context.Context, e db.Effect) (db.Effect, bool, error) {
 	now := ledger.Now()
-	n, err := g.Ledger.Q.ClaimEffect(ctx, db.ClaimEffectParams{
-		ClaimedBy: valid(g.Incarnation), ClaimedAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+	var claimed bool
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		n, err := q.ClaimEffect(ctx, db.ClaimEffectParams{
+			ClaimedBy: valid(g.Incarnation), ClaimedAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+		})
+		if claimed = n == 1; err != nil || !claimed {
+			return err
+		}
+		return note(ctx, q, e.WorkflowID, "effect.claimed", audit.Agentd, map[string]any{"effect_id": e.EffectID,
+			"by": g.Incarnation, "version": e.Version + 1})
 	})
-	if err != nil || n == 0 {
+	if err != nil || !claimed {
 		return e, false, err
 	}
 	e.ClaimedBy, e.ClaimedAt, e.Version = valid(g.Incarnation), valid(now), e.Version+1
@@ -375,9 +399,16 @@ func (g *Gateway) proceed(e db.Effect, bound *db.Approval) tools.Proceed {
 			return tools.ErrStopped
 		}
 		now := ledger.Now()
-		n, err := g.Ledger.Q.TouchEffect(ctx, db.TouchEffectParams{
-			ClaimedAt: valid(now), LastRequestAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
-			ClaimedBy: valid(g.Incarnation),
+		var n int64
+		err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+			var err error
+			if n, err = q.TouchEffect(ctx, db.TouchEffectParams{
+				ClaimedAt: valid(now), LastRequestAt: valid(now), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version,
+				ClaimedBy: valid(g.Incarnation),
+			}); err != nil || n == 0 {
+				return err
+			}
+			return note(ctx, q, e.WorkflowID, "effect.sending", audit.Agentd, map[string]any{"effect_id": e.EffectID})
 		})
 		switch {
 		case err != nil:
@@ -465,7 +496,8 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 	case class == policy.EffectUnsafe || !canFind:
 		return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown: "+why)
 	}
-	v, found, err := finder.Find(ctx, payload)
+	lookup := g.reading(ctx, e.WorkflowID, e.EffectID, e.Tool, "lookup")
+	v, found, err := finder.Find(lookup, payload)
 	if err != nil {
 		return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown, and looking it up failed: "+err.Error())
 	}
@@ -486,7 +518,7 @@ func (g *Gateway) recoverEffect(ctx context.Context, run db.Run, t tools.Writer,
 			if err := g.sleep(ctx, wait); err != nil {
 				return nil, err
 			}
-			if v, found, err = finder.Find(ctx, payload); err != nil {
+			if v, found, err = finder.Find(lookup, payload); err != nil {
 				return g.settle(ctx, e, effectUnknown, nil, "the outcome is unknown, and looking it up failed: "+err.Error())
 			}
 		}
@@ -558,11 +590,29 @@ func (g *Gateway) release(ctx context.Context, e db.Effect, unsent bool) (*agent
 // giveBack releases a claimed effect. Unsent, it is one that never took effect, as far as agentd
 // knows: no attempt so far did. Otherwise an attempt may have, and the effect stays in flight.
 func (g *Gateway) giveBack(ctx context.Context, e db.Effect, unsent bool) (int64, error) {
-	p := db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version}
-	if unsent {
-		return g.Ledger.Q.ReleaseUnsentEffect(ctx, db.ReleaseUnsentEffectParams(p))
+	var n int64
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		p := db.ReleaseEffectParams{UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version}
+		var err error
+		if unsent {
+			n, err = q.ReleaseUnsentEffect(ctx, db.ReleaseUnsentEffectParams(p))
+		} else {
+			n, err = q.ReleaseEffect(ctx, p)
+		}
+		if err != nil || n == 0 {
+			return err
+		}
+		cur, err := q.GetEffect(ctx, e.EffectID) // as it was given back: maybe_sent as it stands
+		if err != nil {
+			return err
+		}
+		return note(ctx, q, e.WorkflowID, "effect.released", audit.Agentd, map[string]any{"effect_id": e.EffectID,
+			"unsent": unsent, "maybe_sent": cur.MaybeSent != 0})
+	})
+	if err != nil {
+		return 0, err
 	}
-	return g.Ledger.Q.ReleaseEffect(ctx, p)
+	return n, nil
 }
 
 // resend claims e again and sends it under its original key, within the time of the approval that
@@ -602,9 +652,16 @@ func (g *Gateway) settle(ctx context.Context, e db.Effect, status string, value 
 		}
 		blob = valid(ref)
 	}
-	n, err := g.Ledger.Q.SetEffectStatus(ctx, db.SetEffectStatusParams{
-		Status: status, ResultBlob: blob, Reason: sql.NullString{String: reason, Valid: reason != ""},
-		UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
+	why := sql.NullString{String: reason, Valid: reason != ""}
+	var n int64
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		var err error
+		if n, err = q.SetEffectStatus(ctx, db.SetEffectStatusParams{
+			Status: status, ResultBlob: blob, Reason: why, UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version,
+		}); err != nil || n == 0 {
+			return err
+		}
+		return noteSettled(ctx, q, e.WorkflowID, e.EffectID, status, why, blob)
 	})
 	if err != nil {
 		return nil, err
@@ -622,7 +679,7 @@ func (g *Gateway) settle(ctx context.Context, e db.Effect, status string, value 
 	if status != effectSucceeded && status != effectDryRun {
 		g.Log.Warn("effect settled", "workflow_id", e.WorkflowID, "effect_id", e.EffectID, "status", status, "reason", reason)
 	}
-	e.Status, e.ResultBlob, e.Reason = status, blob, sql.NullString{String: reason, Valid: reason != ""}
+	e.Status, e.ResultBlob, e.Reason = status, blob, why
 	return g.effectResult(ctx, e)
 }
 
@@ -675,15 +732,42 @@ func (g *Gateway) runCancelled(ctx context.Context, workflowID string) (bool, er
 // the call joins. Nothing is sent from here: an effect that never took effect waits for its
 // run's next call.
 func (g *Gateway) RecoverEffects(ctx context.Context) error {
-	if n, err := g.Ledger.Q.AbandonUnsentEffects(ctx, ledger.Now()); err != nil {
+	var abandoned, handedOver int64
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		// Read first, in the same transaction: each one either query changes is recorded, and only those
+		// (an effect an agentd holds is recovered below, by its class).
+		pending, err := q.ListPendingEffectsOfCancelledRuns(ctx)
+		if err != nil {
+			return err
+		}
+		if abandoned, err = q.AbandonUnsentEffects(ctx, ledger.Now()); err != nil {
+			return err
+		}
+		if handedOver, err = q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {
+			return err
+		}
+		for _, u := range pending {
+			e, err := q.GetEffect(ctx, u.EffectID)
+			if err != nil {
+				return err
+			}
+			if e.Status == effectPending {
+				continue // neither took it: it is held
+			}
+			if err := noteSettled(ctx, q, e.WorkflowID, e.EffectID, e.Status, e.Reason, e.ResultBlob); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return err
-	} else if n > 0 {
-		g.Log.Info("abandoned the unsent effects of cancelled runs", "count", n)
 	}
-	if n, err := g.Ledger.Q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {
-		return err
-	} else if n > 0 {
-		g.Log.Warn("cancelled runs left effects that may have taken effect: a person settles them", "count", n)
+	if abandoned > 0 {
+		g.Log.Info("abandoned the unsent effects of cancelled runs", "count", abandoned)
+	}
+	if handedOver > 0 {
+		g.Log.Warn("cancelled runs left effects that may have taken effect: a person settles them", "count", handedOver)
 	}
 	claimed, err := g.Ledger.Q.ListClaimedEffects(ctx, valid(g.Incarnation))
 	if err != nil {
@@ -734,10 +818,11 @@ func (g *Gateway) recoverClaimed(ctx context.Context, effectID string) (*agentos
 type Resolution struct {
 	EffectID   string
 	Executed   bool
-	ResultJSON string // when executed: what the effect produced
-	Lookup     bool   // when executed: let agentd find the result itself
-	Key        string // idempotency key: the same finding sent again applies once
-	RunClosed  bool   // the run's workflow has ended: nobody will send the effect again
+	ResultJSON string    // when executed: what the effect produced
+	Lookup     bool      // when executed: let agentd find the result itself
+	Key        string    // idempotency key: the same finding sent again applies once
+	RunClosed  bool      // the run's workflow has ended: nobody will send the effect again
+	By         audit.Who // the person, as the audit log records them
 }
 
 // Resolution errors, for the Control service to map.
@@ -834,6 +919,15 @@ func (g *Gateway) Reconcile(ctx context.Context, r Resolution) (string, string, 
 		}); err != nil {
 			return err
 		}
+		// The resolution's key names its row of effect_resolutions, which the record vouches for.
+		p := map[string]any{"effect_id": e.EffectID, "executed": r.Executed, "status": status, "resolve_key": audit.Text(r.Key)}
+		if blob.Valid {
+			p["result_sha256"] = strings.TrimPrefix(blob.String, "sha256:")
+		}
+		if _, err := audit.Append(ctx, q, audit.Event{WorkflowID: e.WorkflowID, Type: "effect.reconciled",
+			Actor: r.By.Actor, PeerUID: r.By.PeerUID, Payload: p}); err != nil {
+			return err
+		}
 		// The call waiting in WAITING_RECONCILE asks again: it gets the result, or sends the effect.
 		return outbox.Ring(ctx, q, e.WorkflowID, outbox.WhyReconciliation)
 	})
@@ -857,7 +951,7 @@ func (g *Gateway) reportedResult(ctx context.Context, e db.Effect, t tools.Write
 		if err != nil {
 			return nil, err
 		}
-		v, found, err := f.Find(ctx, payload)
+		v, found, err := f.Find(g.reading(ctx, e.WorkflowID, e.EffectID, e.Tool, "reconcile"), payload)
 		if err != nil {
 			return nil, fmt.Errorf("look up effect %s: %w", e.EffectID, err)
 		}

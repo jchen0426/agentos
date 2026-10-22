@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -46,11 +47,16 @@ func main() {
 	budget.AddCommand(extendCmd(g))
 	reconcile := &cobra.Command{Use: "reconcile", Short: "Settle external writes whose outcome nobody knows"}
 	reconcile.AddCommand(reconcileListCmd(g), reconcileShowCmd(g), reconcileResolveCmd(g))
-	root.AddCommand(runs, budget, reconcile, approvalsCmd(g))
+	root.AddCommand(runs, budget, reconcile, approvalsCmd(g), auditCmd(g))
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "agentctl:", safetext.Line(err.Error()))
-		os.Exit(1)
+		code := 1
+		var exit exitError
+		if errors.As(err, &exit) {
+			code = exit.code
+		}
+		os.Exit(code)
 	}
 }
 
@@ -371,6 +377,11 @@ func explainCmd(g *globals) *cobra.Command {
 }
 
 func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) error) error {
+	return withClientTimeout(g, 30*time.Second, fn)
+}
+
+// withClientTimeout is withClient, with fn given timeout.
+func withClientTimeout(g *globals, timeout time.Duration, fn func(context.Context, agentosv1.ControlClient) error) error {
 	path, err := filepath.Abs(g.socket)
 	if err != nil {
 		return err
@@ -383,7 +394,7 @@ func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) er
 		return err
 	}
 	defer conn.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return fn(ctx, agentosv1.NewControlClient(conn))
 }

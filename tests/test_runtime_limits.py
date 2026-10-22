@@ -6,6 +6,8 @@ the run, and the Worker keeps serving. The SDK gzips its requests: the limit is 
 decompressed size. A request with more values than agentd decodes is refused in the same
 words, so it ends the same way instead of failing the workflow task for ever."""
 
+import json
+
 import grpc
 from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import EventType
@@ -26,6 +28,13 @@ def refused_completion(stack: Stack, workflows: str) -> tuple[str, list]:
     refused = [e for e in stack.agentd_log() if e["msg"] == "runtime call refused"]
     assert [e["method"].rsplit("/", 1)[1] for e in refused] == ["RespondWorkflowTaskCompleted"], refused
     assert worker.alive() and "GrpcMessageTooLarge" in worker.text()
+    # Temporal ended the run, not agentd: no change to the ledger. verify finds nothing amiss, and lists
+    # the run as terminated outside agentd, with the reason its terminator gave, in its own word.
+    r = stack.agentctl_run("audit", "verify")
+    rep = json.loads(r.stdout)
+    assert r.returncode == 0, (r.returncode, rep, r.stderr)
+    assert [(x["run_id"], x["claimed_reason"]) for x in rep["terminated_outside_agentd"]] == [
+        (run["run_id"], "GrpcMessageTooLarge")], rep
     return refused[0]["reason"], stack.history(run)
 
 

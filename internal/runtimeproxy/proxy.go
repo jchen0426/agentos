@@ -142,15 +142,17 @@ func (s *Server) checkRequest(srv any, ss grpc.ServerStream, info *grpc.StreamSe
 	}
 	// kind is what the refusal log tells refusals apart by: never the Worker's own values.
 	refused := func(kind string, err error) {
-		attrs := []any{"method", logName(method), "reason", logReason(err.Error()), "peer", peerAddr(ctx), "conn", c.name()}
+		line := Refused{Method: logName(method), Reason: logReason(err.Error()), Count: 1}
+		attrs := []any{"method", line.Method, "reason", line.Reason, "peer", peerAddr(ctx), "conn", c.name()}
 		var r *Refusal
 		if errors.As(err, &r) {
 			kind += " " + r.Command + " " + r.rule
 			if r.Command != "" {
 				attrs = append(attrs, "command", r.Command)
+				line.Command = r.Command
 			}
 		}
-		s.refusals.refused(kind, attrs...)
+		s.refusals.refused(kind, line, attrs...)
 	}
 	newRequest, ok := requestTypes[method]
 	if !Allowed(method) || !ok {

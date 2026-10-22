@@ -150,7 +150,7 @@ func TestInvokeWaitingForARunWhoseStartFailedRefusesTheCall(t *testing.T) {
 	g, l := startingRun(t, time.Now())
 	start := time.Now()
 	// Temporal did not start the run, as far as StartRun can tell: it removes the run.
-	after(t, 200*time.Millisecond, func(ctx context.Context) error { return l.Q.DeleteRun(ctx, testWorkflowID) })
+	after(t, 200*time.Millisecond, func(ctx context.Context) error { _, err := l.Q.DeleteRun(ctx, testWorkflowID); return err })
 
 	_, err := invoke(g, noSuchTool)
 	if !unknownRun(err) {

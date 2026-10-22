@@ -42,6 +42,7 @@ from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, Stack, 
 from tests.rogue_workflows import T9_VICTIM
 
 NOBODY_POLLS = "t9-nobody-polls"
+AUDIT_ANCHORS = "agentos-audit-anchor"  # the anchor workflows' type and task queue (internal/audit)
 
 # The run's base branch, which names the step StepsOutOfLine takes, and what agentd refuses it with.
 STEPS = {
@@ -177,6 +178,17 @@ def forbidden_calls(channel: grpc.Channel) -> dict[str, Callable[[], object]]:
             namespace="default", workflow_id="t9-started", workflow_type=audit, task_queue=queue)),
         "PollWorkflowTaskQueue(another queue)": lambda: s.PollWorkflowTaskQueue(ws.PollWorkflowTaskQueueRequest(
             namespace="default", task_queue=TaskQueue(name=NOBODY_POLLS)), timeout=5),
+        # The workflows that hold the audit log's heads (agentd pushes them): a Worker that ran them,
+        # or signalled them, could answer for heads agentd never pushed.
+        "PollWorkflowTaskQueue(the audit log's anchors)": lambda: s.PollWorkflowTaskQueue(ws.PollWorkflowTaskQueueRequest(
+            namespace="default", task_queue=TaskQueue(name=AUDIT_ANCHORS)), timeout=5),
+        "SignalWorkflowExecution(the audit log's anchors)": lambda: s.SignalWorkflowExecution(ws.SignalWorkflowExecutionRequest(
+            namespace="default", workflow_execution=WorkflowExecution(workflow_id=f"{AUDIT_ANCHORS}-2026-10-22"),
+            signal_name="anchor")),
+        "SignalWithStartWorkflowExecution(the audit log's anchors)": lambda: s.SignalWithStartWorkflowExecution(
+            ws.SignalWithStartWorkflowExecutionRequest(namespace="default", workflow_id=f"{AUDIT_ANCHORS}-2026-10-22",
+                                                       workflow_type=WorkflowType(name=AUDIT_ANCHORS),
+                                                       task_queue=TaskQueue(name=AUDIT_ANCHORS), signal_name="anchor")),
         "PollWorkflowTaskQueue(deployment options)": lambda: s.PollWorkflowTaskQueue(ws.PollWorkflowTaskQueueRequest(
             namespace="default", task_queue=queue, deployment_options=ROGUE_DEPLOYMENT), timeout=5),
         "RespondWorkflowTaskCompleted(deployment options)": lambda: s.RespondWorkflowTaskCompleted(

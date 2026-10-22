@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/outbox"
@@ -78,12 +79,20 @@ func supersedeEdited(ctx context.Context, q *db.Queries, a *db.InsertApprovalPar
 	} else if n == 0 {
 		return errChanged
 	}
-	if _, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
-		Reason: valid(fmt.Sprintf("the reviewer edited it: approval %s of the edited call replaced approval %s",
-			a.ApprovalID, edited.ApprovalID)),
-		UpdatedAt: ledger.Now(), EffectID: edited.EffectID,
+	if err := note(ctx, q, a.WorkflowID, "approval.superseded", audit.Agentd, map[string]any{
+		"approval_id": edited.ApprovalID, "superseded_by": a.ApprovalID}); err != nil {
+		return err
+	}
+	why := valid(fmt.Sprintf("the reviewer edited it: approval %s of the edited call replaced approval %s",
+		a.ApprovalID, edited.ApprovalID))
+	if n, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
+		Reason: why, UpdatedAt: ledger.Now(), EffectID: edited.EffectID,
 	}); err != nil {
 		return err
+	} else if n == 1 {
+		if err := noteSettled(ctx, q, a.WorkflowID, edited.EffectID, effectAbandoned, why, sql.NullString{}); err != nil {
+			return err
+		}
 	}
 	a.Supersedes = valid(edited.ApprovalID)
 	return nil
@@ -154,7 +163,7 @@ func (g *Gateway) writesBefore(ctx context.Context, run db.Run, t tools.Writer, 
 func (g *Gateway) describe(ctx context.Context, run db.Run, t tools.Writer, req tools.Request, payload json.RawMessage) (string, error) {
 	card := map[string]any{}
 	if d, ok := t.(tools.Describer); ok {
-		card["write"] = d.Describe(ctx, req, payload)
+		card["write"] = d.Describe(g.reading(ctx, run.WorkflowID, req.EffectID, t.Name(), "approval_card"), req, payload)
 	}
 	if task, ok := g.Tasks[run.Task]; ok && task.ApprovalContext != nil {
 		card["task"] = task.ApprovalContext(ctx, runOutputs{g.Ledger, run.WorkflowID}, req.Args)
@@ -246,8 +255,12 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 		}
 		now := ledger.Now()
 		abandon := func(status string, value map[string]any, reason string) error {
-			if _, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
-				Reason: valid(reason), UpdatedAt: now, EffectID: ce.EffectID}); err != nil {
+			// The effect awaits approval, as read above, in this transaction.
+			if n, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
+				Reason: valid(reason), UpdatedAt: now, EffectID: ce.EffectID}); err != nil || n == 0 {
+				return cmp.Or(err, errChanged)
+			}
+			if err := noteSettled(ctx, q, ce.WorkflowID, ce.EffectID, effectAbandoned, valid(reason), sql.NullString{}); err != nil {
 				return err
 			}
 			value["approval_id"], value["reason"] = cur.ApprovalID, reason
@@ -258,9 +271,13 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 		if expired(cur) {
 			reason := fmt.Sprintf("approved by %s at %s, but the run did not act on it before the approval expired at %s",
 				cur.DecidedBy.String, cur.DecidedAt.String, cur.ExpiresAt)
-			if _, err := q.ExpireUnusedApproval(ctx, db.ExpireUnusedApprovalParams{
+			if n, err := q.ExpireUnusedApproval(ctx, db.ExpireUnusedApprovalParams{
 				DecidedAt: valid(now), Reason: valid(reason), ApprovalID: cur.ApprovalID}); err != nil {
 				return err
+			} else if n == 1 {
+				if err := noteExpired(ctx, q, cur, reason); err != nil {
+					return err
+				}
 			}
 			return abandon(StatusExpired, map[string]any{"expires_at": cur.ExpiresAt}, reason)
 		}
@@ -282,10 +299,20 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 			return err
 		}
 		if n == 0 { // the run was cancelled: the cancel is checked in the transaction that lets it go
+			run, err := q.GetRun(ctx, ce.WorkflowID) // the effect as read above, in this transaction: only that
+			if err != nil {
+				return err
+			}
+			if !run.CancelledAt.Valid {
+				return fmt.Errorf("%w: effect %s let go after its approval", ledger.ErrWriteDropped, ce.EffectID)
+			}
 			return abandon(StatusDenied, map[string]any{}, "the run was cancelled before the approved write was sent")
 		}
-		_, err = q.UseApproval(ctx, db.UseApprovalParams{UsedAt: valid(now), ApprovalID: cur.ApprovalID})
-		return err
+		if n, err := q.UseApproval(ctx, db.UseApprovalParams{UsedAt: valid(now), ApprovalID: cur.ApprovalID}); err != nil || n == 0 {
+			return cmp.Or(err, errChanged) // never the effect let go without its approval used
+		}
+		return note(ctx, q, cur.WorkflowID, "approval.used", audit.Agentd, map[string]any{"approval_id": cur.ApprovalID,
+			"effect_id": cur.EffectID})
 	})
 	switch {
 	case errors.Is(err, errChanged):
@@ -346,7 +373,10 @@ func (g *Gateway) gate(ctx context.Context, run db.Run, t tools.Writer, e db.Eff
 		case n == 0:
 			return errChanged
 		}
-		return q.InsertApproval(ctx, na)
+		if err := q.InsertApproval(ctx, na); err != nil {
+			return err
+		}
+		return noteApproval(ctx, q, na, audit.Agentd)
 	})
 	switch {
 	case errors.Is(err, errChanged):
@@ -380,11 +410,15 @@ func (g *Gateway) expireUnsent(ctx context.Context, e db.Effect, a db.Approval) 
 			DecidedAt: valid(now), Reason: valid(reason), ApprovalID: a.ApprovalID}); err != nil || n == 0 {
 			return cmp.Or(err, errChanged)
 		}
+		if err := noteExpired(ctx, q, a, reason); err != nil {
+			return err
+		}
+		why := valid("the approval expired: " + reason)
 		if n, err := q.AbandonUnclaimedEffect(ctx, db.AbandonUnclaimedEffectParams{
-			Reason: valid("the approval expired: " + reason), UpdatedAt: now, EffectID: e.EffectID, Version: e.Version}); err != nil || n == 0 {
+			Reason: why, UpdatedAt: now, EffectID: e.EffectID, Version: e.Version}); err != nil || n == 0 {
 			return cmp.Or(err, errChanged)
 		}
-		return nil
+		return noteSettled(ctx, q, e.WorkflowID, e.EffectID, effectAbandoned, why, sql.NullString{})
 	})
 	switch {
 	case errors.Is(err, errChanged):
@@ -480,9 +514,17 @@ func (g *Gateway) expire(ctx context.Context, a db.Approval) (bool, error) {
 			done = false
 			return err
 		}
-		if _, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
-			Reason: valid("the approval expired: " + reason), UpdatedAt: now, EffectID: a.EffectID}); err != nil {
+		if err := noteExpired(ctx, q, a, reason); err != nil {
 			return err
+		}
+		why := valid("the approval expired: " + reason)
+		if n, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
+			Reason: why, UpdatedAt: now, EffectID: a.EffectID}); err != nil {
+			return err
+		} else if n == 1 {
+			if err := noteSettled(ctx, q, a.WorkflowID, a.EffectID, effectAbandoned, why, sql.NullString{}); err != nil {
+				return err
+			}
 		}
 		done = true
 		return outbox.Ring(ctx, q, a.WorkflowID, outbox.WhyApproval)
@@ -567,6 +609,9 @@ type Decision struct {
 	Reason        string // a rejection's, required
 	Patch         []byte // an edit's: the reviewer's value for the tool's EditArg
 	RunClosed     bool   // the run's workflow has ended: nothing would act on the decision
+	// Who is the reviewer as every operator record names them: the user of their connection, as the
+	// Control socket's peer credentials gave it. The name they gave (By) goes in the record too.
+	Who audit.Who
 }
 
 // Decision errors, for the Control service to map.
@@ -679,9 +724,13 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 			if err := q.PutBlob(ctx, db.PutBlobParams{Sha256: strings.TrimPrefix(editedRef, "sha256:"), Bytes: d.Patch}); err != nil {
 				return err
 			}
-			if err := q.AddBlobOwner(ctx, db.AddBlobOwnerParams{WorkflowID: cur.WorkflowID,
+			if n, err := q.AddBlobOwner(ctx, db.AddBlobOwnerParams{WorkflowID: cur.WorkflowID,
 				Sha256: strings.TrimPrefix(editedRef, "sha256:")}); err != nil {
 				return err
+			} else if n == 0 { // the run had the same bytes already, or the write was dropped
+				if err := audit.OwnerThere(ctx, q, cur.WorkflowID, strings.TrimPrefix(editedRef, "sha256:")); err != nil {
+					return err
+				}
 			}
 		}
 		n, err := q.DecideApproval(ctx, db.DecideApprovalParams{
@@ -697,12 +746,28 @@ func (g *Gateway) Decide(ctx context.Context, d Decision) (db.Approval, error) {
 		if n == 0 {
 			return errChanged
 		}
+		p := map[string]any{"approval_id": cur.ApprovalID, "decision": d.Kind, "payload_sha256": cur.PayloadSha256,
+			"decided_by": d.By}
+		switch d.Kind {
+		case DecisionReject:
+			p["reason"] = audit.Text(reason)
+		case DecisionEdit:
+			p["edited_patch_sha256"] = strings.TrimPrefix(editedRef, "sha256:")
+		}
+		if _, err := audit.Append(ctx, q, audit.Event{WorkflowID: cur.WorkflowID, Type: "approval.decided",
+			Actor: d.Who.Actor, PeerUID: d.Who.PeerUID, Payload: p}); err != nil {
+			return err
+		}
 		if d.Kind == DecisionReject {
-			if _, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
-				Reason:    valid(fmt.Sprintf("rejected by %s: %s", d.By, reason)),
-				UpdatedAt: ledger.Now(), EffectID: cur.EffectID,
+			why := valid(fmt.Sprintf("rejected by %s: %s", d.By, reason))
+			if n, err := q.AbandonAwaitingEffect(ctx, db.AbandonAwaitingEffectParams{
+				Reason: why, UpdatedAt: ledger.Now(), EffectID: cur.EffectID,
 			}); err != nil {
 				return err
+			} else if n == 1 {
+				if err := noteSettled(ctx, q, cur.WorkflowID, cur.EffectID, effectAbandoned, why, sql.NullString{}); err != nil {
+					return err
+				}
 			}
 		}
 		return outbox.Ring(ctx, q, cur.WorkflowID, outbox.WhyApproval)

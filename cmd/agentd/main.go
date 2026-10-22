@@ -17,12 +17,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	tlog "go.temporal.io/sdk/log"
@@ -33,6 +35,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/control"
@@ -41,6 +44,7 @@ import (
 	"github.com/jchen0426/agentos/internal/githubtool"
 	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
+	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/outbound"
 	"github.com/jchen0426/agentos/internal/outbox"
@@ -55,6 +59,13 @@ import (
 
 // drainTimeout bounds how long a shutdown waits for gateway work in flight.
 const drainTimeout = 30 * time.Second
+
+const (
+	anchorEvery     = 30 * time.Second   // how often, at most, the audit log's head goes out to Temporal
+	minRetention    = 7 * 24 * time.Hour // a shorter retention loses the anchors of runs sooner: agentd warns
+	refusalQueue    = 256                // refused Runtime calls waiting for their records
+	maxGatewayCalls = 200                // gateway calls agentd executes at once
+)
 
 func main() {
 	configPath := flag.String("config", "agentd.yaml", "path to agentd.yaml")
@@ -147,14 +158,6 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return err
 	}
 	defer led.Close()
-	bud := &budget.Budget{Ledger: led}
-	// Before any request is served: a reservation still open belongs to a request agentd
-	// lost track of when it stopped, and the provider may have billed it.
-	if n, err := bud.SettleOpen(ctx); err != nil {
-		return fmt.Errorf("settle open reservations: %w", err)
-	} else if n > 0 {
-		log.Warn("charged reservations left open by the last run of agentd in full", "count", n)
-	}
 
 	tlsConfig, err := temporalTLS(cfg.Temporal.TLS)
 	if err != nil {
@@ -170,6 +173,102 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return fmt.Errorf("connect to Temporal at %s: %w", cfg.Temporal.Address, err)
 	}
 	defer tc.Close()
+	// The anchors of the audit log in Temporal last as long as the namespace keeps histories.
+	ns, err := tc.WorkflowService().DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: cfg.Temporal.Namespace})
+	if err != nil {
+		return fmt.Errorf("describe the namespace %s: %w", cfg.Temporal.Namespace, err)
+	}
+	retention := ns.GetConfig().GetWorkflowExecutionRetentionTtl().AsDuration()
+	if retention < minRetention {
+		log.Warn("the namespace keeps closed runs' histories for a short time: the audit log's anchors in them go with them, "+
+			"and agentctl audit verify cannot check a run's records after that", "namespace", cfg.Temporal.Namespace,
+			"retention", retention.String(), "want_at_least", minRetention.String())
+	}
+
+	// First in the audit log, before this process changes anything: one data directory has one
+	// agentd at a time (lockDataDir), so every record of agentd's after this one is this process's,
+	// until the next start.
+	incarnation := uuid.NewString()
+	startedAt := time.Now()
+	start := startRecord(configPath, cfg, pol, mods, prices, incarnation, faultScript, testTools, insecureDev)
+	start["retention_seconds"] = int64(retention / time.Second)
+	// The chain its anchor workflows are named by: its first record's. A new ledger's first record is
+	// this one, which cannot name its own sha256.
+	chain := ""
+	if first, err := led.Q.ListAuditRecords(ctx, db.ListAuditRecordsParams{Seq: 1, Limit: 1}); err != nil {
+		return fmt.Errorf("audit log: %w", err)
+	} else if len(first) == 1 {
+		chain = audit.AnchorChain(first[0].Sha256)
+		start["chain"] = chain
+	}
+	identity, err := agentdIdentity(cfg.TaskQueues.Workflows, cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	start["agentd"] = identity
+	// The heads of the chain pushed since yesterday are records the ledger holds, in their order, and
+	// the highest this agentd pushed under any chain is this chain's, unless the ledger lost records
+	// while agentd was down: its log cut, or the ledger put back to an older copy, or replaced. What
+	// agentd finds does not stop it (Temporal's signals are not authenticated, the identity in one no
+	// more than its head: anyone who can signal could keep it from starting); its start's record says
+	// it, at most audit.MaxFindings of it, and verify finds it too.
+	findings, err := audit.CheckPushed(ctx, tc, led, identity, chain, time.Now())
+	if err != nil {
+		return fmt.Errorf("read the audit log's anchors in Temporal: %w", err)
+	}
+	if len(findings) > 0 {
+		found, more := audit.FindingsRecord(findings)
+		for _, f := range findings[:len(found)] {
+			msg := "THE LEDGER DOES NOT BEAR OUT A HEAD OF ITS AUDIT LOG IN TEMPORAL: its log was cut, or the ledger put " +
+				"back to an older copy or replaced, while agentd was down; or someone signalled an anchor workflow"
+			if f.NotRead > 0 || f.Seq == 0 && f.EventID == 0 {
+				msg = "THE START CHECK DID NOT READ ALL OF THE AUDIT LOG'S HEADS IN TEMPORAL: agentctl audit verify reads them"
+			}
+			log.Error(msg, "anchor_workflow", audit.Text(f.WorkflowID), "event_id", f.EventID, "seq", f.Seq, "sha256", f.Sha256,
+				"why", f.Why, "not_read", f.NotRead)
+		}
+		start["anchor_findings"] = found
+		if more > 0 {
+			log.Error("THE LEDGER DOES NOT BEAR OUT MORE HEADS OF ITS AUDIT LOG IN TEMPORAL", "more", more)
+			start["anchor_findings_more"] = more
+		}
+	}
+	audit.OnChainMoved(led, func(err error) {
+		log.Error("THE AUDIT LOG CHANGED UNDER AGENTD: agentd appends no more records, and pushes no more heads", "error", err)
+	})
+	startHead, err := audit.Record(ctx, led, audit.Event{Type: "agentd.started", Actor: audit.Agentd, Payload: start})
+	if err != nil {
+		return fmt.Errorf("audit log: %w", err)
+	}
+	// The chain's head goes out of the ledger, to Temporal, whenever it moved; and once more at
+	// shutdown, after the last records (after the refusals' queue, after the gateway's drain: both
+	// are deferred after this, so they end before it).
+	anchors := &audit.Anchors{Ledger: led, Temporal: tc, Every: anchorEvery, Identity: identity,
+		OnError:     func(err error) { log.Warn("could not push the audit log's head to Temporal", "error", err) },
+		OnMisplaced: func(err error) { log.Error("the audit log's anchor workflow is not agentd's", "error", err) }}
+	go anchors.Run(ctx)
+	defer func() {
+		push, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		anchors.Push(push)
+	}()
+	// Refused Runtime calls are recorded off the Worker's requests, through a bounded queue.
+	refusals := audit.NewQueue(led, refusalQueue, func(err error) {
+		log.Error("could not record a refused runtime call in the audit log", "error", err)
+	})
+	refusalsCtx, stopRefusals := context.WithCancel(context.Background())
+	refusalsDone := make(chan struct{})
+	go func() { refusals.Run(refusalsCtx); close(refusalsDone) }()
+	defer func() { stopRefusals(); <-refusalsDone }()
+
+	bud := &budget.Budget{Ledger: led}
+	// Before any request is served: a reservation still open belongs to a request agentd
+	// lost track of when it stopped, and the provider may have billed it.
+	if n, err := bud.SettleOpen(ctx); err != nil {
+		return fmt.Errorf("settle open reservations: %w", err)
+	} else if n > 0 {
+		log.Warn("charged reservations left open by the last run of agentd in full", "count", n)
+	}
 
 	adapters, err := modelAdapters(mods, led, cfg.DataDir, log)
 	if err != nil {
@@ -225,7 +324,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		Tools:       toolset,
 		Faults:      script,
 		Log:         log.With("component", "gateway"),
-		Incarnation: uuid.NewString(),
+		Incarnation: incarnation,
 	}
 	// Before any call is served: effects the last agentd process claimed are recovered by
 	// their class, in the background; the calls that ask for them join the recovery.
@@ -246,7 +345,10 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 			log.Error("shut down with gateway executions still running; their effects stay PENDING")
 		}
 	}()
-	w := worker.New(tc, cfg.TaskQueues.Gateway, worker.Options{WorkerStopTimeout: drainTimeout})
+	// A Worker schedules as many gateway calls as it likes; each waits for the ledger, whose writes
+	// take turns. 200 at once is four times T7's 50, and bounds what one Worker makes agentd hold.
+	w := worker.New(tc, cfg.TaskQueues.Gateway, worker.Options{WorkerStopTimeout: drainTimeout,
+		MaxConcurrentActivityExecutionSize: maxGatewayCalls})
 	w.RegisterActivityWithOptions(gw.Invoke, activity.RegisterOptions{Name: gateway.ActivityName})
 	if err := w.Start(); err != nil {
 		return fmt.Errorf("start gateway worker: %w", err)
@@ -277,6 +379,10 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		SearchAttributes: []string{control.AgentState.GetName(), "TemporalChangeVersion"},
 	}, log.With("component", "runtime-proxy"))
 	defer runtimeSrv.Stop()
+	// The refusals the proxy logs go into the audit log too, as often as it logs them: the first of
+	// each kind, about one a second beyond those, and a count of the rest. Not on the Worker's
+	// request: the queue writes them.
+	runtimeSrv.OnRefused(func(r runtimeproxy.Refused) { refusals.Add(refusalRecord(r)) })
 
 	// Control socket: agentctl only.
 	controlLn, err := listen("unix://" + cfg.ControlSocket)
@@ -284,17 +390,23 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return fmt.Errorf("control socket: %w", err)
 	}
 	ctl := &control.Server{
-		Ledger:      led,
-		Budget:      bud,
-		Effects:     gw,
-		Approvals:   gw,
-		Doorbells:   doorbells,
-		Temporal:    tc,
-		Tasks:       registry,
-		TaskQueue:   cfg.TaskQueues.Workflows,
-		CancelGrace: cfg.CancelGrace,
-		Faults:      script,
-		Log:         log.With("component", "control"),
+		Namespace:      cfg.Temporal.Namespace,
+		AnchorEvery:    anchorEvery,
+		StartedAt:      startedAt,
+		AnchorIdentity: identity,
+		StartRecord:    startHead,
+		Attempts:       gw,
+		Ledger:         led,
+		Budget:         bud,
+		Effects:        gw,
+		Approvals:      gw,
+		Doorbells:      doorbells,
+		Temporal:       tc,
+		Tasks:          registry,
+		TaskQueue:      cfg.TaskQueues.Workflows,
+		CancelGrace:    cfg.CancelGrace,
+		Faults:         script,
+		Log:            log.With("component", "control"),
 	}
 	if err := ctl.RecoverStarts(ctx); err != nil {
 		return fmt.Errorf("recover interrupted starts: %w", err)
@@ -302,7 +414,9 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	if err := ctl.RecoverCancels(ctx); err != nil {
 		return fmt.Errorf("recover cancels: %w", err)
 	}
-	controlSrv := grpc.NewServer()
+	// Every call carries the uid of the process at the other end of the socket, which the audit log
+	// records with each change it makes.
+	controlSrv := grpc.NewServer(grpc.Creds(control.PeerCredentials()))
 	agentosv1.RegisterControlServer(controlSrv, ctl)
 	defer controlSrv.Stop()
 
@@ -322,6 +436,69 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	case err := <-errs:
 		return err
 	}
+}
+
+// agentdIdentity is who this agentd is in the heads it pushes (audit.Identity): from its
+// configuration, not from the ledger; its data directory as the file system resolves it, whatever
+// path the configuration spells (a symbolic link, a relative path).
+func agentdIdentity(taskQueue, dataDir string) (string, error) {
+	dir, err := filepath.Abs(dataDir)
+	if err == nil {
+		dir, err = filepath.EvalSymlinks(dir)
+	}
+	if err != nil {
+		return "", err
+	}
+	return audit.Identity(taskQueue, dir), nil
+}
+
+// refusalRecord is the record of a line of the Runtime proxy's refusal log.
+func refusalRecord(r runtimeproxy.Refused) audit.Event {
+	p := map[string]any{"count": r.Count}
+	if r.Method != "" {
+		p["method"], p["reason"] = audit.Text(r.Method), audit.Text(r.Reason)
+	}
+	if r.Command != "" {
+		p["command"] = audit.Text(r.Command)
+	}
+	if r.Within > 0 {
+		p["within"] = r.Within.String()
+	}
+	return audit.Event{Type: "runtime.refused", Actor: audit.Agentd, Payload: p}
+}
+
+// startRecord is the payload of agentd.started: this process, how it was started, and what it was
+// started with, each configuration file by the sha256 of the bytes it was loaded from.
+func startRecord(configPath string, cfg *config.Config, pol *policy.Policy, mods *models.Config, prices *pricing.Table,
+	incarnation, faultScript string, testTools, insecureDev bool) map[string]any {
+	sandbox := ""
+	if len(cfg.GitTools.Sandbox) > 0 {
+		sandbox = cfg.GitTools.Sandbox[0]
+	}
+	if abs, err := filepath.Abs(configPath); err == nil {
+		configPath = abs
+	}
+	file := func(path, sum string) map[string]string { return map[string]string{"path": path, "sha256": sum} }
+	p := map[string]any{
+		"pid": os.Getpid(), "incarnation": incarnation, "insecure_dev": insecureDev, "test_tools": testTools,
+		"fault_script": faultScript != "", "git_tools_sandbox": sandbox,
+		"config": map[string]any{
+			"agentd": file(configPath, cfg.SHA256), "policy": file(cfg.PolicyFile, pol.SHA256),
+			"models": file(cfg.ModelsFile, mods.SHA256), "prices": file(cfg.PricesFile, prices.SHA256),
+		},
+	}
+	// The commit this agentd was built from, when the build recorded it.
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				p["revision"] = s.Value
+			case "vcs.modified":
+				p["modified"] = s.Value == "true"
+			}
+		}
+	}
+	return p
 }
 
 // listen opens "unix:///path" (in a 0700 directory, socket 0600) or "tcp://host:port".
@@ -403,14 +580,14 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 		repos[id] = githubtool.Repo{Mirror: r.Mirror, Owner: owner, Name: name}
 	}
 	reg := tools.Registry{}
-	reg.Add(&tools.ShowDiff{Blobs: led, Mirrors: cfg.Mirrors(), Git: git})
+	reg.Add(&tools.ShowDiff{Blobs: audit.RunBlobs{Ledger: led}, Mirrors: cfg.Mirrors(), Git: git})
 	// git.apply_check refuses what github.open_draft_pr would: a patch it passes is one that tool
 	// takes, whatever the two tools' deny_paths say.
 	applyDeny := slices.Concat(githubtool.ProtectedPaths, pol.Tools["git.apply_check"].DenyPaths,
 		pol.Tools["github.open_draft_pr"].DenyPaths)
-	reg.Add(&tools.ApplyCheck{Blobs: led, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
-	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: led, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
-	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: led, Effects: gateway.RunRecords{Ledger: led}})
+	reg.Add(&tools.ApplyCheck{Blobs: audit.RunBlobs{Ledger: led}, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
+	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: audit.RunBlobs{Ledger: led}, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
+	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: audit.RunBlobs{Ledger: led}, Effects: gateway.RunRecords{Ledger: led}})
 	if testTools {
 		log.Warn("TEST TOOLS ENABLED: never run this outside tests")
 		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})

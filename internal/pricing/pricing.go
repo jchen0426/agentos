@@ -6,6 +6,8 @@ package pricing
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -36,6 +38,7 @@ var ErrNoPrice = errors.New("no price for model")
 // Table is a loaded price table.
 type Table struct {
 	Version string
+	SHA256  string           // of the file as Load read it: agentd records it at start
 	rates   map[string]rates // by "<provider>/<model>"
 }
 
@@ -104,7 +107,8 @@ func Load(path string) (*Table, error) {
 	if f.Version == "" {
 		return nil, fmt.Errorf("prices %s: price_table_version is required", path)
 	}
-	t := &Table{Version: f.Version, rates: map[string]rates{}}
+	sum := sha256.Sum256(b)
+	t := &Table{Version: f.Version, SHA256: hex.EncodeToString(sum[:]), rates: map[string]rates{}}
 	for model, p := range f.Models {
 		r, err := p.rates()
 		if err != nil {

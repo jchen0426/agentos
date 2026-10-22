@@ -86,6 +86,11 @@ class ControlStub:
                 request_serializer=agentos_dot_v1_dot_control__pb2.ExplainRunRequest.SerializeToString,
                 response_deserializer=agentos_dot_v1_dot_control__pb2.Explanation.FromString,
                 _registered_method=True)
+        self.VerifyAudit = channel.unary_unary(
+                '/agentos.v1.Control/VerifyAudit',
+                request_serializer=agentos_dot_v1_dot_control__pb2.VerifyAuditRequest.SerializeToString,
+                response_deserializer=agentos_dot_v1_dot_control__pb2.AuditReport.FromString,
+                _registered_method=True)
 
 
 class ControlServicer:
@@ -160,6 +165,13 @@ class ControlServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def VerifyAudit(self, request, context):
+        """M5, backs `agentctl audit verify`
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ControlServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -212,6 +224,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.ExplainRun,
                     request_deserializer=agentos_dot_v1_dot_control__pb2.ExplainRunRequest.FromString,
                     response_serializer=agentos_dot_v1_dot_control__pb2.Explanation.SerializeToString,
+            ),
+            'VerifyAudit': grpc.unary_unary_rpc_method_handler(
+                    servicer.VerifyAudit,
+                    request_deserializer=agentos_dot_v1_dot_control__pb2.VerifyAuditRequest.FromString,
+                    response_serializer=agentos_dot_v1_dot_control__pb2.AuditReport.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -486,6 +503,33 @@ class Control:
             '/agentos.v1.Control/ExplainRun',
             agentos_dot_v1_dot_control__pb2.ExplainRunRequest.SerializeToString,
             agentos_dot_v1_dot_control__pb2.Explanation.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def VerifyAudit(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/agentos.v1.Control/VerifyAudit',
+            agentos_dot_v1_dot_control__pb2.VerifyAuditRequest.SerializeToString,
+            agentos_dot_v1_dot_control__pb2.AuditReport.FromString,
             options,
             channel_credentials,
             insecure,

@@ -148,17 +148,23 @@ func (o *Outbox) deliverRun(ctx context.Context, workflowID string, last, attemp
 	case err != nil:
 		wait := min(firstRetry<<min(attempts, 16), maxRetry)
 		log.Warn("doorbell not delivered; trying again", "attempts", attempts+1, "retry_in", wait.String(), "error", err)
-		if _, rerr := o.Ledger.Q.RetryDoorbells(ctx, db.RetryDoorbellsParams{
-			NextAttemptAt: ledger.Stamp(time.Now().Add(wait)), Outcome: sql.NullString{String: err.Error(), Valid: true},
-			WorkflowID: workflowID, Seq: last,
+		if rerr := o.Ledger.Tx(ctx, func(q *db.Queries) error {
+			_, err := q.RetryDoorbells(ctx, db.RetryDoorbellsParams{
+				NextAttemptAt: ledger.Stamp(time.Now().Add(wait)), Outcome: sql.NullString{String: err.Error(), Valid: true},
+				WorkflowID: workflowID, Seq: last,
+			})
+			return err
 		}); rerr != nil {
 			log.Error("doorbells: cannot record a failed delivery", "error", rerr)
 		}
 		return
 	}
-	if _, err := o.Ledger.Q.MarkDoorbellsDelivered(ctx, db.MarkDoorbellsDeliveredParams{
-		DeliveredAt: sql.NullString{String: ledger.Now(), Valid: true}, Outcome: sql.NullString{String: outcome, Valid: true},
-		WorkflowID: workflowID, Seq: last,
+	if err := o.Ledger.Tx(ctx, func(q *db.Queries) error {
+		_, err := q.MarkDoorbellsDelivered(ctx, db.MarkDoorbellsDeliveredParams{
+			DeliveredAt: sql.NullString{String: ledger.Now(), Valid: true}, Outcome: sql.NullString{String: outcome, Valid: true},
+			WorkflowID: workflowID, Seq: last,
+		})
+		return err
 	}); err != nil {
 		// Delivered again later: a doorbell twice only wakes the run twice.
 		log.Error("doorbells: cannot record a delivery", "error", err)
