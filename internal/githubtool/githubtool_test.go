@@ -2371,12 +2371,13 @@ func TestDescribeShowsThePatchAsApplied(t *testing.T) {
 		t.Fatalf("described %v", d)
 	}
 	// Applied again, the patch makes other files than the payload holds (an agentd of another
-	// version made the payload): it is not shown as the patch applied, but as written, and why.
+	// version made the payload): it is not shown as the patch applied, but as agentd reads it
+	// (nothing outside its files' headers and hunks), and why.
 	other := strings.Replace(fix, `= ?", (name,))`, `= :n", {"n": name})`, 1)
-	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte(other))
+	ref, _ = f.blobs.PutRunBlob(context.Background(), workflowID, []byte("A note that nothing applies.\n+decoy\n\n"+other))
 	req.Args["patch_ref"] = ref
 	d = tool.Describe(context.Background(), req, right)
-	if _, ok := d["patch"]; ok || d["patch_as_written"] != other || !strings.Contains(d["patch_error"].(string), "other files than the payload holds") {
+	if _, ok := d["patch"]; ok || d["patch_as_read"] != other || !strings.Contains(d["patch_error"].(string), "other files than the payload holds") {
 		t.Fatalf("described %v", d)
 	}
 	if _, ok := d["apply_check"]; ok {

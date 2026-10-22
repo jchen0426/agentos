@@ -89,7 +89,12 @@ func Parse(b []byte) (*Patch, error) {
 	if n != len(hunks) {
 		return nil, violation("the patch reads as %d hunks one way and %d another", len(hunks), n)
 	}
-	text := format(files)
+	shown := make([]*gitdiff.File, len(files))
+	for i, f := range files {
+		shown[i] = clone(f)
+		canonical(shown[i])
+	}
+	text := format(shown)
 	if len(text) > MaxBytes {
 		return nil, violation("the patch is %d bytes as agentd writes it, over the limit of %d", len(text), MaxBytes)
 	}
@@ -249,6 +254,7 @@ func (p *Patch) Apply(src Source) ([]Change, error) {
 			return nil, err
 		}
 		hunks = hunks[len(f.TextFragments):]
+		canonical(f)
 		placed = append(placed, f)
 		var out bytes.Buffer
 		if err := gitdiff.Apply(&out, bytes.NewReader(orig), f); err != nil {

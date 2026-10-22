@@ -191,6 +191,7 @@ func count(b []byte) ([]string, []hunk, error) {
 		between        // after a hunk
 	)
 	state, inGit, sawGit, sawPlain, afterText := before, false, false, false, false
+	created := false // the file whose header this is is new or deleted: no line of its hunks is on both sides
 	var hunks []hunk
 	for i := 0; i < len(lines); i++ {
 		l := lines[i]
@@ -200,6 +201,9 @@ func count(b []byte) ([]string, []hunk, error) {
 			return nil, nil, violation("line %d of the patch is a hunk header after text, with no file's header between", i+1)
 		case ok:
 			end, blanks := hunkEnd(lines, i+1, s)
+			if created {
+				end, blanks = end-blanks, 0 // not the file's empty lines: it has none before, or none after
+			}
 			h := hunk{line: i, header: strings.TrimSuffix(l, rest), was: s, now: s, blanks: blanks, rest: rest}
 			h.now.oldLines, h.now.newLines = 0, 0
 			for _, body := range lines[i+1 : end] {
@@ -218,11 +222,18 @@ func count(b []byte) ([]string, []hunk, error) {
 			if strings.HasPrefix(l, "diff ") {
 				inGit = strings.HasPrefix(l, "diff --git ")
 				sawGit = sawGit || inGit
+				created = false
 			} else if state != header || !inGit {
 				sawPlain = true
+				created = false
 			}
 			state, afterText = header, false
+			created = created || devNull(l)
 			continue
+		}
+		if state == header && (strings.HasPrefix(l, "new file mode ") || strings.HasPrefix(l, "deleted file mode ") ||
+			strings.HasPrefix(l, "+++ ") && devNull(l)) {
+			created = true
 		}
 		switch {
 		case state == header && (hunkLine(l) && l != "\n" || strings.HasPrefix(l, "\\")) &&
@@ -241,6 +252,12 @@ func count(b []byte) ([]string, []hunk, error) {
 		return nil, nil, violation("the patch mixes git's file headers with plain ones")
 	}
 	return lines, hunks, nil
+}
+
+// devNull reports whether a "--- " or "+++ " line names no file, as a new or a deleted file's does.
+func devNull(l string) bool {
+	name, _, _ := strings.Cut(strings.TrimSuffix(l[min(len(l), 4):], "\n"), "\t")
+	return (strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ")) && strings.TrimSpace(name) == "/dev/null"
 }
 
 // render is the patch with the header of each hunk whose numbers changed rewritten: for go-gitdiff
@@ -266,56 +283,54 @@ func render(lines []string, hunks []hunk) []byte {
 // or in more than one other place, and the patch is refused; so is a hunk that holds none, but the
 // one hunk that gives an empty or a new file its first lines: nothing says where it goes. As git
 // apply reads a hunk with no context after its last change, it must end the file. The blank lines
-// that end a hunk may be empty lines of the file, or set the hunk off from what follows: where its
-// header puts it, the hunk with them wins, else the one without; elsewhere, the two must agree on
-// one place. A file's hunks go in the file's order. A line without its newline, which
-// go-gitdiff joins to the next one, must be the file's last.
+// that end a hunk may be empty lines of the file, or set the hunk off from what follows: wherever
+// the hunk's other lines are, it holds as many of them as the file has empty lines there. A file's
+// hunks go in the file's order. A line without its newline, which go-gitdiff joins to the next one,
+// must be the file's last.
 func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) error {
 	lines := splitLines(string(orig))
-	ends := func(old []string, pos int64) bool { return pos-1+int64(len(old)) == int64(len(lines)) }
-	fits := func(old []string, trailing, pos int64) bool {
-		return len(old) > 0 && at(lines, old, pos) && (trailing > 0 || ends(old, pos))
-	}
 	for i, frag := range f.TextFragments {
-		h := hunks[i]
-		var full []string
+		var old []string
 		for _, l := range frag.Lines {
 			if l.Old() {
-				full = append(full, l.Line)
+				old = append(old, l.Line)
 			}
 		}
-		if len(full) == 0 {
+		if len(old) == 0 {
 			if len(lines) > 0 || len(f.TextFragments) > 1 {
 				return violation("%s: the patch does not apply: hunk %d holds no line of the file (no context, nothing it removes) to say where it goes", path, i+1)
 			}
 			frag.OldPosition = 0
 			continue
 		}
-		bare, tail := full[:len(full)-h.blanks], frag.TrailingContext-int64(h.blanks)
-		stated, pos, withBlanks := frag.OldPosition, frag.OldPosition, true
+		blanks := hunks[i].blanks
+		if blanks == len(old) {
+			blanks = 0 // all the hunk holds of the file: they are its own
+		}
+		base, tail := old[:len(old)-blanks], frag.TrailingContext-int64(blanks)
+		// keep is how many of the blank lines the hunk holds where its other lines start at pos: the
+		// empty lines the file has after them.
+		keep := func(pos int64) int {
+			k, next := 0, pos-1+int64(len(base))
+			for k < blanks && next+int64(k) < int64(len(lines)) && lines[next+int64(k)] == "\n" {
+				k++
+			}
+			return k
+		}
+		// fits reports whether the hunk can go where its other lines start at pos (they are there).
+		fits := func(pos int64) bool {
+			return tail+int64(keep(pos)) > 0 || pos-1+int64(len(base)) == int64(len(lines))
+		}
+		stated, pos := frag.OldPosition, frag.OldPosition
 		switch {
-		case fits(full, frag.TrailingContext, stated):
-		case fits(bare, tail, stated):
-			withBlanks = false
-		case frag.TrailingContext == 0 && at(lines, full, stated) || tail == 0 && len(bare) > 0 && at(lines, bare, stated):
+		case at(lines, base, stated) && fits(stated):
+		case at(lines, base, stated):
 			return violation("%s: the patch does not apply: hunk %d has no context after its last change, so git apply puts it at the file's end, "+
 				"and its header at line %d, where its lines are too", path, i+1, stated)
 		default:
-			var found []int64
-			for _, c := range []struct {
-				old      []string
-				trailing int64
-			}{{full, frag.TrailingContext}, {bare, tail}} {
-				if c.trailing > 0 {
-					found = append(found, find(lines, c.old, 2)...)
-				} else if end := int64(len(lines) - len(c.old) + 1); fits(c.old, 0, end) {
-					found = append(found, end)
-				}
-			}
-			slices.Sort(found)
-			found = slices.Compact(found)
+			found := find(lines, base, 2, fits)
 			switch {
-			case len(found) == 0 && (frag.TrailingContext == 0 || tail == 0) && len(find(lines, bare, 1)) > 0:
+			case len(found) == 0 && tail == 0 && len(find(lines, base, 1, nil)) > 0:
 				return violation("%s: the patch does not apply: hunk %d has no context after its last change, so it must end the file, as git apply reads it, and its lines are not at the file's end",
 					path, i+1)
 			case len(found) == 0:
@@ -328,12 +343,11 @@ func place(path string, f *gitdiff.File, orig []byte, hunks []hunk, moved *int) 
 			if *moved++; *moved > MaxMoved {
 				return violation("more than %d hunks of the patch are not where their headers put them", MaxMoved)
 			}
-			pos, withBlanks = found[0], fits(full, frag.TrailingContext, found[0])
-			frag.Comment = "" // the heading of a hunk somewhere else
+			pos = found[0]
 		}
-		if !withBlanks {
-			n := int64(h.blanks)
-			frag.Lines = frag.Lines[:len(frag.Lines)-h.blanks]
+		if drop := blanks - keep(pos); drop > 0 {
+			n := int64(drop)
+			frag.Lines = frag.Lines[:len(frag.Lines)-drop]
 			frag.OldLines, frag.NewLines, frag.TrailingContext = frag.OldLines-n, frag.NewLines-n, frag.TrailingContext-n
 		}
 		frag.OldPosition = pos
@@ -378,10 +392,10 @@ func at(lines, old []string, pos int64) bool {
 	return slices.Equal(lines[pos-1:pos-1+int64(len(old))], old)
 }
 
-// find is where old starts in lines (from 1), at most limit times, in the file's order. Knuth,
-// Morris and Pratt's search: the lines of the file are compared no more than twice each, so that
-// a file of one line many times over costs no more than any other.
-func find(lines, old []string, limit int) []int64 {
+// find is where old starts in lines (from 1) and ok holds (any, for nil), at most limit times, in
+// the file's order. Knuth, Morris and Pratt's search: the lines of the file are compared no more
+// than twice each, so that a file of one line many times over costs no more than any other.
+func find(lines, old []string, limit int, ok func(pos int64) bool) []int64 {
 	if len(old) == 0 {
 		return nil
 	}
@@ -404,8 +418,10 @@ func find(lines, old []string, limit int) []int64 {
 			k++
 		}
 		if k == len(old) {
-			if found = append(found, int64(i-len(old)+2)); len(found) == limit {
-				break
+			if pos := int64(i - len(old) + 2); ok == nil || ok(pos) {
+				if found = append(found, pos); len(found) == limit {
+					break
+				}
 			}
 			k = next[k-1]
 		}
@@ -423,6 +439,22 @@ func clone(f *gitdiff.File) *gitdiff.File {
 		g.TextFragments[i] = &c
 	}
 	return &g
+}
+
+// canonical leaves of f's header only what agentd holds to: its names, and whether the patch
+// creates or deletes it (a file of mode 100644, or the patch is refused). No mode, blob or score a
+// patch claims, and no heading after a hunk's "@@": the patch's own words, which nothing checks.
+func canonical(f *gitdiff.File) {
+	f.OldOIDPrefix, f.NewOIDPrefix, f.Score, f.OldMode, f.NewMode = "", "", 0, 0, 0
+	if f.IsNew {
+		f.NewMode = regularFile
+	}
+	if f.IsDelete {
+		f.OldMode = regularFile
+	}
+	for _, frag := range f.TextFragments {
+		frag.Comment = ""
+	}
 }
 
 // format writes the files as a patch, as go-gitdiff writes one: their headers and their hunks.

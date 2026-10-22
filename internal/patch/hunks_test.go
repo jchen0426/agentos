@@ -126,9 +126,10 @@ func TestAHunkIsItsLines(t *testing.T) {
 		name, patch, want string // want: the patch as applied
 		files, after      map[string]string
 	}{{
+		// The heading after "@@" is the patch's own words, which nothing checks: left out.
 		name:  "the header counts too many lines",
 		patch: "--- a/f.txt\n+++ b/f.txt\n@@ -4,9 +4,9 @@ func f() {\n 4\n 5\n 6\n-7\n+seven\n 8\n 9\n 10\n",
-		want:  diff("f.txt") + "@@ -4,7 +4,7 @@ func f() {\n 4\n 5\n 6\n-7\n+seven\n 8\n 9\n 10\n",
+		want:  diff("f.txt") + "@@ -4,7 +4,7 @@\n 4\n 5\n 6\n-7\n+seven\n 8\n 9\n 10\n",
 		files: map[string]string{"f.txt": f}, after: map[string]string{"f.txt": seven},
 	}, {
 		name: "the header counts too few, and the next hunk follows its lines",
@@ -206,7 +207,13 @@ func TestAHunkIsItsLines(t *testing.T) {
 			"Subject: [PATCH] seven\n\n---\n f.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n" +
 			"diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n" +
 			"@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n-- \n2.43.0\n\n",
-		want:  "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n",
+		want:  diff("f.txt") + "@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n",
+		files: map[string]string{"f.txt": f}, after: map[string]string{"f.txt": seven},
+	}, {
+		// The patch's blobs and modes are its claims: the file is 100644, or the patch is refused.
+		name:  "the index line's blobs and mode are left out",
+		patch: "diff --git a/f.txt b/f.txt\nindex 1234567..89abcde 100755\n--- a/f.txt\n+++ b/f.txt\n@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n",
+		want:  diff("f.txt") + "@@ -6,3 +6,3 @@\n 6\n-7\n+seven\n 8\n",
 		files: map[string]string{"f.txt": f}, after: map[string]string{"f.txt": seven},
 	}, {
 		name:  "text after the last hunk is left out",
@@ -234,6 +241,28 @@ func TestAHunkIsItsLines(t *testing.T) {
 		want: "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n" +
 			"diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+x\n",
 		files: map[string]string{"gone.txt": "x\ny\n"}, after: map[string]string{"new.txt": "x\n"},
+	}, {
+		name: "a new file and a deleted one, with plain headers",
+		patch: "--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n" +
+			"--- /dev/null\t1970-01-01 00:00:00.000000000 +0000\n+++ b/tests/test_db.py\n@@ -0,0 +1 @@\n+assert True\n",
+		want: "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n" +
+			"diff --git a/tests/test_db.py b/tests/test_db.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_db.py\n@@ -0,0 +1,1 @@\n+assert True\n",
+		files: map[string]string{"gone.txt": "x\ny\n"}, after: map[string]string{"tests/test_db.py": "assert True\n"},
+	}, {
+		// A new file's hunk holds no line of the file before, a deleted file's none after: a blank
+		// line after either is no empty line of the file.
+		name: "blank lines after a deleted file's hunk and a new file's",
+		patch: "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n\n" +
+			"diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+x\n\n",
+		want: "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n" +
+			"diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+x\n",
+		files: map[string]string{"gone.txt": "x\ny\n"}, after: map[string]string{"new.txt": "x\n"},
+	}, {
+		// The first blank line is the file's empty line, the second sets the hunk off.
+		name:  "an empty line of the file written bare, then one more blank line",
+		patch: "--- a/b.txt\n+++ b/b.txt\n@@ -1,3 +1,3 @@\n 1\n-2\n+two\n\n\n",
+		want:  diff("b.txt") + "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n \n",
+		files: map[string]string{"b.txt": "1\n2\n\n3\n"}, after: map[string]string{"b.txt": "1\ntwo\n\n3\n"},
 	}, {
 		name: "svn's headers, and text between files",
 		patch: "Index: f.txt\n===================================================================\n--- a/f.txt\t(revision 1)\n" +
@@ -462,8 +491,8 @@ func TestTextHoldsOnlyWhatIsApplied(t *testing.T) {
 }
 
 // Differential: git's own patches, their hunk headers scrambled, come out as git wrote them (its
-// short counts written out, and without the headings of hunks that moved), and git apply makes of
-// them what agentd does.
+// short counts written out, without the headings after "@@" and the index lines), and git apply
+// makes of them what agentd does.
 func TestScrambledHeadersComeBackAsGitWroteThem(t *testing.T) {
 	// Nothing from the user's git configuration (a diff driver, colours) changes what git writes.
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
@@ -527,10 +556,8 @@ func TestScrambledHeadersComeBackAsGitWroteThem(t *testing.T) {
 		}
 		// As git writes it, and as a model would: without git's own lines.
 		plain := regexp.MustCompile(`(?m)^(diff --git|index) .*\n`).ReplaceAllString(gits, "")
-		for _, tc := range []struct{ patch, want string }{
-			{gits, explicit(gits)},
-			{plain, explicit(regexp.MustCompile(`(?m)^index .*\n`).ReplaceAllString(gits, ""))},
-		} {
+		want := explicit(regexp.MustCompile(`(?m)^index .*\n`).ReplaceAllString(gits, "")) // Text writes no blobs
+		for _, tc := range []struct{ patch, want string }{{gits, want}, {plain, want}} {
 			scrambled := header.ReplaceAllStringFunc(tc.patch, func(h string) string {
 				m := header.FindStringSubmatch(h)
 				n := func(s string, spread int) int {

@@ -212,10 +212,14 @@ func (t *OpenDraftPR) Describe(ctx context.Context, req tools.Request, raw json.
 		err = errors.New("applied again, it makes other files than the payload holds")
 	}
 	if err != nil {
+		// As agentd reads it, its hunks not placed in the files: no text of the patch that is in no
+		// file's header or hunk, but nothing that says this is the change the payload makes.
 		if b, berr := t.Blobs.GetRunBlob(ctx, req.WorkflowID, ref); berr == nil {
-			out["patch_as_written"] = string(b)
+			if read, perr := patch.Parse(b); perr == nil {
+				out["patch_as_read"] = string(read.Text())
+			}
 		}
-		out["patch_error"] = "agentd could not show the patch as it applied it (" + err.Error() + "): the patch as written is not " +
+		out["patch_error"] = "agentd could not show the patch as it applied it (" + err.Error() + "): the patch as read is not " +
 			"what the payload's files are, where its hunk headers are wrong. The payload is."
 	} else {
 		out["patch"] = string(applied.Text())
