@@ -136,8 +136,9 @@ bin/agentctl approvals show <approval-id>
 what GitHub will receive, and the sha256 of that payload, which every decision names. The patch is
 shown as agentd applies it: models get the numbers in hunk headers wrong, so agentd counts each
 hunk's lines and finds them in the file (where the header says if they are there, else the one
-place they are; never a line that differs), and rewrites the headers to match; `patch_rewritten`
-lists the ones it rewrote.
+place they are; never a line that differs), and writes the patch anew, in git's format, with the
+headers to match and nothing outside its files' headers and hunks; `patch_rewritten` lists the
+headers it rewrote. git checks that patch, and must make the same files of it.
 
 ```bash
 bin/agentctl approvals approve <approval-id> --payload-sha256 <sha256>
