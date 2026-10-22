@@ -61,8 +61,13 @@ def write(cs: CaseSet, results: list[dict], out: Path, meta: dict, seed: int = 0
 
 
 def _name(m: dict, profile: str) -> str:
-    """A column's name: the profile, and the models its ledger recorded."""
-    return f"{profile}（{' + '.join(m['models']) or '账本里没有模型调用'}）"
+    """A column's name: the profile, and the models and the efforts its ledger recorded."""
+    efforts = f"，effort {'/'.join(m['efforts'])}" if m.get("efforts") else ""
+    return f"{profile}（{' + '.join(m['models']) or '账本里没有模型调用'}{efforts}）"
+
+
+def _efforts(m: dict) -> str:
+    return "、".join(f"{e}（{n}）" for e, n in m.get("efforts", {}).items()) or "—"
 
 
 def _versions(runs: list[dict]) -> list:
@@ -102,20 +107,14 @@ def markdown(cs: CaseSet, data: dict) -> str:
             f"（sha256 前 16 位）：{_sorted_unique(_binaries(a) for a in _versions(runs))}"
             "（接着跑的运行，开始和结束时的都算）；"
             f"提示词版本：{_sorted_unique(p for r in runs for p in r.get('prompts', []))}。",
-            "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注：",
-            "", "| 配置 | 账本记录的模型 | 次数 | 无效（模型调用没以答复结束） | 重跑掉的无效运行 | 拿到报告的次数 | 由服务端回退答复 | "
-            "账本里的模型和配置不同的次数 |",
-            "|---|---|---|---|---|---|---|---|"]
-    out += [f"| {p} | {' + '.join(metrics[p]['models']) or '—'} | {metrics[p]['runs']} | {metrics[p]['void']} | "
-            f"{metrics[p]['replaced']} | {metrics[p]['answered']} | {metrics[p]['fallback_answers']} | "
-            f"{metrics[p]['unexpected_models']} |" for p in profiles]
-    differs = []  # what the evaluation ran is not always the product as configured
-    for p in profiles:
-        for d in sorted({json.dumps(r.get("differs") or {}, sort_keys=True) for r in runs if r["profile"] == p}):
-            if json.loads(d):
-                differs.append(f"- 配置 {p} 和产品配置（config/models.yaml 的 audit_v1）不同：" + "，".join(
-                    f"{k} 用 {v[0]}（产品是 {v[1]}）" for k, v in sorted(json.loads(d).items())) + "。")
-    out += ["", *differs] if differs else []
+            "- 每次运行按 outcome 和账本判定，不看任务状态。模型按账本里每次调用记下的 provider/model 标注，"
+            "effort 也按账本：agentd 发给供应商的那个（任务的 effort，被 config/models.yaml 里 provider 列出的上限封顶）：",
+            "", "| 配置 | 账本记录的模型 | 账本记录的 effort（请求数） | 次数 | 无效（模型调用没以答复结束） | 重跑掉的无效运行 | "
+            "拿到报告的次数 | 由服务端回退答复 | 账本里的模型和配置不同的次数 |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    out += [f"| {p} | {' + '.join(metrics[p]['models']) or '—'} | {_efforts(metrics[p])} | {metrics[p]['runs']} | "
+            f"{metrics[p]['void']} | {metrics[p]['replaced']} | {metrics[p]['answered']} | "
+            f"{metrics[p]['fallback_answers']} | {metrics[p]['unexpected_models']} |" for p in profiles]
     out += ["", f"- 置信区间：按用例 bootstrap（{meta['resamples']} 次，种子 {meta['seed']}），同一用例的几次运行一起抽；"
             "注入的影响按配对抽。"]
     if meta.get("ledger_spent_usd") is not None:

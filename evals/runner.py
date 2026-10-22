@@ -100,9 +100,6 @@ class Profile:
     real: bool = False  # a real provider: the Worker must run in its sandbox
     concurrency: int = 4
     timeout: float = 1800  # seconds a run may take before the runner cancels it
-    # Where its audit_v1 is not the product's (config/models.yaml): (setting, its, the product's).
-    # Each run records them, and the report says so.
-    differs: tuple[tuple[str, str, str], ...] = ()
 
 
 def _task(model: str, **extra) -> dict:
@@ -132,14 +129,11 @@ PROFILES = {
                           _task("openai/gpt-6.1-sol")),
         PRICES, "openai/gpt-6.1-sol", paid=True, real=True),
     # Ollama answers one request at a time; a queued one would eat into its 10-minute attempt.
-    # At the product's effort high, gpt-oss:20b spends all 16000 output tokens reasoning and writes
-    # no answer on most cases (the pilot, 2026-10-22): medium, as the report says.
     "local": Profile(
         "local", _models("local", {"adapter": "openai_compat", "api": "chat", "base_url": "http://127.0.0.1:11434/v1",
-                                   "context_tokens": 65536, "efforts": ["low", "medium", "high"]},
-                         _task("local/gpt-oss:20b", effort="medium")),
-        PRICES, "local/gpt-oss:20b", paid=False, real=True, concurrency=1, timeout=3600,
-        differs=(("effort", "medium", "high"),)),
+                                   "context_tokens": 65536, "efforts": ["low", "medium"]},
+                         _task("local/gpt-oss:20b")),
+        PRICES, "local/gpt-oss:20b", paid=False, real=True, concurrency=1, timeout=3600),
 }
 
 
@@ -585,7 +579,7 @@ def _start(stack: Stack, cs: CaseSet, c: Case, rep: int, profile: Profile, budge
     return {"event": "start", "profile": profile.name, "case": c.id, "rep": rep, "run_id": started["run_id"],
             "temporal_run_id": started["temporal_run_id"], "budget_micros": budget, "paid": profile.paid,
             "expect": profile.expect, "commit": c.commit, "cases_sha256": cs.sha256, "agentos": agentos,
-            "differs": {name: [its, product] for name, its, product in profile.differs}, "at": time.time()}
+            "at": time.time()}
 
 
 def _binaries() -> dict[str, str]:
@@ -671,6 +665,13 @@ def _patch(stack: Stack, ref: object) -> bool:
     return not rows or bool(bytes(rows[0]["bytes"]).strip())
 
 
+def _effort_sent(stack: Stack, ref: str | None) -> str | None:
+    """The effort agentd sent the provider, as its record of the request says: the task's, capped
+    by what a provider lists (config/models.yaml), whatever the profile meant."""
+    rows = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", ref.removeprefix("sha256:")) if ref else []
+    return (_object(rows[0]["bytes"]).get("effort_sent") or None) if rows else None
+
+
 def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) -> dict:
     """What a run that has ended did, from agentctl (or `info`, for a run agentd does not have),
     Temporal and agentd's ledger. The report keeps each finding's severity, CWE, file, line and
@@ -682,9 +683,9 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
     except Exception:  # noqa: BLE001 - Temporal no longer has it
         started, closed = None, None
     answers, accepted, prompts = [], [], set()
-    for row in stack.ledger("SELECT provider, model, prompt_version, response_blob, usage_json, stop_reason "
-                            "FROM model_calls WHERE workflow_id = ? ORDER BY started_at, activity_id, attempt, "
-                            "request_seq", entry["run_id"]):
+    for row in stack.ledger("SELECT provider, model, prompt_version, request_blob, response_blob, usage_json, "
+                            "stop_reason FROM model_calls WHERE workflow_id = ? ORDER BY started_at, activity_id, "
+                            "attempt, request_seq", entry["run_id"]):
         model = row["model"] if row["model"].startswith(row["provider"] + "/") else f"{row['provider']}/{row['model']}"
         prompts.add(row["prompt_version"])
         billed = json.loads(row["usage_json"] or "[]")
@@ -694,7 +695,7 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
                 if k.endswith("_tokens"):
                     usage[k] = usage.get(k, 0) + v
         answer = {"model": model, "status": None, "answered_by": None, "usage": usage,
-                  "billed": [b.get("model") for b in billed]}
+                  "billed": [b.get("model") for b in billed], "effort": _effort_sent(stack, row["request_blob"])}
         if row["response_blob"]:
             [blob] = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", row["response_blob"].removeprefix("sha256:"))
             resp = _object(blob["bytes"])
@@ -722,8 +723,7 @@ def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) 
     result = _object(info.get("result_json") or "{}")
     return {"event": "result", "profile": entry["profile"], "case": entry["case"], "rep": entry["rep"],
             "commit": entry.get("commit"), "cases_sha256": entry.get("cases_sha256"), "expect": entry.get("expect"),
-            "agentos": entry.get("agentos"), "differs": entry.get("differs") or {}, "prompts": sorted(prompts),
-            "resumed": entry.get("resumed", False),
+            "agentos": entry.get("agentos"), "prompts": sorted(prompts), "resumed": entry.get("resumed", False),
             "run_id": entry["run_id"], "state": info["state"], "outcome": result.get("outcome", ""),
             "failure": (info.get("failure") or "")[:500], "ended_by": ended_by,
             "seconds": (closed - started) if started is not None and closed is not None else None,

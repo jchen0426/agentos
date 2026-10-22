@@ -355,14 +355,15 @@ def test_the_report_names_runs_not_ended_and_runs_without_a_report(tmp_path):
     assert json.loads((tmp_path / "r.json").read_text())["unfinished"] == flying
 
 
-def test_the_report_says_how_a_profile_is_not_the_product(tmp_path):
+def test_the_report_names_the_efforts_the_ledger_recorded(tmp_path):
     from evals import report
-    differs = {"effort": ["medium", "high"]}
-    runs = [run("v", f(10), differs=differs), run("v", f(10), profile="p2")]
+    medium, high = {"status": "ok", "effort": "medium", "usage": {}}, {"status": "ok", "effort": "high", "usage": {}}
+    runs = [run("v", f(10), models=["m/one"], answers=[medium]), run("v", f(10), models=["m/one"], answers=[medium]),
+            run("v", f(10), profile="p2", models=["m/two"], answers=[high, {**high, "effort": None}])]
     report.write(CS, runs, tmp_path / "r", {"title": "t", "void_streak": 3})
     md = (tmp_path / "r.md").read_text()
-    assert "- 配置 p1 和产品配置（config/models.yaml 的 audit_v1）不同：effort 用 medium（产品是 high）。" in md
-    assert "配置 p2 和产品配置" not in md
+    assert "| p1 | m/one | medium（2） |" in md and "| p2 | m/two | high（1） |" in md
+    assert "p1（m/one，effort medium）" in md and "p2（m/two，effort high）" in md
 
 
 def test_a_degenerate_interval_says_so():

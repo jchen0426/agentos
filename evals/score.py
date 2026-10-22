@@ -257,6 +257,8 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int, replaced: list[dict]) -> 
     read = sum(a.get("usage", {}).get("cache_read_tokens", 0) for a in answers)
     inputs = sum(_input_tokens(a.get("usage", {})) for a in answers)
     out["cache_hit_rate"] = read / inputs if inputs else None
+    # The effort agentd sent with each request, as the ledger says: the task's, capped by the provider.
+    out["efforts"] = dict(sorted(_count(a["effort"] for a in answers if a.get("effort")).items()))
     answered = [a for a in answers if a.get("status")]  # a request with no answer (429, 500, cut off) is not one
     invalid = sum(a["status"] == "invalid_output" for a in answered)
     out["invalid_output"] = {"answers": len(answered), "invalid": invalid,

@@ -184,7 +184,8 @@ OpenAI and a local model server work the same way. `config/models.yaml` lists bo
   a project of its own with a monthly budget in OpenAI's console is the outer limit.
 - **Ollama**, through Chat Completions (vLLM uses the same adapter). Start it with the context
   window that `context_tokens` names: it cuts longer input without a word, and agentd refuses to
-  send what does not fit. Its models must be priced at 0 in `config/prices.yaml`: a Chat
+  send what does not fit. Its `efforts` stop at medium, which caps what gpt-oss is sent: at high
+  it spends all its output tokens reasoning and writes no answer to most audits. Its models must be priced at 0 in `config/prices.yaml`: a Chat
   Completions server cannot count tokens before a request. Start it with cloud models off, too:
   they run on Ollama's servers. agentd also asks Ollama about the model before every request and
   sends nothing to a cloud model, whatever it is called.
@@ -311,12 +312,11 @@ earlier runner, nor void runs run again that cost nothing). On macOS the
 state directory and the cache must be under the home directory (the default) or a temporary
 directory, which the sandboxes deny. The profiles are `config/models.yaml`'s providers,
 one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
-Ollama server above with gpt-oss:20b, at effort medium: at the product's high it spends its
-output tokens reasoning and writes no answer on most cases, and the report says the profile
-differs there.
+Ollama server above with gpt-oss:20b. Each profile is the product's configuration as it is (a
+test holds them equal), and the report shows the effort the ledger says each request was sent.
 
 ```bash
-AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 50
+AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 25
 uv run python -m evals report --out docs/eval/<name>
 ```
 
