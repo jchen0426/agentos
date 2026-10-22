@@ -120,8 +120,8 @@ MUTATIONS = {
         (G + "approvals.go", "\tif e.MaybeSent != 0 {\n\t\treturn nil, nil\n\t}\n\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)",
          "\ta, err := g.Ledger.Q.GetApprovalByEffect(ctx, e.EffectID)")],
     "L2 agentd leaves a cancelled run's write in flight waiting, at start": [
-        (G + "effects.go", "\tif n, err := g.Ledger.Q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {",
-         "\tif n, err := int64(0), error(nil); err != nil {")],
+        (G + "effects.go", "\t\tif handedOver, err = q.HandOverUnsentEffects(ctx, ledger.Now()); err != nil {",
+         "\t\tif handedOver, err = 0, error(nil); err != nil {")],
     "L3 gate lets an approved write past its time through, and proceed stops it every time": [
         (G + "approvals.go", "\tcase approved:\n\t\treturn g.expireUnsent(ctx, e, a)\n", "\tcase approved:\n\t\treturn nil, nil\n")],
     # The bugs this state machine found (the fixes, undone).

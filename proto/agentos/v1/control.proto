@@ -17,6 +17,7 @@ service Control {
   rpc ResolveReconciliation(ResolveReconciliationRequest) returns (ResolveReconciliationResponse); // M3
   rpc ExtendBudget(ExtendBudgetRequest) returns (Run);                                            // M2a, backs `agentctl budget extend`
   rpc ExplainRun(ExplainRunRequest) returns (Explanation);           // M5, backs `agentctl runs explain`
+  rpc VerifyAudit(VerifyAuditRequest) returns (AuditReport);         // M5, backs `agentctl audit verify`
 }
 
 message StartRunRequest {
@@ -166,4 +167,132 @@ message Explanation {
   string step = 2;                  // the step that went wrong
   string cause = 3;
   repeated string evidence = 4;     // history events and ledger rows behind the conclusion
+}
+
+message VerifyAuditRequest {
+  string run_id = 1;                // check this run only; empty: every run. The chain is walked whole
+  // The keys of other chains whose anchor workflows the namespace may hold, another agentd's: their
+  // heads name another agentd. Any other chain's is a mismatch: a chain rewritten from its first
+  // record has a new key, and the old one's anchor workflows are what shows it.
+  repeated string allow_chains = 2;
+  // The keys of chains whose heads this agentd pushed, of a ledger the operator replaced (reset)
+  // themselves: only they know that one was not rewritten. Never one that pushed after this chain's
+  // first push: two ledgers of one agentd live at once.
+  repeated string allow_replaced_ledgers = 3;
+}
+
+// The audit log as agentd found it (design doc, section 8): its hash chain, walked from the first
+// record, and the anchors of it that Temporal's history holds, the _audit of each result Invoke
+// returned. A chain rewritten consistently from some record on is whole again; its anchors are not.
+// The runs checked are those Temporal lists, those the audit log records and those in the ledger.
+message AuditReport {
+  int64 records = 1;                // records that verified, from seq 1
+  int64 head_seq = 2;               // the last of them: the chain's head when it is whole
+  string head_sha256 = 3;
+  int64 broken_at_seq = 4;          // the first seq at which the chain breaks; 0 when it is whole
+  string broken_reason = 5;
+  int64 anchors_checked = 6;        // results in the runs' histories whose _audit was checked
+  repeated AnchorMismatch anchors_mismatched = 7;
+  repeated UnavailableRun runs_unavailable = 8;  // runs whose history Temporal could not give: not checked
+  int64 runs_checked = 9;           // executions whose history was read and its anchors checked
+  // Runs that Temporal or the audit log has, which the ledger's runs table has otherwise or not at
+  // all: the ledger alone does not say which runs there are, as whoever rewrites it can drop one.
+  repeated RunMismatch runs_mismatched = 10;
+  // Where the ledger's tables are not the state the records imply, or the records break the effect
+  // protocol (an effect a person was asked to approve, claimed before the approval was used).
+  repeated StateMismatch state_mismatched = 11;
+  int64 external_anchors_checked = 12;      // the chain's heads agentd pushed to Temporal (the anchor workflows)
+  int64 last_external_anchor_seq = 13;      // the latest of them that matches
+  int64 records_after_external_anchor = 14; // records no anchor outside the ledger follows yet
+  int64 retention_seconds = 15;             // how long the namespace keeps a closed run's history
+  // Anchor workflows of the other chains the request allows: not this chain's, and not checked.
+  int64 other_anchor_workflows = 16;
+  // Runs made before the audit log began: of which the log has no record, with no history left, or
+  // with results in Temporal's history that name no record. Not checked; agentctl counts them
+  // unchecked unless --allow-before-log.
+  repeated UnavailableRun runs_before_log = 17;
+  string chain = 18; // the chain's key in its anchor workflows' IDs: its first record's sha256, 16 hex characters
+  // The keys of the other chains whose anchor workflows the namespace holds, allowed or not.
+  repeated string other_chains = 19;
+  // Attempts that recorded their call.started and were cut short: agentd stopped (a crash) before
+  // their call record, and the next agentd's start closed them. Not a mismatch.
+  repeated CutShortAttempt attempts_cut_short = 20;
+  // The ledger's tables verify does not compare with the records, and why.
+  repeated UncheckedTable unchecked_tables = 21;
+  // What verify did not read of what Temporal holds, past its bounds (anyone with Temporal's API can
+  // add anchor workflows, and signals to them): it could not verify all of it, and agentctl never
+  // exits 0 on such a report.
+  repeated Unread unread = 22;
+  // Attempts whose call.started a fault left open: the attempt's call record could not be written
+  // (agentd logged it), or the attempt panicked and its record failed too. Not a mismatch, but not
+  // checked either: agentctl exits 2 on them.
+  repeated UnrecordedAttempt attempts_unrecorded = 23;
+  // Executions Temporal says were terminated that agentd did not terminate: it records
+  // run.terminating before it asks, and these have none. Someone with Temporal's API, or Temporal
+  // itself, ended them. That changes nothing in the ledger: not a mismatch, and agentctl's exit
+  // status does not count them.
+  repeated TerminatedExecution terminated_outside_agentd = 24;
+}
+
+message TerminatedExecution {
+  string run_id = 1;
+  string temporal_run_id = 2;
+  string at = 3; // when, by its history in Temporal; "" when the history does not say
+  // Who the caller that terminated it said it was, and why: its own word, which any caller of
+  // Temporal's API writes as it likes.
+  string claimed_identity = 4;
+  string claimed_reason = 5;
+}
+
+message UnrecordedAttempt {
+  string run_id = 1;
+  string activity_id = 2;
+  int64 attempt = 3;
+  int64 seq = 4; // its call.started
+  string why = 5;
+}
+
+message Unread {
+  string what = 1; // "anchor workflows", or the events of one
+  int64 count = 2; // how many were not read; at least that many when listing stopped
+  string why = 3;
+}
+
+message UncheckedTable {
+  string name = 1;
+  string why = 2;
+}
+
+message CutShortAttempt {
+  string run_id = 1;
+  string activity_id = 2;
+  int64 attempt = 3;
+  int64 seq = 4;                    // its call.started
+  int64 restarted_seq = 5;          // the agentd.started after it
+}
+
+message StateMismatch {
+  string kind = 1;                  // effect, approval, run, budget, blob, protocol
+  string id = 2;
+  string why = 3;
+}
+
+// A result in a run's history that does not match the audit log; or, with run_id an anchor
+// workflow's ID (or its chain's prefix), a head pushed to Temporal that does not, an anchor workflow
+// that is not agentd's, or records no pushed head covers.
+message AnchorMismatch {
+  string run_id = 1;
+  string activity_id = 2;           // the gateway call's, as the workflow named it
+  int64 seq = 3;                    // the record the result names; 0 when it names none
+  string why = 4;
+}
+
+message RunMismatch {
+  string run_id = 1;
+  string why = 2;
+}
+
+message UnavailableRun {
+  string run_id = 1;
+  string why = 2;
 }

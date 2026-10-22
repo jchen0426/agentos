@@ -253,3 +253,163 @@ class Explanation(_message.Message):
     cause: str
     evidence: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, run_id: _Optional[str] = ..., step: _Optional[str] = ..., cause: _Optional[str] = ..., evidence: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class VerifyAuditRequest(_message.Message):
+    __slots__ = ("run_id", "allow_chains", "allow_replaced_ledgers")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_CHAINS_FIELD_NUMBER: _ClassVar[int]
+    ALLOW_REPLACED_LEDGERS_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    allow_chains: _containers.RepeatedScalarFieldContainer[str]
+    allow_replaced_ledgers: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, run_id: _Optional[str] = ..., allow_chains: _Optional[_Iterable[str]] = ..., allow_replaced_ledgers: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class AuditReport(_message.Message):
+    __slots__ = ("records", "head_seq", "head_sha256", "broken_at_seq", "broken_reason", "anchors_checked", "anchors_mismatched", "runs_unavailable", "runs_checked", "runs_mismatched", "state_mismatched", "external_anchors_checked", "last_external_anchor_seq", "records_after_external_anchor", "retention_seconds", "other_anchor_workflows", "runs_before_log", "chain", "other_chains", "attempts_cut_short", "unchecked_tables", "unread", "attempts_unrecorded", "terminated_outside_agentd")
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    HEAD_SEQ_FIELD_NUMBER: _ClassVar[int]
+    HEAD_SHA256_FIELD_NUMBER: _ClassVar[int]
+    BROKEN_AT_SEQ_FIELD_NUMBER: _ClassVar[int]
+    BROKEN_REASON_FIELD_NUMBER: _ClassVar[int]
+    ANCHORS_CHECKED_FIELD_NUMBER: _ClassVar[int]
+    ANCHORS_MISMATCHED_FIELD_NUMBER: _ClassVar[int]
+    RUNS_UNAVAILABLE_FIELD_NUMBER: _ClassVar[int]
+    RUNS_CHECKED_FIELD_NUMBER: _ClassVar[int]
+    RUNS_MISMATCHED_FIELD_NUMBER: _ClassVar[int]
+    STATE_MISMATCHED_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_ANCHORS_CHECKED_FIELD_NUMBER: _ClassVar[int]
+    LAST_EXTERNAL_ANCHOR_SEQ_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_AFTER_EXTERNAL_ANCHOR_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    OTHER_ANCHOR_WORKFLOWS_FIELD_NUMBER: _ClassVar[int]
+    RUNS_BEFORE_LOG_FIELD_NUMBER: _ClassVar[int]
+    CHAIN_FIELD_NUMBER: _ClassVar[int]
+    OTHER_CHAINS_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPTS_CUT_SHORT_FIELD_NUMBER: _ClassVar[int]
+    UNCHECKED_TABLES_FIELD_NUMBER: _ClassVar[int]
+    UNREAD_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPTS_UNRECORDED_FIELD_NUMBER: _ClassVar[int]
+    TERMINATED_OUTSIDE_AGENTD_FIELD_NUMBER: _ClassVar[int]
+    records: int
+    head_seq: int
+    head_sha256: str
+    broken_at_seq: int
+    broken_reason: str
+    anchors_checked: int
+    anchors_mismatched: _containers.RepeatedCompositeFieldContainer[AnchorMismatch]
+    runs_unavailable: _containers.RepeatedCompositeFieldContainer[UnavailableRun]
+    runs_checked: int
+    runs_mismatched: _containers.RepeatedCompositeFieldContainer[RunMismatch]
+    state_mismatched: _containers.RepeatedCompositeFieldContainer[StateMismatch]
+    external_anchors_checked: int
+    last_external_anchor_seq: int
+    records_after_external_anchor: int
+    retention_seconds: int
+    other_anchor_workflows: int
+    runs_before_log: _containers.RepeatedCompositeFieldContainer[UnavailableRun]
+    chain: str
+    other_chains: _containers.RepeatedScalarFieldContainer[str]
+    attempts_cut_short: _containers.RepeatedCompositeFieldContainer[CutShortAttempt]
+    unchecked_tables: _containers.RepeatedCompositeFieldContainer[UncheckedTable]
+    unread: _containers.RepeatedCompositeFieldContainer[Unread]
+    attempts_unrecorded: _containers.RepeatedCompositeFieldContainer[UnrecordedAttempt]
+    terminated_outside_agentd: _containers.RepeatedCompositeFieldContainer[TerminatedExecution]
+    def __init__(self, records: _Optional[int] = ..., head_seq: _Optional[int] = ..., head_sha256: _Optional[str] = ..., broken_at_seq: _Optional[int] = ..., broken_reason: _Optional[str] = ..., anchors_checked: _Optional[int] = ..., anchors_mismatched: _Optional[_Iterable[_Union[AnchorMismatch, _Mapping]]] = ..., runs_unavailable: _Optional[_Iterable[_Union[UnavailableRun, _Mapping]]] = ..., runs_checked: _Optional[int] = ..., runs_mismatched: _Optional[_Iterable[_Union[RunMismatch, _Mapping]]] = ..., state_mismatched: _Optional[_Iterable[_Union[StateMismatch, _Mapping]]] = ..., external_anchors_checked: _Optional[int] = ..., last_external_anchor_seq: _Optional[int] = ..., records_after_external_anchor: _Optional[int] = ..., retention_seconds: _Optional[int] = ..., other_anchor_workflows: _Optional[int] = ..., runs_before_log: _Optional[_Iterable[_Union[UnavailableRun, _Mapping]]] = ..., chain: _Optional[str] = ..., other_chains: _Optional[_Iterable[str]] = ..., attempts_cut_short: _Optional[_Iterable[_Union[CutShortAttempt, _Mapping]]] = ..., unchecked_tables: _Optional[_Iterable[_Union[UncheckedTable, _Mapping]]] = ..., unread: _Optional[_Iterable[_Union[Unread, _Mapping]]] = ..., attempts_unrecorded: _Optional[_Iterable[_Union[UnrecordedAttempt, _Mapping]]] = ..., terminated_outside_agentd: _Optional[_Iterable[_Union[TerminatedExecution, _Mapping]]] = ...) -> None: ...
+
+class TerminatedExecution(_message.Message):
+    __slots__ = ("run_id", "temporal_run_id", "at", "claimed_identity", "claimed_reason")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    TEMPORAL_RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    AT_FIELD_NUMBER: _ClassVar[int]
+    CLAIMED_IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    CLAIMED_REASON_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    temporal_run_id: str
+    at: str
+    claimed_identity: str
+    claimed_reason: str
+    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., at: _Optional[str] = ..., claimed_identity: _Optional[str] = ..., claimed_reason: _Optional[str] = ...) -> None: ...
+
+class UnrecordedAttempt(_message.Message):
+    __slots__ = ("run_id", "activity_id", "attempt", "seq", "why")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    activity_id: str
+    attempt: int
+    seq: int
+    why: str
+    def __init__(self, run_id: _Optional[str] = ..., activity_id: _Optional[str] = ..., attempt: _Optional[int] = ..., seq: _Optional[int] = ..., why: _Optional[str] = ...) -> None: ...
+
+class Unread(_message.Message):
+    __slots__ = ("what", "count", "why")
+    WHAT_FIELD_NUMBER: _ClassVar[int]
+    COUNT_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    what: str
+    count: int
+    why: str
+    def __init__(self, what: _Optional[str] = ..., count: _Optional[int] = ..., why: _Optional[str] = ...) -> None: ...
+
+class UncheckedTable(_message.Message):
+    __slots__ = ("name", "why")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    why: str
+    def __init__(self, name: _Optional[str] = ..., why: _Optional[str] = ...) -> None: ...
+
+class CutShortAttempt(_message.Message):
+    __slots__ = ("run_id", "activity_id", "attempt", "seq", "restarted_seq")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    RESTARTED_SEQ_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    activity_id: str
+    attempt: int
+    seq: int
+    restarted_seq: int
+    def __init__(self, run_id: _Optional[str] = ..., activity_id: _Optional[str] = ..., attempt: _Optional[int] = ..., seq: _Optional[int] = ..., restarted_seq: _Optional[int] = ...) -> None: ...
+
+class StateMismatch(_message.Message):
+    __slots__ = ("kind", "id", "why")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    ID_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    kind: str
+    id: str
+    why: str
+    def __init__(self, kind: _Optional[str] = ..., id: _Optional[str] = ..., why: _Optional[str] = ...) -> None: ...
+
+class AnchorMismatch(_message.Message):
+    __slots__ = ("run_id", "activity_id", "seq", "why")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    activity_id: str
+    seq: int
+    why: str
+    def __init__(self, run_id: _Optional[str] = ..., activity_id: _Optional[str] = ..., seq: _Optional[int] = ..., why: _Optional[str] = ...) -> None: ...
+
+class RunMismatch(_message.Message):
+    __slots__ = ("run_id", "why")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    why: str
+    def __init__(self, run_id: _Optional[str] = ..., why: _Optional[str] = ...) -> None: ...
+
+class UnavailableRun(_message.Message):
+    __slots__ = ("run_id", "why")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    WHY_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    why: str
+    def __init__(self, run_id: _Optional[str] = ..., why: _Optional[str] = ...) -> None: ...

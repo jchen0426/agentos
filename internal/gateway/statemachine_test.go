@@ -23,6 +23,7 @@ import (
 	"go.temporal.io/sdk/activity"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/githubtool"
 	"github.com/jchen0426/agentos/internal/ledger"
@@ -107,6 +108,11 @@ func TestEffectProtocolStateMachine(t *testing.T) {
 		path := filepath.Join(dir, fmt.Sprintf("ledger-%d.db", seed))
 		m := newMachine(t, seed, path)
 		m.walk()
+		if m.violation == "" { // and the audit log's chain is whole
+			if rep, err := audit.Verify(m.ctx, m.cur.led.Q); err != nil || rep.BrokenAt != 0 {
+				m.fail("audit: the chain breaks at %d: %s %v", rep.BrokenAt, rep.Broken, err)
+			}
+		}
 		m.stop()
 		for _, suffix := range []string{"", "-wal", "-shm"} {
 			os.Remove(path + suffix) // the walk's own ledger, done with
@@ -192,6 +198,8 @@ type machine struct {
 	named     map[string]int    // how many approvals and patches the log has named
 	violation string            // the first broken invariant
 	dump      string            // the ledger when it broke
+
+	proj audit.Projection // what the audit log says of the effects and approvals (audit_test.go)
 }
 
 // incarnation is one agentd process: its own connection to the ledger, closed when it dies.
@@ -947,6 +955,7 @@ func (m *machine) decide() {
 
 // submit sends a person's decision on approval a, and records what went through.
 func (m *machine) submit(a db.Approval, d Decision) {
+	d.Who = operator
 	got, err := m.cur.g.Decide(m.ctx, d)
 	what := d.Kind
 	if d.PayloadSHA256 != a.PayloadSha256 {
@@ -997,7 +1006,7 @@ func (m *machine) finding(e db.Effect) (Resolution, bool) {
 	m.mu.Lock()
 	made, pending := m.made(e.EffectID, fx.dedupe) > 0, m.pending(e.EffectID)
 	m.mu.Unlock()
-	r := Resolution{EffectID: e.EffectID, Key: m.key(), Executed: made, RunClosed: fx.run.ended}
+	r := Resolution{By: operator, EffectID: e.EffectID, Key: m.key(), Executed: made, RunClosed: fx.run.ended}
 	switch {
 	case made:
 		r.ResultJSON = `{"id": 7}`
@@ -1135,6 +1144,11 @@ func (m *machine) check() {
 			return
 		}
 	}
+	m.checkAuditLog()
+	if m.violation != "" {
+		m.dumpLedger()
+		return
+	}
 	for _, r := range m.runs {
 		m.checkReport(r)
 		if m.violation != "" {
@@ -1148,7 +1162,7 @@ func (m *machine) check() {
 // approvals as the ledger has it.
 func (m *machine) checkReport(r *runModel) {
 	led := m.cur.led
-	cc := &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: led, Effects: RunRecords{led}}
+	cc := &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: audit.RunBlobs{Ledger: led}, Effects: RunRecords{led}}
 	b, err := cc.Prepare(m.ctx, tools.Request{WorkflowID: r.id, EffectID: strings.Repeat("c", 64),
 		Args: map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "outcome": "done"}})
 	if err != nil {

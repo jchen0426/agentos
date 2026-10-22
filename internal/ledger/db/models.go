@@ -32,12 +32,14 @@ type Approval struct {
 
 type AuditLog struct {
 	Seq        int64
+	At         string
 	WorkflowID string
 	Type       string
+	Actor      string
+	PeerUid    sql.NullInt64
 	Payload    string
 	PrevSha256 string
 	Sha256     string
-	At         string
 }
 
 type Blob struct {

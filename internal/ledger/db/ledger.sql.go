@@ -73,7 +73,7 @@ func (q *Queries) AbandonUnsentEffects(ctx context.Context, updatedAt string) (i
 	return result.RowsAffected()
 }
 
-const addBlobOwner = `-- name: AddBlobOwner :exec
+const addBlobOwner = `-- name: AddBlobOwner :execrows
 INSERT INTO blob_owners (workflow_id, sha256) VALUES (?, ?) ON CONFLICT DO NOTHING
 `
 
@@ -82,9 +82,12 @@ type AddBlobOwnerParams struct {
 	Sha256     string
 }
 
-func (q *Queries) AddBlobOwner(ctx context.Context, arg AddBlobOwnerParams) error {
-	_, err := q.db.ExecContext(ctx, addBlobOwner, arg.WorkflowID, arg.Sha256)
-	return err
+func (q *Queries) AddBlobOwner(ctx context.Context, arg AddBlobOwnerParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, addBlobOwner, arg.WorkflowID, arg.Sha256)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const approveEffect = `-- name: ApproveEffect :execrows
@@ -107,6 +110,41 @@ func (q *Queries) ApproveEffect(ctx context.Context, arg ApproveEffectParams) (i
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const budgetExtended = `-- name: BudgetExtended :one
+SELECT EXISTS (SELECT 1 FROM budget_entries WHERE workflow_id = ? AND kind = 'EXTEND' AND idempotency_key = ?)
+`
+
+type BudgetExtendedParams struct {
+	WorkflowID     string
+	IdempotencyKey sql.NullString
+}
+
+// Whether the extension of that key is there: what an insert that added none must find.
+func (q *Queries) BudgetExtended(ctx context.Context, arg BudgetExtendedParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, budgetExtended, arg.WorkflowID, arg.IdempotencyKey)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const callCounted = `-- name: CallCounted :one
+SELECT EXISTS (SELECT 1 FROM calls WHERE workflow_id = ? AND activity_id = ? AND scheduled_at = ?)
+`
+
+type CallCountedParams struct {
+	WorkflowID  string
+	ActivityID  string
+	ScheduledAt string
+}
+
+// Whether InsertCall's row is there: what an insert that added none must find.
+func (q *Queries) CallCounted(ctx context.Context, arg CallCountedParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, callCounted, arg.WorkflowID, arg.ActivityID, arg.ScheduledAt)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const claimEffect = `-- name: ClaimEffect :execrows
@@ -195,13 +233,16 @@ func (q *Queries) DecideApproval(ctx context.Context, arg DecideApprovalParams) 
 	return result.RowsAffected()
 }
 
-const deleteRun = `-- name: DeleteRun :exec
+const deleteRun = `-- name: DeleteRun :execrows
 DELETE FROM runs WHERE workflow_id = ? AND run_id IS NULL
 `
 
-func (q *Queries) DeleteRun(ctx context.Context, workflowID string) error {
-	_, err := q.db.ExecContext(ctx, deleteRun, workflowID)
-	return err
+func (q *Queries) DeleteRun(ctx context.Context, workflowID string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteRun, workflowID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const expirePendingApproval = `-- name: ExpirePendingApproval :execrows
@@ -684,6 +725,38 @@ func (q *Queries) InsertApproval(ctx context.Context, arg InsertApprovalParams) 
 	return err
 }
 
+const insertAuditRecord = `-- name: InsertAuditRecord :exec
+INSERT INTO audit_log (seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`
+
+type InsertAuditRecordParams struct {
+	Seq        int64
+	At         string
+	WorkflowID string
+	Type       string
+	Actor      string
+	PeerUid    sql.NullInt64
+	Payload    string
+	PrevSha256 string
+	Sha256     string
+}
+
+func (q *Queries) InsertAuditRecord(ctx context.Context, arg InsertAuditRecordParams) error {
+	_, err := q.db.ExecContext(ctx, insertAuditRecord,
+		arg.Seq,
+		arg.At,
+		arg.WorkflowID,
+		arg.Type,
+		arg.Actor,
+		arg.PeerUid,
+		arg.Payload,
+		arg.PrevSha256,
+		arg.Sha256,
+	)
+	return err
+}
+
 const insertBudgetEntry = `-- name: InsertBudgetEntry :exec
 INSERT INTO budget_entries (
   workflow_id, kind, amount_micros, request_id, activity_id, attempt, model, price_table_version, reason, created_at
@@ -745,7 +818,7 @@ func (q *Queries) InsertBudgetExtension(ctx context.Context, arg InsertBudgetExt
 	return result.RowsAffected()
 }
 
-const insertCall = `-- name: InsertCall :exec
+const insertCall = `-- name: InsertCall :execrows
 INSERT INTO calls (workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT DO NOTHING
@@ -761,8 +834,9 @@ type InsertCallParams struct {
 	CreatedAt   string
 }
 
-func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) error {
-	_, err := q.db.ExecContext(ctx, insertCall,
+// One row per logical call: a retry finds it there and inserts nothing.
+func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, insertCall,
 		arg.WorkflowID,
 		arg.ActivityID,
 		arg.ScheduledAt,
@@ -771,7 +845,10 @@ func (q *Queries) InsertCall(ctx context.Context, arg InsertCallParams) error {
 		arg.ArgsSha256,
 		arg.CreatedAt,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const insertDoorbell = `-- name: InsertDoorbell :exec
@@ -934,6 +1011,338 @@ func (q *Queries) IsBlobOwner(ctx context.Context, arg IsBlobOwnerParams) (int64
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const lastAuditRecord = `-- name: LastAuditRecord :one
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log ORDER BY seq DESC LIMIT 1
+`
+
+func (q *Queries) LastAuditRecord(ctx context.Context) (AuditLog, error) {
+	row := q.db.QueryRowContext(ctx, lastAuditRecord)
+	var i AuditLog
+	err := row.Scan(
+		&i.Seq,
+		&i.At,
+		&i.WorkflowID,
+		&i.Type,
+		&i.Actor,
+		&i.PeerUid,
+		&i.Payload,
+		&i.PrevSha256,
+		&i.Sha256,
+	)
+	return i, err
+}
+
+const listAllRuns = `-- name: ListAllRuns :many
+SELECT workflow_id, run_id, task, params_json, budget_limit_micros, created_at, cancelled_at, dry_run FROM runs ORDER BY created_at, workflow_id
+`
+
+func (q *Queries) ListAllRuns(ctx context.Context) ([]Run, error) {
+	rows, err := q.db.QueryContext(ctx, listAllRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Run
+	for rows.Next() {
+		var i Run
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.RunID,
+			&i.Task,
+			&i.ParamsJson,
+			&i.BudgetLimitMicros,
+			&i.CreatedAt,
+			&i.CancelledAt,
+			&i.DryRun,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listApprovalsCreated = `-- name: ListApprovalsCreated :many
+SELECT approval_id, workflow_id, created_at FROM approvals ORDER BY approval_id
+`
+
+type ListApprovalsCreatedRow struct {
+	ApprovalID string
+	WorkflowID string
+	CreatedAt  string
+}
+
+func (q *Queries) ListApprovalsCreated(ctx context.Context) ([]ListApprovalsCreatedRow, error) {
+	rows, err := q.db.QueryContext(ctx, listApprovalsCreated)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListApprovalsCreatedRow
+	for rows.Next() {
+		var i ListApprovalsCreatedRow
+		if err := rows.Scan(&i.ApprovalID, &i.WorkflowID, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditRecords = `-- name: ListAuditRecords :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE seq >= ? ORDER BY seq LIMIT ?
+`
+
+type ListAuditRecordsParams struct {
+	Seq   int64
+	Limit int64
+}
+
+// A page of the chain, from seq on.
+func (q *Queries) ListAuditRecords(ctx context.Context, arg ListAuditRecordsParams) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listAuditRecords, arg.Seq, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBlobOwnersAll = `-- name: ListBlobOwnersAll :many
+SELECT workflow_id, sha256 FROM blob_owners ORDER BY workflow_id, sha256
+`
+
+func (q *Queries) ListBlobOwnersAll(ctx context.Context) ([]BlobOwner, error) {
+	rows, err := q.db.QueryContext(ctx, listBlobOwnersAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []BlobOwner
+	for rows.Next() {
+		var i BlobOwner
+		if err := rows.Scan(&i.WorkflowID, &i.Sha256); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBlobsAfter = `-- name: ListBlobsAfter :many
+SELECT sha256, bytes FROM blobs WHERE sha256 > ? ORDER BY sha256 LIMIT ?
+`
+
+type ListBlobsAfterParams struct {
+	Sha256 string
+	Limit  int64
+}
+
+// The blobs in the order of their keys, a page at a time: a verification hashes each one's bytes.
+func (q *Queries) ListBlobsAfter(ctx context.Context, arg ListBlobsAfterParams) ([]Blob, error) {
+	rows, err := q.db.QueryContext(ctx, listBlobsAfter, arg.Sha256, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Blob
+	for rows.Next() {
+		var i Blob
+		if err := rows.Scan(&i.Sha256, &i.Bytes); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBudgetEntriesAll = `-- name: ListBudgetEntriesAll :many
+SELECT e.entry_id, e.workflow_id, e.kind, e.amount_micros, CAST(COALESCE(e.request_id, '') AS TEXT) AS request_id,
+  CAST(COALESCE(e.model, '') AS TEXT) AS model, CAST(COALESCE(e.price_table_version, '') AS TEXT) AS price_table_version,
+  CAST(COALESCE(e.reason, '') AS TEXT) AS reason, CAST(COALESCE(e.idempotency_key, '') AS TEXT) AS idempotency_key, e.created_at,
+  CAST(COALESCE(e.activity_id, '') AS TEXT) AS activity_id, CAST(COALESCE(e.attempt, 0) AS INTEGER) AS attempt
+FROM budget_entries e ORDER BY e.entry_id
+`
+
+type ListBudgetEntriesAllRow struct {
+	EntryID           int64
+	WorkflowID        string
+	Kind              string
+	AmountMicros      int64
+	RequestID         string
+	Model             string
+	PriceTableVersion string
+	Reason            string
+	IdempotencyKey    string
+	CreatedAt         string
+	ActivityID        string
+	Attempt           int64
+}
+
+// Every budget entry, with the activity and attempt of the reservation it closes, for a
+// verification to compare with the records.
+func (q *Queries) ListBudgetEntriesAll(ctx context.Context) ([]ListBudgetEntriesAllRow, error) {
+	rows, err := q.db.QueryContext(ctx, listBudgetEntriesAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListBudgetEntriesAllRow
+	for rows.Next() {
+		var i ListBudgetEntriesAllRow
+		if err := rows.Scan(
+			&i.EntryID,
+			&i.WorkflowID,
+			&i.Kind,
+			&i.AmountMicros,
+			&i.RequestID,
+			&i.Model,
+			&i.PriceTableVersion,
+			&i.Reason,
+			&i.IdempotencyKey,
+			&i.CreatedAt,
+			&i.ActivityID,
+			&i.Attempt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBudgetExtensions = `-- name: ListBudgetExtensions :many
+SELECT workflow_id, CAST(COALESCE(idempotency_key, '') AS TEXT) AS idempotency_key, amount_micros, created_at
+FROM budget_entries WHERE kind = 'EXTEND' ORDER BY entry_id
+`
+
+type ListBudgetExtensionsRow struct {
+	WorkflowID     string
+	IdempotencyKey string
+	AmountMicros   int64
+	CreatedAt      string
+}
+
+func (q *Queries) ListBudgetExtensions(ctx context.Context) ([]ListBudgetExtensionsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listBudgetExtensions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListBudgetExtensionsRow
+	for rows.Next() {
+		var i ListBudgetExtensionsRow
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.IdempotencyKey,
+			&i.AmountMicros,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCallsAll = `-- name: ListCallsAll :many
+SELECT workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at, outcome FROM calls
+ORDER BY workflow_id, activity_id, scheduled_at
+`
+
+// Every logical call, for a verification to recount against the records.
+func (q *Queries) ListCallsAll(ctx context.Context) ([]Call, error) {
+	rows, err := q.db.QueryContext(ctx, listCallsAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Call
+	for rows.Next() {
+		var i Call
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.ScheduledAt,
+			&i.Kind,
+			&i.Name,
+			&i.ArgsSha256,
+			&i.CreatedAt,
+			&i.Outcome,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listCancelledRuns = `-- name: ListCancelledRuns :many
@@ -1102,6 +1511,39 @@ func (q *Queries) ListEffectsByStatus(ctx context.Context, status string) ([]Eff
 	return items, nil
 }
 
+const listEffectsCreated = `-- name: ListEffectsCreated :many
+SELECT effect_id, workflow_id, created_at FROM effects ORDER BY effect_id
+`
+
+type ListEffectsCreatedRow struct {
+	EffectID   string
+	WorkflowID string
+	CreatedAt  string
+}
+
+func (q *Queries) ListEffectsCreated(ctx context.Context) ([]ListEffectsCreatedRow, error) {
+	rows, err := q.db.QueryContext(ctx, listEffectsCreated)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEffectsCreatedRow
+	for rows.Next() {
+		var i ListEffectsCreatedRow
+		if err := rows.Scan(&i.EffectID, &i.WorkflowID, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listExpiredApprovals = `-- name: ListExpiredApprovals :many
 SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE status = 'PENDING' AND expires_at <= ? ORDER BY expires_at
 `
@@ -1199,6 +1641,50 @@ func (q *Queries) ListFinishedModelCalls(ctx context.Context, arg ListFinishedMo
 	return items, nil
 }
 
+const listMissingBlobs = `-- name: ListMissingBlobs :many
+SELECT CAST('effect' AS TEXT) AS kind, effect_id AS id, CAST(payload_blob AS TEXT) AS ref FROM effects
+WHERE payload_blob IS NOT NULL AND NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.sha256 = substr(effects.payload_blob, 8))
+UNION ALL
+SELECT CAST('effect' AS TEXT), effect_id, CAST(result_blob AS TEXT) FROM effects
+WHERE result_blob IS NOT NULL AND NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.sha256 = substr(effects.result_blob, 8))
+UNION ALL
+SELECT CAST('approval' AS TEXT), approval_id, CAST(context_blob AS TEXT) FROM approvals
+WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.sha256 = substr(approvals.context_blob, 8))
+UNION ALL
+SELECT CAST('approval' AS TEXT), approval_id, CAST(edited_patch_blob AS TEXT) FROM approvals
+WHERE edited_patch_blob IS NOT NULL AND NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.sha256 = substr(approvals.edited_patch_blob, 8))
+`
+
+type ListMissingBlobsRow struct {
+	Kind string
+	ID   string
+	Ref  string
+}
+
+// What effects and approvals refer to that the ledger has no blob of.
+func (q *Queries) ListMissingBlobs(ctx context.Context) ([]ListMissingBlobsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listMissingBlobs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMissingBlobsRow
+	for rows.Next() {
+		var i ListMissingBlobsRow
+		if err := rows.Scan(&i.Kind, &i.ID, &i.Ref); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listModelAnswers = `-- name: ListModelAnswers :many
 SELECT m.workflow_id, m.activity_id, m.attempt, m.request_seq, m.request_blob, m.response_blob, m.provider, m.model, m.prompt_version, m.effort, m.stop_reason, m.usage_json, m.started_at, m.finished_at FROM model_calls m
 WHERE m.workflow_id = ?1 AND m.response_blob IS NOT NULL AND m.activity_id IN (
@@ -1235,6 +1721,66 @@ func (q *Queries) ListModelAnswers(ctx context.Context, arg ListModelAnswersPara
 			&i.UsageJson,
 			&i.StartedAt,
 			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listModelCallsAll = `-- name: ListModelCallsAll :many
+SELECT workflow_id, activity_id, attempt, request_seq, request_blob, CAST(COALESCE(response_blob, '') AS TEXT) AS response_blob,
+  provider, model, prompt_version, CAST(COALESCE(effort, '') AS TEXT) AS effort, CAST(COALESCE(stop_reason, '') AS TEXT) AS stop_reason,
+  CAST(COALESCE(usage_json, '') AS TEXT) AS usage_json, started_at
+FROM model_calls ORDER BY workflow_id, activity_id, attempt, request_seq
+`
+
+type ListModelCallsAllRow struct {
+	WorkflowID    string
+	ActivityID    string
+	Attempt       int64
+	RequestSeq    int64
+	RequestBlob   string
+	ResponseBlob  string
+	Provider      string
+	Model         string
+	PromptVersion string
+	Effort        string
+	StopReason    string
+	UsageJson     string
+	StartedAt     string
+}
+
+func (q *Queries) ListModelCallsAll(ctx context.Context) ([]ListModelCallsAllRow, error) {
+	rows, err := q.db.QueryContext(ctx, listModelCallsAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListModelCallsAllRow
+	for rows.Next() {
+		var i ListModelCallsAllRow
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.Attempt,
+			&i.RequestSeq,
+			&i.RequestBlob,
+			&i.ResponseBlob,
+			&i.Provider,
+			&i.Model,
+			&i.PromptVersion,
+			&i.Effort,
+			&i.StopReason,
+			&i.UsageJson,
+			&i.StartedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1342,6 +1888,99 @@ func (q *Queries) ListPendingApprovals(ctx context.Context) ([]Approval, error) 
 	return items, nil
 }
 
+const listPendingEffectsOfCancelledRuns = `-- name: ListPendingEffectsOfCancelledRuns :many
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects
+WHERE status = 'PENDING' AND workflow_id IN (SELECT workflow_id FROM runs WHERE cancelled_at IS NOT NULL)
+ORDER BY created_at, effect_id
+`
+
+// What AbandonUnsentEffects and HandOverUnsentEffects may change, read in their transaction: each
+// change is recorded in the audit log. Those an agentd holds stay as they are, for recovery.
+func (q *Queries) ListPendingEffectsOfCancelledRuns(ctx context.Context) ([]Effect, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingEffectsOfCancelledRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Effect
+	for rows.Next() {
+		var i Effect
+		if err := rows.Scan(
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.EffectClass,
+			&i.PayloadSha256,
+			&i.IdempotencyKey,
+			&i.Status,
+			&i.ResultBlob,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.PayloadBlob,
+			&i.ClaimedBy,
+			&i.ClaimedAt,
+			&i.Version,
+			&i.Reason,
+			&i.MaybeSent,
+			&i.LastRequestAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listResolutionsAll = `-- name: ListResolutionsAll :many
+SELECT r.effect_id, r.resolve_key, r.executed, r.status, r.resolved_at, COALESCE(e.workflow_id, '') AS workflow_id
+FROM effect_resolutions r LEFT JOIN effects e ON e.effect_id = r.effect_id ORDER BY r.effect_id, r.resolve_key
+`
+
+type ListResolutionsAllRow struct {
+	EffectID   string
+	ResolveKey string
+	Executed   int64
+	Status     string
+	ResolvedAt string
+	WorkflowID string
+}
+
+func (q *Queries) ListResolutionsAll(ctx context.Context) ([]ListResolutionsAllRow, error) {
+	rows, err := q.db.QueryContext(ctx, listResolutionsAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListResolutionsAllRow
+	for rows.Next() {
+		var i ListResolutionsAllRow
+		if err := rows.Scan(
+			&i.EffectID,
+			&i.ResolveKey,
+			&i.Executed,
+			&i.Status,
+			&i.ResolvedAt,
+			&i.WorkflowID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunApprovals = `-- name: ListRunApprovals :many
 SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE workflow_id = ? ORDER BY created_at, approval_id
 `
@@ -1375,6 +2014,122 @@ func (q *Queries) ListRunApprovals(ctx context.Context, workflowID string) ([]Ap
 			&i.Supersedes,
 			&i.SupersededBy,
 			&i.UsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunAuditRecords = `-- name: ListRunAuditRecords :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE workflow_id = ? ORDER BY seq
+`
+
+func (q *Queries) ListRunAuditRecords(ctx context.Context, workflowID string) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listRunAuditRecords, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunLastRecords = `-- name: ListRunLastRecords :many
+SELECT workflow_id,
+  CAST(COALESCE(MAX(CASE WHEN (type = 'call' AND actor = 'run') OR type IN ('run.created', 'run.started') THEN at END), '')
+    AS TEXT) AS at,
+  COUNT(*) AS records
+FROM audit_log WHERE workflow_id <> '' GROUP BY workflow_id
+`
+
+type ListRunLastRecordsRow struct {
+	WorkflowID string
+	At         string
+	Records    int64
+}
+
+// When each run's execution was last seen live: its last call's record (only a running execution
+// calls), or its start's. Temporal removes a history its retention after the execution closed, and
+// so after this; records appended after the close (an expiry, a reconciliation) say nothing of it.
+// records counts all of each run's records.
+func (q *Queries) ListRunLastRecords(ctx context.Context) ([]ListRunLastRecordsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listRunLastRecords)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListRunLastRecordsRow
+	for rows.Next() {
+		var i ListRunLastRecordsRow
+		if err := rows.Scan(&i.WorkflowID, &i.At, &i.Records); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunLifeRecords = `-- name: ListRunLifeRecords :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE type IN ('run.created', 'run.started', 'run.discarded') ORDER BY seq
+`
+
+// Each run's creation, start and discard, as the audit log has them: what the runs table must agree with.
+func (q *Queries) ListRunLifeRecords(ctx context.Context) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listRunLifeRecords)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
 		); err != nil {
 			return nil, err
 		}

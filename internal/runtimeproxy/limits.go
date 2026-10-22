@@ -242,7 +242,8 @@ func (c *conn) name() string { return fmt.Sprintf("%d %s", c.id, c.RemoteAddr())
 // first of each kind (method, command and rule) in an hour is logged in full, whatever came
 // before it: a flood of one kind hides no other. Beyond those, about one a second is logged
 // across all connections, and the rest are counted in a line at most `every` later: a Worker
-// could otherwise fill agentd's log as fast as it can make calls.
+// could otherwise fill agentd's log as fast as it can make calls. The hook, when set, gets each
+// line as it is logged: as many as the log, and no more.
 type refusalLog struct {
 	log   *slog.Logger
 	every time.Duration
@@ -252,9 +253,26 @@ type refusalLog struct {
 	seen  map[string]time.Time // when each kind was last logged in full
 	held  int64                // refusals not logged since the last count
 	timer *time.Timer
+	hook  func(Refused)
 }
 
-func (r *refusalLog) refused(kind string, attrs ...any) {
+// Refused is a line of the refusal log: one refused call (Count 1), or how many were refused
+// without a line of their own (Count of them, in the Within before it).
+type Refused struct {
+	Method, Command, Reason string
+	Count                   int64
+	Within                  time.Duration
+}
+
+// OnRefused has fn called with each line the refusal log writes, as it writes it: agentd records
+// them in its audit log. The log's limits bound how often.
+func (s *Server) OnRefused(fn func(Refused)) {
+	s.refusals.mu.Lock()
+	defer s.refusals.mu.Unlock()
+	s.refusals.hook = fn
+}
+
+func (r *refusalLog) refused(kind string, line Refused, attrs ...any) {
 	now := time.Now()
 	r.mu.Lock()
 	first := now.Sub(r.seen[kind]) > time.Hour && r.room(now)
@@ -269,8 +287,12 @@ func (r *refusalLog) refused(kind string, attrs ...any) {
 		r.mu.Unlock()
 		return
 	}
+	hook := r.hook
 	r.mu.Unlock()
 	r.log.Warn("runtime call refused", attrs...)
+	if hook != nil {
+		hook(line)
+	}
 }
 
 // room makes room for one more kind, dropping those not logged for an hour. Kinds are few
@@ -291,8 +313,12 @@ func (r *refusalLog) count() {
 	r.mu.Lock()
 	n := r.held
 	r.held, r.timer = 0, nil
+	hook := r.hook
 	r.mu.Unlock()
 	r.log.Warn("runtime call refusals not logged", "count", n, "within", r.every.String())
+	if hook != nil {
+		hook(Refused{Count: n, Within: r.every})
+	}
 }
 
 const maxKinds = 256

@@ -467,3 +467,483 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
 - **模型输出里的超长整数会卡住产品的审计**（第二轮安全审查发现，产品本身的问题，不在这次范围，已单独提了一个任务）：schema 里 `line` 没有上下界，agentd 原样收下、原样交给工作流，Worker 用 `json.loads` 读 4300 位以上的整数时报错，工作流任务一直失败，运行停在 RUNNING，直到被取消。被审的提交里写一段话诱导模型这么写，就能让审计发不出报告。评测这边已经绕开（见上）。
 - **没有答复的失败都算无效**：上下文太长、供应商拒绝请求、本地模型生成太慢以致每次尝试都超时，都算无效，不算模型漏检；报告按原因列出，看得到。`--retry-void` 也会重跑它们，本地模型每次最长一小时：重跑之前先看原因。
 - **研究用的部分克隆**在 `~/.cache/agentos-eval/research/`（约 1.8 GB，调研代理留下的），镜像在 `~/.cache/agentos-eval/mirrors/`（约 300 MB）；都不在仓库里。调研代理在几个 C 项目的部分克隆里删过 commit-graph 文件（可以重新生成）。
+
+## A：哈希链审计日志（2026-10-22）
+
+验收：设计文档第 8 节“审计记录”：每个策略决定、副作用和审批都进 agentd 的哈希链审计日志，记下是谁做的。黑盒测试 `tests/test_audit_log.py`，结果见“测试怎么测”。
+
+### 做了什么
+
+下面写的是第五轮修改（第三次复审的两批发现、父会话转来的两批修正之后，后一批即 5b；再加上最终对抗复审的一条，5c）的样子；第二到第五轮各改了什么，见“推送前审查”“复审（第一次）”“复审（第二次）”“复审（第三次）”四节。
+
+- **审计表**（迁移 `00009_audit.sql`，只有 Up）：00001 里的 audit_log 从没写过一行，重建：seq（从 1 起，`CHECK (seq > 0)`）、at（定宽，`ledger.Stamp`）、workflow_id（agentd 自己的事件为空串）、type、actor、peer_uid（操作者连接的 uid，别的为 NULL）、payload（JSON 文本）、prev_sha256、sha256（UNIQUE）；按任务和 seq 建索引。
+- **`internal/audit`**：
+  - `Append` 在调用方的写事务里读最后一条、写下一条；`ledger.Tx` 是 BEGIN IMMEDIATE，追加天然串行。`Record` 自己开一个事务，给不记录别的变化的事件用（agentd 启动、被拒的 Runtime 调用）。
+  - payload 是 `json.Marshal` 的结果（map 按键排序），存的就是被哈希的文本，验证的人不需要自己的规范化 JSON。
+  - 哈希：依次把 `agentos-audit/1`、十进制 seq、at、workflow_id、type、actor、十进制 peer_uid（NULL 为空）、payload、prev_sha256 各写成网串 `<字节数>:<字节>,`，连起来取 sha256 的十六进制。第一条的 prev_sha256 是 64 个 0。
+  - `Verify` 从 seq 1 起一页页地走：seq 连续、每条的 prev_sha256 等于上一条的 sha256、每条的 sha256 重算得出；报第一处断开（seq 和原因）。
+  - `Text`：Worker 或工具写的文字进 payload 前截到 2000 字节以内（截在字符边界，末尾加“…”），非法 UTF-8 换成 U+FFFD。
+- **事件**：每条都和它记录的变化在同一个事务里；原来是单条语句的（领取、`proceed`、交还、`settle`、建任务、记 run ID、删任务、取消）都包进了 `Ledger.Tx`。完整清单：
+
+  | type | actor | 字段 | 在哪里 |
+  |---|---|---|---|
+  | agentd.started | agentd | pid、incarnation、insecure_dev、test_tools、fault_script、git_tools_sandbox、四个配置文件的路径和 sha256、构建的提交（revision、modified）、命名空间的保留期 retention_seconds、这个 agentd 的身份 agentd；从第二次启动起还有链的键 chain；启动检查有发现时还有 anchor_findings（最多 20 条，每条：workflow_id、event_id、why，读得出的链头还有 seq、sha256），多出来的条数在 anchor_findings_more | 账本打开、连上 Temporal、查过这条链今天和昨天的锚工作流之后，`SettleOpen` 之前 |
+  | budget.settled_open | agentd（workflow_id 是被结账的任务） | count、amount_micros | `SettleOpen` 的事务里，每个被结账的任务一条（每个被结账的请求另有它自己的 budget.settled） |
+  | budget.reserved | agentd | request_id、activity_id、attempt、model、amount_micros、price_table_version | 和预算表的 RESERVE 一行同一个事务 |
+  | budget.settled | agentd | request_id、amount_micros、model、price_table_version、reason | 和 SETTLE 一行（按账单结账、按零结账、`SettleOpen` 全额结账） |
+  | budget.released | agentd | request_id、reason | 和 RELEASE 一行（请求没离开 agentd） |
+  | budget.extended | 操作者 | amount_micros、idempotency_key | `Extend` 的事务里，真加了额度时 |
+  | call.started | run | activity_id、attempt、kind、name、args_sha256（参数不是对象时为 raw_args_sha256）、policy {decision, reason} | 策略放行之后、这次尝试的任何请求离开 agentd 之前，自己一个事务（同样走写的轮次、有上限、等的时候发心跳）；写不进去就什么都不发，尝试以可重试的 AuditUnavailable 结束 |
+  | call.counted | agentd | activity_id、scheduled_at、kind、name、args_sha256 | 和 calls 表新插的一行同一个事务（循环保护数的就是这张表）；同一次调用的重试不再插行，也就不再记 |
+  | call | run；不是 agentd 启动的执行为 unknown-run | activity_id、attempt、kind、name、args_sha256（参数不是对象时为 raw_args_sha256）、policy {decision, reason}；status 和 result_sha256，或者 error/error_type；agentd 自己给的状态才有 reason；不是 agentd 启动的执行还有 temporal_run_id；有 call.started 时 started_seq 指向它；计过数的调用有 scheduled_at；有 outcome 时 outcome（第四轮只加了这两个字段，类型和原有字段不变） | 每次 Invoke 尝试结束时；有 outcome 时和 `SetCallOutcome` 同一个事务；被循环保护拒绝的，和计数同一个事务 |
+  | model.requested | agentd | activity_id、attempt、request_seq、request_sha256、provider、model、prompt_version、effort | 和 model_calls 新插的一行（请求离开 agentd 之前） |
+  | model.answered | agentd | activity_id、attempt、request_seq、response_sha256、stop_reason、usage_sha256 | 和写回答的那次更新同一个事务（被接受的回答在同一个事务里结账） |
+  | run.created | 操作者 | task、params、budget_limit_micros、dry_run | 和 `InsertRun` 同一个事务 |
+  | run.started | 操作者（StartRun）或 agentd（RecoverStarts） | temporal_run_id | 和 `SetRunID` |
+  | run.discarded | 操作者（启动失败）或 agentd（RecoverStarts 发现没到 Temporal） | why | 和 `DeleteRun` |
+  | run.cancelled | 操作者 | cancelled_at | 和 `MarkRunCancelled` |
+  | run.refused | 操作者（workflow_id 为空串：没有建任务） | task、params、why | StartRun 拒绝启动时（任务不认识、参数解析失败、预算为负），自己一个事务 |
+  | run.terminating | agentd | temporal_run_id、why | 第五轮：enforceCancel 或 StartRun 让 Temporal 终止执行之前，自己一个事务；写不进去也照样终止（这是取消的最后一招），verify 会报出来 |
+  | run.terminated | agentd | temporal_run_id、why | 终止之后，自己一个事务（改的是 Temporal 的状态） |
+  | effect.recorded | run | effect_id、tool、class、payload_sha256、status；第五轮起还有 idempotency_key（重发时用的幂等键） | `record` 的事务 |
+  | effect.claimed | agentd | effect_id、by、version | 领取 |
+  | effect.sending | agentd | effect_id | `proceed`，每个外人看得到的请求之前 |
+  | effect.released | agentd | effect_id、unsent、maybe_sent | 交还 |
+  | effect.settled | agentd | effect_id、status、reason、有结果时 result_sha256 | `settle`；启动时放弃或交给人的已取消任务的写（先在同一个事务里查出来）；过期、拒绝、修改取代、批准后发不出去时放弃的写 |
+  | effect.reconciled | 操作者 | effect_id、executed、status、result_sha256、resolve_key（这次发现的幂等键，effect_resolutions 的一行） | `Reconcile` 的事务 |
+  | agentd.read | agentd | purpose（lookup：恢复时查一个结果不明的写；reconcile：对账时由 agentd 去查；approval_card：审批卡片要读的）、effect_id、tool、method、path（不带查询串） | agentd 自己的每个外部请求离开之前，自己一个事务；写不进去，这个请求就不发；查到了什么在后面的记录里 |
+  | blob.owned | agentd | sha256 | 和 blob_owners 新插的一行（`PutRunBlob`：工具存下的 blob 归这个任务，模型提示词可以读它）；审批时改过的补丁由 approval.decided 记 |
+  | approval.created | run，或 agentd（`gate` 补审批单） | approval_id、effect_id、tool、payload_sha256、expires_at、supersedes；第五轮起还有 context_sha256（审批人看到的卡片） | 和 `InsertApproval` |
+  | approval.decided | 操作者（连接 uid 的用户名） | approval_id、decision、payload_sha256、decided_by（agentctl 给的名字）、reason、edited_patch_sha256 | `Decide` 的事务 |
+  | approval.expired | agentd | approval_id、why | 三种过期 |
+  | approval.superseded | agentd | approval_id、superseded_by | `supersedeEdited` |
+  | approval.used | agentd | approval_id、effect_id | 和 `UseApproval` |
+  | runtime.refused | agentd | method、command、reason、count 1；或者 count、within；之前有丢掉的还带 dropped | Runtime 代理的拒绝日志写一行，就放进一个 256 条的队列，后台写进账本 |
+
+- **锚**：Invoke 返回的每个结果，value_json 里都多一个 `"_audit": {"seq": N, "sha256": "..."}`，就是这次调用自己那条 call 记录（它的事务里最后一条，即那一刻的链头）。Temporal 的历史留着它，改账本的人够不着。那条记录里有结果的 sha256（result_sha256：value 去掉 `_audit`、UseNumber 解码后 `json.Marshal` 的 sha256），验证的人能从历史里的 value_json 重算出来。另外，agentd 每 30 秒（链头动了才推）和停下时，把链头推给 Temporal 里这条链自己的工作流（`agentos-audit-anchor-<键>-<UTC 日期>`，键是第 1 条记录 sha256 的前 16 位），没有结果锚着的记录也就有了锚；每天第一次推送后看一眼那个工作流是不是 agentd 的。推的信号是 `{seq, sha256, agentd}`：agentd 是这个 agentd 的身份（`audit.Identity`：Worker 的任务队列和数据目录的绝对路径，sha256 的前 16 位），来自配置，不来自账本。工作流不认识的键照样忽略；比较整个 value 的只有 T3 的测试（`tests/t3_workflows.py` 把 value 原样返回），改成去掉 `_audit` 再比。
+- **其他**：README 加了审计日志和 `agentctl audit verify`；`scripts/mutate-effects.py` 的 L2 跟着 `RecoverEffects` 的新写法改了匹配的文本，意思不变。
+- **操作者**：Control 的 gRPC 服务器用新的传输凭据（`control.PeerCredentials`），握手时向内核要 Unix socket 对端进程的 uid（macOS `LOCAL_PEERCRED`，Linux `SO_PEERCRED`，按平台分文件），每个调用的 `peer.AuthInfo` 里都带着。操作者的事件 actor 都是 `operator:<名字>`，名字是 uid 在系统里的用户名（查不到、或者含空白和不可打印的字符、超过 100 个字符，就是 `uid:<n>`），peer_uid 是内核给的 uid；审批时 agentctl 给的 decided_by 只记在 payload 里。没有对端凭据的调用不做任何改变（Unauthenticated）；不是 Unix socket 的连接握手就拒绝。
+- **链尾**（第四轮）：agentd 在内存里记着这条链在它手里停在哪儿：最后追加的那条记录（事务提交之后才更新，`ledger.TxOf` 和提交钩子）、最后推出去的链头、自己的 agentd.started。`Append` 只接在这条链上：账本的最后一条不是它最后追加的那条，或者推出去的那条不在了（被截、被清空、被重写、被别人追加过），就不追加，返回 `ErrChainMoved`，第一次时记一条 error 日志；`Push` 在写的轮次里读链头，同样查过才推；`VerifyAudit` 在快照里查这三条。5c 起 verify 还报两样：快照里排在这个 agentd 最后追加的那条之后的每一条记录（它没有追加过，是别人写的；前 10 条点名，带引号的类型和 actor），以及 agentd 自己发现链被动过这件事（`audit.Moved`：第一次拒绝追加或推送时的原因）。快照和链尾一起在写的轮次里读（`Ledger.ReadAtTurn`），见“我定的几处”。
+- **启动检查**（第四轮）：追加 agentd.started 之前，读今天和昨天（UTC）的锚工作流。这条链的两个（按 ID 直接读，不靠列表）：每个链头都要是账本上那个 seq 的那条记录、哈希相同，后推的 seq 不能比先推的小，名为链头却不是 agentd 推的那种（seq 不为正、sha256 不是 64 个小写十六进制字符、身份不是 16 个）是“读不出的链头”，什么都不抄。所有链的（从列表里找）：这个 agentd 的身份推的链头里 seq 最高的那个，要是这条链的；不是，就是账本在 agentd 停着时被换掉了（或者有人以它的名义发了信号）。有发现照样启动（Temporal 的信号没有认证，信号里的身份和链头一样谁都能写，不能让它挡住 agentd），记 error 日志，写进这次 agentd.started 的 anchor_findings，最多 20 条，多出来的只记条数；verify 也会自己查出来。检查有界、尽力而为：总共 10 秒，最多读 50 个锚工作流（这条链的两个排在最前），每个最多 10,000 个事件；列表按开始时间收窄到最近两天（Temporal 不支持时退回不收窄）。碰到上限、超时、Temporal 报错，都是一条发现，带着没读的数量（not_read），排在发现的最前面，都不让启动失败。
+- **agentd 自己的读**（第四轮）：恢复时的查找、对账时由 agentd 去查、审批卡片要读的 GitHub 请求，每一个离开之前都先有一条 agentd.read。记在 GitHub 客户端的 transport 里（`tools.WithReads`）：这三处的 ctx 带着记录的函数，Find 和 Describe 发的每个请求都经过它，记不下就不发。写自己的请求（Execute）不经过它，那些由 effect.claimed、effect.sending 记。
+- **账本的模式**（第五轮）：账本里只能有迁移建的东西，别人的触发器能让 agentd 的写什么都不做（`RAISE(IGNORE)`：没有行、也没有错），别人的索引能让 `INSERT ... ON CONFLICT DO NOTHING` 跳过它的行。
+  - 比的是 sqlite_master 的每一行：type、name、tbl_name、sql（不比 rootpage，它随文件的历史变），重复的行也算，NULL 的 sql 和空串不一样。SQLite 自己的对象和别的一起比：迁移在内存里同样建出 sqlite_sequence 和各个 sqlite_autoindex_*；而 `PRAGMA writable_schema` 能把 CREATE 不收的、以 sqlite_ 开头的触发器和视图直接写进 sqlite_master，SQLite 照样载入、照样执行。只有 ANALYZE 建的 sqlite_stat1、sqlite_stat4 不比，各按类型、名字（tbl_name 与它同名）和 ANALYZE 给的那句 SQL 认出来：它们只影响查询计划，操作者也可能跑 ANALYZE。
+  - 打开时：先 `PRAGMA quick_check`，在写任何东西之前；SQLite 说文件坏了（报出问题的行，或者读不下去、报 SQLITE_CORRUPT 或 SQLITE_NOTADB），就不打开（`ledger.ErrDamaged`）。迁移之后比模式，不一样就不打开（`ledger.ErrSchemaMismatch`，一处一处点名）。这些在一组自己的连接上做，做完关掉。
+  - 每个新连接：账本的连接池经自己的 connector 开连接（包着 modernc 的 `sqlite.NewConnector`）。交出去之前，在一个读事务里让它重新载入模式（`PRAGMA writable_schema=RESET`）、再比，不一样就关掉它、报错。新连接按当时的 sqlite_master 载入模式，不管 schema_version 说什么。
+  - 每个写事务：拿到写锁（BEGIN IMMEDIATE）之后、写任何东西之前，先让这个连接重新载入模式、再比，不一样就回滚、报错，什么都不写。连接只在 schema_version 变了时才重新载入，而 sqlite_master 可以改了又改回去，schema_version 一直不动：载入过一个后来又拿掉的触发器的连接，会照它执行下去（见“复审（第三次）”第三批第 1 条）。拿着写锁时谁也改不了模式，载入的就是比过的。
+  - 每个读事务（5b）：`Ledger.Read` 在 BEGIN 之后也先读 schema_version 定下快照、让连接重新载入、再比，不一样就失败，错误里点名那些对象，不返回行。Control 给操作者看的读（runs list/show、approvals list/show、等人处理的对账，以及写之前读的那几样）、verify、启动检查，都走它。
+  - verify：先比模式，再跑 `PRAGMA integrity_check`（5b），有发现就报在 `state_mismatched` 里（kind 为 schema 或 integrity，一处一条），并且不再往下读：unread 里写着 “the rest of the audit”。
+- **写了 0 行**（第五轮）：本该有行的写一行都没改动时，重读一遍。行确实在（之前的尝试写过，或者刚被写了），照旧；不在，就是写被丢掉了（`ledger.ErrWriteDropped`），这次写失败，不当作做成了。重读的地方：InsertCall（循环保护的计数，`CallCounted`）、SetRunID、DeleteRun、MarkRunCancelled（`GetRun`）、追加额度（`BudgetExtended`）、blob 的归属两处（`audit.OwnerThere`）、InsertEffect（`GetEffect`）、批准之后的 ApproveEffect（任务没被取消，就不该是 0 行）。
+- **在 agentd 里执行着的尝试**（第五轮）：网关在内存里记着正在执行的每次尝试（任务、activity、attempt），从 call.started 之前到 call 记录提交之后（`Gateway.Executing`）；还记着 call.started 之后、call 记录因为故障没写成的尝试（试了几次都失败，agentd 的日志里有，`Gateway.Faulted`，最多 1,000 个）。工具或适配器 panic 时，Invoke 里的 defer 先把这次调用记下来，错误就是那个 panic，再把 panic 交给 SDK。
+- **终止**（第五轮）：让 Temporal 终止一个执行之前写 run.terminating，之后照旧写 run.terminated，各自一个事务。
+- **验证**：Control 新接口 `VerifyAudit`，命令行 `agentctl audit verify [--run ID] [--allow-chain 键]... [--allow-replaced-ledger 键]... [--allow-unavailable] [--allow-before-log] [--timeout 5m]`（文本输出经 safetext，Worker 和命名空间里任何人能起的名字都加引号，`-o json`）。
+  - 先读 Temporal，再在一个读事务（快照）里读 runs 表和链上的任务记录；然后读每个执行的历史和推出去的链头；最后在另一个快照里走链、重放、查锚。锚都是它指向的记录提交之后才发出的，所以后一个快照一定有它们。
+  - 查锚：每个任务的 Temporal 历史里每个 ActivityTaskCompleted 的结果，`_audit` 必须指向账本里这个任务在那个 seq 上的 call 记录，sha256 相同、activity_id 相同、状态相同且不是 error、attempt 等于这次完成的 ActivityTaskStarted 的 attempt、result_sha256 等于按历史里的 value_json 重算的；一条记录在一次执行里只能被一个结果指向。推出去的每个链头也要是链上那个 seq 的那条记录，所在的工作流要是 agentd 的类型和任务队列。报告最后一个对得上的链头的 seq，和它之后还有几条记录；agentd 已运行超过 60 秒时，最后一个链头之后早于 60 秒、又在保留期之内的记录算对不上。这条链推出去的链头还要按推的顺序：按 Temporal 的时间排（同一个工作流里按事件），后推的 seq 比先推的小，说明两次推送之间账本倒退了，算对不上。前缀下别的链的锚工作流算对不上，看链头里的身份是谁推的：别的 agentd 的，`--allow-chain <键>` 接受，报告也这样提示；这个 agentd 自己推过的（账本被换掉了：重置，或者从第 1 条起重写，只有操作者分得清），报告写明事实（旧链最后一个链头和时间、这条链第一次推送和时间，都是 Temporal 的时间），不提示任何开关，`--allow-chain` 不接受，`--allow-replaced-ledger <键>` 接受，除非旧链在这条链第一次推送之后还推过（同一个 agentd 的两个账本同时在用，重置不会这样，开关也不接受）；链头里没有身份的（身份出现之前推的），两个开关都接受，都不提示。这个 agentd 自己的 agentd.started、最后追加的记录、最后推出去的链头，账本都要在原来的 seq 上、哈希相同。审计日志一条记录都没有、Temporal 里却有锚工作流或带锚的结果，也算对不上。
+  - 查哪些任务不只看账本的 runs 表（父会话转来的审查意见）：Temporal 列出的 Worker 任务队列上的执行（`TaskQueue = 'agentos-workflows'`）、审计链里 run.created/started/discarded 记下的任务、runs 表的行，三者的并集。Temporal 或链里有、runs 表里没有、run_id 为空或者不同的，都报 `runs_mismatched`，不悄悄跳过。`--run` 只是在这个集合里筛。
+  - Temporal 没有某个执行的历史：这个任务最后一次被看到活着（它最后一条由 run 发出的调用记录，没有就用 run.created、run.started）还在命名空间的保留期之内，算对不上；过了保留期，报 `runs_unavailable`。日志开始之前建的、日志里没有它任何记录的任务，以及历史里结果不带 `_audit`、开始于日志之前的执行，报 `runs_before_log`。不知道日志何时开始时，没有任务算在它之前。读历史出别的错，整个验证失败。
+  - 按记录重放出的状态（`audit.Projection`，测试也用它）和表比：副作用（状态、领取者、maybe_sent、payload 和结果的哈希）、审批单（状态、是否用过、谁决定的、payload 的哈希、过期时间、改过的补丁）、任务、追加额度；第四轮起还有 calls（每一行的 kind、name、参数的哈希、outcome）、budget_entries（每个请求的 RESERVE、SETTLE、RELEASE，金额、模型、价目表版本、原因）、model_calls（请求和回答的哈希、提供方、模型、提示词版本、effort、停止原因、usage 的哈希）、blob_owners、effect_resolutions；以及审计日志开始之后才建、却没有记录的行（没有日志时，每一行都是：从 1970 年算起）；还有协议规则。第五轮起还比副作用的工具、类别和幂等键，审批单的工具和卡片（context_blob）；要有记录的行按任务定：有 run.created 的任务，每一行都要有，不管行上自己写的日期；没有 run.created 的任务（日志之前的），日志开始之后的行才要；call 记录的 scheduled_at 指向一个日志里没有 call.counted 的计数，也是对不上。没有记录设过的字段不比。每个 blob 的字节要哈希成它的键，副作用和审批单引用的 blob 要在。对不上的报 `state_mismatched`。账本里 agentd 写的表，除了 outbox（只有门铃）、goose_db_version 和 migration_files（agentd 打开账本时自己查），都和记录比；不比的三张连同原因列在报告的 unchecked_tables 里，账本里有、两边都没列的表也列为不比（“verify 不认识的表”）。
+  - 每次尝试的记录：每条 call.started 要由它那次尝试的 call 记录（指向它）关上，或者由它之后的一条 agentd.started 关上，后者是被打断的尝试（attempts_cut_short），只报告、不算对不上；两样都没有的，任务还在跑就算正常（还在进行中，哪一次尝试都一样：超时的尝试在 agentd 里可能还没跑完，Temporal 已经开始了下一次），任务结束了才算对不上（第四轮放宽，见“复审（第二次）”第 7 条）。call 记录指向的 call.started 必须是同一任务、同一 activity_id 和 attempt、在它之前的那条；策略放行了、有结果的 call 记录必须指向一条。对不上的报在 `state_mismatched` 里（kind 为 call）。第五轮起：任务已经结束、这次尝试还在这个 agentd 里执行的，也算进行中（取消的任务马上结束，它的模型调用还在跑）；快照之后才落下记录的，按账本现在的样子再查一遍（`closedNow`）；记录因为故障丢了的，单列在 `attempts_unrecorded`，不算对不上。Temporal 说被终止的执行，要有它的 run.terminating（更早的 agentd 只写 run.terminated，也算）；没有的，5b 起列在 `terminated_outside_agentd`，不算对不上，不影响退出码，带着它历史里终止事件的时间，以及调用者自称的身份和理由（字段名就叫 claimed_identity、claimed_reason：那是调用者自己的话，谁调 Temporal 的 API 都能随便写）。
+  - 有界（第四轮）：锚工作流最多列出、读 2,000 个，每个最多读 20,000 个事件；超出的报在 unread 里（什么、至少多少、为什么）。
+  - 退出码：0 全部查过且都对得上；1 链断了、有锚、任务或状态对不上；2 只是有任务没查，`runs_unavailable` 由 `--allow-unavailable`、`runs_before_log` 由 `--allow-before-log` 放开，或者有调用的记录因为故障丢了（`attempts_unrecorded`，第五轮；没有开关，agentd 重启之后这次尝试算被打断）；3 验证本身没能进行，或者只读了一部分（unread 不为空）而读到的都对得上：读了一部分绝不以 0 退出。
+
+### 我定的几处（文档没细说）
+
+- **agentd.started 放在 SettleOpen 之前**（和父会话的说明不一样：说明写的是“账本打开、SettleOpen 跑完之后”）。actor 只写 agentd，不带 incarnation；一个数据目录同一时间只有一个 agentd（目录锁先于账本），所以“两条 agentd.started 之间的 agentd 记录都属于前一条”。SettleOpen 在后，它的 budget.settled_open 就落在新 agentd 名下；放在前面，读的人会以为是被杀掉的那个 agentd 结的账。
+- **一次尝试两条记录**：策略放行之后、任何请求离开 agentd 之前写 call.started（设计文档第 7 节：先有记录，才有调用），尝试结束时写 call 记录。call.started 写不进去，什么都不发，尝试以可重试的 `AuditUnavailable` 结束。call 记录和 outcome 的事务写不进去时，带结果的、以可重试错误结束的，返回可重试的 `AuditUnavailable`，而不是一个没有锚的结果；下一次尝试从账本作答（模型的回答、副作用的结果都在账本里），不会重发。被永久拒绝的保留自己的错误（第三轮）。
+- **call.started 写在策略放行之后，不等到第一个请求**：说明允许什么都不发的调用不写它（被拒、已取消、未知的任务、从账本作答、只是等待）；我在策略放行的那一刻就写，所以从账本作答的、只是等待的调用也有一条。这样“这次尝试有没有发请求”不用猜：策略放行了、有结果的 call 记录，就必须有 call.started，verify 照这一条查。以错误结束的 call 记录不要求有：错误可能出在 call.started 写下之前（比如它本身写不进去）。被拒的（策略拒绝、循环保护、已取消、未知的任务、参数错误）在策略放行之前就结束，没有 call.started。
+- **“还在进行中”按任务算**（第四轮由父会话改定）：一条没关上的 call.started，只要它的任务还在跑，就算正常，不管是第几次尝试；任务结束了还没关上才算对不上。第三轮要求它是同一个 activity_id 最新的一次尝试，可超时的一次尝试在 agentd 里可能还没跑完，Temporal 已经开始了下一次：验证会误报，直到前一次写完 call 记录。
+- **两种锚**：结果出去时，链头就是这次调用的记录，结果锚住它。agentd 自己的记录（启动、过期、恢复）、以错误结束因而没有结果的调用，由推给 Temporal 的链头锚住：最多晚 30 秒；agentd 停着时追加到账本里的，要到下次启动后的第一次推送才有锚。
+- **执行在审计日志之前开始的，结果可以没有锚**：`VerifyAudit` 以链的第一条记录的时间为界，用 Temporal 给的执行开始时间比较。这样的任务列在 runs_before_log 里，算没查（退出码 2），除非 `--allow-before-log`（修正 3）；不知道日志何时开始时，没有任务在它之前。之后的执行，结果缺锚就是对不上（agentd 不会返回没有锚的结果，有人绕过 agentd 完成了活动才会这样）。
+- **正在启动的任务也报**：Temporal 已经列出、账本还没记下 run ID 的执行，报“ledger records no execution of it”。这只在 StartRun 的那几毫秒里出现，过一会儿再验一次就没了；按审查意见不悄悄跳过。
+- **effect.reconciled 多带 status**：说明里只有 executed 和 result_sha256，可“没执行”之后是 PENDING（重发）还是 ABANDONED（任务已取消或已结束），要看 status。
+- **call 记录多两个字段**：参数不是 JSON 对象时，记 raw_args_sha256（原文的哈希），不和规范化参数的 args_sha256 混用一个键；不是 agentd 启动的执行（unknown run、run ID 没记上）记 temporal_run_id，方便在 Temporal 里找到它。error_type 照说明只写不可重试的应用错误的类型。
+- **actor 的规则**：run 的调用和它要的东西（call、effect.recorded、approval.created）是 run 的；人经 agentctl 做的是 `operator:<名字>`；agentd 自己做的（协议的每一步、过期、恢复、gate 补审批单、拒绝之后放弃副作用）是 agentd 的。拒绝时同一个事务里有 approval.decided（操作者）和 effect.settled（agentd）。
+- **配置文件的哈希是读进来的那份字节**：`config.Load`、`policy.Load`、`models.Load`、`pricing.Load` 各自记下所读字节的 sha256，不在启动记录时再读一遍文件。
+- **runtime.refused 的 count**：完整写出的一行 count 为 1；计数行 count 为没写出的条数、within 为时间窗。所有 runtime.refused 的 count 加起来就是被拒的总数。钩子跟着日志走，日志的限流也就是审计记录的上限。
+- **启动时放弃的写先查后改**：`AbandonUnsentEffects`、`HandOverUnsentEffects` 是批量 UPDATE；同一个事务里先列出将被改的写，改完逐条读回，状态变了的才记一条 effect.settled。
+- **Fallback 的策略检查不单记**：跨提供方的 fallback 在启动时就由 `CheckModels` 核过（策略不许的启动不了），运行时那次检查不会拒绝；call 记录里记的是这个模型任务的那次决定。
+- **每张表逐个变化地记**（第四轮，复审第 1 条）：calls、budget_entries、model_calls、blob_owners、effect_resolutions 的每一行，和它的记录（call.counted、budget.reserved/settled/released、model.requested/answered、blob.owned、effect.reconciled 的 resolve_key）在同一个事务里，而不是在尝试结束时的 call 记录里汇总：被崩溃打断的尝试，它写下的行也有记录。call 记录只加了 scheduled_at 和 outcome 两个字段，类型和原有字段都不变（B 部分的 runs explain 读它）。
+- **身份取 Worker 的任务队列和数据目录**（第四轮，复审第 2 条）：同一个命名空间里的两个 agentd 必须用不同的任务队列（否则它们的 Worker 会领走对方的任务），同一台机器上的两个 agentd 必须用不同的数据目录（目录锁）；换掉账本的人留着 agentd 的配置，身份也就不变。取 sha256 的前 16 位，不把机器上的路径写进 Temporal。命名空间不放进去：锚工作流本来就在命名空间里。改了任务队列或者挪了数据目录，身份就变了，旧链看起来像别的 agentd 的。第五轮：数据目录先取绝对路径、再解析符号链接（`filepath.EvalSymlinks`），同一个目录换个写法（符号链接、相对路径），身份不变。
+- **启动检查不挡启动**（第四轮，父会话的修正 1）：第一版是“账本不含这个 agentd 最后推出去的链头就不启动，除非 `--allow-older-ledger`”，取的是按时间最新的那个、身份或链的键对得上的链头。自动提交审查指出两处：能给 Temporal 发信号的人，可以在截断之后补一个时间更晚、和截剩的链尾对得上的链头，藏住截断；也可以发一个 seq 极大的假链头，让 agentd 再也起不来。改成：这条链今天和昨天的锚工作流里，每个链头都查（截断表现为 agentd 推过的最高的那个不在账本里，后来补的链头拿不走它），后推的比先推的低也算一条；查出来的不挡启动，写进 agentd.started，verify 独立地查出同样的东西。`--allow-older-ledger` 删掉了。第二批修正又加回了按身份读别的链（见下一条），也只记不拦。
+- **启动时也读这个 agentd 在别的链下推的链头**（父会话转来的第二批修正 1）：只读这条链的锚工作流，看不出账本在 agentd 停着时被整个换掉：新账本的链有新键，它的锚工作流里什么都没有。所以也从列表里找今天和昨天所有链的锚工作流，取这个 agentd 的身份推的、seq 最高的链头：它不是这条链的（一样高时算这条链的），就记一条。只记不拦：信号里的身份和链头一样没有认证。重置之后的头两天，每次启动都会记这一条（旧链昨天推过的链头还在窗口里），这是如实的：账本确实换过。
+- **伪造的信号不进记录**（父会话转来的第二批修正 2）：发信号的人想发多少就发多少、想写什么就写什么。只收 seq 为正、sha256 是 64 个小写十六进制字符、身份为空或者是 16 个小写十六进制字符的链头；别的都是“读不出的链头”，只记工作流和事件号，不抄它的内容（别的链里读不出的链头不记：说不出是谁的）。工作流 ID 经 `audit.Text`。agentd.started 和日志里最多 20 条，多出来的记条数。verify 用同一条规则：这条链里读不出的链头报“cannot be read”，不抄内容；别的链里的直接跳过。
+- **启动检查有界、尽力而为；verify 有界、读不全不算通过**（父会话转来的第三批修正）：启动时列出的、读的，都是有 Temporal 权限的人能随便加的：建一万个带锚前缀的工作流，或者往一个里灌信号，原来就能让启动做无界的事，读错一次还会让 agentd 起不来。启动检查只是帮忙发现，verify 才是定论，所以启动检查给了时间（10 秒）、工作流（50 个，这条链的两个在前）、事件（每个 10,000 个）三个上限，碰到上限、超时、读错都只是一条发现。verify 读得多些（2,000 个工作流、每个 20,000 个事件），也有界；读不全时报在 unread 里，agentctl 以 3 退出（读到的有对不上时以 1 退出），绝不以 0 退出。上限取得比 agentd 自己会推的多得多：agentd 每 30 秒最多推一次，一天最多 2,880 个信号。
+- **不用 HMAC 给链头签名**：密钥只能放在 agentd 旁边（数据目录或钥匙串），能改账本的人（v0.1 就是 agentd 运行的那个用户）也读得到它，签名挡不住他；只能写 Temporal 的人本来就伪造不了账本里的记录。所以：只能动 Temporal 的人可以让 verify 失败（发假链头，它们对不上账本，或者排在更高的链头之后），但藏不住一次截断（agentd 推过的最高链头还在，账本没有它就对不上）。
+- **换掉的账本只由操作者接受**（第四轮，父会话的修正 2）：第一版让 `--allow-chain` 接受这个 agentd 自己的旧链，条件是旧链最后一次推送早于这条链的第 1 条记录。可第 1 条记录的时间来自被检查的账本，重写的人想写多少就写多少；Temporal 的时间也帮不上忙：重置和恶意重写都表现为一条旧链停了、一条新链开始了。只有操作者知道自己有没有重置。所以 `--allow-chain` 只接受别的 agentd 的链；这个 agentd 自己的旧链总是对不上，除非 `--allow-replaced-ledger <键>`，报告只写事实、不提示开关。留一条连开关也盖不过的：旧链在这条链第一次推送之后还推过，两个时间都来自 Temporal，说明同一个 agentd 的两个账本同时在用，重置不会这样。第五轮（安全复审第 2 条）把这条推到底：只看 Temporal 的时间，不看身份。在这条链第一次推送之后还推过的链，才是旁边另一个在跑的 agentd，`--allow-chain` 只接受这种（它的链头写着这个 agentd 的身份时，就是同一个 agentd 的两个账本同时在用，两个开关都不接受）；别的链，不管链头写着谁（身份来自配置，配置能换写法），都按换掉的账本处理：不提示开关，只有 `--allow-replaced-ledger` 接受。
+- **没有身份的链头两个开关都接受**：身份出现之前推的链头不知道是谁的，可能是别的 agentd 的，也可能是这个 agentd 自己旧账本的；两个开关都接受，都不提示。当作“自己的”从严处理的话，共用开发 Temporal 的别的检出（还在跑旧代码）推的链头会因为时间重叠永远被拒，要等到它们过期（8 天加保留期）。第五轮起不再按身份分，没有身份的链也按上一条：同时在推的，`--allow-chain` 接受；别的，只有 `--allow-replaced-ledger` 接受。
+- **agentd 的读记在 transport 里，每个请求一条**（第四轮，复审第 5 条）：而不是每次查找一条、由工具事先报出要读的路径：审批卡片要沿着目录树读，读几次事先不知道；记在 transport 里，工具新加的请求也跑不掉。只记方法和路径：令牌在请求头里，查询串（分页、head=分支）不记。审批卡片的 effect_id 是这次调用的副作用 ID：卡片在审批单之前生成，审批单 ID 那时还没有；之后的事务若没写成（达到上限、并发），这条读的记录指向一个没有记下的副作用，照实如此。
+- **Push 在写的轮次里读链头**：不然它读到的最后一条记录和内存里的“最后追加”之间，可能插进本进程刚提交的一条，误以为链被动过；拿着轮次时，本进程不会有提交，提交钩子也已经跑完。推送本身（网络请求）在轮次之外。
+- **空日志的重放从 1970 年算起**：没有第一条记录时，以前跳过重放；现在每一行都算“日志开始之后、没有记录的行”。
+- **加引号的是谁都能起的名字**（第四轮，复审第 6 条）：activity ID、Worker 在自己任务队列上起的工作流的 ID、别的链的键（命名空间里谁都能建这样 ID 的工作流）、调用的 kind 和 name、结果里的状态。agentctl 每一行里的任务 ID 都加了引号，agentd 自己起的 UUID 也一样，规则简单。
+- **模式逐行比，每个写事务先重新载入**（第五轮）：父会话转来的修正说“每个写事务给 sqlite_master 的行算一个哈希，和期望的比”。我逐行比，不算哈希：一样严，几十行，读一遍的开销一样，也没有编码可以写错。只比行还不够：我先用测试证实了，一个连接载入了某个触发器之后，有人把它从 sqlite_master 里拿掉、schema_version 不动，sqlite_master 已经和迁移的一样，这个连接却还照那个触发器执行（`TestAWriteRunsNoTriggerSinceTakenOut`，去掉重新载入就失败）。所以每个写事务先 `PRAGMA writable_schema=RESET`，再比。开销见“测试怎么测”：每个写事务多 0.18 毫秒左右，其中重新载入约 0.14 毫秒。另一个办法是所有写走一条专用的连接（写本来就一个接一个），只在换连接时重新载入，省下这 0.14 毫秒，但它的正确要靠“这条连接上从不在写事务之外跑语句”这样的约定；我选了每个事务自己就站得住的写法。
+- **新连接不合格就不给**（第五轮）：模式不是迁移的时候，连接池开不出新连接，用到新连接的读也失败；5b 起 verify 先比模式（比的是 sqlite_master 的内容，用池里已有的连接就行），不一样就报对不上、不再往下读；比完之后才变的，读事务失败，verify 以“读不了账本”失败，错误里同样点名，两样都不是 0。检查新连接时，先开一个读事务、读一下 schema_version 定下快照，再让连接重新载入、再比。重新载入不能省：modernc 开连接时执行 DSN 里的 pragma，那时连接就已经载入了模式；那之后、检查之前被拿掉的对象（比如一个索引），不重新载入就留在连接里，而 sqlite_master 已经和迁移的一样（`TestANewConnectionKeepsNothingItLoadedBeforeItsCheck`，去掉重新载入就失败）。
+- **quick_check 在迁移之前**：坏了的文件不往里写。不跑 `integrity_check`：它还核对每个索引和它的表，代价随行数增长，打开时不划算（见“留到后面”）。
+- **0 行的写，哪些要重读**（第五轮）：只有“写了 0 行”会被当成“已经是那样了”而接着往下走的地方要重读，上面列的就是这些。别的比较并交换式的更新（领取、`proceed`、交还、结账、审批的决定、过期）写了 0 行时，本来就当作“状态变了”，返回 busy、changed 或 ErrStopped，什么都不往外发；触发器让它们写不进去，结果是该做的没做（失败、重试），不是没做的被当成做了。每个写事务的模式检查之后，这种触发器也进不来。
+- **终止先记后做，记不下也照样终止**（第五轮）：终止是取消的最后一招（任务不理取消、宽限期过了），run.terminating 写不进去就不终止的话，一个坏了的账本能让任务一直跑下去。写不进去时 agentd 记一条错误日志、照样终止，verify 会把这个执行报成“没有 run.terminating 的终止”。Temporal 自己终止的执行（比如工作流任务超过它的上限），在 verify 看来也是没有 run.terminating 的终止；第五轮第一版把它报成对不上，5b 改成列出来（父会话的修正：账本没有被改，报成对不上会让诚实的流程失败，`test_runtime_limits` 就是）。一条 run.terminating 后面没有 run.terminated，不算对不上：agentd 被杀在两条之间（之后有 agentd.started），或者 TerminateWorkflow 失败了，都会这样。
+- **按任务定哪些行要有记录**（第五轮，对抗复审第 3 条）：行上的日期是行自己写的，以前日志开始之前的日期就能让一行不要记录。现在：有 run.created 的任务（日志记下了它的创建），每一行都要有记录；没有 run.created、建于日志之前的任务（`runs_before_log` 里的那些），日志开始之后的行才要；别的任务（没有 runs 行的，或者建于日志之后、却没有记录的），每一行都要。
+- **读事务也先重新载入、再比**（5b，父会话的修正和最终安全审查的补充）：连接只在 schema_version 变了时才重新载入；有人改了 sqlite_master 再改 schema_version，已经开着的连接就都载入他的模式，比如一个顶替 approvals 的视图，给操作者看编出来的行。往外发的东西之前都有一次查过模式的写，所以不会被骗着发出去，但操作者会被骗。现在每个读事务开始时都和写一样重新载入、再比；Control 原来直接用连接池读的地方（runs、approvals、待处理的列表，写之前的查找），都改成在读事务里读，向 Temporal 的查询放在事务之外。代价：一个读事务从 5 微秒变成约 137 微秒（`BenchmarkR5bRead`，一个读事务读一个 blob，2,000 次一轮，9 轮的中位数，负载 10 到 15），一次 Control 调用开一到两个读事务。网关自己的读（查任务、读 blob、循环保护以外的查询）不走读事务，见“留到后面”。
+- **模式或文件有问题，verify 就停在那里**（5b）：模式不是迁移的，或者 integrity_check 有发现，后面读到的任何东西都可能是编的：索引能让读漏掉行、视图能编出行。所以只报这些，unread 里写明其余没读，退出码 1（有对不上时 unread 不改成 3）。
+- **integrity_check 在 verify 里，打开时只 quick_check**（5b）：integrity_check 还核对每个索引和它的表，比 quick_check 多出这一步，索引的 rootpage 被换过、行在索引之外被改过，都靠它；代价随行数和索引数长：130 MB 的账本（10 万个 1 KB 的 blob，一张表、一个索引）约 0.12 秒，176 MB 的（30 万条审计记录，每条两个索引）约 0.65 秒，页都在缓存里。verify 本来就要读每个 blob 的字节，这点时间不显眼；每次打开都跑就不值了。报告里每一行都加引号、截到 300 个字符，最多 10 行，满了另加一条说可能还有。
+- **快照和链尾在写的轮次里一起读**（5c）：verify 要说“这条之后的记录不是这个 agentd 追加的”，链尾和快照就得是同一刻的。agentd 只在写事务里追加，写事务拿着写的轮次，链尾在提交之后、轮次交出去之前更新（提交钩子）。所以 verify 拿着轮次开始快照、读链尾、再交出轮次：那一刻没有进行中的写事务，提交了的都已经记进链尾，快照里这个 agentd 的记录都在链尾或它之前。先读链尾、后开快照，中间提交的一条诚实的追加就像别人的；先开快照、后读链尾而不拿轮次，一条已经提交、还没记进链尾的也一样。拿轮次的只是开快照的那一下（约 0.15 毫秒），之后的读不挡写。测试里 8 个 goroutine 不停追加，verify 跑 200 次，一次都不报；两种错的顺序都被抓到。
+- **快照之后再问一遍**（第五轮）：verify 在快照里看到一条没关上的 call.started，再去问网关它是不是还在执行；尝试可能恰好在两者之间结束（网关只在 call 记录提交之后才忘掉它），所以问完网关，再按账本现在的样子查一次这条 call.started 有没有被关上（`closedNow`）。顺序反过来就会漏：先查账本、后问网关，两次都看不到它。
+
+### 推送前审查（安全审查 + 对抗性审查）发现的问题
+
+两个审查代理审的是 c90d892。每条后面括号里是审查给的严重程度和出处，以及复现的情况：审查代理实测过的写明了；其余是审查按代码指出的，我补的测试在旧的行为上都失败（“改坏检查”把旧行为一处处改回去，测试都失败），算是用测试复现了；第 5 条没能复现。
+
+1. **Temporal 给不出历史时，验证放行**（中，安全审查；按代码指出）。
+   - 原来：读不到历史就报 runs_unavailable，退出码 0。能动 Temporal 的人删掉一个执行，就把这个任务的锚全藏起来了。
+   - 改法：agentd 启动时用 DescribeNamespace 读命名空间的保留期，写进 agentd.started（retention_seconds），短于 7 天就警告；读不到命名空间，agentd 不启动。验证时，历史 NotFound、而这个任务最后一条记录还在保留期之内，算对不上（runs_mismatched）；过了保留期才算没查（runs_unavailable）。读历史出别的错，整个 VerifyAudit 失败（Unavailable），不落进 runs_unavailable。agentctl 有没查的任务时以 2 退出，给了 `--allow-unavailable` 才是 0。
+   - 测试：Control 的假 Temporal 能删历史、设保留期、让读历史出错，三种情形各有断言；agentctl 的退出码表（8 种报告）；黑盒检查 agentd.started 里的保留期，以及保留期短于 7 天时日志里有警告。
+2. **锚没绑住结果**（中，安全审查；按代码指出）。
+   - 原来：锚只说明“结果指向了这次调用的记录”，记录里没有结果的哈希。能直接访问 Temporal 的人可以完成活动、给出任意结果，再抄一个真记录的锚。
+   - 改法：有结果的 call 记录都带 result_sha256，编码见“做了什么”里的“锚”。checkAnchors 现在要求：是这个任务的 call 记录，activity_id 对得上；状态和结果的一样，且不是 error；attempt 等于完成它的那次 ActivityTaskStarted 的 attempt（经 started_event_id 找到）；result_sha256 对得上；一条记录在一次执行里最多被一个结果指向。`_audit` 仍放在 value_json 里：给 Result 加字段，旧 Worker 的 Python SDK 解析 protobuf JSON 时会拒绝不认识的字段。
+   - 测试：Control 的锚测试逐条覆盖（冒名的非 call 记录、error 记录、状态不同、attempt 不同、值不同、一条记录被指两次）；改了历史里的结果，VerifyAudit 报对不上。黑盒测试用 Python 另写了一份 Go 的 JSON 编码（键排序、HTML 字符和 U+2028/U+2029 转义、`\b` `\f`、数字照原样），重算历史里每个结果的 sha256，和记录比。这份编码和 Go 在一个刁钻的输入上算出的哈希逐字节相同。
+3. **SQLite 写竞争**（中，安全审查实测：1000 个同时被拒的调用出现 SQLITE_BUSY，记录丢了）。
+   - 改法：`Ledger.Tx` 在进程内排队（容量为 1 的 channel，等的时候看 ctx），写事务一个接一个，不再靠 SQLite 的忙等待。被循环保护拒绝的调用，它的记录和计数写在同一个事务里，原来是两个。网关 Worker 的 MaxConcurrentActivityExecutionSize 定为 200（T7 要 50），注释写了原因。
+   - 排队之后，在 Tx 的闭包里再开 Tx，会自己等自己（死锁）。为此加了一个 AST 测试：扫 internal/ 和 cmd/ 的非测试代码，按包和接收者解析调用，求出所有会开事务的函数，断言没有一个在 Tx 的闭包里被调用。
+   - 测试：400 个同时的写事务全部提交（约 50 毫秒；去掉排队要 9 秒左右，机器忙的时候有一次失败了，所以它抓不稳）；排队的写事务等到 ctx 结束为止（去掉排队，这个测试每次都失败）；循环保护的拒绝和它的记录同进同退。
+   - 自己复查时又找到一处，也改了：循环保护的事务回滚时，`rec.head` 已经指向那条没写成的记录，recordCall 就不再记这次尝试，把原始错误原样返回。现在事务成功后才设它；测试断言这时返回可重试的 AuditUnavailable。
+4. **验证不比较账本的表和链**（中，对抗审查；按代码指出）。
+   - 原来：“按记录重放状态、再和表比”的代码只在测试里。改表不改记录，verify 照样通过。
+   - 改法：重放代码挪进 `internal/audit`（Projection），测试和 VerifyAudit 共用。比较的内容见“做了什么”里的“验证”，比说明多了几项：副作用的领取者和 maybe_sent，审批单是谁决定的，任务的 task，以及审计日志开始之后才建、却没有记录的行。协议规则：要审批的副作用，在 approval.used 之前不能有 effect.claimed。对不上的报 state_mismatched，退出码 1。
+   - 测试：Control 里 14 种改表的情形（预算、dry run、params、task、run_id、行没了、没有记录的取消、取消的时间、没有记录的任务、追加额度改了、没了、没有记录、没有记录的副作用、没有记录的审批单），再加上“已丢弃的任务的行又回来了”。网关里 9 种：副作用的状态、领取者、maybe_sent，副作用没了，审批单没了，审批单的状态、是否用过、谁决定的，没有记录的副作用。协议规则 1 个；黑盒里改预算 1 种。
+5. **一次快照**（对抗审查，没给严重程度；按代码指出，没能复现）。
+   - 原来：runs 表和链上的任务记录分几次读，中间插进一次写，就会报出假的对不上。
+   - 改法：和说明不一样，没有拿写锁，用的是读事务：专用连接上执行普通的 BEGIN（ledger 的 DSN 让 BeginTx 都成了 BEGIN IMMEDIATE，所以不用 BeginTx）。WAL 模式下，读事务从第一次读起就是一个快照，不挡任何写。VerifyAudit 用两个快照：读 Temporal 之前，读 runs 表和链上的任务记录；读完 Temporal 之后，读整条链、重放、读锚指向的记录。
+   - 测试：`Ledger.Read` 读到的是一个快照，读的时候写不用等。VerifyAudit 里两次读之间插进一次写，不在生产代码里加钩子做不到，所以 VerifyAudit 自己的这两处没有测试（见“改坏检查”）。
+6. **AuditUnavailable**（两个审查都提到，没给严重程度；按代码指出）。
+   - 改法：记录写不进去时，在进程内重试，最多 5 次（50 毫秒起翻倍，最多 2 秒，期间发心跳）；每次尝试都这样，不只最后一次。以错误结束的尝试，记录写不进去时也返回可重试的 AuditUnavailable。原来返回原错误：不可重试的错误，就再也不会有记录了。记录用 `context.WithoutCancel` 写，尝试的 ctx 结束了也照写。
+   - 测试：用触发器让记录写入先失败 150 毫秒、再恢复，这次尝试照样成功。参数错误（不可重试）而记录写不进去时，返回可重试的 AuditUnavailable，重试后记下 BadArguments。ctx 已经取消时，recordCall 照样写下记录。
+7. **审批的 actor**（两个审查都提到，没给严重程度；按代码指出）。
+   - 原来：approval.decided 的 actor 是 agentctl 自报的 decided_by。
+   - 改法：和别的操作者记录一样，actor 是连接 uid 的用户名；decided_by 放进 payload，重放时和审批单的 decided_by 比。
+8. **缺的记录**（两个审查都提到，没给严重程度；按代码指出）。
+   - 补了 run.refused、run.terminated，budget.settled_open 改成每个任务一条（见“做了什么”的表）。
+   - 不是 agentd 启动的执行发来的调用（unknown run、run ID 一直没记上），call 记录的 actor 是 `unknown-run`，不再是 run。
+   - 顺带：run.cancelled 带上 cancelled_at，重放时和表比。
+   - 测试：Control 里拒绝启动的三种原因、两处终止各有记录；预算里两个任务各一条；网关里 unknown-run 的两种调用。
+9. **链尾没有锚**（低，安全审查；按代码指出；代替原来“发到 GitHub”的想法）。
+   - 改法：agentd 每 30 秒（链头动了才推）和停下时，用 SignalWithStart 把链头 {seq, sha256} 推给自己的工作流：类型和任务队列都是 `agentos-audit-anchor`，ID 为 `agentos-audit-anchor-<UTC 日期>`，执行超时 8 天，没有谁轮询它。停下时的那次推送排在网关排空、拒绝队列写完之后。验证时列出这个类型的所有工作流，读它们的信号，逐个和链比。对不上的放在 anchors_mismatched 里，run_id 是锚工作流的 ID。
+   - Runtime 代理本来就只放行 Worker 自己的队列，也不放行任何 Signal。T9 的禁止调用表里加了三项：轮询锚的队列、给锚工作流发信号、SignalWithStart，都得到 PERMISSION_DENIED。
+   - 测试：Go 里覆盖推送的时机（链头没动不推、推失败了下次再推、按间隔推），以及工作流 ID、选项和 UTC 日期；VerifyAudit 查链头（对得上、之后有几条、sha256 不同、seq 不存在）。黑盒：停下 agentd 后，Temporal 里最后一个链头就是账本的链头，verify 查过它们；把账本换回旧副本（回滚），也被推出去的链头抓到。
+10. **runtime.refused 的钩子**（提示，安全审查；按代码指出）。
+    - 改法：钩子不在 Runtime 请求的路径上写账本，只往一个 256 条的队列里放，满了就丢、计数；后台把队列写进账本，下一条记录带 dropped。单条写入最多等 5 秒；agentd 停下时，最多再写 5 秒，写不完的算丢弃，并记一行错误日志。
+    - 测试：丢弃的条数进下一条记录，写失败的也算丢弃；账本不响应时，停下不超过上限。
+11. **reason**（提示，安全审查；按代码指出）。只有 agentd 自己给出的状态（denied、rejected、expired、needs_*、budget_exhausted、refused、edited、invalid_output），才把结果里的 reason 抄进 call 记录；ok 的结果里的 reason 是工具或外面写的，不抄。测试：一个返回 `{"reason": ...}` 的读工具。
+12. **列哪些执行**（提示，安全审查；按代码指出）。按 Worker 的任务队列列（`TaskQueue = 'agentos-workflows'`），不按配置里的工作流类型。测试：假 Temporal 记下查询语句，验证时断言用的是这一条。
+13. **测试**（对抗审查实测：这些地方改坏后测试仍通过）。
+    - 交错的断言原来是空的：四个任务的记录，只要换了任务就算“交错”。现在要求某个任务的记录之间夹着别的任务的记录。
+    - 补了测试，抓住原来漏掉的改坏：
+      - n==0 的分支，即 UPDATE 没改到东西就不该有记录：settle、giveBack、RecoverEffects；拒绝、过期、修改被取代、批准后写没生效就过期这几条放弃的路；run.started、discarded、cancelled。
+      - 决定和过期同时发生：先后两种顺序各 5 次，并发 20 次，都只有赢的一方有记录。
+      - recordCall 在 ctx 已取消时照写；effect.claimed 的 version 是领取之后的；executions() 认 run.started；ListWorkflow 翻页；checkAnchors 查记录的类型；peercred 不收不该收的名字；钩子的 command 和 within。
+    - RecoverEffects 为了能测到“没变就不记”，改成在同一个事务里先列出已取消任务所有 PENDING 的写（包括被领取的），改完逐条读回，状态变了的才记。
+    - approved() 里两处 n==0，在同一个事务里读过之后不可能发生。其中一处原来“返回 nil”：要是真发生，副作用会放行而没有 approval.used 记录。两处都改成回滚（errChanged）。
+
+**只写文档，不改代码**：
+
+- **在链头伪造一个操作者的决定，验证照样通过**（中，对抗审查）。能写账本的人，可以在下一次推送之前追加一条链接正确的记录，比如一个谁也没给过的批准；之后 agentd 推出去的链头会把它也锚住。链证明的是记录追加之后的顺序和完整，不证明是谁追加的。v0.1 里能写账本的就是运行 agentd 的那个用户，不在威胁模型之内。README 的审计段落也写了这一点，报告给出最后一个推出去的链头之后还有几条记录。
+- **独立的验证者**（安全审查，范围之外）：现在的判决出自被审计的 agentd 自己。见“留到后面”。
+
+### 复审（第一次）发现并修掉的问题
+
+两个复审代理审的是 9b049ee（第二轮的修复，加上父会话的 README）。在诚实的账本上 verify 站得住：对抗复审跑了 45 个黑盒测试，每个之后都调一次 verify，全部以 0 退出；安全复审确认了第二轮的修复，其中 1000 个调用的洪水现在 0.8 秒、一条不丢。下面每条后面括号里是严重程度、出处和复现情况，复现的说法同上一节；每条都补了在旧行为上失败的测试，改坏检查见“测试怎么测”。
+
+1. **锚工作流属于命名空间，不属于某个 agentd**（中，两个复审都提到；按代码指出）。
+   - 原来：同一个命名空间里的第二个 agentd（有自己的账本）也推到 `agentos-audit-anchor-<日期>`，两边的 verify 从此都失败；新建的开发账本也一样。
+   - 改法：工作流 ID 带上链的键，成为 `agentos-audit-anchor-<键>-<UTC 日期>`，键是第 1 条记录 sha256 的前 16 个十六进制字符。之后每次启动的 agentd.started 都写上 chain；全新账本的第一条 agentd.started 就是第 1 条记录，写不进自己的哈希，所以不写。验证时按 ID 前缀列出（`WorkflowId STARTS_WITH 'agentos-audit-anchor-'`），每个执行都查类型和任务队列；读不出的信号、agentd 不发的信号都算对不上，不再让整个验证报错。别的链的锚工作流报出它们的键（other_chains），怎么处理见下面的修正 1。
+   - 测试：Go 里各链各管各的、别的链计数、类型或队列不对、读不出的信号、名字不对的信号。黑盒：一个 Temporal 上两个 agentd、两个账本，各自加上 `--allow-chain <对方的键>` 都通过，不加则点出对方的链。
+2. **丢了的锚工作流没人发现**（中，安全复审；按代码指出）。删掉它、抢先用别的类型建它、把它 continue-as-new 成别的类型，都要有 Temporal 的写权限。
+   - 改法：VerifyAudit 里，最后一个对得上的链头之后，只要有一条记录早于推送间隔的两倍（60 秒）、又还在保留期之内，就算对不上（报第一条）。只在这个 agentd 已经运行超过 60 秒时查：它启动前被 kill 掉的那个 agentd 最后没推出去的记录，要等它的第一次推送。agentd 每天第一次推送之后 describe 当天的工作流，类型或任务队列不对就记一条 error 日志；verify 自己也按类型和队列查（第 1 条）。
+   - 测试：Go 里覆盖到的、太新的、在保留期之外的、头推出去之后的；每天看一次、看失败下次再看、类型不对就说。黑盒：删掉锚工作流，等 agentd 运行过 65 秒，verify 报对不上；有人抢先用别的类型建了当天的锚工作流，agentd 记 error，verify 报对不上，也不把里面的东西当链头。
+3. **重放跳过了记录里带的哈希**（中，两个复审都提到；对抗复审实测：把一个等审批的 PR 的 payload blob 和 sha 都换掉，PR 以“TAMPERED”发了出去，verify 以 0 退出）。
+   - 改法：重放并比较副作用的 payload_sha256 和 payload_blob（对 effect.recorded）；审批单的 payload_sha256 和 expires_at（对 approval.created、approval.decided）；result_blob（对 effect.settled、effect.reconciled 的 result_sha256）；edited_patch_blob（对 edited_patch_sha256）；记了 run.created 却没有 run.started 的任务，runs.run_id 必须为空。VerifyAudit 逐个检查每个 blob 的字节是否哈希成它的键，以及副作用和审批单引用的 blob 在不在。`Ledger.GetBlob` 拒绝哈希对不上键的字节（ErrBadBlob），被换掉的 payload 就发不出去。
+   - 没有记录设过的字段不比：审批单的状态、是否用过、谁决定的，都只在有记录说过之后才比。审计日志开始之前就做出、之后才决定或用掉的审批单，不再误报。
+   - 测试：网关里新加 6 种改表（payload 连同 blob 被换、payload blob、payload 的 sha256、结果、审批单的 payload、过期时间）和改过的补丁；日志开始前批准、之后用掉的审批单没有差异。Control 里有没有 run.started 时的 run_id；blob 被改、缺 blob，blob 超过一页。ledger 里 GetBlob 拒绝被改过的字节。
+4. **Tx 里的函数 panic 会卡住账本**（低，安全复审实测）。改法：`defer tx.Rollback()`，panic 时回滚、交还写的轮次，panic 继续往上抛。测试：panic 之后，下一个事务和另一个连接上的写都马上成功，panic 那个事务写的东西没有留下。
+5. **结果哈希的固定向量**（提示，安全复审）。`internal/audit/result_test.go` 有 10 个向量，每个都写死编码后的字节和 sha256：`<>&`、U+2028/2029、控制字符（DEL 不转义）、引号反斜杠和斜杠、非 ASCII 和 astral 字符、键按字节排序、1.50、1e2、-0、20 位整数、-1.5E-7、只删顶层的 `_audit`、重复的键取最后一个、空白、非法 UTF-8 和孤立的代理对、空对象；另外 7 种不是一个 JSON 对象的输入都报错。编码规则写进了 `internal/audit` 的包文档，外面的验证者照着就能算。值后面还有内容的，现在算读不出（原来只读第一个值）。除了 Python 读法不同的那两个字符串，这些向量和黑盒测试里 Python 另写的编码算出的哈希逐字节相同。
+6. **保留期从任务最后一条由 run 发出的调用记录算起**（低到中，对抗复审实测）。只有活着的执行才会产生这种记录；执行关闭之后的记录（过期、对账）原来会造成误报。没有调用的任务，用它的 run.created 或 run.started。测试：复审的那个情形（关闭 3 小时，保留期 2 小时，1 小时前 agentd 过期了它的审批单）现在报没查；保留期改成 4 小时，就报对不上。
+7. **agentctl audit verify 的退出码**（低，对抗复审）：0 全部查过且都对得上；1 有对不上的；2 有任务没查（`--allow-unavailable`、`--allow-before-log` 各放开一种）；3 验证本身没能进行（RPC 错误、超时、`--run` 找不到、agentd 不在）。加了 `--timeout`，默认 5 分钟。测试：在真的 Unix socket 上起一个假 agentd，各种回答各对应一个退出码；`--timeout 100ms` 要在 5 秒内返回。
+8. **事务之外的写不排队**（低，对抗复审实测，最长等了 4 秒）。改法：PutBlob、PutRunBlob（连同 AddBlobOwner，现在在同一个事务里）、InsertModelCall、被拒那条路上的 FinishModelCall、outbox 的两个标记，都改走 `Tx`。测试：新的 AST 测试读 sqlc 生成的查询，找出所有写的（INSERT、UPDATE、DELETE），断言 agentd 的代码里没有一处经 `.Q.` 调用它们。
+9. **日志之前的任务**（低，对抗复审）。在第一条记录之前建的、日志里没有它的任何记录、Temporal 里也没有历史的任务，单独列在 runs_before_log 里。按修正 3，它们算没查（退出码 2），除非给了 `--allow-before-log`。
+10. **appendCall**（低，对抗复审）。
+    - 每次等写的轮次最多 10 秒（appendTurnWait），等的时候每秒发一次心跳（keepAlive）。原来那个 heartbeat 辅助函数在活动没有心跳超时的时候什么都不做。
+    - 被永久拒绝的调用（UnknownRun、BadArguments、TooManyAttempts），进程内重试之后记录还是写不进去，就返回原来的不可重试错误，并记日志：一次重试只会再被拒一次，尝试次数的上限也因此仍然管用。只有带结果的，和可重试的错误，才返回 AuditUnavailable。这推翻了第二轮对错误结果的规定；当初的理由是写竞争，写的轮次已经把它消除了。
+    - 测试：参数错误、超过尝试上限的保留自己的错误，一般的错误返回 AuditUnavailable；轮次被占着时，尝试在轮次空出来之前就以 AuditUnavailable 结束，期间有心跳；只等、不重试的那次记录也有心跳。
+11. **改坏后测试仍通过的几处**（对抗复审实测）：
+    - project.go 的 after()：读不出的 created_at 不算“日志开始之前”。Control 的改表表里加了一个时间读不出的副作用。
+    - queue.go：写失败的那条把之前丢掉的条数也算上。先丢两条，再写失败一条，下一条记录说丢了 3 条。
+    - gateway.go：两次重试之间的心跳。测试数心跳；默认每秒一次的 keepAlive，碰不上这么短的重试。
+    - VerifyAudit 的两个快照：`Ledger.ReadHook` 是给测试用的口子，把 Read 的连接包一层。测试在两次读之间提交一个 StartRun 做的事（runs 表的一行和 run.created），断言什么都没报，也断言这次写确实插进去了。测试同时包住 Ledger.Q，所以不经 Read 的读也会被插进去。
+12. **只写文档**：有 run.closed 记录，保留期就能从关闭时算起，但 agentd 看不到每一次关闭。写进了“留到后面”。
+
+**父会话转来的四处修正**（前三处是自动提交审查指出的：每处都默认放松了检查，改成默认从严，由操作者显式放开；第四处让 Invoke 照设计文档先记录、后调用）：
+
+1. **链的键来自被检查的账本**。从第 1 条起重写整条链，键就变了，旧链的锚工作流原来只算“别的链”。现在默认别的链的锚工作流都是对不上（退出码 1），报告点出它们的键；`--allow-chain <键>`（可以给多次）接受指名的外链：命名空间里的第二个 agentd，或者退役的开发账本。README 的重置说明和审计段落都写了。按链分 ID 的做法保留：它仍然让两个 agentd 不会写进对方的工作流。
+2. **空的审计日志会放行**。没有第一条记录时，链的键为空，原来什么锚工作流都不读。现在照样列出前缀下所有的锚工作流；只要有一个（没有被 `--allow-chain` 接受的），或者 Temporal 列出的任务里有结果带 `_audit`，就报“Temporal holds heads or anchored results, but the audit log has no records”。不知道日志从何时开始（没有第一条记录，或者时间读不出）时，没有任务算“日志之前”，结果没有锚也算对不上。
+3. **RunsBeforeLog 是一种降级**。列为日志之前的任务算没查（退出码 2），除非 `--allow-before-log`。历史还在 Temporal 里、开始于日志之前、结果不带 `_audit` 的执行，也是它早于日志的证据，同样列出、同样由这个开关管。README 写明：带着 M1 到 M4 任务的开发账本需要 `--allow-before-log`，直到那些任务离开 Temporal 和账本。
+   - 测试：Control 里空日志的三种情形（锚工作流、带锚的结果、不知道日志何时开始时没有“日志之前”），以及历史还在 Temporal 里的日志之前的任务。黑盒：agentd 运行时清空审计日志，verify 失败并说出原因；从第 1 条起重写整条链，不加 `--allow-chain` 时失败并点出旧链的键，加上旧键就通过；日志之前的任务退出码 2，加 `--allow-before-log` 为 0。
+4. **先有记录，才有调用**（设计文档第 7 节：“Hash-chained log entry, written before anything happens: no entry, no call”）。原来一次调用唯一的记录在调用之后、和结果一起写，所以被崩溃打断的尝试，既没有它的策略决定的记录，也没有它发出的模型请求的记录（黑盒测试 5 原来断言的正是这个）。
+   - 改法：策略放行之后、任何请求离开 agentd 之前（模型请求、工具调用、副作用的执行），在自己的事务里追加 call.started：activity_id、attempt、kind、name、args_sha256（参数不是对象时为 raw_args_sha256）、policy {decision, reason}。和别的写一样走写的轮次，等的时候发心跳（和 appendCall 共用 appendTried）；写不进去就什么都不发，返回可重试的 AuditUnavailable。call 记录除了多一个 started_seq（有 call.started 时指向它），类型、内容和锚都不变：B（runs explain）读它们。
+   - verify：每条 call.started 由它的 call 记录或者它之后的 agentd.started 关上；后者报为被打断的尝试，不算对不上。两样都没有的，任务还在跑、它又是这个调用最新的一次尝试时算正常，否则对不上。call 记录指向的 call.started 必须找得到：同一任务、activity_id、attempt，在它之前。策略放行了、有结果却不指向 call.started 的 call 记录，对不上。
+   - 测试：网关里工具调用和模型调用各一个：call.started 写不进去时没有任何请求出去；call 记录指向 call.started，两者说的是同一次尝试；被拒的调用没有 call.started。Control 里 12 种情形（正常关上、被重启打断、进行中、任务已结束还开着、后一次尝试已开始还开着、指向别的尝试的、指向之后的、被指两次的、被打断后又被指的、放行了却不指的、被策略拒绝的、以错误结束的）。黑盒测试 5 改了（见“测试怎么测”）；诚实的流程照旧以 0 退出：见下面的“诚实流程的普查”。
+
+### 复审（第二次）发现并修掉的问题
+
+安全复审审的是第三轮的定稿 b64d47b（父会话在它上面合进了 origin/main，即 4737610）。下面第 1 到 6 条是它的发现，第 7 条是父会话自己加的，最后是父会话转来的自动提交审查对第四轮进行中的提交的两处修正（和第二遍的一处补充）。严重程度、出处和复现的说法同上；每条都补了在旧行为上失败的测试，改坏检查见“测试怎么测”。
+
+1. **verify 不读执行限额的那几张表**（中，安全复审；实测：`DELETE FROM calls` 之后，同一个写第二次越过了 GatewayCalls 的上限，链和重放都干干净净。复现在复审的 `gateway_review3_test.go`，照约定只读不跑）。
+   - 原来：循环保护数 calls 表，预算看 budget_entries，模型请求在 model_calls，blob 的归属在 blob_owners，对账的幂等在 effect_resolutions；这些行都没有记录对着，重放也不比。能写账本的人删掉 calls 的行，任务就能多发调用；删掉一笔 SETTLE，任务就多了预算。
+   - 改法：这几张表的每一行都和它的记录在同一个事务里（call.counted、budget.reserved/settled/released、model.requested/answered、blob.owned、effect.reconciled 的 resolve_key），重放把它们和表一行行比：记录了的行要在、要一样，日志开始之后的行要有记录。call 记录加了 scheduled_at 和 outcome，calls 的行和它的尝试对得上。agentd 写的表都比；不比的三张连同原因列在报告里（outbox：只有门铃，改了只改变任务何时醒来再问，不改变它做什么、做过什么；goose_db_version、migration_files：agentd 打开账本时自己查），账本里有、两边都没列的表也列为不比。
+   - 顺手修的一处：`closeUnanswered` 的结账原来直接写 `g.Ledger.Q`，不经写的轮次。AST 测试扩成跟着“会写的函数”走（参数里有 `*db.Queries`，往里写、或者把它传给别的会写的函数，按包、接收者和导入解析，做到不动点），抓到了它。
+   - 测试：网关里四组：calls 的每一列、模型请求的每一列、blob 的归属、对账的发现，改表、删行、多出没有记录的行都报对不上；预算的每一种分录都有它的记录；每张表要么比、要么列出原因。黑盒：任务跑完后清空 calls 和 budget_entries，verify 以 1 退出，报 call 和 budget 两类，文本输出里有 “unchecked table”。
+2. **`--allow-chain` 能藏住从第 1 条起重写的链，而且报对不上时提示用它**（中，安全复审；按代码指出）。
+   - 原来：旧链的锚工作流只算“别的链”，说明里写着 “accepted with --allow-chain <键>”；照着做，重写就被接受了。
+   - 改法：每个链头带上推它的 agentd 的身份（`audit.Identity`，见“我定的几处”）。别的 agentd 推的链才提示 `--allow-chain`、才被它接受；这个 agentd 自己推过的链，按下面父会话的修正 2 处理。
+   - 测试：Control 里三种链（别的 agentd 的、没有身份的、这个 agentd 自己的）各自的说明和开关；agentd 推的信号带身份。黑盒：从第 1 条起重写整条链，旧链的对不上写着 “this agentd pushed its heads” 和两边推送的时间，不提示开关，`--allow-chain` 不接受，`--allow-replaced-ledger` 接受；一个 Temporal 上两个 agentd，对方的链照样由 `--allow-chain` 接受。
+3. **链尾比推送间隔还新的记录可以被悄悄截掉**（低，安全复审；按代码指出：runtime.refused、run.refused、run.terminated、以错误结束的调用、budget.settled_open，这些都没有结果锚着）。
+   - 改法：链尾记在内存里（见“链尾”）。agentd 运行时被截，它不再追加、不再推送，日志里说一次，verify 报对不上。agentd 停着时被截，启动检查读这条链今天和昨天的锚工作流，查出来的写进 agentd.started。第一版是查出来就不启动（还加了 `--allow-older-ledger`），父会话的修正 1 改成照样启动，理由见下。
+   - 剩下的：kill -9 之后，最后一次推送之后追加的记录没有任何锚，agentd 停着时把它们截掉，谁也不知道（README 和“留到后面”都写了）。
+   - 测试：audit 里四种改动（截掉最后一条、清空、别人追加了一条、推出去的那条被改）之后都不追加、不推送、只说一次；同一个事务里的几次追加，回滚了的事务。Control 里截掉链尾、清空、只删掉 agentd.started，都报对不上。黑盒：agentd 运行时截掉最后一条，再起任务失败、链不再变长、日志里有那一行，verify 报 “the last record this agentd appended”；agentd 停着时截掉链尾，见修正 1 的测试。
+4. **空的审计日志会放行**（低，安全复审；按代码指出：没有第一条记录时，重放跳过、日志之前的任务以 2 退出、没有锚的结果不查）。
+   - 改法：agentd 在内存里记着自己这次的 agentd.started（seq 和 sha256，`Server.StartRecord`），账本必须在那个 seq 上有它、哈希相同；空日志、没有它的日志都是对不上。没有第一条记录时照样重放，每一行都算没有记录的行。
+   - 测试：Control 里清空日志、只删掉 agentd.started，都报对不上，清空时任务的行报为没有记录；黑盒的清空日志测试加了这两条。
+5. **agentd 自己的请求，有的出去之前没有记录**（提示，安全复审：启动恢复时的查找、Control 的对账查找、审批卡片的 GET）。
+   - 改法：agentd.read，在 GitHub 客户端的 transport 里每个请求之前写，写不进去就不发（见事件表和“我定的几处”）。
+   - 测试：githubtool 里对着模拟器，卡片、PR 的查找、评论的查找发出的每个请求，都在模拟器收到之前记下了，方法和路径一一对应；记不下时一个请求都不出去，查找失败，卡片说读不到。网关里三处（恢复的查找、对账的查找、审批卡片）的请求出去时，账本最新的一条就是它的 agentd.read，字段齐全。黑盒：T2 里 kill -9 之后，恢复时查 PR 的请求有它的 agentd.read（purpose lookup，`GET /repos/acme/payments/pulls`），在副作用的 effect.settled 之前；审批卡片的读都在 effect.recorded 之前。
+6. **Worker 起的 activity ID 在对不上和 “cut short” 那几行里没加引号**（提示，安全复审）。
+   - 改法：agentctl 的文本输出里，activity ID、任务 ID、别的链的键都用 `%q`；重放和 verify 的说明里，调用的 kind、结果的状态也加了。不属于任务和调用的锚对不上（agentd 自己的检查）只写 seq 和原因，不再印出空的 “run , call ,”。
+   - 测试：agentctl 里 “7, seq 9: matches; run r2” 这样的 activity ID 和几种别的 ID，都带着引号出现在各自的行里。
+7. **进行中的尝试按任务算**（父会话加的）：一条没关上的 call.started，任务还在跑就算正常，不管是第几次尝试；任务结束了才算对不上（见“我定的几处”）。
+   - 测试：Control 里后一次尝试已开始、后一次尝试已结束而任务还在跑、后一次尝试已结束而任务已结束，三种情形。
+
+**父会话转来的修正**（自动提交审查看的是第四轮进行中的提交，前后三批）：
+
+1. **启动检查信了没有认证的信号**（第一批）：见“我定的几处”的“启动检查不挡启动”和“不用 HMAC 给链头签名”。第二遍审查补了一处：这条链的锚工作流里，后推的链头 seq 比先推的低，是对不上（agentd 按顺序推，这说明两次推送之间账本倒退了）；verify 和启动检查都查，启动检查查出来的写在同一个 anchor_findings 里。
+   - 测试：audit 里截到第 7 条、再补一个时间更晚的第 7 条：推过的第 10 条不在账本里、第 7 条排在第 10 条之后，两条都查出来；seq 极大的假链头查出来、不报错；哈希不同的；空日志没有链可查；读不出历史时启动检查报错（没查成不算查过）。Control 里跨两个工作流推送顺序倒退。黑盒：agentd 停着时截掉链尾、再补一个更晚的链头，agentd 照样启动，agentd.started 和 verify 都报那两条；一个 seq 十亿的假链头不挡启动，记进 agentd.started，verify 以 1 退出。
+2. **`began` 来自被检查的账本**（第一批）：见“我定的几处”的“换掉的账本只由操作者接受”。README 的重置说明改成：重置后的账本要 `--allow-replaced-ledger <旧键>`，直到旧链的锚工作流过期。
+   - 测试：Control 里这个 agentd 的两条旧链，一条在这条链第一次推送之前就停了，一条之后还推过：默认都对不上，说明里写着两边的时间、不提示开关；`--allow-chain` 都不接受，`--allow-replaced-ledger` 接受前一条、不接受后一条；别的 agentd 的链 `--allow-replaced-ledger` 不接受，没有身份的两个开关都接受。agentctl 把 `--allow-replaced-ledger` 发给 agentd。黑盒：一个 agentd 的两个账本轮流用（一个、一个新的、再换回第一个），第一个的 verify 加上 `--allow-replaced-ledger <第二个的键>` 仍以 1 退出，说 “two ledgers of this agentd were live at once”。
+3. **启动检查只读这条链的锚工作流**（第二批）：账本在 agentd 停着时被整个换掉，新账本的链有新键，启动记录里什么都看不出。见“我定的几处”的“启动时也读这个 agentd 在别的链下推的链头”。
+   - 测试：audit 里这个 agentd 昨天在另一条链下推过第 500 条，这条链（新链、空日志两种）什么都没推过：查出一条，写着那条链的键；别的 agentd 推的更高的链头不算；这条链推得一样高时什么都不记。黑盒：从第 1 条起重写整条链之后再起 agentd，启动记录里有一条，写着旧链最后推的那个 seq 和旧链的键。
+4. **信号里的内容原样进了 agentd.started，条数不限**（第二批）：见“我定的几处”的“伪造的信号不进记录”。
+   - 测试：audit 里 101 个伪造的信号（seq 为负、sha256 是一长串乱码、sha256 是大写、身份是乱码、根本不是一个链头）：101 条“读不出的链头”，记录里只有 20 条、另记 81，记录里没有它们的任何内容。Control 里这条链的一个乱码链头报“cannot be read: it is not a head agentd pushes”，不抄内容。黑盒：往锚工作流里发 30 个伪造的信号，agentd 照样启动，启动记录里 20 条、另记 10，没有它们的内容；verify 报 30 条“cannot be read”，也没有它们的内容。
+5. **启动检查的工作量由别人的输入决定，读错还会让 agentd 起不来**（第三批）：见“我定的几处”的“启动检查有界、尽力而为；verify 有界、读不全不算通过”。
+   - 测试：audit 里列出 5,000 个当天的垃圾锚工作流：只读 50 个（这条链的在前），发现里写着另外 4,952 个没读，几毫秒完成，列表的查询按开始时间收窄，Temporal 不支持时退回不收窄；事件超过上限的；读历史出错、列表出错（假的 Temporal 客户端注入）都是发现、不是错误；每次读都慢，总时间到了就停，说没读几个。Control 里锚工作流超过上限（分页列出）、事件超过上限，报告的 unread 各有一条；agentctl 对只有 unread 的报告以 3 退出，同时有对不上时以 1 退出，没查的任务被放开时仍以 3 退出。黑盒：建 60 个当天的垃圾锚工作流，agentd 照样很快起来，启动记录里一条发现，写着 12 个没读。
+
+### 复审（第三次）发现并修掉的问题
+
+两批发现：安全复审审的是第四轮的定稿 6bb4916，对抗复审审的是第三轮的代码 4737610（按约定逐条对着第四轮的代码查，第四轮已经修掉的去掉并说明）；最后是父会话转来的、自动提交审查对第五轮第一个提交 baecfbd 的两处修正。复现都照约定只读不跑；每条都补了在旧行为上失败的测试，改坏检查见“测试怎么测”。
+
+**第一批：安全复审**
+
+0. **根目录误提交了一个 118 MB 的 agentd**（父会话指出）：第四轮的 7e97951 里，`go build ./cmd/agentd` 在仓库根目录留下的二进制被宽泛的 `git add` 带了进去，父会话在 3e51a04 里删掉了。之后每次提交只 add 明确的路径，提交前看 `git status` 和暂存文件的大小。CI 的 Go 任务加了一步：被跟踪的文件有超过 5 MB 的就失败，并点名（在一个临时仓库里试过：6 MB、名字带空格的文件被点名，以 1 退出；在本仓库以 0 退出）。
+1. **一个触发器就能关掉循环保护**（中，安全复审；实测：calls 上一个 `RAISE(IGNORE)` 的触发器，GatewayCalls 为 1 时四个调用都放行，calls 没有行、没有 call.counted，链完整、重放也没有差别。复现在 `gateway_review4_test.go`）。
+   - 原来：InsertCall 写了 0 行时当作“这次调用之前就数过了”，不写 call.counted；call 记录指向的计数不在，重放就不管它。
+   - 改法分三处：账本的模式（见“做了什么”，打开时、每个写事务、verify 都比）；写了 0 行时重读（见“做了什么”的“写了 0 行”，共 9 处）；重放里，call 记录的 scheduled_at 指向一个日志里没有 call.counted 的计数，是对不上。
+   - 测试：ledger 里打开时 6 种模式的改动（触发器、索引、视图、少了索引、多了列、多了表），建了又删掉的触发器不算改动，运行时埋下的触发器让下一个写事务失败、拿掉之后照常；网关里关掉模式检查（`Ledger.UncheckedSchema`，只给测试用）之后，同一个触发器让调用失败、不再放行，副作用、批准后的写、改过的补丁的归属各一种被丢掉的写；预算、blob 的归属、Control 的三种任务写，各自失败；重放里一条指向没数过的计数的 call 记录；verify 报出模式的改动。
+2. **按身份决定接不接受别的链**（低，安全复审；按代码指出）。
+   - 原来：链头写着另一个身份，`--allow-chain` 就接受，对不上的说明里还提示它。身份来自配置（任务队列和数据目录的写法）：重写了账本的人换个写法（符号链接、相对路径）再起 agentd，这个 agentd 自己的旧链看起来就像别的 agentd 的。
+   - 改法：`--allow-chain` 只接受在这条链第一次推送之后还推过的链（按 Temporal 的时间，即旁边另一个在跑的 agentd）；别的链不管身份，一律按换掉的账本处理，不提示，只有 `--allow-replaced-ledger` 接受（见“我定的几处”的“换掉的账本只由操作者接受”）。数据目录先解析符号链接再进身份。
+   - 测试：Control 里各链的测试按新规则改写，加了“链头写着另一个身份、却停在这条链开始之前”的一种（`--allow-chain` 不接受）；cmd/agentd 里符号链接和相对路径算出同一个身份。黑盒：一个 Temporal 上两个 agentd 的测试，第一个 agentd 在第二个之后再推一次，两条链都在对方第一次推送之后推过，`--allow-chain` 才接受；从第 1 条重写的测试，`--allow-chain` 的说明改成 “--allow-chain accepts only a chain that pushed after this chain's first push”。
+3. **两处没加引号**（安全复审，没给严重程度）：“not read” 那一行里锚工作流的 ID，“unchecked table” 那一行里表的名字，现在都用 `%q`。测试：agentctl 的两种情形。
+
+**第二批：对抗复审**（审的是 4737610，第三轮的代码；逐条对着第四轮的代码查过）
+
+1. **任务结束了、它的调用还在执行，verify 就失败**（对抗复审没给严重程度，下同；复现 `test_rev3_cancel.py`：模型调用卡在写记录之前时取消任务，任务马上 CANCELLED，verify 以 1 退出；第四轮没有修：第四轮的规则是“任务结束了，没关上的 call.started 就是对不上”）。
+   - 改法：网关在内存里记着正在执行的尝试，从 call.started 之前到 call 记录提交之后；verify 问它，在执行的算进行中，不管任务的状态；快照之后才结束的再查一遍（见“我定的几处”的“快照之后再问一遍”）。被打断的、任务结束的两条规则照旧。
+   - 测试：网关里尝试从 call.started 之前到记录提交之后都在执行、之后不在；Control 里 5 种情形（在执行、快照之后才落下记录、故障丢了记录、都不是、没有网关）。黑盒：上面复现的情形，verify 在执行时、记录落下之后都以 0 退出。
+2. **副作用的类别、工具，以及幂等键、审批卡片不比**（复现 `test_rev3_class.py`：把评论的副作用的类别从 lookup 改成 idempotent（恢复时就按幂等键重发，不先去查），给开 PR 的副作用换一个幂等键，verify 照样以 0 退出）。
+   - 改法：effect.recorded 的工具和类别本来就记了，现在和表比；effect.recorded 加 idempotency_key，approval.created 加 context_sha256（审批人看到的卡片），也比。
+   - 测试：网关里改类别、改工具、改幂等键、改审批单的工具、换掉卡片，各报对不上。
+3. **把行的日期改到日志开始之前，它就不要记录了**（复现 `test_rev3_backdated.py`：给一个日志之后建的任务，往表里加一个日期在 2000 年、没有记录的副作用和它的审批单，verify 以 0 退出）。
+   - 改法：见“我定的几处”的“按任务定哪些行要有记录”。日志之前的任务的行，照旧按日期，仍算在 before-log 里。
+   - 测试：网关里一个日志记下了创建的任务，日期在 2000 年的副作用和审批单，各报没有记录；同样的行放在日志之前建的任务名下，不报。
+4. **call.started 之后 panic，记录就永远写不下**（按代码指出）。
+   - 改法：Invoke 里 defer 一个 recover，把这次调用记下来（错误就是那个 panic），再把 panic 交给 SDK。记录因为故障没写成的（不只是 panic：写了几次都失败），单列在报告的 `attempts_unrecorded` 里，agentctl 以 2 退出，不是 1：不是有人改了账本，而是 agentd 自己没写成，日志里有。
+   - 测试：网关里 panic 的工具留下 call 记录、带着 panic；写记录一直失败的尝试被记成故障；Control 里故障丢的记录单列、不算对不上；agentctl 的退出码（丢了记录为 2，同时有对不上为 1）。
+5. **Temporal 里被终止的执行，日志里看不出是谁终止的**（按代码指出）。
+   - 改法：见“做了什么”的“终止”和“我定的几处”的“终止先记后做”。verify 里 Temporal 说被终止的执行要有 run.terminating。
+   - 测试：Control 里没有 run.terminating 的终止报对不上；agentd 终止时，问 Temporal 的那一刻 run.terminating 已经在账本里，run.terminated 在它之后，之后 verify 通过。
+6. **改坏检查里活下来的几处**：
+   - “只数 call.started 里最新的那次尝试”（control/audit.go:595）：第四轮把这段改成按任务算，代码已经没有了，去掉。
+   - “require_approval 的调用不用指向 call.started”（:601）：补了测试，要审批的调用有结果的 call 记录也必须指向一条。
+   - “可重试的错误、记录又写不下时，保留它自己的错误”（gateway.go:320）：第四轮的 `TestAnErrorWhoseRecordFails` 已经抓到（第三轮的改坏在第四轮代码上重跑时就抓到了），去掉。
+   - “故障注入的状态在 call.started 之前就答了”（:510）：补了测试，工具和模型调用各一，故障答出的状态都在 call.started 之后。
+   - “保留期也从未知任务的调用算起”（ListRunLastRecords）：保留期的测试加了一个未知任务的调用。
+   - “审批卡片的 blob 不在，不报”（ListMissingBlobs）：blob 的测试加了一个卡片不在的审批单。
+
+**第三批：父会话转来的修正**（自动提交审查看的是 baecfbd）
+
+1. **schema_version 没变就不再查**：第五轮的第一版只在 schema_version 变了时才比模式。用 `PRAGMA writable_schema` 改 sqlite_master，schema_version 不变（也能改回去）；database/sql 随时开新连接，新连接按 sqlite_master 载入模式，执行那个触发器，而记下的版本号说“查过了”。
+   - 改法：每个写事务都比 sqlite_master 的每一行；比之前先让连接重新载入模式，这一步是我加的，原因和开销见“我定的几处”的“模式逐行比，每个写事务先重新载入”。每个新连接开的时候也比，打开时和 verify 照旧。
+   - 测试：经 writable_schema 写进 sqlite_master 的触发器，schema_version 不变（测试先断言这一点），下一个写事务失败、点名它；载入过一个后来拿掉的触发器的连接，下一个写照常写进去（没有重新载入时这个写被丢掉）；sqlite_master 里有这个触发器时，新连接开不出来；驱动开连接时已经载入、检查之前又被拿掉的索引，不留在连接里（这一条是改坏检查逼出来的，见“测试怎么测”）。
+2. **以 sqlite_ 开头的都不比**：SQLite 不许 CREATE 这样的名字，writable_schema 却能直接插一个叫 sqlite_x 的触发器，检查看不见它。
+   - 改法：每一行都比，SQLite 自己的对象也是（见“做了什么”的“账本的模式”）；打开时先跑 `PRAGMA quick_check`。
+   - 测试：打开时，名叫 sqlite_ 开头的触发器、视图，一个自动索引的行出现两次，自动索引的 sql 从 NULL 变成空串，sqlite_sequence 的 SQL 改了，sqlite_stat1 的 SQL 改了，各不打开、点名；ANALYZE 建的两张表，在打开之前建的、运行时建的，都不挡；quick_check：一页的类型被抹掉（SQLite 读不下去）、空闲页数写错（SQLite 报一行），都不打开。verify 里名叫 sqlite_x 的触发器报模式对不上。黑盒：agentd 运行时往 sqlite_master 里写一个名叫 sqlite_no_count 的触发器，起任务失败并点名它、链不变长，verify 不通过；拿掉之后照常；agentd 停着时写进去，agentd 不启动，说明原因；拿掉之后启动，verify 以 0 退出。
+
+**第四批：父会话转来的三处修正**（看的是 50e3021），**和最终安全审查的一处补充**（5b）
+
+1. **Temporal 自己的终止被报成对不上**：没有 run.terminating 的终止是 agentd 之外的终止，不是账本被改；`test_runtime_limits` 里 Temporal 终止的任务让诚实的流程失败。
+   - 改法：列在新的 `terminated_outside_agentd` 里（任务、执行、时间，终止事件里调用者自称的身份和理由），不算对不上，不影响退出码；agentctl 的文本加了一行 “terminated”，引号括起、截断，写明那是调用者的话。见“做了什么”和“我定的几处”的“终止先记后做”。
+   - 测试：Control 里终止事件的时间、身份（带一个换行）、理由原样列出、身份里的换行被转义，不算对不上；操作者写的、别的执行的 run.terminating 不算；agentd 自己终止的不列。agentctl 里这一行的引号和截断，只有这一项时以 0 退出。黑盒：`test_runtime_limits` 的两个超限测试，Temporal 以 GrpcMessageTooLarge 终止任务之后，verify 以 0 退出，列出这个任务和它的理由。普查加上了这个文件。
+2. **verify 的读不重新载入模式**：verify 的读事务在 BEGIN 之后重新载入、再比，和写一样。
+   - 补充（最终安全审查）：Control 的只读调用（GetApproval、ListPending、ListRuns 等）连读事务都不用，同样会被骗。改成在 `Ledger.Read` 里做，每个读事务都有，Control 的读都放进读事务（见“我定的几处”的“读事务也先重新载入、再比”）。
+   - 测试：ledger 里一个伪造的索引（自己的树里少一行），被所有连接载入之后又从 sqlite_master 拿掉：在读事务之外读，漏掉那一行（测试先断言这一点）；读事务里读到它；索引还在 sqlite_master 里时，读事务失败、点名它。Control 里一个顶替 approvals 的视图（approvals 的行之外编一条等审批的），schema_version 跟着变了：ListPending、GetApproval、ListRuns、GetRun 都失败、点名这个视图，不给出编的行；verify 进行中、快照之后再读之前被改的模式，让 verify 失败、点名它（这一条是改坏检查逼出来的）。
+3. **rootpage 不比**：verify 跑 `PRAGMA integrity_check`，结果不是 “ok” 就是对不上，列出前几行，加引号、截断。
+   - 测试：ledger 里两个索引互换 rootpage（sqlite_master 除了 rootpage 都是迁移的）、一页的类型被抹掉，都有发现，没动过的什么都没有。Control 里同样互换审计日志的两个索引：10 行 “row N missing from index ...”，再加一条说可能还有，verify 不再往下读。
+
+**第五批：最终对抗复审**（看的是 50e3021，5c）
+
+1. **agentd 发现别人追加了记录、停了写，verify 却以 0 退出**（中；复现 `test_rev_forge.py`：任务等审批时，同一个用户的进程往账本末尾追加一条链接正确的 approval.decided，改好审批单，不碰 Temporal。agentd 在下一次追加时发现，记下 “THE AUDIT LOG CHANGED UNDER AGENTD”，之后每个调用都以 AuditUnavailable 失败，任务 FAILED，什么都没发出去；verify 以 0 退出）。
+   - 原因：Append 的检查（`tip.go` 的 `onto()`）要求链的最后一条就是 agentd 最后追加的那条；VerifyAudit 只用 `Held()` 查那条还在，接在它后面的追加不动它。
+   - 改法：verify 把快照里排在这个 agentd 最后追加的那条之后的记录都报成对不上（前 10 条点名、加引号，再多写 “and more”），也报 agentd 发现链被动过的那个状态（`tell` 记下的第一次原因，新加 `audit.Moved`）。读的顺序见“我定的几处”的“快照和链尾在写的轮次里一起读”。
+   - 测试：Control 里另一个进程（同一个文件的另一个 Ledger）追加一条 operator:mallory 的 approval.decided：verify 点名它；agentd 的下一次追加被拒之后，verify 也报 agentd 发现链被动过；再追加 11 条，只点名前 10 条、写 “and more”。8 个 goroutine 不停追加时 verify 跑 200 次，一条都不报。黑盒：照复现的做法伪造一条决定，任务 FAILED、一个 PR 都没开、日志里有那句话，verify 以 1 退出，点名那条记录，也报 agentd 发现链被动过。
+2. **`Find`、`Describe` 在 `Tx` 的闭包里调用会死锁**（低，只写笔记）：见“留到后面”。
+
+### 测试怎么测
+
+- **黑盒**（`tests/test_audit_log.py`，经 agentctl、只读打开账本文件、Temporal 的 API）：
+  1. 一个等审批、被批准的任务：链从 agentd.started 开始（agentd 自己的、pid 和四个配置文件的 sha256 都对，带命名空间的保留期；保留期短于 7 天时日志里有警告）；run.created、approval.decided 是操作者的，peer_uid == os.getuid()，decided_by 在 payload 里；call 都是 run 的，每个调用的 policy 对得上（开 PR 的两次都是 require_approval，第一次 needs_approval）；开 PR 那条写的顺序是 effect.recorded、approval.created（run）、approval.used、effect.claimed、若干 effect.sending、effect.settled（agentd），approval.decided 在 approval.created 和 approval.used 之间。Python 自己实现的哈希走完整条链。历史里每个结果的 `_audit` 都对得上账本：记录的 activity_id、attempt（这次完成的 ActivityTaskStarted 的）、状态，以及 result_sha256（Python 另写的 Go JSON 编码重算）。`agentctl audit verify` 通过（状态也对得上），`--run` 也通过。
+  2. agentd 停着时改账本，再起 agentd：改一条记录的 payload，verify 报在那个 seq 断开；删一条，同样报在那个 seq，指向它的锚也对不上，而且账本换回旧副本这件事本身也被抓到（上一个 agentd 停下时推出去的链头，和副本上新追加的那条对不上）；从那条起整条链按 Python 的哈希重写，链完整，但从那条起的每个锚、每个推出去的链头都对不上；改任务的预算不改记录，state_mismatched 点名这个任务。文本输出也写明了，退出码 1。
+  3. 从账本里抹掉一个任务（审查意见要的）：三个任务依次跑完，删掉中间那个的 runs 行和它所有的记录，后面的记录重新编号、重算哈希。链自己是完整的、找不到这个任务；verify 仍然失败，runs_mismatched 点名它（Temporal 有、账本没有行），它和后面那个任务的锚都对不上，它之后推出去的链头也对不上；`--run` 按 ID 照样找得到它。
+  4. 四个任务同时跑：seq 连续、每条都链得上；有任务的记录之间夹着别的任务的记录；各任务的锚各指各的。
+  5. 模型调用中途 kill -9 agentd 再起：链完整，agentd.started 两条（incarnation 不同）；被打断的那次尝试有它的 call.started（策略的决定在里面），没有 call 记录，后面是新 agentd 的 agentd.started；第二次尝试也有 call.started，它的 call 记录指向它。新 agentd 的 budget.settled_open 在它自己的 agentd.started 之后，是这个任务的，金额等于账本里那笔 open_at_start 的结账；任务跑完，verify 以 0 退出，并把第一次尝试报为被打断的。
+  6. 对 Runtime 入口发三个不许的调用：审计日志里三条 runtime.refused（经队列写入），和 agentd 日志的三行一一对应。
+  7. 链头推到 Temporal：agentd 运行时 30 秒内推出链头；停下前最后一条记录（一次被拒的启动）在停下时推出；锚工作流的 ID 带着第 1 条记录的键，之后的 agentd.started 写着这个键，第一条不写；每个推出去的链头都是链上的那条记录；再起 agentd，verify 查过它们，报出最后一个链头之后的记录数。
+  8. 一个 Temporal 上两个 agentd、两个账本：各推各的锚工作流；各自的 verify 点出对方的链（不加 `--allow-chain` 时退出码 1），加上对方的键就都以 0 退出。
+  9. 有人抢先用别的类型建了当天这条链的锚工作流：agentd 第一次推送后看出来，记一条 error；verify 报对不上，也不把里面的东西当链头。
+  10. agentd 运行时清空审计日志：verify 以 1 退出，说“Temporal holds heads or anchored results, but the audit log has no records”，没有任务算在日志之前。
+  11. 从第 1 条起重写整条链（Python 重算每个哈希）：链完整，键变了；verify 点出旧链的键并以 1 退出，文本输出里也有；加 `--allow-chain <旧键>` 就通过（这正是这个开关要点名的原因）。
+  12. 日志之前的任务（模拟 M1 到 M4 的一行，没有记录，Temporal 里也没有它）：退出码 2，`--allow-before-log` 时为 0。
+  13. 删掉锚工作流：agentd 运行过 65 秒后，verify 报第 1 条记录起没有推出去的链头覆盖，以 1 退出。
+  14. 第四轮：任务跑完后清空 calls 和 budget_entries：verify 以 1 退出，报 call 和 budget，报告列出不比的三张表。
+  15. 第四轮：agentd 运行时截掉最后一条：再起任务失败，链不再变长，日志里有 “THE AUDIT LOG CHANGED UNDER AGENTD”，verify 报 “the last record this agentd appended”。
+  16. 第四轮：agentd 停着时截掉链尾，再补一个时间更晚的链头：agentd 照样启动，启动记录和 verify 都报推过的最高链头不在账本里、补的那个排在它后面。
+  17. 第四轮：往锚工作流里灌 30 个伪造的信号：启动记录 20 条、另记 10，不抄内容；verify 报 30 条 “cannot be read”。建 60 个当天的垃圾锚工作流：agentd 照样很快起来，启动记录写着 12 个没读。发一个 seq 十亿的假链头：不挡启动，记进启动记录，verify 以 1 退出。
+  18. 第四轮：从第 1 条起重写整条链（第 11 条改了）：启动记录写着这个 agentd 推的最高链头是旧链的；verify 的对不上写着两边推送的时间、不提示开关，`--allow-chain` 不接受，`--allow-replaced-ledger` 接受。一个 agentd 的两个账本轮流用：`--allow-replaced-ledger` 也不接受，说两个账本同时在用。
+  19. 第四轮：清空审计日志（第 10 条）还报 agentd 自己的 agentd.started 和最后追加的记录不在了，任务的行报为没有记录；第 1 条的一个等审批的任务里，审批卡片的每个 GitHub 请求都有 agentd.read，在 effect.recorded 之前；T2 里 kill -9 之后恢复时查 PR 的请求有它的 agentd.read，在 effect.settled 之前。
+  20. 第五轮：一个 Temporal 上两个 agentd（第 8 条）：两个都重启过之后，第一个再停一次、推一次，两条链都在对方第一次推送之后推过，加上对方的键才都以 0 退出。
+  21. 第五轮：从第 1 条重写整条链（第 18 条）：`--allow-chain` 不接受时，说明写着它只接受在这条链第一次推送之后推过的链。
+  22. 第五轮：agentd 运行时往 sqlite_master 里直接写一个名叫 sqlite_no_count、丢掉每个计数的触发器（schema_version 不变）：起任务失败，错误里点名它，链不变长；verify 不通过（报告里模式对不上，或者读不了账本、错误里点名它）；拿掉之后任务照常跑完。agentd 停着时写进去：agentd 不启动，日志里点名它，说 “agentd does not open it”；拿掉之后启动，verify 以 0 退出。
+  23. 第五轮：模型调用卡在写记录之前时取消任务：任务马上 CANCELLED，它的 call.started 没关上，verify 以 0 退出（agentd 说这次尝试还在执行）；放开之后记录落下，verify 仍以 0 退出。
+  24. 5b：`tests/test_runtime_limits.py` 的两个超限测试，Temporal 以 GrpcMessageTooLarge 终止任务之后，verify 以 0 退出，`terminated_outside_agentd` 里是这个任务和这个理由。
+  25. 5c：任务等审批时，另一个进程往账本末尾追加一条链接正确的 approval.decided、改好审批单：任务 FAILED，没有开 PR，agentd 日志里有 “THE AUDIT LOG CHANGED UNDER AGENTD”；verify 以 1 退出，点名那条记录（类型和 actor 加引号），并报 agentd 发现链被动过。
+  - T9 的禁止调用表多了三项：轮询锚的任务队列、给锚工作流发信号、SignalWithStart 它。
+- **Go 测试**：
+  - `internal/audit`：哈希的两个固定样例（用 Python 的 hashlib 和 shasum 另算的）、每个字段和字段边界都进哈希；追加的链接；事务回滚时记录一起回滚；50 个并发追加成一条链；不收空 type、空 actor、非对象、非 UTF-8；每种篡改都在改动处断开（改 payload、actor、peer_uid、at，删一条、删第一条，改了记录又重算它自己的哈希、两条换位、跳着链接）；整体重写过的链能通过（只有锚抓得到）；跨页；Text。
+  - `internal/gateway`：触发器让某种记录写不进去，17 种变化都失败、账本一个字节都不变，去掉触发器后同样的变化带着记录做成（记录、带审批单的记录、领取、`proceed`、交还、`settle`、批准、拒绝、过期、批准后放行、`gate` 补审批单、批准了却没及时用（审批作废、副作用放弃，各一个）、批准后写没生效就过期、修改被取代、人的核对、启动时放弃已取消任务的写）；Invoke 的 call 记录和指向它的 `_audit`、记录之前是协议的各步、outcome 一起写下；七种在派发前或被拒的调用各有记录（run ID 一直没记上的那种是可重试的错误，不带 error_type）；call 记录写不进去时返回可重试的 AuditUnavailable、outcome 也没写，下一次尝试带着记录作答。另外，每个用 `newFixture` 的网关测试结束时都核对一遍：链完整，按审计记录重放出的每个副作用（状态、领取者、maybe_sent）和审批单（状态、是否用过）等于账本里的。状态机每一步之后也做这项核对（并且要求账本里每个副作用和审批单都有记录），每次游走结束再走一遍链。
+  - `internal/control`：run.created/started/discarded/cancelled 各自和它的变化同进同退；没有对端凭据什么都不做；真 Unix socket 上的 uid 来自内核，TCP 连接被拒；runs 表和 Temporal、审计链对不上的 14 种情形；锚的各种对不上；历史里结果的读取。
+  - `internal/budget`：追加额度和启动时结账各自要有记录。`internal/runtimeproxy`：钩子收到的和日志写的一一对应，count 加起来是被拒的总数。`cmd/agentctl`：报告里 Worker 写的文字不起作用，伪造不出第二行 chain。
+  - 第二轮加的：
+    - `internal/ledger`：400 个同时的写事务全部提交；排队的写事务等到 ctx 结束为止；读事务是一个快照，读的时候写不用等；AST 测试：没有一个会开事务的函数在 Tx 的闭包里被调用（同时检查扫到了 20 个以上的闭包，并且认得出 `Gateway.settle` 会开事务，免得测试本身空跑）。
+    - `internal/audit`：拒绝队列（丢弃的条数进下一条记录、写失败的也算、账本不响应时停下有上限）；链头推送（链头没动不推、推失败下次再推、按间隔推、工作流 ID 和选项、UTC 日期）。
+    - `internal/gateway`：call 记录的 result_sha256 和 reason（ok 的结果里的 reason 不抄）；以错误结束、记录又写不进去时返回可重试的 AuditUnavailable；记录写入失败一阵后恢复，尝试照样成功；ctx 已取消时照写记录；循环保护的拒绝和记录同进同退；effect.claimed 的 version；7 种 UPDATE 没改到东西的情形都没有记录；决定和过期同时发生；改表不改记录的 9 种情形；协议规则。`checkAudit` 和状态机的核对改用 `audit.Projection`，和 VerifyAudit 是同一份代码。
+    - `internal/control`：VerifyAudit 整体跑在假 Temporal 上：完整的日志、翻页、Temporal 没有历史（保留期之内、之外）、读历史出错、历史里的结果被改、推出去的链头、改表的 14 种情形和已丢弃任务的行又回来了；run.refused 的三种原因、两处 run.terminated；没改到东西的 run.started、discarded、cancelled 不记；操作者的名字（不收含空白、不可打印字符或过长的名字）。
+    - `internal/budget`：启动时结账，每个任务一条记录、金额对得上。`cmd/agentd`：runtime.refused 记录的 method、command、reason、count、within。`cmd/agentctl`：退出码的 8 种情形；报告里的状态对不上那几行也经 safetext。
+  - 第三轮加的：
+    - `internal/ledger`：panic 的事务回滚、交还轮次；被改过的 blob 读不出来；每个写都经过轮次（AST 测试读 sqlc 生成的查询）。
+    - `internal/audit`：结果哈希的 10 个固定向量和 7 种不是一个对象的输入；锚工作流 ID 带链的键、每天看一眼当天的工作流；写失败的那条记录把之前丢掉的条数也算上。
+    - `internal/gateway`：改表的 6 种新情形和改过的补丁；日志之前批准、之后用掉的审批单；参数错误和超过尝试上限的保留自己的错误；等轮次有上限、有心跳；重试之间有心跳。
+    - `internal/control`：各链各管各的（别的链默认对不上、`--allow-chain`、类型和队列、读不出和名字不对的信号）；没有推出去的链头覆盖的记录；保留期从最后一次调用算起；日志之前的任务（没有历史的、历史还在的）；空的审计日志；blob；没有 run.started 的 run_id；读不出的 created_at；VerifyAudit 的两个快照（在两次读之间插进一个 StartRun）。
+    - `cmd/agentctl`：在真 Unix socket 上的假 agentd 面前跑 `audit verify`：0、1、2、3 各种情形，`--allow-chain` 发到 agentd，`--allow-before-log`，`--timeout`。
+    - 修正 4：网关里工具调用和模型调用的 call.started 都在请求出去之前，写不进去就什么都不发；call 记录指向它、两者说的是同一次尝试；被拒的调用没有它。Control 里尝试记录的 12 条规则；被改过 payload 的审批单和对账项照样显示为“改过了”。agentctl 的报告里有被打断的尝试。
+  - 第四轮加的：
+    - `internal/ledger`：AST 测试跟着“会写的函数”走（抓到了 `closeUnanswered`）；事务的提交钩子。
+    - `internal/audit`：链尾的四种改动之后不追加、不推送、只说一次；同一个事务里的几次追加，回滚的事务；推送的信号带身份；启动检查（每个链头、顺序、哈希不同、补的链头藏不住截断、seq 极大的假链头只是一条发现）；按身份找出被换掉的账本；101 个伪造的信号有界、不抄内容；启动检查的三个上限、超时、读错、列表错、不支持按开始时间收窄。
+    - `internal/gateway`：calls、model_calls、blob_owners、effect_resolutions 的每一列都和记录比（四组）；agentd 自己的三处读，以及写不下记录时请求不出去。
+    - `internal/githubtool`：卡片、PR 和评论的查找，每个请求都先记下、方法和路径和模拟器收到的一一对应；记不下时一个请求都不出去。
+    - `internal/budget`：每种分录都有它的记录。
+    - `internal/control`：三种别的链（别的 agentd 的、没有身份的、这个 agentd 自己的）和两个开关，两个账本同时在用；推送顺序倒退；截掉链尾、清空日志、删掉 agentd.started；乱码链头不抄；锚工作流和事件超过上限；每张表要么比、要么列出原因；进行中的尝试按任务算。
+    - `cmd/agentctl`：Worker 和别人能起的名字都带引号；`--allow-replaced-ledger` 发给 agentd；读了一部分的报告以 3 退出（有对不上时以 1）。
+  - 第五轮加的：
+    - `internal/ledger`：打开时 12 种模式的改动，以及不算改动的两种（建了又删掉的触发器、ANALYZE 的表），见“复审（第三次）”；运行时改模式的三种（建触发器、经 writable_schema 写进去而 schema_version 不变、载入之后又拿掉）；新连接的检查两种（开不出来、不留下检查之前载入的）；quick_check 的两种损坏。
+    - `internal/gateway`：触发器关不掉循环保护；被丢掉的副作用、批准后的写、补丁的归属；循环保护的拒绝记不下、和计数一起回滚时，这次尝试的记录不指向那个计数；尝试从 call.started 之前到记录提交之后都在执行，同一次尝试开始了两次的，两次都结束才算不在执行；panic 留下记录；故障丢的记录被记下；故障答出的状态在 call.started 之后（工具、模型）；副作用的类别、工具、幂等键和审批单的工具、卡片都和记录比；日志记下了创建的任务，日期在日志之前的行也要有记录。
+    - `internal/control`：任务的三种写被丢掉；verify 报模式的改动（索引，名叫 sqlite_x 的触发器）；任务结束之后还在执行的尝试（5 种）；被终止的执行（以及 agentd 终止时记录的先后；操作者写的、别的执行的 run.terminating 都不算）；各链的规则按 Temporal 的时间改写；保留期不从未知任务的调用算起；卡片的 blob 不在；要审批的调用也要指向 call.started。
+    - `internal/budget`、`internal/audit`：被丢掉的追加额度、blob 归属；指向没数过的计数的 call 记录。
+    - `cmd/agentd`：数据目录的符号链接、相对路径算出同一个身份。`cmd/agentctl`：两处引号；丢了记录的退出码。
+  - 5b 加的：
+    - `internal/ledger`：读事务重新载入、再比（伪造的索引：读事务之外漏行，读事务里不漏，还在 sqlite_master 里时读事务失败）；integrity_check 的三种（没动过、两个索引互换 rootpage、一页的类型被抹掉）。
+    - `internal/control`：agentd 之外的终止列出来、不算对不上；顶替 approvals 的视图让四个只读调用都失败；verify 遇到模式的改动、互换的索引都停下，unread 里写明；快照之后的再读也查模式；没有迁移的表是模式的对不上。
+    - `cmd/agentctl`：terminated 那一行的引号和截断；只有它时以 0 退出。
+  - 5c 加的：`internal/control` 里另一个进程追加的记录（点名、被拒的下一次追加、超过 10 条），以及 verify 和不停的诚实追加赛跑 200 次。
+- **跑过的**（5c 的代码，macOS 不加沙箱）：`go vet`（macOS 和 Linux arm64）、`gofmt -l` 都干净；`go test ./...` 里网关的一个测试（`TestRecoveryOfAnApprovedWriteAfterItsApprovalExpired`，审批的有效期只有 300 毫秒）在机器同时跑普查和改坏检查时失败了一次，单独跑 5 次都过，和 5c 无关；其余全过。control、audit、ledger 在 `-race` 下也过（control 的赛跑测试在 `-race` 下很慢，所以后来把 verify 的次数从 200 降到 100：不加 `-race` 约 2 秒，两种错的顺序仍然次次被抓到，6 次里 6 次）。黑盒：新的伪造决定测试通过；普查的 23 个文件 78 passed。
+- **诚实流程的普查**（5c）：同样的 23 个文件，78 个测试全部通过。和 5b 逐个对照，原来的 77 个没有一个变了：诚实的 58 个都以 0 退出（T7 的并发调用、kill -9 的那些都在里面，没有一个报“goes on past”），新的伪造决定测试有意以 1 退出。
+- **5c 的改坏检查**：Go 的 11 处（不报之后的记录、不报 agentd 发现的变化、不记下这个变化、从最后一条算起而不是它之后、名字不加引号、全部点名、超过 10 条不说、先读链尾后开快照、开快照后不拿轮次读链尾、开快照之前就交出轮次），加上第四轮一处在 5c 改写的代码上的移植（verify 不查最后追加的那条还在）。10 处抓到；活下来的是“开快照之前就交出轮次”：它先拿过一次轮次，等进行中的写事务做完，窗口只剩“另一个写事务提交之后、记进链尾之前”的几微秒，测试撞不上，道理写在代码的注释里；要紧的两种错的顺序都抓到了。只有黑盒抓得到的 2 处（不报之后的记录、不报 agentd 发现的变化）都由新的黑盒测试抓到。第五轮、5b 的改坏在 5c 的代码上都还匹配（它们改的代码 5c 没动），没有重跑。
+- **跑过的**（5b 的代码，macOS 不加沙箱）：`go vet ./...`（macOS 和 Linux arm64）、`gofmt -l` 都干净；`go test ./...` 全过（第一次被一个 SIGTERM 连同整个 go test 打断，不是测试失败，重跑全过）；ledger、control、budget、agentctl 在 `-race` 下也过。黑盒：`tests/test_runtime_limits.py` 3 passed；下面普查的 23 个文件，77 passed。
+- **诚实流程的普查**（5b）：同一个插件（多看一项 terminated_outside_agentd），第五轮的 22 个文件加上 `tests/test_runtime_limits.py`，77 个测试全部通过。和第五轮逐个对照，没有一个变了；新的 3 个都以 0 退出，两个超限测试各列出一个 agentd 之外的终止，理由是 GrpcMessageTooLarge。诚实的 58 个都以 0 退出（14 个报出被打断的尝试），有意改账本、改 Temporal 的 17 个还是那些（16 个以 1、日志之前的任务以 2），拒绝启动的 2 个没法验；哪一个都没有 attempts_unrecorded，也没有模式或 integrity_check 的发现。
+- **5b 的改坏检查**：Go 的 23 处：agentd 之外的终止 8（又算成对不上、不列、不读调用者的话、不留终止事件、调用者的话不做安全处理、agentctl 不显示、不加引号、算进退出码）；读事务 9（不重新载入、不比、整个不查，ListPending、GetApproval、ListRuns、GetRun 绕过读事务，verify 遇到坏模式还往下读，快照之后的再读绕过读事务）；integrity_check 6（不跑、不看它的行、读不下去的页算错误、绕过重新载入、不加引号、满 10 行不说）。第一遍 22 处抓到，活下来的是“快照之后的再读绕过读事务”：补了 `TestVerifyAuditReadsAgainThroughTheCheck`（verify 问网关的时候埋一个触发器，再读必须失败），重跑抓到。只有黑盒抓得到的 2 处（又算成对不上、不列）都由 `test_runtime_limits` 抓到。第五轮的 71 处在 5b 的代码上重跑：70 处照旧抓到，1 处（“被终止的执行什么都不要”）的代码 5b 改写了，由上面的“不列”代替。
+- **跑过的**（第五轮的定稿代码，macOS 不加沙箱）：`go vet ./...`（macOS 和 Linux arm64）、`gofmt -l` 都干净；`go test ./...` 在定稿上全过。之前的一次里 githubtool 撞上了 10 分钟的超时：同时有别的会话的模糊测试和服务占着机器（负载 28 上下），单独重跑 682 秒通过，定稿上那次 252 秒（第四轮约 240 秒）；它的测试不碰账本。ledger、audit、control、budget、agentctl、agentd 和网关里审计相关的测试在 `-race` 下也过；`-race` 抓到 agentctl 退出码测试自己的一处竞争（测试换 answer 的时候，服务器上一个请求的 goroutine 还可能在读它），加了锁。黑盒：`tests/test_audit_log.py` 的 22 个、T2 的 4 个、取消的 2 个，28 passed；下面普查的 22 个文件，74 passed；定稿的二进制上 `tests/test_audit_log.py` 又跑了一遍，22 passed。
+- **诚实流程的普查**（第五轮）：同一个插件（多看一项 attempts_unrecorded），同样的 22 个文件，74 个测试（多了上面的第 22、23 条），全部通过。和第四轮逐个对照，没有一个变了：诚实的 55 个都以 0 退出（第四轮的 53 个，加上新的两个），其中 14 个报出被打断的尝试；不是 0 的 17 个还是那些有意改账本、改 Temporal 的测试（16 个以 1，日志之前的任务以 2）；agentd 按设计拒绝启动的 2 个没法验。哪一个都没有 attempts_unrecorded。
+- **第五轮的改坏检查**：Go 的 71 处。按改的地方分：模式 15（打开时不比、写事务不比、只在 schema_version 变了时才比、新连接不比、新连接不重新载入、写事务不重新载入、又把 sqlite_ 开头的排除、重复的行合成一行、NULL 当空串、ANALYZE 的表不放过、只按名字放过、quick_check 不跑、它报的行不看、它的失败不算损坏、verify 不报）；写了 0 行 12；链和身份 6；引号 2；执行着的尝试和故障 8；类别、工具、幂等键和卡片 7；按任务定要记录的行 3；终止 4；对抗复审活下来的 3；第四轮在第五轮改写过的代码上移植的 11。只有黑盒抓得到的 4 处，都抓到：Control 拿不到网关的尝试（`Attempts: gw`）、写事务不比模式、又把 sqlite_ 开头的排除、打开时不比模式。
+  - 第一遍：6 处测试仍通过，11 处的写法编译不过（`if false` 之后变量没人用了，换了写法）。活下来的 6 处：新连接不重新载入（补了 `TestANewConnectionKeepsNothingItLoadedBeforeItsCheck`，这才看出 modernc 执行 DSN 里的 pragma 时就已经载入了模式，重新载入是必要的）；“NULL 当空串”第一版只改了排序时的比较，判定用的是 ==，这个改坏和原来等价，换成在查询里 COALESCE（第五轮之前就是这样），抓到；守卫的事务回滚时不清 scheduled_at（补了 `TestARefusalRolledBackNamesNoCount`：拒绝记不下、和计数一起回滚，之后那条记录不能指向这个计数）；同一次尝试开始两次、第一次结束就当不在执行（补了单元测试）；操作者写的、别的执行的 run.terminating 也算（两种都补进 `TestVerifyAuditOfTerminatedExecutions`）。
+  - 补了测试之后重跑：71 处全部抓到。
+  - 第四轮的 105 处 Go 改坏在第五轮的代码上重跑：91 处照旧抓到；14 处改的代码第五轮重写了，其中 11 处按新代码移植（上面那 11 处），都抓到；另外 3 处不再移植：“这个 agentd 的链被 `--allow-chain` 接受”就是上面的“`--allow-chain` 接受不在同时推的链”；“别的 agentd 的链被 `--allow-replaced-ledger` 接受”现在是有意的（不在同时推的链都按换掉的账本处理），同时在推的那种由“`--allow-replaced-ledger` 接受同时在推的链”管；“没有身份的链头提示了开关”由第四轮那条仍然匹配的“这个 agentd 的链提示了开关”管，它照旧抓到。第四轮只有黑盒抓得到的 7 处，在第五轮的二进制上重跑，都照旧抓到。
+- **模式检查的开销**（第五轮，父会话要的数）：每个写事务（`BenchmarkR5Tx`：一次写一个 blob，2,000 次一轮，5 轮的中位数）：只在 schema_version 变了时才比（第五轮第一版）64 微秒；每次都比、不重新载入 104 微秒；定稿（先重新载入、再比）240 微秒。多出的 176 微秒里，重新载入约 136。安全复审那个 1000 个调用同时被循环保护拒绝、操作者每 100 毫秒写一次的测试（照抄成 `TestR5WriteContention`，用 -overlay 编进去，不进仓库），三种代码交替各跑 8 轮（机器被别的会话占着，负载 15 到 22）：中位数从 1.02 秒到 1.45 秒，操作者的写最慢的一次从 0.50 秒到 0.68 秒；没有 SQLITE_BUSY，没有失败，1000 条记录一条不少。负载更高（28 上下）时的 5 轮：2.03 秒到 3.12 秒。打开一个 132 MB 的账本，quick_check 用 70 到 130 毫秒（页在缓存里）。两个基准都在会话的 scratchpad 里。
+- **跑过的**（第四轮的定稿代码 7e97951，macOS 不加沙箱）：`go vet ./...`、`gofmt -l`、`go test ./...` 全过；Linux（arm64）交叉编译、`go vet` 都过。黑盒：`tests/test_audit_log.py` 的 20 个和 T2 的 4 个，24 passed；下面普查的 22 个文件，72 passed。
+- **诚实流程的普查**（第四轮）：同一个插件（插件在会话的 scratchpad 里），同样的 22 个文件（对抗复审的 19 个，加上 T13、跨提供方 fallback、T1 的 Worker 那半），共 72 个测试，全部通过。诚实的 53 个都以 0 退出，其中 14 个被 kill -9 打断过，报出被打断的尝试，不算对不上。不是 0 的 17 个都是测试有意造成的：改账本、截掉链尾（agentd 停着时、运行时）、清空日志、抹掉任务、改表、从第 1 条重写、一个 agentd 的两个账本轮流用、删锚工作流、抢先建锚工作流、伪造的链头（灌信号、seq 十亿的、一堆垃圾锚工作流）、两个 agentd（不加 `--allow-chain`）、T5 改 payload 的字节、在 Temporal 里直接起一个重用任务 ID 的执行（以上为 1），日志之前的任务（2）。另有 2 个测试里 agentd 按设计拒绝启动，没法验。
+- **第四轮的改坏检查**（连同父会话的三批修正）：Go 的 93 处（`internal/audit` 的链尾、启动检查、伪造的信号、上限，`internal/control` 的身份和两个开关、推送顺序、上限、`internal/gateway` 的表和 agentd 的读，`internal/githubtool` 的 transport，`internal/ledger` 的提交钩子，`cmd/agentctl` 的引号和退出码），全部有测试失败。第一遍 88 处抓到；2 处测试仍通过，都补上了：恢复时等过之后的第二次查找没有测试走到，补了一个；`closeUnanswered` 那处改坏把 `g.Ledger.Q` 藏在了闭包参数里，不是原来那个毛病的样子，改成原样（`budget.Release(ctx, g.Ledger.Q, …)`）后 AST 测试抓到；另有 3 处改坏的写法编译不过，换写法后都抓到。只有黑盒抓得到的 7 处（agentd 的接线：启动记录不写发现、不写多出的条数、推送不带身份、Control 不知道身份、启动检查不知道身份、Control 不知道自己的启动、链被动过不记日志）全部抓到（1 处第一遍编译不过，换了写法）。脚本在会话的 scratchpad 里，没进仓库。
+  - 前几轮的在第四轮的代码上重跑：第三轮的 60 处 Go 改坏，53 处照旧抓到，7 处改的代码第四轮重写了，按新代码重写后都抓到；第三轮只有黑盒抓得到的 3 处，1 处照旧、2 处按新代码重写后都抓到。第二轮的 96 处：81 处抓到（其中 2 处让写事务、队列永远等下去，测试以超时失败）；2 处照旧是等价的或有意改过的（`approved()` 里不可能的 n==0，第三轮改过的“以错误结束、记录写不进去时返回原错误”的规定）；13 处改的代码后来重写了（第三轮 9 处，当时已按新代码重写；第四轮 4 处，按新代码重写后都抓到）。`scripts/mutate-effects.py` 的 28 处全部抓到。
+- **跑过的**（第三轮的定稿代码，macOS 不加沙箱）：`go vet ./...`、`gofmt -l`、`go test ./...` 全过；Linux（arm64）交叉编译、`go vet` 都过。黑盒：`tests/test_audit_log.py` 的 13 个全过；T14、T13、跨提供方 fallback、T7、T1 的 agentd 那半、T3、T9 的 Runtime 入口、T4、取消、agentd 重启、mTLS、审批闸门、T16、dry run，33 passed。
+- **诚实流程的普查**（修正 4 要的）：照对抗复审的做法，一个 pytest 插件在每个黑盒测试的测试体跑完、栈还在时调一次 `agentctl audit verify`（插件在会话的 scratchpad 里）。跑了对抗复审那 19 个文件，加上 T13、跨提供方 fallback、T1 的 Worker 那半，共 65 个测试（64 passed；T5 有一个因为修正 3 改了提示的措辞而失败，改回措辞后 4 个都过）。诚实的 52 个都以 0 退出，其中被 kill -9 打断的那个报出被打断的尝试。不是 0 的 11 个都是测试有意造成的：改账本、抹掉任务、清空日志、从第 1 条重写、删锚工作流、抢先建锚工作流、在 Temporal 里直接起一个重用任务 ID 的执行、改 payload 的字节（以上为 1）、两个 agentd（不加 `--allow-chain` 为 1）、日志之前的任务（2）；另有 2 个测试里 agentd 按设计拒绝启动，没法验。
+- **第二轮的定稿代码上跑过的**（macOS 不加沙箱）：`go vet ./...`、`gofmt -l`、`go test ./...` 全过；ledger、audit、control、budget、agentctl 和网关里审计相关的测试在 `-race` 下也过；Linux（arm64）交叉编译、`go vet` 都过。黑盒：`tests/test_audit_log.py` 的 7 个，加上 T9 的 Runtime 入口那个，8 passed；T7、T4、取消、T15、mTLS、agentd 重启、Runtime 上限、T1 的 agentd 那半、网关身份，18 passed；T3、T5、dry run、T14、T16、T6、审批闸门，16 passed。三种环境的完整套件留给用户跑。（第一轮：`tests/test_audit_log.py` 的 6 个和 T3、T4、T5、dry run、取消，20 passed；T7、T9、网关身份、Runtime 上限、T14、T1 的 agentd 那半，12 passed、2 skipped。）
+- **第三轮的改坏检查**（连同四处修正）：一共改坏 93 处（Go 90 处，只有黑盒抓得到的 3 处），92 处有测试失败，剩下 1 处是等价的改坏（审批单 decided_at 的比较，表上的 CHECK 把它和状态绑在一起）。脚本在会话的 scratchpad 里，没进仓库。
+  - 按改的地方分：事务里 panic 1 处；blob 的哈希 1 处；写不经轮次 3 处；结果的编码 2 处；重放的哈希、日志之前的审批单和读不出的 created_at 8 处；没有 run.started 的 run_id 1 处；队列的丢弃计数 1 处；锚工作流的 ID 和每天的查看 5 处；各链的锚工作流 9 处；覆盖 4 处；保留期 1 处；日志之前的任务 5 处；空日志 3 处；blob 的检查 3 处；两个快照和测试口子 3 处；appendCall 和错误的规定 5 处；agentctl 的退出码和开关 5 处；修正 4 的 call.started 7 处、verify 的尝试规则 12 处；第三轮重写过的第二轮的检查 9 处；Control 显示被改的 payload 2 处。只有黑盒抓得到的 3 处：agentd.started 不写链的键、锚工作流不是 agentd 的却不记日志、不把推送间隔交给 Control。
+  - 第一遍时 3 处测试仍通过，后来都抓到了：payload 只改 sha256、保留期之外的覆盖、Control 显示被改的 approval payload，各补了测试。另外 3 处改坏的写法编译不过，换写法后都抓到了。
+  - 第二轮的 96 处在第三轮的代码上重跑：83 处抓到；9 处改的代码第三轮重写了，按新代码重写的那几处见上；1 处是等价的改坏（`approved()` 里不可能的 n==0）；1 处（以错误结束、记录写不进去时返回原错误）是第三轮有意改过的规定，它的测试也改了名，按新规定写的改坏抓到了。
+- **第二轮的改坏检查**：一共改坏 101 处（Go 96 处，只有黑盒抓得到的 5 处），97 处有测试失败，4 处改坏后测试仍通过，原因见下。脚本在会话的 scratchpad 里，没进仓库。
+  - 按改的地方分：账本的排队和快照 4 处；事务里开事务（直接开、调用会开事务的函数、在事务里 `audit.Record`）3 处；call 记录（不带 result_sha256、ok 的 reason 也抄、agentd 的 reason 不抄、从不用 unknown-run）4 处；记录写不进去时（以错误结束的不重试、只试一次、用尝试的 ctx）3 处；循环保护（记录挪到事务之后、回滚了还留着 head）2 处；effect.claimed 的 version 1 处；n==0 的分支 12 处；决定的 actor 和 decided_by 2 处；run.refused、run.terminated、每个任务一条 budget.settled_open 3 处；验证放行（保留期之内也算没查、过了保留期也算对不上、读历史出错算没查、不问保留期、按类型列执行）5 处；锚的各条规则 7 处；推出去的链头的检查 4 处；链头的推送 4 处；拒绝队列 5 处；表和链的比较 28 处（每个比较的字段、没有记录的行、协议规则、VerifyAudit 不比较、重放时过期的决定者和交还时的 maybe_sent）；agentctl 的退出码 4 处；runtime.refused 的字段 2 处；操作者名字 1 处；VerifyAudit 的两个快照 2 处。只有黑盒抓得到的 5 处：停下时不推链头、运行时不推链头、保留期短不警告、agentd.started 不带保留期、拒绝不进队列。
+  - 测试仍通过的 4 处：`approved()` 里放弃副作用时的 n==0（同一个事务里刚读过，不可能发生，等价的改坏）；审批单 decided_at 的比较（表上的 CHECK 让它和状态绑在一起，比了状态就等于比了它，等价的改坏）；VerifyAudit 里 runs 表和任务记录不在一个快照里读、链和锚指向的记录不在一个快照里读（两次读之间插不进写，不加钩子测不到）。
+  - 第一遍时 5 处改坏编译不过（`n == 0` 换成别的条件后变量没人用了），换一种写法重跑都被抓到；3 处第一遍测试仍通过，后来都抓到了：run.cancelled 的 n==0 是挑测试的正则没选中那个已有的测试；决定的 actor 和 error 结果对 error 记录的锚，补了测试（`TestADecisionIsItsOperators`，锚表里加一行）。
+  - 第一轮的改坏（见下）在第二轮的代码上重跑：Go 测试的 75 处都还被抓到。其中 7 处的匹配文本跟着代码改了（call 记录的追加挪进了 `appendCall`，budget.settled_open 按任务记，锚的检查重写了），1 处（去掉 budget.settled_open 的追加）去掉后循环变量没人用了，换了写法。只有黑盒抓得到的 5 处没有重跑：它们改的代码第二轮都动过，第二轮另有 5 处黑盒的改坏，agentctl 的退出码改由 Go 测试管。
+  - `scripts/mutate-effects.py`（状态机的 28 处）在第二轮的代码上重跑，28 处都还被抓到。
+- **第一轮的改坏检查**：一共改坏 80 处，每一处都有测试失败。
+  - 每个追加点各两种：去掉它（27 处：网关 20、预算 2、Control 4，加上 call 记录）；挪到它的事务之外（25 处：在另一个 goroutine 里另开事务追加，等原事务提交之后才写进去；call 记录则是把 outcome 挪到记录的事务之外）。`supersedeEdited` 的两处没有“挪出去”的版本：这个函数手里只有事务，没有别的句柄可写。
+  - “挪出去”的 25 处，只跑专门的测试（触发器那张表、AuditUnavailable、预算和 Control 的同类测试）也每一处都失败。起初有 2 处（批准后没及时用、审批作废并放弃副作用的那条路）只被别的测试抓到，补了两个触发器用例。
+  - call 记录：结果不带 `_audit`、不记策略的决定、派发前被拒的调用不记，3 处。
+  - 哈希、追加、验证：哈希漏掉 actor、漏掉 peer_uid、不写长度、换版本字符串，追加时每条都链到 64 个 0、存的 payload 和算哈希用的不一样，验证时不查 seq 连续、不查链接、不重算哈希、只读一页，10 处。
+  - 锚和任务：不比 sha256、记录没了也算对、别的调用的记录也算对、执行在日志之后却没有锚也算对，runs 表的四条规则各放过一种，8 处。
+  - Runtime 代理的钩子：完整的一行、计数行各不调用钩子，2 处。
+  - 只有黑盒测试抓得到的 5 处：不写 agentd.started、不写 runtime.refused、Control socket 不用对端凭据、不列 Temporal 的执行、有对不上时 agentctl 以 0 退出。
+  - 有 5 处改坏的写法一开始编译不过（去掉追加后，只为它准备的变量没人用了），改成保留那个变量之后重跑，都被抓到。
+  - `scripts/mutate-effects.py`（状态机的 28 处）在新代码上重跑，28 处都还被抓到。其中 R3.1a（`proceed` 不置 maybe_sent）现在最先由新加的审计核对抓到：日志里有 effect.sending，账本的 maybe_sent 却是 0。
+
+### 留到后面
+
+- **最后一个推出去的链头之后**：两次推送之间（最多 30 秒），以及 agentd 停着的时候，账本里追加或截掉的记录还没有锚；下次推送会把当时的链头锚住，之前追加的伪造记录也一起锚住（见上面“只写文档”的第一条）。verify 报告最后一个链头之后还有几条记录。Temporal 连不上时推送只记警告，锚停在最后一次成功的推送。要堵上链头伪造，操作者的决定得在账本之外另有凭据，比如 agentctl 签名，或者把决定的哈希也推到 Temporal。
+- **独立的验证者**：现在的判决出自被审计的 agentd 自己。应该有一个只读打开账本、直接连 Temporal 的 agentctl 子命令（或者单独的程序），自己走链、重算结果的哈希、重放状态。黑盒测试里的 Python 代码（哈希、链、result_sha256 的编码、锚的检查）是个开头，还缺重放和任务集合的比较。
+- **Temporal 的保留期**：执行被 Temporal 删掉后，它的锚也没了。开发服务器的 default 命名空间只保留 24 小时（agentd 启动时会警告），过了这个时间，任务就只能报“没查”（退出码 2）。长期要靠更长的保留期，或者 Temporal 的归档。
+- **锚工作流被删了之后又推了一次**：覆盖检查只看得见“最后一个链头之后”的空档。锚工作流被删、而 agentd 之后又推了链头（链头动过），新的链头就盖住了之前所有的记录，那一天被删掉的链头无声地没了；被删的若是过去某一天的工作流，后面几天的链头本来就盖得住。更强的检查要求每条记录在它的时间之后两个推送间隔之内就有链头（用信号事件的时间，重启前的记录按下一个 agentd 的第一次推送算），但那样 Temporal 一次短暂的故障就会让 verify 永远失败，所以先没做。锚工作流本身（8 天超时，之后还按保留期留着）验证时每次都全读，一天最多 2880 个信号。
+- **能直接访问 Temporal 的人**：给出的结果现在和记录绑在一起，伪造的结果会对不上；删执行在保留期之内会报对不上，之后只能报没查；往锚工作流里发假的链头、抢先用别的类型建这条链的锚工作流，都会让验证失败，只是查不出是谁做的。
+- **换了新账本**：删掉数据目录重来，旧链的锚工作流还在，verify 会报对不上，直到它们超时（8 天）、再过了保留期，除非 `--allow-replaced-ledger <旧键>`（第四轮起；旧链的链头是这个 agentd 推的，`--allow-chain` 不接受它）。这和有人从第 1 条起重写了账本分不出来，所以默认照样报，也不提示开关；也正因为这样，开关要求点名。旧账本的任务也还在 Temporal 里（Worker 任务队列上），新账本没有它们的行，这个没有开关，要等 Temporal 不再保留它们，或者换一个命名空间。
+- **还没写完 call 记录的旧尝试**（第四轮放宽之后）：任务还在跑时，一条没关上的 call.started 不管是第几次尝试都算正常；所以一个永远写不下 call 记录、agentd 也没有重启的旧尝试，要到任务结束才报出来。要更早，就要知道 agentd 里还有哪些尝试在跑。第五轮起 verify 会问网关哪些尝试还在执行，但只用来放过任务结束之后还在执行的；任务还在跑时，仍然什么尝试都算正常。
+- **每个放行的调用多一次写**：call.started 在自己的事务里，经写的轮次；对一个调用，多出的是一次提交（约零点几毫秒）。
+- **run.closed**（只写文档）：保留期现在从任务最后一次调用算起，它早于执行关闭，所以不会误报，但会早早地把“历史不见了”当成“过了保留期”。要是有一条 run.closed 记录，保留期就能从关闭时算起；可 agentd 看不到每一次关闭（Worker 完成工作流时并不经过 agentd），先这样。
+- **agentd 启动要能 DescribeNamespace**：Temporal 开了授权时，agentd 的身份要有这个权限，否则 agentd 起不来。
+- **审批人自报的名字**：approval.decided 的 actor 已经是 uid 的用户名；payload 里的 decided_by 仍是 agentctl 给的，只作参考。
+- **写事务排队之后**：所有写一个接一个，一个慢的写事务会挡住别的写；另一个进程写同一个账本时，仍然靠 SQLite 的 busy_timeout（v0.1 没有这样的进程）。验证用的读事务不挡写，但它没结束之前，WAL 不能检查点到它之后。
+- **测不到的几处**（改坏后测试仍通过，见“改坏检查”）：MaxConcurrentActivityExecutionSize（要真的同时排几百个活动）；`Decide` 和 `approved()` 里在同一个事务读过之后不可能的 n==0，审批单 decided_at 的比较（等价的改坏）；agentd 把自己启动的时间交给 Control（黑盒里不稳定地抓得到）。VerifyAudit 的两个快照第三轮有了测试（`Ledger.ReadHook`）。
+- **心跳被 SDK 节流**：keepAlive 每秒发一次心跳，Temporal 的 SDK 在一个节流间隔里只马上发第一个，其余的攒到间隔末尾；测试里也只看得到第一个。
+- **ID 前缀的列表**：`WorkflowId STARTS_WITH` 要 Temporal 的可见性支持它（1.32 的开发服务器支持）；不支持的可见性存储上，verify 列不出锚工作流，会报“没有推出去的链头覆盖”。
+- **kill -9 之后的链尾**：agentd 被 kill -9 时，最后一次推送之后追加的记录（最多 30 秒）没有任何锚；agentd 停着时有人把它们截掉，启动检查和 verify 都看不出（推出去的最高链头还在账本里）。
+- **停了一天以上**：启动检查只读今天和昨天的锚工作流（这条链的，和这个 agentd 在所有链下推的）；agentd 停得更久，被截的链尾、被换掉的账本只能由 verify 查出来（它查所有还在的锚工作流），等锚工作流超时、过了保留期，就谁也看不出了。
+- **按身份找别的链靠列表**：别的链的锚工作流是从可见性的列表里找的，列表跟不上时，刚推的链头可能还没列出来；这条链的两个工作流按 ID 直接读，不受影响。
+- **重置之后的头两天**：每次启动都会记一条“这个 agentd 推的最高的链头是旧链的”，直到旧链昨天的锚工作流出了窗口；verify 那边由 `--allow-replaced-ledger` 接受。
+- **anchor_findings 只记不查**：启动检查的发现写进 agentd.started，verify 不读它，而是自己去查锚工作流；锚工作流过期之后，这个发现只留在链上。要让 verify 一直报它，可以让 verify 读历次 agentd.started 的 anchor_findings。
+- **只能动 Temporal 的人**：可以往这条链的锚工作流里发假链头，让 verify 失败、让 agentd.started 里多出发现，但藏不住一次截断（见“不用 HMAC 给链头签名”）。能同时改账本和 Temporal 的人不在 v0.1 的防护之内。
+- **身份出现之前推的链头**：不知道是谁推的。第五轮起它们和别的链一样按时间分：第四轮之前的旧账本被从第 1 条起重写，旧链停在新链开始之前，`--allow-chain` 不再接受它。
+- **身份跟着配置走**：改了 Worker 的任务队列、挪了数据目录，身份就变了；同一个目录换个写法不会（第五轮起解析符号链接），但在不分大小写的 APFS 上换个大小写还是会，`EvalSymlinks` 不规范大小写。第五轮起这只影响说明里写的是谁：不是同时在推的链，不管身份，都不提示 `--allow-chain`。
+- **两个账本轮流用、不重叠**：先用 A、换成 B、停掉 B 再换回 A（中间没有同时推送），看起来就和一次重置一样，只能由操作者判断；verify 只拒绝时间上重叠的那种。
+- **agentd.read 不带查询串**：分页的列表请求、不同 head 的 PR 查找，看起来是同一个路径；按 effect_id 和前后的记录对得上是哪一次查找。
+- **审批卡片的读按副作用记**：卡片在审批单之前生成，记录里是副作用的 ID；之后那个事务若没写成（达到上限、并发），读的记录指向一个没有记下的副作用。
+- **模型请求的记录**：每次 Invoke 尝试有一条 call 记录（含策略决定）；第四轮起，每个发给提供方的请求（model.requested、model.answered）、每笔预留和结账（budget.*）也各有记录，和表里的行同一个事务。
+- **提示词和输出 schema 不在 agentd.started 里**：它们的版本（文件名加哈希）记在每条 model_calls 上。
+- **VerifyAudit 读每个任务的完整历史，还读每个 blob 的字节**：任务和 blob 多了会慢；`agentctl audit verify` 默认等 5 分钟（`--timeout`）。
+- **outbox 的投递不进审计日志**：门铃只是唤醒，送没送到在 outbox 表里。
+- **被攻破的 Worker 能让审计日志变大**：每个调用、每次重试都有一条 call 记录，被循环保护拒绝的也有，和 calls 表的增长同一个量级；能直接访问 Temporal 的人对未知任务排活动，也是每次一条。Runtime 拒绝的调用经队列写，队列满了只计数，不再变大。
+- **闲着的另一个 agentd 看起来像换掉的账本**（第五轮）：`--allow-chain` 只接受在这条链第一次推送之后推过的链；一个停了、或者自这条链开始以来没推过的邻居，它的链只能用 `--allow-replaced-ledger` 接受，说明里也不提示。等它再推一次，`--allow-chain` 就接受了。
+- **读事务之外的读**（5b 之后）：Control、verify、启动检查的读都在读事务里，每个都先重新载入、再比。网关自己的读（查任务、读 blob、循环保护以外的几处查询）仍然直接走连接池，不重新载入：载入过被改的模式的连接，会照它读到错的结果。它们之后都有一次查过模式的写（计数、记录、领取），被骗的读走不出 agentd；要彻底，就让这些读也进读事务，每次多约 0.13 毫秒。
+- **直接改文件的字节**：不经 SQLite 改 ledger.db，不受写锁约束，进程里的任何检查都挡不住；靠的是链、推到 Temporal 的锚和 verify 的 integrity_check（5b）事后查出来。打开时只跑 quick_check，它不核对索引和表：两次 verify 之间被换了 rootpage 的索引，agentd 照样读写，直到下一次 verify。
+- **`Find`、`Describe` 在 `Tx` 的闭包里会死锁**（5c，最终对抗复审，低）：agentd 自己对 GitHub 的读先写一条 agentd.read，那个写要拿写的轮次；在一个 `Tx` 的闭包里调 `Find` 或 `Describe`，读的记录就等闭包手里的轮次，永远等不到。`notx_test` 看不出：记录读的函数是经请求的 ctx 带进 transport 的，AST 里看不到“在 Tx 里开事务”。现在没有这样调用的地方；要防住，可以让记录读的那个写等轮次有一个短的上限，等不到就失败、读不发出去，把死锁变成一次失败的读。
+- **ANALYZE 的表里的内容不查**：sqlite_stat1、sqlite_stat4 只按名字、类型和 SQL 认；里面的统计能改变查询计划，没有 ORDER BY 的查询可能换了行的顺序；我没有逐条核对 agentd 的查询是否都不依赖它。
+- **故障丢的记录只在内存里**（第五轮）：agentd 重启之后，那次尝试有了后面的 agentd.started，算被打断，verify 以 0 退出；故障只留在旧 agentd 的日志里。超过 1,000 个之后不再记，verify 把多出来的报成对不上。

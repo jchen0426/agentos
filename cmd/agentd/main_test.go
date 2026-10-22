@@ -10,11 +10,14 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zalando/go-keyring"
 
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/runtimeproxy"
 	"github.com/jchen0426/agentos/internal/secrets"
 )
 
@@ -233,5 +236,61 @@ func TestSafetyIdentifier(t *testing.T) {
 	}
 	if info, err := os.Stat(filepath.Join(dir, "safety-identifier")); err != nil || info.Mode().Perm() != 0o600 {
 		t.Errorf("kept as %v, %v", info.Mode(), err)
+	}
+}
+
+// A refusal's record says what the refusal log says: the method, the command and the reason of a
+// refusal logged in full, and how many were refused within how long for a count.
+func TestARefusalsRecord(t *testing.T) {
+	e := refusalRecord(runtimeproxy.Refused{Method: "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted",
+		Command: "COMMAND_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION", Reason: "a Worker signals no workflow", Count: 1})
+	p := e.Payload.(map[string]any)
+	if e.Type != "runtime.refused" || e.Actor != audit.Agentd || e.WorkflowID != "" || p["count"] != int64(1) ||
+		p["method"] != "/temporal.api.workflowservice.v1.WorkflowService/RespondWorkflowTaskCompleted" ||
+		p["command"] != "COMMAND_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION" || p["reason"] != "a Worker signals no workflow" ||
+		p["within"] != nil {
+		t.Fatalf("record %+v", e)
+	}
+	p = refusalRecord(runtimeproxy.Refused{Count: 40, Within: time.Minute}).Payload.(map[string]any)
+	if p["count"] != int64(40) || p["within"] != "1m0s" || p["method"] != nil || p["command"] != nil || p["reason"] != nil {
+		t.Fatalf("record %v", p)
+	}
+}
+
+// An agentd's identity names its data directory as the file system resolves it: the same directory
+// reached through a symbolic link, or a relative path, is the same agentd; another directory, or
+// another task queue, is another.
+func TestTheIdentityNamesTheDataDirectoryItself(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "data")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := func(queue, path string) string {
+		t.Helper()
+		s, err := agentdIdentity(queue, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	t.Chdir(dir)
+	same := id("agentos-workflows", real)
+	if id("agentos-workflows", link) != same || id("agentos-workflows", "data") != same || id("agentos-workflows", "link/") != same {
+		t.Fatal("the same directory, spelled otherwise, is another agentd")
+	}
+	if id("agentos-workflows", other) == same || id("other-workflows", real) == same {
+		t.Fatal("another directory or task queue is the same agentd")
+	}
+	if _, err := agentdIdentity("q", filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("an identity for a data directory that is not there")
 	}
 }

@@ -4,6 +4,8 @@ package policy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -73,6 +75,8 @@ type Policy struct {
 	Repos  []string         `yaml:"repos"`
 	Tools  map[string]Tool  `yaml:"tools"`
 	Models map[string]Model `yaml:"models"`
+
+	SHA256 string `yaml:"-"` // of the file as Load read it: agentd records it at start
 }
 
 // Load reads a policy file. Unknown keys are an error, so a typo cannot silently allow
@@ -88,6 +92,8 @@ func Load(path string) (*Policy, error) {
 	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("policy %s: %w", path, err)
 	}
+	sum := sha256.Sum256(b)
+	p.SHA256 = hex.EncodeToString(sum[:])
 	for name, t := range p.Tools {
 		switch t.Decision {
 		case "allow", "require_approval", "deny":

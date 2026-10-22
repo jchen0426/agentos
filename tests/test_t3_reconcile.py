@@ -36,7 +36,11 @@ def waiting_for_a_person(stack: Stack, run: dict) -> dict:
 def finished(stack: Stack, run: dict) -> None:
     final = stack.wait_state(run, TERMINAL, timeout=60)
     assert final["state"] == "SUCCEEDED", final
-    assert json.loads(final["result_json"]) == {"status": "ok", "value": {"written": True}}, final
+    # The workflow returns the call's value as it got it: the write's result, and the record of the
+    # call in agentd's audit log (_audit).
+    result = json.loads(final["result_json"])
+    value = result.pop("value")
+    assert result == {"status": "ok"} and value.pop("_audit")["seq"] > 0 and value == {"written": True}, final
     assert stack.agentctl("reconcile", "list")["items"] == []
 
 

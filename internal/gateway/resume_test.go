@@ -49,7 +49,7 @@ func (f *resumeFixture) call(id string, at time.Time, outcome string) activity.I
 	f.t.Helper()
 	ctx := context.Background()
 	scheduled := at.UTC().Format(time.RFC3339Nano)
-	if err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: id, ScheduledAt: scheduled,
+	if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: id, ScheduledAt: scheduled,
 		Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: ledger.Now()}); err != nil {
 		f.t.Fatal(err)
 	}

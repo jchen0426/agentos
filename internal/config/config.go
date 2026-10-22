@@ -5,6 +5,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -40,6 +42,8 @@ type Config struct {
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
 	LoopLimits  LoopLimits    `yaml:"loop_limits"`
+
+	SHA256 string `yaml:"-"` // of the file as Load read it: agentd records it at start
 }
 
 // LoopLimits cap what one run may ask of the gateway (design doc, section 9). A call's
@@ -122,6 +126,8 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
+	sum := sha256.Sum256(b)
+	c.SHA256 = hex.EncodeToString(sum[:])
 	base, err := filepath.Abs(filepath.Dir(path))
 	if err != nil {
 		return nil, err

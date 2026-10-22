@@ -750,6 +750,14 @@ func TestAFloodOfRefusalsHidesNoOtherKindNorFillsTheLog(t *testing.T) {
 	tp := startTemporal(t, nil)
 	srv, addr, logs := startServer(t, tp, DefaultLimits)
 	srv.refusals.every = 200 * time.Millisecond
+	// agentd's audit log gets what the log writes, line for line.
+	var mu sync.Mutex
+	var lines []Refused
+	srv.OnRefused(func(r Refused) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, r)
+	})
 	w := dialWorker(t, addr)
 	floodStart := time.Now()
 	for range 200 {
@@ -782,6 +790,27 @@ func TestAFloodOfRefusalsHidesNoOtherKindNorFillsTheLog(t *testing.T) {
 	// The first of each kind, a burst of 20, then one a second.
 	if limit := 2 + 20 + int(floodTook.Seconds()) + 2; logged > limit {
 		t.Errorf("%d of 201 refusals logged in %v, want at most %d", logged, floodTook, limit)
+	}
+	mu.Lock()
+	var one, counts, sum int
+	for _, r := range lines {
+		sum += int(r.Count)
+		if r.Method == "" {
+			counts++
+			if r.Within != srv.refusals.every || r.Reason != "" {
+				t.Errorf("a count line: %+v", r)
+			}
+			continue
+		}
+		one++
+		if r.Count != 1 || !strings.Contains(r.Method, "WorkflowService/") || r.Reason == "" {
+			t.Errorf("a refusal: %+v", r)
+		}
+	}
+	mu.Unlock()
+	if one != logged || counts != len(logs.lines("runtime call refusals not logged")) || sum != 201 {
+		t.Errorf("the hook got %d refusals and %d counts, %d in all; the log has %d and %d lines", one, counts, sum,
+			logged, len(logs.lines("runtime call refusals not logged")))
 	}
 	var polls []map[string]any
 	for _, e := range logs.lines("runtime call refused") {
@@ -1043,7 +1072,7 @@ func TestTheRefusalLogKeepsFewKinds(t *testing.T) {
 	r := refusalLog{log: slog.New(slog.NewJSONHandler(io.Discard, nil)), every: time.Minute,
 		lines: rate.NewLimiter(0, 0), seen: map[string]time.Time{}}
 	for i := range 10 * maxKinds {
-		r.refused(fmt.Sprintf("kind %d", i))
+		r.refused(fmt.Sprintf("kind %d", i), Refused{Count: 1})
 	}
 	if len(r.seen) > maxKinds {
 		t.Errorf("%d kinds kept, want at most %d", len(r.seen), maxKinds)

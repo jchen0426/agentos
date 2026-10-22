@@ -1,4 +1,9 @@
 /bin/
+/agentd
+/agentctl
+/agentos-mcp-git
+/githubsim
+/modelsim
 /.venv/
 __pycache__/
 *.pyc

@@ -132,6 +132,10 @@ type Task struct {
 type Config struct {
 	Providers map[string]Provider `yaml:"providers"`
 	Tasks     map[string]Task     `yaml:"tasks"`
+
+	// SHA256 is of the file as Load read it, which agentd records at start; each task's prompt has
+	// its own hash in its version.
+	SHA256 string `yaml:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -145,6 +149,8 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("models %s: %w", path, err)
 	}
+	sum := sha256.Sum256(b)
+	c.SHA256 = hex.EncodeToString(sum[:])
 	for name, p := range c.Providers {
 		if err := p.check(); err != nil {
 			return nil, fmt.Errorf("models %s: provider %s: %w", path, name, err)

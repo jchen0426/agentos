@@ -40,11 +40,12 @@ wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes
 | `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude, OpenAI-compatible and fake adapters; keys from the OS keyring |
 | `config/prompts`, `config/schemas` | each model task's prompt and output schema |
 | `internal/runtimeproxy` | the Worker's only way to Temporal; an allowlist of WorkflowService methods |
-| `internal/control` | the Control service on the 0700 control socket |
+| `internal/control` | the Control service on the 0700 control socket, which records the uid of each caller |
+| `internal/audit` | agentd's hash-chained audit log: each policy decision, side effect and approval, with who made it |
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement |
 | `evals/`, `docs/eval/` | the first task's evaluation: the case set, its mirrors, the runner, the scoring and the per-model report (`python -m evals`); the reports |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
@@ -87,7 +88,14 @@ d=~/.agentos/old-$(date +%Y%m%d-%H%M%S) && mkdir "$d" && mv ~/.agentos/ledger.db
 
 Runs recorded in the old ledger cannot continue. If any wrote to GitHub, first settle what
 `bin/agentctl reconcile list` shows, with the agentd that migrated the ledger. For a clean slate,
-stop the dev server and move `~/.agentos/temporal.db*` there too.
+stop the dev server and move `~/.agentos/temporal.db*` there too. Keep the dev server's database,
+and `bin/agentctl audit verify` reports what the old ledger left there, until Temporal no longer
+keeps it: its runs, missing from the new ledger, and the anchor workflows of its chain. To verify,
+a fresh ledger looks like one cut short, or rewritten from its first record. Note the old chain's
+key before you move the ledger aside (the report's `chain key` line): a reset ledger needs
+`--allow-replaced-ledger <old key>` until the old chain's anchor workflows expire (8 days, then the
+namespace's retention). A ledger with runs of M1 to M4, from before the audit log began, needs
+`--allow-before-log` until those runs leave Temporal and the ledger.
 
 In another shell, with any git repository at `~/.agentos/mirror` standing in for `acme/payments`
 (agentd reads it through the git tool server, which the dev config runs per call under
@@ -217,6 +225,86 @@ OLLAMA_NO_CLOUD=1 OLLAMA_CONTEXT_LENGTH=65536 ollama serve
 ollama pull gpt-oss:20b
 ```
 
+Every policy decision, side effect and approval goes into agentd's audit log, in the ledger, with
+who made it: the run, agentd, or the operator whose uid the control socket reported. Each record
+holds the sha256 of the one before it; every result of a gateway call names its call's record in
+Temporal's history, and that record holds the result's sha256; and agentd pushes the chain's head
+to a workflow of its own in Temporal every 30 seconds, and as it stops. To check that the ledger
+still holds what was recorded:
+
+```bash
+bin/agentctl audit verify
+```
+
+It walks the chain, checks each run's results and the pushed heads against the records they name,
+for the runs Temporal lists and the audit log records as well as the ledger's, and compares the
+ledger's tables, and the bytes of every blob, with what the records say. It exits 0 when all of it
+was checked and matches, 1 on any mismatch, 3 when it could not verify at all, and 2 when some runs
+could not be checked: Temporal no longer keeps their histories (`--allow-unavailable` accepts
+that; keep the namespace's retention at 7 days or more, or agentd warns at start), they were made
+before the audit log began (`--allow-before-log` accepts those), or a fault lost a call's record
+after its `call.started` (agentd's log says which; once agentd restarts, the attempt counts as cut
+short). agentd records each termination before it asks Temporal for it: an execution Temporal says
+was terminated with no such record was ended outside agentd, from Temporal's UI or CLI, or by
+Temporal itself (a workflow task too large for it). That changes nothing in the ledger, so it is no
+mismatch and does not change the exit status; the report lists it, with when, and who its caller
+said it was and why, which is that caller's own word. The pushed heads go to
+workflows named by the chain's key, its first record's sha256; another chain's workflows in the
+namespace are a mismatch, since a chain rewritten from its first record has a new key and leaves
+the old one's behind. Each head names the agentd that pushed it, by the sha256 of its Worker's task
+queue and its data directory as the file system resolves it: no ledger says that. A chain that
+pushed after this one's first push, by Temporal's times, is a second agentd beside this one:
+`--allow-chain <key>` (as often as needed) accepts it, which the mismatch suggests when its heads
+name another agentd; when they name this one, two ledgers of one agentd were live at once, which
+no flag accepts. Any other chain, whatever agentd its heads name (a name that comes from
+configuration), is of a ledger replaced: a reset, or a rewrite from its first record, which only
+you can tell apart. Its mismatch says when each chain pushed and suggests no flag; `--allow-chain`
+does not accept it, `--allow-replaced-ledger <key>` does (the reset above). So does a second
+agentd's chain that has not pushed since this one began. A head pushed
+after a higher one is a mismatch too: agentd pushes them in order, so the ledger went backwards
+in between. The report names the tables it does not check, and why: the outbox, which holds the
+runs' doorbells only, and the schema's own two, which agentd checks as it opens the ledger.
+
+agentd opens a ledger only when SQLite finds its file sound (`PRAGMA quick_check`) and its schema
+is the one its migrations make, row for row of `sqlite_master`, SQLite's own objects too (only the
+tables `ANALYZE` makes are left aside): a trigger or an index of anyone else's changes what
+agentd's writes do without a trace, and `PRAGMA writable_schema` writes objects under the names
+SQLite keeps for itself, without changing `schema_version`. It compares the schema again on each
+connection as it opens, and in each transaction, write or read, once the connection has loaded the
+schema afresh. While it is not the migrations', agentd writes nothing to the ledger, and shows
+nothing of it: what agentctl shows of runs and approvals comes through a read transaction, which
+fails, naming what differs, rather than show what a view put in place of a table makes up. verify
+checks the schema first, then has SQLite check every page and every index against its table
+(`PRAGMA integrity_check`, which sees an index whose rootpage was swapped, as a comparison of
+`sqlite_master` does not); either finding is a mismatch, and verify reads no further.
+
+agentd also keeps in memory where the chain ends: its start's record, the last record it appended,
+and the last head it pushed. A log cut, emptied or rewritten under it is a mismatch however whole
+what is left, and so is one someone else appended to, however well chained: verify names each
+record after the last one this agentd appended, and says when agentd found the log changed. agentd
+appends no more records to such a log and pushes no more heads of it, and says so in its log. As it
+starts, it checks every head of its chain's anchor workflows of the day and the
+day before: each must be a record the ledger holds, and none may come after a higher one, or the
+log was cut, or the ledger put back to an older copy, while agentd was down; and the highest head
+it pushed under any chain must be this chain's, or the ledger was replaced. The check is bounded
+(10 seconds, 50 anchor workflows, its own chain's first, 10,000 events of each) and best-effort.
+What it finds, and what it could not read, does not stop it, since anyone who can signal Temporal
+can add a head; it logs it, and its start's record names it (`anchor_findings`, at most 20).
+verify reads more, but bounded too (2,000 anchor workflows, 20,000 events of each): past that it
+says what it did not read, and exits 3, or 1 if anything it read did not match. Its own requests to
+GitHub, lookups of a write in doubt and what an approval card shows, each have a record before
+they go out (`agentd.read`), with the request's method and path.
+
+What the chain shows is that the records are the ones appended, in their order, and that nothing
+changed them since; not who appended them. Whoever can write the ledger while agentd is down can
+append records with the right links after the last head it pushed, an operator's approval that
+nobody gave, say: they verify, and the next head agentd pushes anchors them like any other (while
+agentd runs, its next append finds them, as above). The report says how many
+records no pushed head follows yet. Nor does anything anchor the records agentd appended after its
+last push before it was killed (`kill -9`): what cuts those while agentd is down, nothing tells. In
+v0.1 whoever can write the ledger is the user agentd runs as, whom its threat model does not defend
+against.
+
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 
 ```bash
@@ -273,7 +361,7 @@ there.
 ```bash
 AGENTOS_GITHUB=live AGENTOS_GITHUB_REPO=<owner>/<name> AGENTOS_SANDBOX=srt uv run pytest tests/test_t2_live.py -s
 ```
-`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation; approvals (the first of concurrent decisions wins, expiry, a payload changed after its approval, edits) and the doorbell outbox.
+`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation; approvals (the first of concurrent decisions wins, expiry, a payload changed after its approval, edits), the doorbell outbox, and the audit log (each record in the transaction of its change, the hash chain, each way of changing it by hand).
 
 After a workflow change that is meant to be compatible, the replay gate
 (`tests/test_replay.py`) must still pass. To add samples to it, run

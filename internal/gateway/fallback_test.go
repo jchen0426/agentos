@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
+	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
@@ -232,5 +235,39 @@ func TestDetachFollowsTheActivityDeadline(t *testing.T) {
 		if d := got.Sub(c.want); d < -time.Second || d > time.Second {
 			t.Errorf("%s: deadline %v, want about %v", name, got, c.want)
 		}
+	}
+}
+
+// A model call's call.started comes before its request goes to the provider: one that cannot be
+// written sends nothing.
+func TestNoModelRequestBeforeItsRecord(t *testing.T) {
+	g, run, _ := fallbackGateway(t)
+	fake := &counted{Adapter: models.Fake{}}
+	g.Adapters = map[string]models.Adapter{"fake": fake, "other": fake}
+	call := &agentosv1.Call{Kind: "model", Name: "audit_v1", ArgsJson: `{"diff":"x"}`}
+	args := map[string]any{"diff": "x"}
+	canon, _ := encodeCanonical(args)
+	info := activity.Info{ActivityID: "1:audit_v1", Attempt: 1, RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
+		ScheduledTime: time.Unix(1000, 0)}
+	info.WorkflowExecution.ID = run.WorkflowID
+	drop := failAppends(t, g.Ledger, "call.started")
+	rec := &callRecord{argsSHA256: sha256Hex(canon)}
+	var app *temporal.ApplicationError
+	if _, err := g.dispatch(context.Background(), info, run, call, args, canon, faults.Effect{}, rec); !errors.As(err, &app) ||
+		app.Type() != "AuditUnavailable" || fake.calls != 0 || rec.startedSeq != 0 {
+		t.Fatalf("got %v, %d requests sent", err, fake.calls)
+	}
+	drop()
+	rec = &callRecord{argsSHA256: sha256Hex(canon)}
+	if _, err := g.dispatch(context.Background(), info, run, call, args, canon, faults.Effect{}, rec); err != nil || fake.calls == 0 {
+		t.Fatalf("%v, %d requests", err, fake.calls)
+	}
+	started, err := g.Ledger.Q.ListAuditRecords(context.Background(), db.ListAuditRecordsParams{Seq: rec.startedSeq, Limit: 1})
+	if err != nil || len(started) != 1 || started[0].Type != "call.started" || !strings.Contains(started[0].Payload, `"kind":"model"`) {
+		t.Fatalf("call.started %+v %v", started, err)
+	}
+	var requested string
+	if err := g.Ledger.DB.QueryRow(`SELECT MIN(started_at) FROM model_calls`).Scan(&requested); err != nil || requested < started[0].At {
+		t.Fatalf("the first request at %s, its record at %s: %v", requested, started[0].At, err)
 	}
 }

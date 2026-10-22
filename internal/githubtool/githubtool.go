@@ -43,7 +43,8 @@ type Client struct {
 }
 
 func New(cfg Config) (*Client, error) {
-	opts := []github.ClientOptionsFunc{github.WithTimeout(cfg.RequestTimeout), github.WithUserAgent("agentos")}
+	opts := []github.ClientOptionsFunc{github.WithTimeout(cfg.RequestTimeout), github.WithUserAgent("agentos"),
+		github.WithTransport(recordReads{http.DefaultTransport})}
 	if cfg.Token != "" {
 		opts = append(opts, github.WithAuthToken(cfg.Token))
 	}
@@ -58,6 +59,23 @@ func New(cfg Config) (*Client, error) {
 }
 
 func (c *Client) live() bool { return c != nil }
+
+// recordReads is the client's transport. A request made for one of agentd's own reads (a Find, a
+// Describe: tools.WithReads) is recorded before it goes out, and does not go out unrecorded. The
+// record names the method and the path; the token is in a header and the query is left out.
+type recordReads struct{ next http.RoundTripper }
+
+func (t recordReads) RoundTrip(req *http.Request) (*http.Response, error) {
+	if reads := tools.ReadsOf(req.Context()); reads != nil {
+		if err := reads(req.Context(), req.Method, req.URL.EscapedPath()); err != nil {
+			if req.Body != nil {
+				req.Body.Close()
+			}
+			return nil, fmt.Errorf("%w: agentd could not record its read of %s: %v", tools.ErrNotSent, req.URL.EscapedPath(), err)
+		}
+	}
+	return t.next.RoundTrip(req)
+}
 
 // unconfiguredSettle is the settle of an agentd without GitHub's config. It sends nothing, but may
 // find a request another agentd sent, as a person reconciles it, and cannot know that one's settle:

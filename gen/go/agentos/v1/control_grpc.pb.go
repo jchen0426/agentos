@@ -29,6 +29,7 @@ const (
 	Control_ResolveReconciliation_FullMethodName = "/agentos.v1.Control/ResolveReconciliation"
 	Control_ExtendBudget_FullMethodName          = "/agentos.v1.Control/ExtendBudget"
 	Control_ExplainRun_FullMethodName            = "/agentos.v1.Control/ExplainRun"
+	Control_VerifyAudit_FullMethodName           = "/agentos.v1.Control/VerifyAudit"
 )
 
 // ControlClient is the client API for Control service.
@@ -48,6 +49,7 @@ type ControlClient interface {
 	ResolveReconciliation(ctx context.Context, in *ResolveReconciliationRequest, opts ...grpc.CallOption) (*ResolveReconciliationResponse, error)
 	ExtendBudget(ctx context.Context, in *ExtendBudgetRequest, opts ...grpc.CallOption) (*Run, error)
 	ExplainRun(ctx context.Context, in *ExplainRunRequest, opts ...grpc.CallOption) (*Explanation, error)
+	VerifyAudit(ctx context.Context, in *VerifyAuditRequest, opts ...grpc.CallOption) (*AuditReport, error)
 }
 
 type controlClient struct {
@@ -158,6 +160,16 @@ func (c *controlClient) ExplainRun(ctx context.Context, in *ExplainRunRequest, o
 	return out, nil
 }
 
+func (c *controlClient) VerifyAudit(ctx context.Context, in *VerifyAuditRequest, opts ...grpc.CallOption) (*AuditReport, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AuditReport)
+	err := c.cc.Invoke(ctx, Control_VerifyAudit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -175,6 +187,7 @@ type ControlServer interface {
 	ResolveReconciliation(context.Context, *ResolveReconciliationRequest) (*ResolveReconciliationResponse, error)
 	ExtendBudget(context.Context, *ExtendBudgetRequest) (*Run, error)
 	ExplainRun(context.Context, *ExplainRunRequest) (*Explanation, error)
+	VerifyAudit(context.Context, *VerifyAuditRequest) (*AuditReport, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -214,6 +227,9 @@ func (UnimplementedControlServer) ExtendBudget(context.Context, *ExtendBudgetReq
 }
 func (UnimplementedControlServer) ExplainRun(context.Context, *ExplainRunRequest) (*Explanation, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExplainRun not implemented")
+}
+func (UnimplementedControlServer) VerifyAudit(context.Context, *VerifyAuditRequest) (*AuditReport, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyAudit not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -416,6 +432,24 @@ func _Control_ExplainRun_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_VerifyAudit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyAuditRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).VerifyAudit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_VerifyAudit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).VerifyAudit(ctx, req.(*VerifyAuditRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -462,6 +496,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExplainRun",
 			Handler:    _Control_ExplainRun_Handler,
+		},
+		{
+			MethodName: "VerifyAudit",
+			Handler:    _Control_VerifyAudit_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

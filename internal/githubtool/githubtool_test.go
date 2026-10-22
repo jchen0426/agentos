@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,6 +191,88 @@ func (f *fixture) allCarriedTheToken(t *testing.T) bool {
 		}
 	}
 	return true
+}
+
+// requests is GitHub's log of every request it answered, as "METHOD path".
+func (f *fixture) requests(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(f.sim.LogPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var e struct{ Method, Path string }
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e.Method+" "+e.Path)
+	}
+	return out
+}
+
+// Each request of agentd's own reads (a lookup, an approval card's) is recorded before it goes
+// out, by its method and path; one that cannot be recorded does not go out. The writes' own
+// requests are not reads.
+func TestAgentdsOwnReadsAreRecordedFirst(t *testing.T) {
+	f := setup(t)
+	pr, payload := f.prepare(t, f.git, fix)
+	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
+	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
+	report, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(`{"summary": "ok", "patch": null, "findings": []}`))
+	cc := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{pr: 7}}
+	comment, err := cc.Prepare(context.Background(), f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit,
+		"report_ref": report, "outcome": "ok"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var recorded []string
+	sent := len(f.requests(t))
+	ctx := tools.WithReads(context.Background(), func(_ context.Context, method, path string) error {
+		if n := len(f.requests(t)); n != sent+len(recorded) {
+			t.Errorf("%s %s recorded after %d request(s) went out unrecorded", method, path, n-sent-len(recorded))
+		}
+		p, err := url.PathUnescape(path)
+		if err != nil {
+			t.Error(err)
+		}
+		recorded = append(recorded, method+" "+p)
+		return nil
+	})
+	for name, read := range map[string]func(){
+		"the card":    func() { pr.Describe(ctx, req, payload) },
+		"a PR lookup": func() { _, _, _ = pr.Find(ctx, payload) },
+		"a comment's": func() { _, _, _ = cc.Find(ctx, comment) },
+	} {
+		before := len(recorded)
+		read()
+		if len(recorded) == before {
+			t.Errorf("%s recorded no request", name)
+		}
+	}
+	if got := f.requests(t)[sent:]; !slices.Equal(got, recorded) {
+		t.Fatalf("GitHub answered\n\t%s\nagentd recorded\n\t%s", strings.Join(got, "\n\t"), strings.Join(recorded, "\n\t"))
+	}
+
+	// The ledger cannot take the record: nothing goes out, and the lookup fails.
+	sent = len(f.requests(t))
+	full := errors.New("the ledger is full")
+	ctx = tools.WithReads(context.Background(), func(context.Context, string, string) error { return full })
+	if _, _, err := pr.Find(ctx, payload); err == nil {
+		t.Error("a lookup that could not be recorded did not fail")
+	}
+	if _, _, err := cc.Find(ctx, comment); err == nil {
+		t.Error("a comment's lookup that could not be recorded did not fail")
+	}
+	if card := pr.Describe(ctx, req, payload); card["github"].(map[string]any)["error"] == nil {
+		t.Errorf("a card whose reads could not be recorded: %v", card["github"])
+	}
+	if n := len(f.requests(t)) - sent; n != 0 {
+		t.Fatalf("%d request(s) went out unrecorded", n)
+	}
 }
 
 func TestOpenDraftPROpensOnceAndFindsItAgain(t *testing.T) {

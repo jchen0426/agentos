@@ -80,6 +80,9 @@ func (f *fixture) decide(t *testing.T, a db.Approval, d Decision) (db.Approval, 
 	if d.By == "" {
 		d.By = "alice"
 	}
+	if d.Who.Actor == "" {
+		d.Who = operator
+	}
 	return f.g.Decide(context.Background(), d)
 }
 
@@ -874,7 +877,7 @@ func TestAWriteThatMayBeOutWithoutAnApprovalGoesToAPerson(t *testing.T) {
 	if err != nil || res.GetStatus() != StatusNeedsReconcile || w.sent.Load() != 0 || len(f.approvals(t)) != 0 {
 		t.Fatalf("%v %v, sent %d, %d approvals", res.GetStatus(), err, w.sent.Load(), len(f.approvals(t)))
 	}
-	if _, _, err := f.g.Reconcile(context.Background(), Resolution{EffectID: req.EffectID, Executed: false, Key: "k"}); err != nil {
+	if _, _, err := f.g.Reconcile(context.Background(), Resolution{By: operator, EffectID: req.EffectID, Executed: false, Key: "k"}); err != nil {
 		t.Fatal(err)
 	}
 	if res, err := f.ask(t, w, args, 1, time.Hour); err != nil || res.GetStatus() != StatusNeedsApproval || w.sent.Load() != 0 {
@@ -903,6 +906,7 @@ func TestRecoveryDoesNotResendAnUnapprovedWrite(t *testing.T) {
 			w := &finder{writer: writer{class: class}}
 			f.claimElsewhere(t, w)
 			if c.visible {
+				f.direct = true
 				if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET maybe_sent = 1 WHERE effect_id = ?`, f.req().EffectID); err != nil {
 					t.Fatal(err)
 				}
@@ -963,6 +967,7 @@ func (f *fixture) approvedThenClaimedElsewhere(t *testing.T, w tools.Writer, rul
 	if res, err := f.g.approved(context.Background(), effectOf(t, f, a), a); res != nil || err != nil {
 		t.Fatalf("approved: %v %v", res, err)
 	}
+	f.direct = true
 	if _, err := f.g.Ledger.DB.Exec(`UPDATE effects SET claimed_by = 'gone', claimed_at = ?, maybe_sent = ?,
 		version = version + 1 WHERE effect_id = ?`, ledger.Now(), sent, req.EffectID); err != nil {
 		t.Fatal(err)
