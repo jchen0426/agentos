@@ -667,9 +667,11 @@ def _patch(stack: Stack, ref: object) -> bool:
 
 def _effort_sent(stack: Stack, ref: str | None) -> str | None:
     """The effort agentd sent the provider, as its record of the request says: the task's, capped
-    by what a provider lists (config/models.yaml), whatever the profile meant."""
+    by what a provider lists (config/models.yaml), whatever the profile meant; "" for none sent,
+    None when the record does not say."""
     rows = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", ref.removeprefix("sha256:")) if ref else []
-    return (_object(rows[0]["bytes"]).get("effort_sent") or None) if rows else None
+    sent = _object(rows[0]["bytes"]).get("effort_sent") if rows else None
+    return sent if isinstance(sent, str) else None
 
 
 def collect(stack: Stack, entry: dict, ended_by: str, info: dict | None = None) -> dict:

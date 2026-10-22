@@ -317,7 +317,7 @@ def _flow(text: str) -> object:
 
 def _product() -> tuple[dict, dict]:
     """config/models.yaml's providers and its audit_v1, read as the simple YAML they are."""
-    providers, task, block, entry = {}, {}, None, ""
+    providers, task, block, name, entry = {}, {}, None, None, ""
     for line in (runner.REPO / "config/models.yaml").read_text().splitlines():
         code = line.split(" #", 1)[0].rstrip() if not line.lstrip().startswith("#") else ""
         if not code:
@@ -327,10 +327,12 @@ def _product() -> tuple[dict, dict]:
         elif block == "providers":
             entry = (entry + " " + code.strip()) if entry else code.strip()
             if entry.count("{") == entry.count("}"):
-                name, value = entry.split(":", 1)
-                providers[name.strip()] = _flow(value)
+                provider, value = entry.split(":", 1)
+                providers[provider.strip()] = _flow(value)
                 entry = ""
-        elif block == "tasks" and code.startswith("    "):
+        elif block == "tasks" and not code.startswith("    "):
+            name = code.strip().rstrip(":")
+        elif block == "tasks" and name == "audit_v1":
             key, value = code.strip().split(":", 1)
             task[key] = _flow(value)
     return providers, task
@@ -468,10 +470,12 @@ def test_the_metrics_are_what_the_answers_make_them(tmp_path: Path, evalset, mod
     md = out.with_suffix(".md").read_text()
     assert "44%（4/9 次，3 个用例；95% 区间" in md, md
     assert "67%（6/9 次，3 个用例；区间退化：每个用例都一样）" in md  # every case detected leniently 2 times of 3
-    # The effort each request was sent, as the ledger says: b's capped to medium, a's none at all.
+    # The effort each request was sent, as the ledger says: b's capped to medium; a's task has none.
     assert {a["effort"] for r in results if r["profile"] == "b" for a in r["answers"]} == {"medium"}
-    assert {a["effort"] for r in results if r["profile"] == "a" for a in r["answers"]} == {None}
+    sent_a = [a["effort"] for r in results if r["profile"] == "a" for a in r["answers"]]
+    assert set(sent_a) == {""}
     assert "| a（anthropic/claude-opus-5-5） | b（local/gpt-oss:20b，effort medium） |" in md
+    assert f"| a | anthropic/claude-opus-5-5 | 不发（{len(sent_a)}） |" in md
     assert "| b | local/gpt-oss:20b | medium（15） |" in md
     assert "0%（0/3 次，1 个用例；只有一个用例，没有区间）" in md and "1 对；只有一对，没有区间" in md  # model b's
     assert "| py-sqli | 漏洞 | blame 找到的引入提交 | python | CWE-89 | 2/2/3 | 0/0/3 |" in md

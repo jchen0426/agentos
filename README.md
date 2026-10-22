@@ -185,10 +185,11 @@ OpenAI and a local model server work the same way. `config/models.yaml` lists bo
 - **Ollama**, through Chat Completions (vLLM uses the same adapter). Start it with the context
   window that `context_tokens` names: it cuts longer input without a word, and agentd refuses to
   send what does not fit. Its `efforts` stop at medium, which caps what gpt-oss is sent: at high
-  it spends all its output tokens reasoning and writes no answer to most audits. Its models must be priced at 0 in `config/prices.yaml`: a Chat
-  Completions server cannot count tokens before a request. Start it with cloud models off, too:
-  they run on Ollama's servers. agentd also asks Ollama about the model before every request and
-  sends nothing to a cloud model, whatever it is called.
+  it spends all its output tokens reasoning and writes no answer to most audits. Its models must
+  be priced at 0 in `config/prices.yaml`: a Chat Completions server cannot count tokens before a
+  request. Start it with cloud models off, too: they run on Ollama's servers. agentd also asks
+  Ollama about the model before every request and sends nothing to a cloud model, whatever it is
+  called.
 
 A provider that is not on this machine is reached over https only. agentd takes no proxy from
 its environment (`HTTPS_PROXY` and the like): its requests go straight to the hosts its
