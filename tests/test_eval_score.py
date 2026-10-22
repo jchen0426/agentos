@@ -355,6 +355,22 @@ def test_the_report_names_runs_not_ended_and_runs_without_a_report(tmp_path):
     assert json.loads((tmp_path / "r.json").read_text())["unfinished"] == flying
 
 
+def test_the_report_names_the_efforts_the_ledger_recorded(tmp_path):
+    from evals import report
+    medium, high = {"status": "ok", "effort": "medium", "usage": {}}, {"status": "ok", "effort": "high", "usage": {}}
+    # A record that says none was sent; one that does not say; a run collected before the runner read it.
+    none, unsaid, before = {**high, "effort": ""}, {**high, "effort": None}, {"status": "ok", "usage": {}}
+    runs = [run("v", f(10), models=["m/one"], answers=[medium]), run("v", f(10), models=["m/one"], answers=[medium]),
+            run("v", f(10), profile="p2", models=["m/two"], answers=[high, none, unsaid]),
+            run("v", f(10), profile="p2", models=["m/two"], answers=[none, before]),
+            run("v", f(10), profile="p3", models=["m/three"], answers=[none])]
+    report.write(CS, runs, tmp_path / "r", {"title": "t", "void_streak": 3})
+    md = (tmp_path / "r.md").read_text()
+    assert "| p1 | m/one | medium（2） |" in md and "| p2 | m/two | high（1）、不发（2）、没记录（2） |" in md
+    assert "| p3 | m/three | 不发（1） |" in md
+    assert "p1（m/one，effort medium）" in md and "p2（m/two，effort high）" in md and "p3（m/three）" in md
+
+
 def test_a_degenerate_interval_says_so():
     from evals import report
     degenerate = {"hits": 0, "runs": 36, "cases": 12, "rate": 0.0, "ci": [0.0, 0.0]}

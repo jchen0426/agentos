@@ -188,7 +188,7 @@ providers:
     api: chat
     base_url: "http://127.0.0.1:11434/v1"
     context_tokens: 65536
-    efforts: [low, medium, high]
+    efforts: [low, medium]
 tasks:
   audit_v1:
     model: local/gpt-oss:20b

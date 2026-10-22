@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/zalando/go-keyring"
+
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/secrets"
 )
 
 // The git tool server's launcher gets everything of agentd's it must keep out of reach.
@@ -167,9 +173,47 @@ func TestModelAdapterKeys(t *testing.T) {
 		"Claude over http":    {`{adapter: anthropic, base_url: "http://proxy.lan:8080", key: "keyring:k"}`, "only over https"},
 	} {
 		m := load("providers:\n  local: " + c.provider + "\n" + task)
-		_, err := modelAdapters(m, nil, t.TempDir())
+		_, err := modelAdapters(m, nil, t.TempDir(), slog.New(slog.DiscardHandler))
 		if (c.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), c.wantErr)) {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A key exactly as long as security's prompt keeps was likely cut there: agentd says so at
+// start, without showing the key.
+func TestCutKeyWarning(t *testing.T) {
+	keyring.MockInit() // an in-memory keyring for this process
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "models.yaml")
+	body := `providers:
+  openai: {adapter: openai_compat, api: responses, base_url: "https://api.openai.com/v1", key: "keyring:agentos-test-cut"}
+tasks: {audit_v1: {model: openai/m, max_tokens: 10}}
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := models.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for length, warns := range map[int]bool{secrets.PromptLimit: true, secrets.PromptLimit - 1: false, 164: false} {
+		key := "sk-proj-" + strings.Repeat("k", length-len("sk-proj-"))
+		if err := keyring.Set("agentos-test-cut", me.Username, key); err != nil {
+			t.Fatal(err)
+		}
+		var logs bytes.Buffer
+		if _, err := modelAdapters(m, nil, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(logs.String(), "security's prompt"); got != warns {
+			t.Errorf("a %d-character key: warned %v, want %v: %s", length, got, warns, logs.String())
+		}
+		if strings.Contains(logs.String(), key) {
+			t.Errorf("a %d-character key: the log shows it", length)
 		}
 	}
 }

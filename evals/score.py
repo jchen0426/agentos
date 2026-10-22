@@ -5,12 +5,13 @@ end SUCCEEDED, with the reason in the outcome). Its report is the model answer t
 accepted; a run without one (a refusal, an answer that kept breaking the schema) found nothing.
 
 A run counts when its model call ended with an answer of the model's: an accepted report, a
-refusal, or a second answer that broke the schema too (the outcome invalid_output: the gateway
-asks again after the first). Any other run is void, whatever ended it (a timeout, budget it
-waited for, a cancel, a policy that denied the call, a provider that kept failing, the second
-request of a call whose first answer broke the schema, a lost run): the rates leave void runs
-out, and the report counts them by reason. The runner can run them again (--retry-void); the
-runs they replaced still count in the money spent and the void count.
+refusal, or an answer that broke the schema for good (the outcome invalid_output: the gateway asks
+again after a first one, unless that one was cut off at max_tokens). Any other run is void,
+whatever ended it (a timeout, budget it waited for, a cancel, a policy that denied the call, a
+provider that kept failing, the second request of a call whose first answer broke the schema, a
+lost run): the rates leave void runs out, and the report counts them by reason. The runner can
+run them again (--retry-void); the runs they replaced still count in the money spent and the void
+count.
 
 - Detection: a finding in the labelled file, within WINDOW lines of a labelled line (in the
   commit's version of the file), with the label's CWE: the strict rate. The lenient rate also
@@ -257,6 +258,10 @@ def _profile(cs: CaseSet, runs: list[dict], seed: int, replaced: list[dict]) -> 
     read = sum(a.get("usage", {}).get("cache_read_tokens", 0) for a in answers)
     inputs = sum(_input_tokens(a.get("usage", {})) for a in answers)
     out["cache_hit_rate"] = read / inputs if inputs else None
+    # The effort agentd sent with each request, as its record says (effort_sent): the task's, capped
+    # by the provider. The efforts first, then the requests sent none, then those that do not say.
+    efforts = _count(_effort(a) for a in answers)
+    out["efforts"] = dict(sorted(efforts.items(), key=lambda kv: (kv[0].startswith("("), kv[0])))
     answered = [a for a in answers if a.get("status")]  # a request with no answer (429, 500, cut off) is not one
     invalid = sum(a["status"] == "invalid_output" for a in answered)
     out["invalid_output"] = {"answers": len(answered), "invalid": invalid,
@@ -283,6 +288,13 @@ def outcome_kind(run: dict) -> str:
 def _input_tokens(u: dict) -> int:
     return sum(u.get(k, 0) for k in ("input_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens",
                                       "cache_write_tokens", "cache_read_tokens"))
+
+
+def _effort(answer: dict) -> str:
+    """The effort a request was sent: "(none)" when its record says none, "(unrecorded)" when the
+    record does not say, or the runner did not read it (a run collected before it did)."""
+    effort = answer.get("effort")
+    return effort or ("(none)" if effort == "" else "(unrecorded)")
 
 
 def _count(items) -> dict:

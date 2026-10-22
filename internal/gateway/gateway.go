@@ -483,9 +483,8 @@ func (g *Gateway) ask(ctx context.Context, info activity.Info, run db.Run, r mod
 	adapter models.Adapter, args map[string]any, fx faults.Effect, seq *int, gen int) (models.Response, error) {
 	for ; ; gen++ {
 		*seq++
-		resp, err := g.modelRequest(ctx, info, run, r, adapter, args, fx, *seq)
-		// An answer cut off at max_tokens would be cut off again: only a larger max_tokens helps.
-		if err != nil || resp.Status != StatusInvalidOutput || gen >= generations || resp.StopReason == "max_tokens" {
+		resp, err := g.modelRequest(ctx, info, run, r, adapter, args, fx, *seq, gen)
+		if err != nil || !asksAgain(resp, gen) {
 			return resp, err
 		}
 		g.Log.Warn("the answer broke the output schema; asking again", "workflow_id", run.WorkflowID,
@@ -655,10 +654,17 @@ func (g *Gateway) waitTurn(ctx context.Context, provider string) error {
 // breaks the task's output schema is asked for once more, and paid for like any request.
 const generations = 2
 
-// modelRequest is one network request to the provider: reserve the most it can cost, record
-// it, send it, check the answer, then record the answer together with its charge.
+// asksAgain reports whether ask sends another request after resp, the answer of generation
+// gen. An answer cut off at max_tokens would be cut off again: only a larger max_tokens helps.
+func asksAgain(resp models.Response, gen int) bool {
+	return resp.Status == StatusInvalidOutput && gen < generations && resp.StopReason != "max_tokens"
+}
+
+// modelRequest is one network request to the provider, of generation gen: reserve the most it
+// can cost, record it, send it, check the answer, then record the answer together with its
+// charge.
 func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.Run, route models.Route,
-	adapter models.Adapter, args map[string]any, fx faults.Effect, seq int) (models.Response, error) {
+	adapter models.Adapter, args map[string]any, fx faults.Effect, seq, gen int) (models.Response, error) {
 	if err := g.tooLate(ctx, info, route, seq); err != nil {
 		return models.Response{}, err
 	}
@@ -785,7 +791,10 @@ func (g *Gateway) modelRequest(ctx context.Context, info activity.Info, run db.R
 	}); err != nil {
 		return models.Response{}, recordError{err}
 	}
-	fx.StallAfterRecord(ctx.Done())
+	// Once the answer the call returns is recorded: not one it asks for again.
+	if !asksAgain(resp, gen) {
+		fx.StallAfterRecord(ctx.Done())
+	}
 	return resp, nil
 }
 

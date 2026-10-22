@@ -23,7 +23,10 @@ def test_t1_kill_agentd_after_the_model_result_is_recorded(stack: Stack) -> None
     stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_after_record_while_exists": str(hold)}])
     stack.start_worker()
     run = stack.start_run()
-    wait_for(lambda: (rows := stack.model_calls(run)) and rows[0]["response_blob"] is not None,
+    # The answer the call returns: a real model's first answer may break the schema and be
+    # asked for again, and agentd holds only after the one that counts.
+    wait_for(lambda: any(r["response_blob"] is not None and r["stop_reason"] != "invalid_output"
+                         for r in stack.model_calls(run)),
              "the model result to be recorded", timeout=MODEL_TIMEOUT)
     stack.restart_agentd(kill=True)  # the result is in the ledger; Temporal never heard of it
     hold.unlink()
@@ -53,13 +56,15 @@ def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded
     # The unanswered attempt stays visible; the retry got the one accepted answer.
     answered = {r["attempt"] for r in rows if r["response_blob"] is not None and r["stop_reason"] != "invalid_output"}
     assert {r["attempt"] for r in rows} == {1, 2} and answered == {2}, [dict(r) for r in rows]
-    # Unrecorded, so charged in full when agentd started again; the retry, what it cost.
+    # Unrecorded, so charged in full when agentd started again; the retry, what it cost. A
+    # model priced at 0 (the local one) reserves and settles nothing.
     entries = stack.budget_entries(run)
     reserved = {e["request_id"]: e for e in entries if e["kind"] == "RESERVE"}
     settled = [(reserved[e["request_id"]], e) for e in entries if e["kind"] == "SETTLE"]
     first = [s for r, s in settled if r["attempt"] == 1]
-    second = [s for r, s in settled if r["attempt"] == 2]
+    second = [(r, s) for r, s in settled if r["attempt"] == 2]
     assert first and all(s["reason"] == "open_at_start" and s["amount_micros"] == reserved[s["request_id"]]["amount_micros"]
                          for s in first), [dict(e) for e in entries]
-    assert second and all(s["reason"] == "usage" and 0 < s["amount_micros"] < reserved[s["request_id"]]["amount_micros"]
-                          for s in second), [dict(e) for e in entries]
+    assert second and all(s["reason"] == "usage" and (0 < s["amount_micros"] < r["amount_micros"]
+                                                      or s["amount_micros"] == r["amount_micros"] == 0)
+                          for r, s in second), [dict(e) for e in entries]

@@ -170,15 +170,20 @@ that is. `--executed --result '{...}'` records
 what the write produced instead, and `--executed --lookup` lets agentd look it up for tools that
 can.
 
-To send the audit to Claude instead of the fake model, store an API key in the login keychain
-(the command asks for it, so it stays out of your shell history), then start agentd with
-`config/dev/agentd-claude.yaml`. Every run then costs money; the budget caps each run.
+To send the audit to Claude instead of the fake model, store an API key in the login keychain,
+then start agentd with `config/dev/agentd-claude.yaml`. Every run then costs money; the budget
+caps each run. Copy the key, run the command below, then empty the clipboard with
+`pbcopy </dev/null`. The shell's own `printf` hands the key to `security` through a pipe, so it
+stays out of your shell history and out of every process's arguments. Don't let `security`
+prompt for it (`-w` last): the prompt reads with getpass(3), which keeps the first 128
+characters and drops the rest without a word, and OpenAI's keys are longer. A key cut there is
+refused (401); agentd warns at start when a key in the keychain is exactly 128 characters.
 Run the Worker in its sandbox whenever agentd holds a real key: an unsandboxed Worker runs as
 you and could read the key from the keychain with `security`. Under the sandbox the keychain is
 out of its reach, which `tests/test_t9_isolation.py` checks.
 
 ```bash
-security add-generic-password -U -s agentos-anthropic-api-key -a "$USER" -w
+printf 'add-generic-password -U -s agentos-anthropic-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
 
 ```bash
@@ -190,10 +195,12 @@ OpenAI and a local model server work the same way. `config/models.yaml` lists bo
   a project of its own with a monthly budget in OpenAI's console is the outer limit.
 - **Ollama**, through Chat Completions (vLLM uses the same adapter). Start it with the context
   window that `context_tokens` names: it cuts longer input without a word, and agentd refuses to
-  send what does not fit. Its models must be priced at 0 in `config/prices.yaml`: a Chat
-  Completions server cannot count tokens before a request. Start it with cloud models off, too:
-  they run on Ollama's servers. agentd also asks Ollama about the model before every request and
-  sends nothing to a cloud model, whatever it is called.
+  send what does not fit. Its `efforts` stop at medium, which caps what gpt-oss is sent: at high
+  it spends all its output tokens reasoning and writes no answer to most audits. Its models must
+  be priced at 0 in `config/prices.yaml`: a Chat Completions server cannot count tokens before a
+  request. Start it with cloud models off, too: they run on Ollama's servers. agentd also asks
+  Ollama about the model before every request and sends nothing to a cloud model, whatever it is
+  called.
 
 A provider that is not on this machine is reached over https only. agentd takes no proxy from
 its environment (`HTTPS_PROXY` and the like): its requests go straight to the hosts its
@@ -205,7 +212,7 @@ Point a task at either with `model`. Or list them in `cross_provider_fallback`, 
 asked, each in a request of its own, when the model declines.
 
 ```bash
-security add-generic-password -U -s agentos-openai-api-key -a "$USER" -w
+printf 'add-generic-password -U -s agentos-openai-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
 
 ```bash
@@ -317,10 +324,11 @@ earlier runner, nor void runs run again that cost nothing). On macOS the
 state directory and the cache must be under the home directory (the default) or a temporary
 directory, which the sandboxes deny. The profiles are `config/models.yaml`'s providers,
 one at a time: `claude` and `openai` need their keys in the keychain (above), `local` needs the
-Ollama server above with gpt-oss:20b.
+Ollama server above with gpt-oss:20b. Each profile is the product's configuration as it is (a
+test holds them equal), and the report shows the effort the ledger says each request was sent.
 
 ```bash
-AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 50
+AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai --profile local --cap-usd 25
 uv run python -m evals report --out docs/eval/<name>
 ```
 

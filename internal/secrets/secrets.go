@@ -11,6 +11,17 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
+// PromptLimit is the most characters security(1) keeps when it asks for a password itself (-w
+// last): it reads with getpass(3), which drops the rest without a word. OpenAI's keys are
+// longer.
+const PromptLimit = 128
+
+// MayBeCut reports whether secret is exactly as long as security's prompt keeps: a longer key
+// stored through it was cut there, and nothing but the provider's refusal says so.
+func MayBeCut(secret string) bool {
+	return len(secret) == PromptLimit
+}
+
 // Resolve reads the secret ref names. The one scheme is "keyring:<service>[/<account>]": an
 // item in the OS keyring (on macOS the login keychain, read through /usr/bin/security);
 // the account defaults to the user agentd runs as.
