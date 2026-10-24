@@ -500,7 +500,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
 
 验收：设计文档第 8 节“审计记录”：每个策略决定、副作用和审批都进 agentd 的哈希链审计日志，记下是谁做的。黑盒测试 `tests/test_audit_log.py`，结果见“测试怎么测”。
 
-合并为 PR #45。合并后，设计文档 rev 358–367 按你批准的清单改了：第 4 节组件表里 agentctl 一行加上 `audit verify`（rev 358）；第 7 节的 proto 加上 `VerifyAudit`，`Result.value_json` 的注释写明 `_audit`（rev 359–360）；`Invoke` 改成实际的顺序（rev 361–362）；SQL 换成 00009 的 audit_log（rev 363）；SQL 后面新加“审计日志”一段（rev 364）；第 8 节“审计记录”一条补上锚和 verify，并写明防不住的情形（rev 365）；第 11 节加一句审计日志的黑盒测试（rev 366）；第 12 节 A 的完成记录（rev 367）。第 11 节那句先写得保守（“各种篡改”“诚实的流程”）：有几种篡改只在 Go 里测，每个测试跑完都调 verify 的普查也还不在仓库里；`--verify-after-each` 合并后改回强的说法。
+合并为 PR #45。合并后，设计文档 rev 358–367 按你批准的清单改了：第 4 节组件表里 agentctl 一行加上 `audit verify`（rev 358）；第 7 节的 proto 加上 `VerifyAudit`，`Result.value_json` 的注释写明 `_audit`（rev 359–360）；`Invoke` 改成实际的顺序（rev 361–362）；SQL 换成 00009 的 audit_log（rev 363）；SQL 后面新加“审计日志”一段（rev 364）；第 8 节“审计记录”一条补上锚和 verify，并写明防不住的情形（rev 365）；第 11 节加一句审计日志的黑盒测试（rev 366）；第 12 节 A 的完成记录（rev 367）。第 11 节那句先写得保守（“各种篡改”“诚实的流程”）：有几种篡改只在 Go 里测，每个测试跑完都调 verify 的普查也还不在仓库里；`--verify-after-each` 合并后改回强的说法。#50 合并后，rev 369 把它改回了：开着 `pytest --verify-after-each` 时，三种环境下诚实的流程跑完 verify 都以 0 退出，有意篡改的测试要声明退出码和对不上的种类。
 
 ### 做了什么
 
