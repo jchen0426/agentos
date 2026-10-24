@@ -133,6 +133,7 @@ def test_without_a_fallback_a_refusal_ends_the_call(stack: Stack) -> None:
     assert [r["stop_reason"] for r in stack.model_calls(run)] == ["refusal"]
 
 
+@pytest.mark.audit_verify(skip="agentd refuses to start, by design")
 def test_agentd_refuses_a_fallback_the_policy_never_allows(stack: Stack) -> None:
     # The test policy allows only fake and anthropic for audit_v1: the fallback could never run.
     with pytest.raises(AssertionError, match="cross_provider_fallback other/audit-fixture"):

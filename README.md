@@ -342,6 +342,8 @@ make test-linux  # in the Lima VM, Workers under bubblewrap
 
 `tests/test_temporal_mtls.py` also needs the full Temporal server: `make temporal-server`.
 
+`uv run pytest --verify-after-each` also runs `agentctl audit verify` on every agentd a test starts, before it stops: every honest flow must leave an audit log that verifies (exit 0), and a test that tampers on purpose declares the exit and the kinds of mismatch it expects (`@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])`).
+
 T1 on a real model instead of the fake one: `AGENTOS_MODEL=claude`, `openai` (gpt-6.1-sol) or
 `local` (gpt-oss:20b on the Ollama server above, which is free). Claude and OpenAI cost money,
 a few cents a run; the Worker runs under its sandbox because agentd holds a real key. Check the
