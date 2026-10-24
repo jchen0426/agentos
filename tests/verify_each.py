@@ -21,6 +21,8 @@ on its own is not verified: its failure says more.
 
 No wait is needed for runs still executing as the test ends: verify takes an attempt whose call
 record is yet to come for one in flight while its run runs, and while agentd says it is executing.
+An exit of 3 (verify could not verify: Temporal just restarted, say) is tried once more, after
+RETRY_AFTER seconds, and the summary says so; a 1 or a 2 never is, and a second 3 stands.
 
 Off by default: without the option nothing here is registered, nothing watches, and nothing changes
 (conftest.py).
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -37,6 +40,7 @@ from tests import harness
 
 OPTION = "--verify-after-each"
 MARK = "audit_verify"
+RETRY_AFTER = 5.0  # seconds before verify is tried again, after an exit of 3
 FIELDS = ("broken_at_seq", "anchors_mismatched", "runs_mismatched", "state_mismatched", "unread", "attempts_unrecorded",
           "runs_unavailable", "runs_before_log")  # what a report holds that is not a clean verification
 
@@ -76,6 +80,7 @@ class Watched:
     outcome: str = ""     # "", or "verified", "declared", "failed", "skipped"
     detail: str = ""      # why it failed, or was not verified
     code: int | None = None
+    retried: bool = False  # verify exited 3, and was tried again
 
     @property
     def label(self) -> str:
@@ -158,6 +163,10 @@ class VerifyAfterEach:
             w.outcome, w.detail = "failed", f"the test declares exit {want} without the kinds of mismatch it expects"
             return
         r = w.stack.agentctl_run("audit", "verify")
+        if r.returncode == 3 and want != 3:  # could not verify, perhaps for now: once more, never after a 1 or a 2
+            w.retried = True
+            time.sleep(RETRY_AFTER)
+            r = w.stack.agentctl_run("audit", "verify")
         w.code = r.returncode
         try:
             found = findings(json.loads(r.stdout)) if r.stdout else set()
@@ -201,7 +210,12 @@ class VerifyAfterEach:
         tr.section(OPTION)
         tr.line(f"{len(stacks)} stacks started an agentd, in {len(self.done)} tests: {count['verified']} verified with "
                 f"exit 0, {count['declared']} as their mark declares, {count['failed']} failed verification, "
-                f"{count['skipped']} not verified")
+                f"{count['skipped']} not verified; verify tried again after an exit of 3 for "
+                f"{sum(w.retried for w in stacks)}")
+        for t in self.done:
+            for w in t.stacks:
+                if w.retried:
+                    tr.line(f"  tried again after an exit of 3: {t.item.nodeid}: {w.label}: then exited {w.code}")
         for t in self.done:
             for w in t.stacks:
                 if w.outcome == "declared":

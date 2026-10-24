@@ -27,6 +27,7 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    verify_each.RETRY_AFTER = 0  # no wait here
     verify_each.configure(config)
 
 
@@ -52,6 +53,8 @@ class Stack:
 
     def __init__(self, name="stack"):
         self.name, self.tmp, self.agentd, self.exit, self.report = name, Path("/fake") / name, None, 0, {}
+        self.exits = []  # exits for the first verifies, before exit
+        self.verifies = 0
 
     def start_agentd(self):
         self.agentd = Agentd()
@@ -59,7 +62,9 @@ class Stack:
             harness.WATCH.on_start(self)
 
     def agentctl_run(self, *args):
-        return subprocess.CompletedProcess(args, self.exit, json.dumps(self.report), "")
+        self.verifies += 1
+        code = self.exits.pop(0) if self.exits else self.exit
+        return subprocess.CompletedProcess(args, code, json.dumps(self.report if code else {}), "")
 
     def audit_verify(self, *args):
         return subprocess.CompletedProcess(args, self.exit, f"verify of {self.name}: {sorted(self.report)}\\\\n", "")
@@ -182,6 +187,31 @@ def test_without_a_stack():
     pass
 
 
+def test_could_not_verify_then_verified(stack):
+    stack.exits = [3]
+
+
+def test_could_not_verify_twice(stack):
+    stack.exits = [3, 3]
+    stack.report = {"unread": [{}]}
+
+
+def test_a_mismatch_is_not_tried_again():
+    s = Stack("once")
+    s.start_agentd()
+    s.exits, s.report = [1, 0], ANCHORS
+    s.close()
+    assert s.verifies <= 1, s.verifies  # verified once at most: never tried again
+
+
+def test_unchecked_is_not_tried_again():
+    s = Stack("once")
+    s.start_agentd()
+    s.exits, s.report = [2, 0], {"runs_unavailable": [{}]}
+    s.close()
+    assert s.verifies <= 1, s.verifies  # verified once at most: never tried again
+
+
 def test_with_no_agentd_started():
     Stack("idle").close()
 '''
@@ -202,7 +232,7 @@ def test_every_agentd_is_verified_and_a_marked_test_passes_only_as_it_declares(t
     assert {name for name, o in got.items() if o == "passed"} == {
         "test_honest", "test_tampers_as_declared", "test_any_kind_of_state", "test_a_stack_of_its_own_honest",
         "test_two_stacks_the_named_one_as_declared", "test_agentd_refused", "test_without_a_stack",
-        "test_with_no_agentd_started"}, (got, out)
+        "test_with_no_agentd_started", "test_could_not_verify_then_verified"}, (got, out)
     for name, says in {
         "test_tampers_unmarked": ["verify exited 1, and the test declares 0", "| verify of stack: ['anchors_mismatched']"],
         "test_tampers_with_a_kind_undeclared": ["found state_mismatched:budget, which the test does not declare"],
@@ -215,11 +245,16 @@ def test_every_agentd_is_verified_and_a_marked_test_passes_only_as_it_declares(t
         "test_two_stacks_the_other_one_tampered": ["stack 'stack' (/fake/stack): agentctl audit verify exited 1"],
         "test_agentd_gone_unmarked": ["its agentd is not running, so its log cannot be verified"],
         "test_fails_on_its_own": ["its own failure"],
+        "test_could_not_verify_twice": ["verify exited 3, and the test declares 0"],
+        "test_a_mismatch_is_not_tried_again": ["stack 'once' (/fake/once): agentctl audit verify exited 1"],
+        "test_unchecked_is_not_tried_again": ["stack 'once' (/fake/once): agentctl audit verify exited 2"],
     }.items():
         assert all(s in got[name] for s in says), (name, got[name])
     assert "stack 'other'" not in got["test_two_stacks_the_other_one_tampered"], got  # the named one verified as declared
-    assert ("19 stacks started an agentd, in 17 tests: 3 verified with exit 0, 4 as their mark declares, "
-            "10 failed verification, 2 not verified") in out, out
+    assert ("23 stacks started an agentd, in 21 tests: 4 verified with exit 0, 4 as their mark declares, "
+            "13 failed verification, 2 not verified; verify tried again after an exit of 3 for 2") in out, out
+    assert "tried again after an exit of 3: test_them.py::test_could_not_verify_then_verified: stack 'stack' (/fake/stack): then exited 0" in out, out
+    assert "tried again after an exit of 3: test_them.py::test_could_not_verify_twice: stack 'stack' (/fake/stack): then exited 3" in out, out
     for line in ["exit 1: test_them.py::test_two_stacks_the_named_one_as_declared: stack 'other' (/fake/other)",
                  "not verified: test_them.py::test_agentd_refused: stack 'stack' (/fake/stack): agentd refuses to start, by design",
                  "not verified: test_them.py::test_fails_on_its_own: stack 'stack' (/fake/stack): the test did not pass on its own",
