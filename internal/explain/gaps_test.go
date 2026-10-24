@@ -232,16 +232,16 @@ func TestAnExplanationIsBounded(t *testing.T) {
 	}
 }
 
-// The report takes from the workflow an error type that is an identifier of at most 64 characters,
-// and says nothing longer than its bounds, on one line.
+// The report names no error type the workflow made up, however well formed (64 characters, as the
+// report call's arguments allow), and says nothing longer than its bounds, on one line.
 func TestTheReportsBounds(t *testing.T) {
 	w := newWorld(t)
 	w.ok("git.show_diff")
-	if o := w.report(ReasonWorkflowError, strings.Repeat("E", 64)); !strings.Contains(o.Claim, "("+strings.Repeat("E", 64)+")") {
-		t.Fatalf("%+v", o)
-	}
-	if o := w.report(ReasonWorkflowError, strings.Repeat("E", 65)); !strings.Contains(o.Claim, "did not name") {
-		t.Fatalf("%+v", o)
+	for _, name := range []string{strings.Repeat("E", 64), strings.Repeat("E", 65)} {
+		if o := w.report(ReasonWorkflowError, name); strings.Contains(o.Claim, "EEEE") ||
+			!strings.Contains(o.Claim, "(an exception of another type)") {
+			t.Fatalf("%+v", o)
+		}
 	}
 	c := w.schedule("audit_v1")
 	c.failsForGood(1, strings.Repeat("boom\n", 400), "", nil)

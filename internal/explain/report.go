@@ -14,6 +14,29 @@ const (
 // ErrorType is what an exception's type a workflow names may look like: an identifier.
 var ErrorType = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]{0,63}$`)
 
+// PublicErrorTypes are the exception types a report names, when the workflow says its own code failed
+// with one: Python's built-in exceptions (not its warnings), and json's JSONDecodeError, which the
+// workflow's own code can raise besides. The set is fixed, not a pattern: a subverted Worker chooses
+// the name, and a report is public, so a name it could choose freely would carry whatever it likes out
+// of agentd, a few dozen bytes a report. With this set it chooses one of these names, or none. Any other
+// name, and none, is said as "an exception of another type". runs explain, which is local, quotes the
+// workflow's own words (its failure in Temporal) as its claim.
+var PublicErrorTypes = map[string]bool{
+	"Exception": true, "ArithmeticError": true, "FloatingPointError": true, "OverflowError": true,
+	"ZeroDivisionError": true, "AssertionError": true, "AttributeError": true, "BufferError": true, "EOFError": true,
+	"ExceptionGroup": true, "ImportError": true, "ModuleNotFoundError": true, "LookupError": true, "IndexError": true,
+	"KeyError": true, "MemoryError": true, "NameError": true, "UnboundLocalError": true, "OSError": true,
+	"BlockingIOError": true, "ChildProcessError": true, "ConnectionError": true, "BrokenPipeError": true,
+	"ConnectionAbortedError": true, "ConnectionRefusedError": true, "ConnectionResetError": true,
+	"FileExistsError": true, "FileNotFoundError": true, "InterruptedError": true, "IsADirectoryError": true,
+	"NotADirectoryError": true, "PermissionError": true, "ProcessLookupError": true, "TimeoutError": true,
+	"ReferenceError": true, "RuntimeError": true, "NotImplementedError": true, "RecursionError": true,
+	"StopAsyncIteration": true, "StopIteration": true, "SyntaxError": true, "IndentationError": true, "TabError": true,
+	"SystemError": true, "TypeError": true, "ValueError": true, "UnicodeError": true, "UnicodeDecodeError": true,
+	"UnicodeEncodeError": true, "UnicodeTranslateError": true,
+	"JSONDecodeError": true, // json's: the workflow's code reads JSON
+}
+
 // Outcome is what a run's report says of the run: the verdict Explain gives a run that ends with
 // this report, by the same rules over the run's history and agentd's records, the report's own calls
 // left out (a report cannot report its own posting, which Explain, once the run has ended, covers
@@ -97,8 +120,8 @@ func bound(o Outcome) Outcome {
 func report(f *facts, reason, errorType string) Outcome {
 	if reason == ReasonWorkflowError {
 		name := errorType
-		if !ErrorType.MatchString(name) {
-			name = "an error it did not name"
+		if !PublicErrorTypes[name] {
+			name = "an exception of another type"
 		}
 		o := Outcome{Verdict: VerdictFailed, Kind: KindWorkflowError, Claim: fmt.Sprintf("the workflow reports that its own "+
 			"code failed (%s), and fails the run once this report is out", name),

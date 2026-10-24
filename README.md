@@ -380,10 +380,13 @@ is `unknown`, never `ok`: when Temporal answers that it has none, or with an err
 agentd cannot reach Temporal, the report's call fails before anything of it is recorded, and
 Temporal tries it again once it answers), and takes the report from the run's own accepted audit;
 the workflow tells it only why it reports (done, or that its own code failed, and the error's type).
-The report shows no internal error's text: where agentd could not read something, or a tool's server
-failed, it says so and that agentd's log has the details; a model's or a tool's own words are shown
-fenced. When the outcome rests on everything it needs but other evidence was past agentd's bounds,
-the report says which, and that it does not change the outcome.
+The report names the type only if it is one of Python's built-in exceptions or json's
+JSONDecodeError: a name the Worker chose freely could carry something out of agentd in a public
+comment, so any other shows as "an exception of another type". `runs explain` quotes the workflow's
+own words. The report shows no internal error's text: where agentd could not read something, or a
+tool's server failed, it says so and that agentd's log has the details; a model's or a tool's own
+words are shown fenced. When the outcome rests on everything it needs but other evidence was past
+agentd's bounds, the report says which, and that it does not change the outcome.
 
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 

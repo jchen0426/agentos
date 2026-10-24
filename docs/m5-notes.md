@@ -1135,7 +1135,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
   - 第 3 节：评论的字段（outcome 由 agentd 按 runs explain 的规则，从运行的历史和自己的记录生成；读不到历史就是 unknown；报告取运行自己最新一个被接受的答复；工作流只给 reason 和 error_type；围栏外只有 agentd 的词）。
   - 第 7 节：工作流的报告调用（不再发 outcome，发 reason、error_type）；`run()` 的异常处理（拦下自己代码的异常，发报告，再以 FAILED 结束；报告之后的任何错误也以 FAILED 结束）。
   - 第 5 节第 9 项：explain 的字段和判定规则，结果要过锚这一关，kind 只看 agentd 自己的字段，任务配置里要求的步骤；第 4 节：审计导出的格式（推送的链头、锚的 result_json，历史是 agentd 的编码）；D12：任务配置里加了 Steps（按种类和名字）、Report、Required。
-- **被攻破的 Worker 在报告里还能决定的**：reason 二选一，和一个短的异常类型名（只在围栏里）。它也能少做步骤，但少了任务要求的那几个，判定就不是 ok。
+- **被攻破的 Worker 在报告里还能决定的**：reason 二选一（done 或 workflow_error），和 51 个名字里的一个，或者不给名字（只在围栏里，见最后的“报告里的异常类型”）。它也能少做步骤，但少了任务要求的那几个，判定就不是 ok。
 - **Temporal 命名空间里的人伪造的失败**：伪造的完成（结果）会被锚这一关拦下；伪造的失败（RespondActivityTaskFailedById）没有锚可查，explain 照历史说这一步失败了，用 agentd 对那次尝试的记录（如果有）说为什么。要查它，得把失败也带上记录的锚，网关返回错误时现在做不到。（第三轮做了：失败按那次尝试的记录和它的 error_type 判，见“第三轮”。）
 - **读账本的上限**：读的是每类行的前 N 条（按 seq 或时间），超了的运行，它后面的调用的结果不验锚，判定标为部分；不读后 N 条是因为前面的步骤也要过锚这一关。（第三轮改了：结果指的记录、失败那次尝试的记录都单独读，不受上限影响，见“第三轮”。）
 - **要求的步骤和 models.yaml 是连着的**：validate_patch、open_pr 的条件是 analyze 的结果里有 `patch_ref`，这个字段名来自 audit_v1 的 `blobs: [patch]`；改了那里，这里也要改，现在没有测试会提醒（可以让 agentd 启动时检查任务的条件字段在模型任务的输出里）。（第三轮做了：启动时检查，见“第三轮”。）
@@ -1449,3 +1449,25 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - **改坏**：12 处都有测试失败（verify 3 处、`terminate` 2 处、explain 7 处）。第一遍有 2 处编译不过，换了写法。
 - **跑过的**：`go test ./...`、`go vet ./...`、`gofmt -l`。黑盒由协调者跑。
 
+### 报告里的异常类型（合并之后，你定的）
+
+- **问题**：被攻破的 Worker 能随意选 `error_type`。参数只按模式检查（`[A-Za-z0-9_.]`，最多 64 个字符），`explain.Report` 再把它写进公开的 GitHub 评论（“its own code failed (<type>)”）。这样每个报告都是一条几十字节的通道，Worker 想带什么出去都行。
+- **改法**：公开的报告只在类型属于一个固定集合时才写出名字（`explain.PublicErrorTypes`，就写在这一处，注释说明为什么是固定的）。集合是 Python 内置的异常，不含警告类；再加上工作流自己的代码会抛的 json 的 JSONDecodeError，一共 51 个（EnvironmentError、IOError 是 OSError 的别名，类型名就是 OSError）。别的名字，和不给名字，都写成“an exception of another type”，不带名字。大小写不同的、带点的路径、在内置名字前后多几个字的，都不算。本地的 runs explain 照旧引用工作流自己的话（它在 Temporal 里的失败）作为它的说法。参数的模式没动，报告调用的参数里照旧有工作流给的名字。
+- **剩下的通道**：done 或 workflow_error，再加 51 个名字里的一个或者不给名字，一个报告不到 6 位。
+- **测试**：
+  - `TestTheReportNamesOnlyBuiltinExceptionTypes`：集合里的写出来，比如 KeyError、JSONDecodeError。集合外的不写，比如 PatchUnreadable。照着集合里的名字造的也不写，比如 keyerror、KeyError.x、json.JSONDecodeError、builtins.KeyError、KeyErrorX。警告类、KeyboardInterrupt、不给名字也都不写。explain 的 claim 里照旧有 PatchUnreadable。
+  - `TestTheReportsBounds`、`TestTheReportAgreesWithExplain` 的预期跟着改了。
+  - 黑盒 T12 的 workflow_error 四种：KeyError、ValueError 照旧写出来；“its own type”（PatchUnreadable）照旧放在参数里，评论里写的是 another type；“a type it cannot name”（Fehlerä）参数里没有，评论里也是 another type；两种的 explain 都还有原来的名字。
+- **改坏**：7 处都有测试失败：
+  - 什么名字都写出来；
+  - 什么名字都不写；
+  - 带点的路径取最后一段；
+  - 不管大小写；
+  - 集合里少了 KeyError；
+  - 集合里少了 JSONDecodeError；
+  - 集合里多了工作流自己的名字。
+
+  第一遍有 2 处编译不过，换了写法。
+- **跑过的**（macOS）：
+  - `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过。
+  - 黑盒，不加沙箱，带 `--verify-after-each`，跑了 T12 和 T13：30 passed。30 个栈：28 个以 0 通过，2 个照设计没验（agentd 不启动），0 个失败。

@@ -260,8 +260,10 @@ def test_t12_the_tool_server_crashes(stack: Stack, call: str, step: str, activit
 def test_t12_the_workflows_own_code_fails(stack: Stack, fault: str) -> None:
     # A result the workflow's code cannot take: a call's value without the key it reads, and a
     # model's line number of 5,000 digits, which Python's json refuses to read. Or its code raises an
-    # exception of a type of its own, whose name the report takes, or does not.
-    workflows, error, named = None, None, True
+    # exception of a type of its own, whose name the workflow sends with its report, or cannot. The
+    # public report names only Python's built-in exceptions (and json's JSONDecodeError): any other
+    # name the Worker could choose to carry something out. runs explain keeps the workflow's own words.
+    workflows, error, sent, shown = None, None, True, True
     if fault == "missing key":
         stack.start_agentd(faults=[{"name": "git.show_diff", "status": "ok"}])
         step, activity, error = "fetch_diff", "1:git.show_diff", "KeyError"
@@ -275,9 +277,9 @@ def test_t12_the_workflows_own_code_fails(stack: Stack, fault: str) -> None:
         stack.start_agentd()
         step, activity = "fetch_diff", "1:git.show_diff"
         if fault == "its own type":
-            workflows, error = "tests.t12_workflows:RaisesItsOwnError", "PatchUnreadable"
+            workflows, error, shown = "tests.t12_workflows:RaisesItsOwnError", "PatchUnreadable", False
         else:
-            workflows, error, named = "tests.t12_workflows:RaisesAnUnnamedError", "Fehlerä", False
+            workflows, error, sent, shown = "tests.t12_workflows:RaisesAnUnnamedError", "Fehlerä", False, False
     stack.start_worker(**({"workflows": workflows} if workflows else {}))
     run = stack.start_run()
     final = stack.wait_state(run, TERMINAL, timeout=120)
@@ -290,10 +292,11 @@ def test_t12_the_workflows_own_code_fails(stack: Stack, fault: str) -> None:
     fenced = body.split("```")[1]
     [report] = [c for c in gateway_calls(stack.history(run)) if c["name"] == "github.comment_commit"]
     assert report["args"]["reason"] == "workflow_error", report["args"]
-    if named:
-        assert f"its own code failed ({error})" in fenced and report["args"]["error_type"] == error, (body, report["args"])
+    assert (report["args"].get("error_type") == error) == sent and ("error_type" in report["args"]) == sent, report["args"]
+    if shown:
+        assert f"its own code failed ({error})" in fenced, body
     else:
-        assert "its own code failed (an error it did not name)" in fenced and "error_type" not in report["args"], body
+        assert "its own code failed (an exception of another type)" in fenced and error not in body, body
     if fault == "long integer":
         assert "app.py:" + "9" * 20 + "…" in fenced, body  # the run's accepted report, whose line is cut
 
