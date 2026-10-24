@@ -269,7 +269,9 @@ def started_at(pid: int) -> str:
 
 
 def command_of(pid: int) -> str:
-    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+    # -ww: no width at all. Without it, a ps that finds a terminal width (an 80-column pty, a
+    # COLUMNS) cuts the line there, and a long checkout path leaves argv[0] a stub ("…/bin/li").
+    return subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                           start_new_session=True).stdout
 
 
