@@ -70,6 +70,10 @@ type Server struct {
 	CancelGrace time.Duration  // how long a cancelled run may keep running before it is terminated
 	Faults      *faults.Script // nil unless agentd runs with --fault-script
 	Log         *slog.Logger
+	// SnapshotDir is where an export's snapshot of the chain goes: agentd's data directory. MaxSnapshot
+	// bounds the snapshot (1 GiB unless set): an export of a chain larger stops short, and says so.
+	SnapshotDir string
+	MaxSnapshot int64
 }
 
 // Reconciler records a person's finding about an effect whose outcome nobody knew: the
@@ -710,10 +714,6 @@ func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRe
 		}
 	}
 	return s.getRun(ctx, r.WorkflowID)
-}
-
-func (s *Server) ExplainRun(context.Context, *agentosv1.ExplainRunRequest) (*agentosv1.Explanation, error) {
-	return nil, status.Error(codes.Unimplemented, "runs explain arrives in M5")
 }
 
 // lookup is the run's row, as one of the ledger's read transactions reads it (ledger.Read checks the

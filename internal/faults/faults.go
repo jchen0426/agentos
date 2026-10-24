@@ -1,10 +1,12 @@
 // Package faults is agentd's test-only fault injection, enabled with --fault-script. It
-// lets black-box tests make a gateway call hold, hang, skip heartbeats or return a
-// scripted status, to reproduce the failure scenarios of the design doc's section 11, and
-// make StartRun slow to record a run's ID.
+// lets black-box tests make a gateway call hold, hang, skip heartbeats, return a scripted
+// status or fail as its tool would, to reproduce the failure scenarios of the design doc's
+// section 11, and make StartRun slow to record a run's ID.
 package faults
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,6 +32,15 @@ type Rule struct {
 	HoldRecordOn                string `json:"hold_record_on"` // a model call's record holds apply only to this provider's request
 	NoHeartbeat                 bool   `json:"no_heartbeat"`   // this attempt sends no heartbeats
 	Status                      string `json:"status"`         // return this status instead of executing
+	// With Status, the result's value: a JSON object, numbers as written (one the Worker cannot read,
+	// for T12). Empty: an empty object.
+	Value json.RawMessage `json:"value"`
+	// A read tool's call fails as the tool would when it refuses the call, with this text: a tool
+	// error, for good (T12).
+	ToolError string `json:"tool_error"`
+	// A git tool server's call holds while this file exists, once the server is up and before the
+	// call is sent to it: the server runs meanwhile, for a test to kill it (T12).
+	HoldInToolWhileExists string `json:"hold_in_tool_while_exists"`
 
 	// What the fake model provider does with this attempt's request (models.FakeFault).
 	ProviderStatus      int    `json:"provider_status"`      // answer 429 or 5xx, unbilled
@@ -39,6 +50,20 @@ type Rule struct {
 	ProviderServedBy    string `json:"provider_served_by"`   // answer as this fallback model
 	ProviderBadOutput   bool   `json:"provider_bad_output"`  // answer with output that breaks the schema
 	ProviderRefuses     string `json:"provider_refuses"`     // this provider's fake model declines to answer
+}
+
+// Result is the result a Status fault returns instead of executing: its value, as the script has it.
+func (e Effect) Result() (map[string]any, error) {
+	if len(e.Value) == 0 {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(e.Value))
+	dec.UseNumber()
+	var v map[string]any
+	if err := dec.Decode(&v); err != nil || v == nil {
+		return nil, fmt.Errorf("fault script: a status's value must be a JSON object: %v", err)
+	}
+	return v, nil
 }
 
 // Effect is what the matching rules ask of one Invoke attempt.
@@ -51,6 +76,9 @@ type Effect struct {
 	HoldRecordOn                string
 	NoHeartbeat                 bool
 	Status                      string
+	Value                       json.RawMessage
+	ToolError                   string
+	HoldInToolWhileExists       string
 	ProviderStatus              int
 	ProviderStatusOn            string
 	ProviderLoseAnswer          bool
@@ -144,7 +172,13 @@ func (s *Script) Match(workflowID, name string, attempt int32) Effect {
 		e.Delay += time.Duration(r.Delay)
 		e.NoHeartbeat = e.NoHeartbeat || r.NoHeartbeat
 		if r.Status != "" {
-			e.Status = r.Status
+			e.Status, e.Value = r.Status, r.Value
+		}
+		if r.ToolError != "" {
+			e.ToolError = r.ToolError
+		}
+		if r.HoldInToolWhileExists != "" {
+			e.HoldInToolWhileExists = r.HoldInToolWhileExists
 		}
 		if r.ProviderStatus != 0 {
 			e.ProviderStatus, e.ProviderStatusOn = r.ProviderStatus, r.ProviderStatusOn
@@ -189,6 +223,27 @@ func (e Effect) StallBeforeRecord(done <-chan struct{}) {
 // StallAfterRecord holds an execution after the ledger recorded its answer.
 func (e Effect) StallAfterRecord(done <-chan struct{}) {
 	holdWhileExists(e.HoldAfterRecordWhileExists, done)
+}
+
+// inTool carries an Effect's hold inside a tool server's call (InTool).
+type inTool struct{}
+
+// InTool is ctx carrying e's hold inside a tool server's call, for StallInTool; ctx itself when e
+// has none.
+func (e Effect) InTool(ctx context.Context) context.Context {
+	if e.HoldInToolWhileExists == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, inTool{}, e.HoldInToolWhileExists)
+}
+
+// StallInTool holds a tool server's call while the file ctx's Effect names exists (InTool): the
+// git tool client calls it once the server is up, before it sends the call. It stops early when
+// ctx ends.
+func StallInTool(ctx context.Context) {
+	if path, _ := ctx.Value(inTool{}).(string); path != "" {
+		holdWhileExists(path, ctx.Done())
+	}
 }
 
 // holdWhileExists blocks while path exists; it reports false if done closed first.

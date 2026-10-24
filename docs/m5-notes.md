@@ -978,3 +978,425 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
 - **ANALYZE 的表里的内容不查**：sqlite_stat1、sqlite_stat4 只按名字、类型和 SQL 认；里面的统计能改变查询计划，没有 ORDER BY 的查询可能换了行的顺序；我没有逐条核对 agentd 的查询是否都不依赖它。
 - **故障丢的记录只在内存里**（第五轮）：agentd 重启之后，那次尝试有了后面的 agentd.started，算被打断，verify 以 0 退出；故障只留在旧 agentd 的日志里。超过 1,000 个之后不再记，verify 把多出来的报成对不上。
 - **诚实流程的普查进了仓库**（A 合并之后）：原来每一轮的普查用的是会话 scratchpad 里的插件，现在是 `tests/verify_each.py`，`uv run pytest --verify-after-each` 打开。测试启动的每个 agentd 都验（`agentctl audit verify`，默认开关），不管栈是谁建的：`Stack` 每起一个 agentd、每关一次，都告诉 `harness.WATCH`。测试自己关掉的栈在关的时候、agentd 停下之前验，测试结束时还开着的在拆之前验；agentd 已经不在、栈又没关的，测试失败。诚实的测试必须以 0 退出，否则测试失败，带着 verify 的输出。有意篡改、或者本来就该是别的结论的测试，用 `@pytest.mark.audit_verify(exit=N, kinds=[...])` 声明退出码和可以出现的对不上：kinds 是 verify 报告（`-o json`）里的字段名，`state_mismatched:<kind>` 只放过那一种状态的对不上；出现了没声明的就失败。一个测试有几个栈时，标记用 `stack=` 点名（审计日志测试里两个 agentd 的那个）。声明了的共 19 处：审计日志的 16 个测试（其中一个有两个栈）、T5 改 payload、重用任务 ID 的执行；agentd 按设计起不来的两个用 `skip=` 写明原因。测试自己失败了就不验。结束时按测试列出每个起过、没验的 agentd 和原因。仍在执行的任务不需要等：verify 本来就把它们的调用当作进行中。verify 以 3 退出（没能验，比如 Temporal 刚重启过）时，隔 5 秒再验一次，汇总里写明；1 和 2 从不重试，第二次还是 3 就照样失败。看不到的是别的进程起的 agentd（比如当作子进程跑的评测 runner）。默认不开，CI 也不跑；要不要让 CI 跑，留着再定。
+
+## B：runs explain 和审计导出（2026-10-22）
+
+验收：T12（`tests/test_t12_explain.py`）和 T13 里 runs explain 的部分（`tests/test_t13_model_errors.py`），以及第 4 节的“审计导出时两边合并”（`tests/test_audit_export.py`）。结果见“测试怎么测”。第二轮按两份推送前审查改过，见“推送前审查”；第三轮按协调者、自动提交审查和两份复审改过，见最后的“第三轮”。
+
+### 做了什么
+
+- **判定是一个函数，在它自己的包里**（`internal/explain`）：
+  - `Explain(in, read)`：先读 Temporal 的历史，再在一个读事务（快照）里读账本（`read`）。结果里 `_audit` 指向的记录，在结果发出之前就提交了，所以后读的账本一定有它们。历史经 Temporal 的迭代器一页页取，一个事件一个事件地处理，只留每个网关调用的一小段摘要，不留整份历史；最多读 10 万个事件、2 万个网关调用，再多就停下，并在 `missing` 里说明（Temporal 自己的上限是 51,200 个事件）。
+  - `Report(in, read, reason, error_type)`：报告用的同一套规则，读的也是同一份历史和账本，只是去掉报告调用自己，见下面“报告”。
+  - `ReadTemporal`：Control 和报告读 Temporal 用的同一段代码（DescribeWorkflowExecution，再给出历史的迭代器）。
+  - `ReadLedger`：Control 和报告读账本用的同一段代码，每类行都有上限（任务的记录 5000 条、model_calls 2000 条、审批 500、副作用 1000、calls 表 5000、任务开始以来 agentd 的启动记录 1000），各多读一条来知道有没有超；超了的写进 `Ledger.Cut`，explain 的 `missing` 里有这句，报告标明是部分判定。另外读审计日志的第一条（日志从何时开始）、答复 blob 里的状态和拒答的话（最多 200 个答复）、预算合计。
+- **结果算不算 agentd 的**（第二轮）：历史里一个调用的结果，只有它的 `_audit` 按 A 的锚规则指向 agentd 自己的那条记录才算：这次运行自己的执行的 call 记录（actor 是 run，比 control 的 checkAnchors 多查这一条），seq 和 sha256 对得上，activity ID 是这个调用的，是完成它的那次尝试的，状态和结果一样且不是 error，result_sha256 是结果的值去掉 `_audit` 之后的 sha256，而且没有更早的结果指向同一条。不算的（日志开始之后的执行里没有锚、锚不对、结果读不了），这个调用按 agentd 对那次尝试的记录判（没有就按这个调用最新的记录；一条都没有 → kind `foreign_result`），另外列一条 incident：“a result agentd did not send”，把历史里的状态当成 Temporal 命名空间里某人的说法，写明为什么不算。日志开始之前的执行没有锚，照旧算。锚指向的记录在读账本的上限之外的，不验，照结果的状态，判定标为部分。
+- **判定的规则，先看状态**：
+  - SUCCEEDED：任务有报告调用而运行一次都没调用 → `step_failed` / `report_not_posted`，步骤 post_report（第二轮）。否则第一个改变了运行走向的调用：人拒绝或审批过期 → `not_approved`（`approval_rejected`、`approval_expired`，cause 写谁在什么时候、为什么拒绝，或者何时过期）；其余 → `step_failed`；报告调用本身没成功 → `report_not_posted`。都没有，再看任务要求的步骤（第二轮，见“我定的几处”）：缺一个被接受的结果 → `step_failed` / `step_missing`，步骤是缺的那个。都有 → `ok`，路上的麻烦单列在 incidents。
+  - 什么算“之后接着走了”（不算改变走向）：等待（needs_approval、needs_reconcile、budget_exhausted）之后有同一种类、同一名字的调用；修改（edited）之后有任何不是报告的调用（就是检查审批人那份补丁的那些调用：它们拒绝了，被点名的是它们，带着它们的理由）；报告之后又发了报告（前一个没发出去的，列成 incident）。
+  - FAILED：最后一个报告调用不是 ok → `failed` / `report_not_posted`；报告发出去了而运行失败 → 工作流自己的代码出错（`workflow_error`），步骤是报告之前最后一个不是报告的调用；没有报告调用 → 同样是 `workflow_error`，步骤是最后一个调用。之前改变了走向的调用列成 incident。TIMED_OUT 也是 `failed` / `workflow_error`。
+  - CANCELLED（以及取消之后的 FAILED、TERMINATED，和 GetRun 一样）：`cancelled`，cause 写 run.cancelled 记录里的操作者和时间；之后被 agentd 终止的，再写 run.terminated 的原因。取消了却照样 SUCCEEDED 的，按 SUCCEEDED 判。
+  - TERMINATED：有 run.terminated 记录 → agentd 终止的，写原因；没有 → 不是 agentd 终止的，Temporal 历史里的身份和原因只作为对方的说法（claim）。
+  - RUNNING，按这个顺序（第二轮）：已经被取消、还没结束 → `cancelled`，不给 `next`（agentd 拒绝它所有的调用）；`stuck`：DescribeWorkflowExecution 里的工作流任务到了第 3 次尝试（连着失败或超时两次）、某个活动到了第 3 次尝试，或者工作流任务排队超过 1 分钟没有 Worker 接（`no_worker`）；`waiting`，按 agentd 自己的表（PENDING 且没过期的审批、UNKNOWN 的副作用、最后一个调用是 budget_exhausted 且之后没有同样的调用），`next` 写要执行的 agentctl 命令；否则 `running`，指出当前步骤。卡住或正在取消的运行不给 `next`：那时批准、追加预算都动不了它。
+  - Temporal 已经没有这个执行（保留期过了，或开发服务器丢了状态）：`unknown`，只用审计日志和账本能说的部分，`missing` 写明缺了 Temporal。
+- **kind 来自 agentd 自己的字段，不来自文字**（第二轮）：
+  - 拒绝：网关在每个拒绝的地方写明是谁拒绝的，进 call 记录的 `refused_by`：policy（策略的决定，或它对一次运行写操作个数的上限）、loop_guard、cancel（运行已取消）、tool（工具拒绝了这个调用，比如补丁检查）、agentd（其余：没有这个工具、范围不对、审批之后 payload 变了……）。值从拒绝的地方经结果带到 recordCall（`_refused_by`），recordCall 把它取出写进记录，再从结果里删掉：工作流拿不到它，result_sha256 也不含它。explain 按它分 kind；没有这个字段的旧记录，策略的决定是 deny 就是 policy_denied，否则是 `denied`，cause 写“记录没说是谁拒绝的”，不看理由的文字。
+  - git 工具服务器出错：gitmcp 的客户端把它返回成一个类型（`gitmcp.ServerFailure`，没起来、退出、超时、回了读不了的东西），网关用 errors.As 认出来，在记录里写 `error_cause: tool_server`；explain 按它判 `tool_server_failed`。同样的文字、没有这个类型的错误，只是 tool_error。
+- **可信度**：verdict、step、kind 只来自 agentd 自己的记录（call 记录及其 refused_by、error_cause，副作用、审批、model_calls、预算、agentd.started）和 Temporal 自己记的东西（事件类型、超时、尝试次数），历史里的结果要过锚这一关。Worker 写的东西（结果里的 outcome、工作流的失败信息、工作流任务的失败原因）只放进 `claim`，标明是工作流自己的说法；Worker 写的 AgentState 不用来判断等待。
+- **崩溃靠它留下的痕迹推断，原因里写明是推断**：
+  - Worker：WorkflowTaskTimedOut → `worker_stopped`（“处理它的 Worker 停了或卡住了”），算在这个工作流任务处理的那个结果的步骤上。
+  - agentd：某次尝试有 call.started 没有 call 记录，之后（下一次尝试开始之前）有 agentd.started → `agentd_stopped`；没有 call.started 时回退到时间：某次尝试没有 call 记录，而 agentd.started 在上一次尝试的记录（没有就是这个调用排期）之后、下一次尝试开始之前 → `agentd_stopped`；没有这样的启动 → `activity_timeout`。记录写了、结果没到 Temporal（agentd 在两者之间被杀）的，看记录之后、下一次尝试之前有没有启动。
+  - 一次尝试的 error 记录在下一次尝试开始之后才写（T8 那种：Temporal 已经放弃它了，它后来才失败）→ `activity_timeout`，cause 写“它后来以错误结束”（第二轮）。
+  - git 工具服务器：见上面的 error_cause。实测它在调用中途被 kill -9 时，这次尝试的 call 记录状态 error，error 是 git 客户端自己的那句话，error_cause 是 tool_server；下一次尝试起一个新的服务器。
+- **步骤名属于任务配置（D12）**：`tasks.Task` 的 `Steps` 按调用的种类和名字（`tasks.Call{Kind, Name}`）给步骤起名，`Report` 是报告调用（也是种类和名字），`Required` 是一个运行要算结束得好必须有被接受结果的调用，可以带条件（`When: &Holds{Call, Field}`：另一个调用最新被接受的结果里这个字段有值）。security-audit：fetch_diff、analyze 总要；validate_patch、open_pr 在 analyze 的结果有 patch_ref 时才要。映射里没有的调用显示成它的种类和名字，加引号（`"tool foo"`），从不用活动 ID（第二轮）。
+- **proto**：`Explanation` 的 1–4 号字段不变（`step` 是步骤名，`evidence` 仍是给旧客户端的一行行文字），从 5 号起加了 state、verdict、kind、activity_id、call、attempt、next、incidents、sources（每条证据带来源：temporal 的事件 ID、audit 的 seq、ledger 的表和键）、cost（spent、reserved、limit）、usage（按计费的模型：请求数、输入、输出、读缓存、写缓存的 token，拒答次数）、claim、missing、incidents_omitted。新的 RPC `ExportAudit`（服务端流）和它的消息；第二轮加了 `PushedHead` 这一段和 `ExportedAnchor.result_json`。
+- **agentctl**：`runs explain <run>`（文本；`-o json` 是全部字段），`audit export [--run ID] [-o FILE]`。文本输出里工作流或模型选的东西（claim、调用名、活动 ID、incident 的活动 ID、模型名）用 %q 印（第二轮）。
+- **Control 的每个 RPC 都有恢复拦截器**（第二轮，`control.ServerOptions`：一元和流各一个）：panic 连同调用栈写进日志，调用方拿到 Internal，agentd 不倒。ExplainRun 自己的 recover 去掉了，只留一处。
+- **报告的 outcome 由 agentd 生成**（用户的决定：“comment_commit 的 outcome 改由 agentd 根据账本生成，和 runs explain 用同一套判定。”）。第二轮起它读的是运行的历史和 agentd 的记录（`explain.Report`），不再只看记录，见“我定的几处”。
+- **工作流（选择 10）**：`run()` 拦下工作流自己的代码抛出的异常（取消除外，asyncio 和 temporalio 两种都放过），照样发报告（`reason=workflow_error`，`error_type` 是异常类型名），然后抛不可重试的 ApplicationError，运行以 FAILED 结束。第二轮：报告调用本身也包起来，之后无论出什么错（报告调用最后失败、它的结果读不了），运行都以 FAILED 结束并写明原因，不再一直 RUNNING；取消照旧放过。正常路径的命令不变，T10 的重放测试照样通过。
+- **故障注入**：faults 有 `tool_error`（读工具的调用按工具拒绝的方式失败，走网关真正的 toolError 映射）、`hold_in_tool_while_exists`（git 工具服务器握手之后、发调用之前停住，测试可以 kill 它；第二轮起 github.open_draft_pr 生成 payload 时读文件也受它管），和第二轮的 `value`（`status` 故障返回的值，数字原样，比如 5000 位的评论 ID）。
+- **modelsim**：答复文件用 UseNumber 解码，报告里的数字原样发出，5000 位的行号也行。
+- **harness**：`start_modelsim(answers=...)`、`report_comment(run)`、`explain(run)`。
+- **账本查询**：ListAgentdStarts、ListRunAuditRecordsPage、CountRunAuditRecords、ListRunModelCalls、ListRunEffects、ListRunCalls（第二轮都带 LIMIT），ListRunApprovalsLimit。
+- README 写了 `runs explain`、`audit export`、报告的 outcome，以及 T12、T13、导出的测试。
+
+### 我定的几处（文档没细说）
+
+- **Explanation 的字段**按草稿，几处不同：
+  - 证据带来源的那组叫 `sources`；`evidence` 照旧是一行行文字，由 sources 生成。
+  - usage 数的是请求（`requests`），不是草稿说的 calls：一个网关调用可能有几次请求（重试、二次生成、跨提供方回退），计费按请求，T13 的 cut-off、429 都是一次调用两次请求。
+  - 多了 `claim`（工作流自己的话，单独一个字段，文本输出标明“its own claim, not checked”）、`missing`（缺了哪些来源，读账本时超了上限的也在这里）、`incidents_omitted`、`cost.reserved`。
+  - `verdict` 的词：ok、step_failed、not_approved、failed、cancelled、terminated、waiting、stuck、running、unknown。`kind` 的词有 27 个（proto 里列着；第二轮加了 step_missing、foreign_result）。ok 的运行 kind 和 step 为空。
+- **步骤名和要求的步骤放在 tasks.Task**，不放在 policy.yaml：策略管能不能做，步骤名和“哪些步骤必须有”是任务对平台说“我的流程是什么”，和 Scope、默认预算一样属于任务的注册。按种类和名字而不是只按名字：一个叫 audit_v1 的工具调用不是 analyze。
+- **要求的步骤**（第二轮，对抗性审查的高危项）：“被接受”是指调用以 ok 完成、结果是 agentd 发的（过了锚这一关）。条件只看字段有没有值（null、空字符串、空数组、空对象、false 都算没有）。只在 SUCCEEDED 和报告里检查；FAILED、取消的运行另有判定。
+- **等待只看 agentd 自己的表**，到了 expires_at 的 PENDING 审批不算在等（agentd 随时会把它记成过期，运行接着走；agentd 也不再接受对它的决定）；Worker 说它在等审批而 agentd 没有这张审批单，就是 running（有测试）。
+- **stuck 的门槛**：工作流任务和活动都是第 3 次尝试。`no_worker`（工作流任务排队超过 1 分钟没有 Worker 接）是草稿没有的，我加的：这是“Worker 没在跑”最常见的样子。
+- **预算等待的 next**：建议追加“缺的 + 同样多”。实测：第一次被拒时网关只知道输出那一侧的上界（还没数输入的 token），只补缺的，数完输入还会再被拒一次。多给的只是上限，不会被花掉。只取 agentd 发的结果里的数字。
+- **报告（用户的决定）**：
+  - outcome 由 agentd 按 `explain.Report` 生成：和 runs explain 读同一份历史（agentd 在 comment_commit 的 Prepare 里用自己的 Temporal 客户端读）和同一份账本，规则也是同一套，只去掉报告调用自己：报告不能报告它自己发出去没有；运行结束后 explain 的判定还会把 post_report 算进去（报告没发出去 → FAILED / report_not_posted）。报告调用自己之前失败的尝试也不算。
+  - 读不到历史（Temporal 出错、没有这个执行、历史读到一半出错）→ `unknown` / `history_unavailable`，原因写进围栏，绝不是 ok。读不了账本 → 这次尝试失败，Temporal 会重试。读的超了上限 → 围栏外多一行“The outcome is partial”。
+  - 报告取运行最新一个被接受的 audit_v1 答复（`tasks.AuditModel`），不管工作流给不给 report_ref；给了而不是它（比如 diff 的 blob），就拒绝（denied，报告没发出去）。
+  - 目标 repo 和 commit：网关的 scope 检查本来就管，工作流给别的值，策略拒绝（`commit is not this run's`）。
+  - PR 仍是 agentd 副作用记录里的 `#n`。
+  - 工作流只能说 `reason`（done、workflow_error）和 `error_type`（`^[A-Za-z_][A-Za-z0-9_.]{0,63}$`，只能和 workflow_error 一起）；agentd 把它写成工作流自己的说法：“The workflow says, as its own claim: the workflow reports that its own code failed (KeyError)…”。工作流的异常类型名不合这个规则（Python 允许非 ASCII 的类名）就不发 error_type，agentd 写“an error it did not name”。
+  - 围栏外只有 agentd 自己的词：`Outcome: <verdict> at <step> (<kind>)`，verdict 和 kind 是固定词表，step 只在是任务按种类和名字起的步骤名时才写，render 里再按 `^[a-z][a-z0-9_]{0,63}$` 过一遍；cause（可能引用工具、模型、审批人的话）和 claim 在围栏里，单行、有界。
+  - 兼容：`outcome` 改为可选，收下但不显示（旧 Worker 在途的运行还会发）；新 Worker 不再发。工作流的返回值 `{"outcome", "pr_url"}` 不变：评测读它。
+  - 报告里发现的行号改成 json.Number，只显示前 20 位。
+- **工作流的 except**：`except (asyncio.CancelledError, CancelledError): raise`，`except Exception` 发报告再失败。不是 Exception 的 BaseException（SDK 的 eviction）不拦；NondeterminismError 只在 replayer 里抛，不会进工作流代码；沙箱的 RestrictedWorkflowAccessError 会被拦下，按选择 10 也是报告 + FAILED。报告调用那一段：ActivityError（不是取消）→ “report not posted: …”；别的异常 → “the workflow raised X on its report's result: …”，都是不可重试的 ApplicationError；两种取消照旧重新抛出。
+- **导出**：
+  - 服务端流，一段段发：先各个执行的历史，再（只在导出整条链时）agentd 推给链的锚工作流的链头，最后是链头和记录。历史先读，链在之后的一个快照里读，快照里一定有历史和推送的链头指向的每条记录。所以文档里键的顺序是 runs、pushed_heads、run_id、head、records。
+  - 第二轮：链的快照在一个短的读事务里写进 agentd 自己的临时文件（0600，protodelim 分隔），事务结束之后再从文件发出去：读导出的人再慢（比如管道接 less），也不会让账本的读事务开着、WAL 没法 checkpoint。
+  - 第二轮，审查让我二选一，我选了把锚工作流的链头放进去（不只是写进文档）：用 A 的 externalAnchors，只取这条链的、确实是 agentd 的锚工作流（类型和任务队列对）里的链头；不是 agentd 的锚工作流这类问题仍归 VerifyAudit 报。`--run` 的导出没有它们（链头管的是整条链）。
+  - 历史是 agentd 从 Temporal 读到的事件的 protojson（`temporal.api.history.v1.History`），是 agentd 的编码，不是 Temporal 原样的字节；文档的 `hashes` 和 proto 注释都写明了。Python SDK 的 `WorkflowHistory.from_json` 读得回来（测试用它）。
+  - 锚：每个结果里带 `_audit` 的 ActivityTaskCompleted：event_id、activity_id、attempt、seq、sha256，第二轮加了 `result_json`：记录里 result_sha256 算的那些字节本身（JSON 里是 base64），读的人直接算 sha256，再看它解析出来是不是历史里那个值去掉 `_audit`；`hashes` 里写的编码规则也按 Go 的实际行为改对了（`\b` `\f` 用短转义，其余控制字符 `\u00XX`，`< > &` U+2028 U+2029 转义，无效 UTF-8 变 `�`），用 Go 跑过核对。
+  - 哪些任务：和 VerifyAudit 一样，Temporal 在 Worker 队列上列出的、审计日志记下的、runs 表里的，三者的并集。
+  - `-o FILE`：导出命令里 `-o` 是文件名（导出总是 JSON）；`-o json`、`-o text` 拒绝。文件先写临时文件再改名，权限 0600。
+- **文字的出口**：服务端把每段文字变成单行可打印文本（safetext.Line），第二轮起连续的空格并成一个（别的空白 safetext.Line 本来就转义），再截断（cause、claim 1000 字节，名字 200 字节；incidents 最多 50 条，多的计数；证据最多 12 条）；进 agentd 句子里的工作流、工具、模型的话都加引号（%q），活动 ID 在证据里也加引号；agentctl 的文本输出再过一遍 safetext.Line，并给工作流选的东西加引号。Incident 的时间用定宽格式（ledger.Stamp），能按文本排序。
+- **没有 refused_by 的旧记录**：协调者说“退回 unknown，不按文字匹配”。我的理解是“不知道是谁拒绝的”，不是另起一个 verdict：kind 用已有的 `denied`，cause 写明记录没说是谁拒绝的；只有记录里策略的决定（`policy.decision`，agentd 自己的结构化字段，不是文字）是 deny 时才是 policy_denied。
+- **报告在哪一次尝试里生成**：comment_commit 的 payload 只在第一次成功的 Prepare 里生成并记下，之后的尝试都用它。所以那一刻 Temporal 读不了，发出去的报告就一直写 unknown。按要求（“读不到就说 unknown，绝不 ok”）我没有改成重试；另一种做法是读不了时让这次尝试失败、交给 Temporal 重试，几次之后再写 unknown，见“留到后面”。
+- **认不出的记录类型一律忽略**（A 第 4 轮的 call.counted、budget.*、model.*、blob.owned、agentd.read 等），有测试。
+- **“指对”怎么判**（文档没定义）：kind、step、activity_id、attempt 是注入的那个；cause 写出注入的具体内容；证据指向那条审计记录和那个历史事件。
+- **unknown-run 的记录**（同一个工作流 ID 下 agentd 没启动的执行）不算这个任务的调用，锚指向它也不算。
+- **一个调用的种类和名字**取它结束时的那条记录（没有就取它的第一条记录，再没有才用历史里 Worker 写的输入）。
+
+### 推送前审查（安全审查 + 对抗性审查）发现的问题
+
+两份审查都是对第一轮的提交（e1ca7d0）。每条的测试都是审查探针的那个情形（探针在 e1ca7d0 上失败，是审查记下的），在新代码上通过；没有把新测试搬回旧代码上跑（接口变了，搬不回去），它们拦得住什么，由下面的改坏检查说明。
+
+**安全审查**（六条，没有高危）：
+
+1. 中：explain 相信一个不是 agentd 发出的结果。审查的探针：有 Temporal 访问权的人用 RespondActivityTaskCompletedById 把模型调用以 ok 完成，agentd 的记录说 refused，explain 说“ok: the run ended well”。改：日志开始之后的执行，按 A 的锚规则（再加上 actor 必须是 run）认结果，不算的按 agentd 的记录判，另列 incident（见“做了什么”）。测试：`TestAResultAgentdDidNotSend`（没有锚、别的调用的记录、sha256 不对、不是 call 记录、agentd 没启动的执行的记录、别的尝试的记录、状态不对、值和记录的 result_sha256 不对、读不了的值，九种伪造；完全没有记录；同一条记录被两个结果指向；日志之前的结果照旧算），`TestAResultPastWhatWasReadIsUnchecked`。
+2. 中低：从不报告的运行算 ok。改：任务有报告调用而运行没调用 → step_failed / report_not_posted，之前改变走向的调用列成 incident。测试：`TestARunThatNeverReports`；T12 的 Floods（不报告）现在也是这个判定。
+3. 低：工具的文字决定 kind（`git.apply_check` 的拒绝理由是 git 服务器原样的话，`loop guard…`、`run cancelled` 会被当成 agentd 的循环守卫和取消，还不加引号地写进 agentd 的句子）。改：网关在每个拒绝的地方写 `refused_by`，explain 只看它；旧记录只看策略的决定，不看文字。测试：网关 `TestARefusedCallHasItsRecord`（每种拒绝的 refused_by，结果里没有 `_refused_by`）、`TestTheRecordSaysWhoRefusedAndWhereAnErrorCameFrom`；explain `TestWhoRefusedPicksTheKind`（八种，包括审查的两句工具文字和两种旧记录）。
+4. 低：Worker 在围栏外选步骤（没名字的调用退到活动 ID，起名叫 analyze 就成了 analyze；按名字不按种类映射）。改：按种类和名字映射，没映射的用加引号的种类和名字，从不用活动 ID；只有映射到的才 Named。测试：`TestStepsAreTheTasksByKindAndName`（活动 ID 叫 analyze、post_report 的无名调用，叫 audit_v1 的工具调用，叫 git.show_diff 的模型调用，叫 open_pr 的工具调用），`internal/tasks` 的测试。
+5. 低：文本输出的行可以伪造（safetext.Line 保留连续空格，claim、调用名、活动 ID 不加引号进句子）。改：连续空格并成一个；agentd 句子里和证据里的这些都加引号；agentctl 用 %q 印 claim、调用名、活动 ID、模型名。测试：`TestWorkerTextCannotForgeRows`、`TestTheirWordsAreQuoted`。
+6. 低：读账本无上限（每次 explain、每次 comment_commit 的 Prepare 都读一个任务的全部记录，Worker 能让它变大）。改：每类行一个上限，超了写进 missing，报告标明是部分判定。测试：`TestReadLedger`（真的 SQLite：上限、Cut 的话、启动记录从任务的第一条记录之后开始）、`TestAResultPastWhatWasReadIsUnchecked`、githubtool `TestTheReportSaysWhatItsVerdictCovers`。
+
+导出（信息级）的几条：`hashes` 的文字改对了，并且每个锚带上被哈希的字节（`result_json`）；proto 注释里各段的顺序改对了；不再用一个读事务包住整个流（快照先写进临时文件），测试 `TestAnExportHoldsNoTransactionWhileItSends`：导出发记录时从另一个连接做一次 TRUNCATE checkpoint（busy_timeout 200 毫秒）必须成功，把发送放回事务里它就失败（试过）；历史是 agentd 的编码这一点写进了文档，锚工作流的链头放进了导出（我选的），测试 `TestAnExportHoldsThePushedHeads`、agentctl 的 `TestTheExportIsOneDocument`、黑盒导出测试（正常重启 agentd 让它推一次链头，链头对得上那条记录）。
+
+还有两条要求：
+
+- Control 的每个 RPC 加恢复拦截器：做了，ExplainRun 自己的 recover 去掉了（拦截器管所有调用，留两处只会让人以为不一样）。测试 `TestAPanicInAControlCallFailsTheCall`：真的 gRPC（Unix 套接字），一元的 ExplainRun 和流式的 ExportAudit 都 panic，都拿到 Internal，日志里两次都有调用栈，之后的调用照常。
+- 报告调用的结果读不了时运行卡住：包起来了（见“做了什么”）。测试：黑盒 `test_t12_a_report_whose_result_cannot_be_read`（`status` 故障加 `value`，评论 ID 5000 位）→ FAILED，历史里没有一个 WorkflowTaskFailed；faults 的 `TestAStatusValue`。
+
+**对抗性审查**：
+
+1. 高：报告按 agentd 的最后一条记录判，不按工作流拿到的结果。审查的例子：T8 那种过期的尝试后来以错误结束，记录里最后一条是 error，报告说失败而运行其实接着走了；audit_v1 每次尝试都卡住、全部超时，记录里只有后来的 ok，报告说 ok；任何跳过 analyze 的运行都是 ok（OldStyleReport 的测试还断言了这一点）。改：去掉只看记录的那一份，报告用同一个 `Explain` 的规则读运行的历史（agentd 在 comment_commit 里有 Temporal 客户端），只去掉报告调用；要求的步骤写进任务配置；读不到历史就是 unknown。测试：`TestTheReportAgreesWithExplain`（15 种情形，报告在报告调用失败一次之后算，和运行结束后的 explain 比，也和期望的值比：过期的尝试后来失败、模型卡住到超时、没有分析、有补丁而没检查、修改后检查拒绝、不是 agentd 发的结果……）、`TestTheReportNeedsTheHistory`、网关 `TestTheReportsVerdictIsRunsExplains`；黑盒：OldStyleReport 现在是 `step_failed at analyze (step_missing)`，`test_t12_a_stale_attempt_that_failed_late`（T8 那种，报告和 explain 一致，都是 ok，过期的那次尝试列成 activity_timeout）。“全部尝试都卡住”这一种的黑盒要五次 30 秒的心跳超时，只在 Go 里测。
+2. 中：审批人改过的补丁没通过验证，被怪到修改上。改：修改之后的任何不是报告的调用都算“接着走了”，拒绝的那个调用被点名，带着它的理由。测试：上面的“修改后检查拒绝”，黑盒 `test_t12_an_edit_the_validation_refuses`（补丁改到 `.github/`，validate_patch / tool_denied）。
+3. 中低：先看 waiting 再看 stuck。改：正在取消 → 卡住 → 等待；`next` 只给 agentd 现在会接受、也能让运行动起来的命令。测试：`TestWhatMovesTheRunComesFirst`（工作流任务一直失败时有待批的审批、取消了还在跑时有待批的审批、追加了预算却没有 Worker）。
+4. 低：git 服务器在 validate_patch、open_pr 里被杀记成 tool_error（靠文字前缀，而这两个工具的错误外面又包了一层）。改：类型化的错误加 error_cause（见“做了什么”）；open_pr 生成 payload 时读文件也受 hold_in_tool 管，T12 在三个步骤里各杀一次。测试：gitmcp `TestServerFailure`、网关、explain `TestWhereAnErrorCameFrom`，黑盒 `test_t12_the_tool_server_crashes` 三种。
+5. 改坏：他们的 69 处里 46 处测试仍通过。点名的那些都补了测试：R3（报告里的过期）、F16（没有历史时记录和 calls 表只用一个）、F17/F18（报告发了两次）、J27（顺序）、J29（只有 UNKNOWN 的副作用才等）、J14b 和 J9（门槛两侧：59 秒、61 秒；到期的那一刻）、E2（取消了却照样完成）、E6（取消的运行不说被终止）、J24（以拒答结束的调用，它的拒答不算 incident）、J18–J23（崩溃推断的时间窗：进行中的调用之前的尝试、启动在记录之前、启动在上一次尝试之前、启动在下一次尝试开始之后、两次对账各归各的）、J26（incident 按时间排）、J1（旧记录没有策略的决定不算策略拒绝）、J13（日志之前的运行在等预算）、T1（按字符截断）、L1（启动记录从任务的第一条之后）；Python 的两处：加了第三种异常类型（`PatchUnreadable`）和一个名字不合规则的类型（`Fehlerä`，`fullmatch` 改成 `match` 时 error_type 会被发出去，comment_commit 拒绝它，报告发不出去）。`facts.cancelReq` 删了。他们点名之外仍通过的，能补的也补了测试（重用的活动 ID、没有报告调用的任务、正好 10 万个事件、拒答和拒绝取对的那一个、Worker 已领的工作流任务、还在启动的运行、没结束的报告调用、几个上限、行号上限的两侧）；F5（失败的调用，最后一次尝试没有记录时退到更早一次尝试的记录）我当成了修正：那时说它怎么结束的应该是 Temporal 的失败，不是更早那次的错误，改了代码并加了测试。他们的列表我在新代码上重写了一遍，结果见“测试怎么测”。
+
+### 测试怎么测
+
+- **黑盒 T12**（`tests/test_t12_explain.py`，24 个，经 agentctl 的 JSON 和 proto）：每种故障一个运行，断言 verdict、kind、step、activity_id、attempt，原因里写着注入的具体内容，证据指向那条审计记录的 seq 和那个历史事件的 ID；每个发了报告的运行，报告围栏外的 `Outcome: <verdict> at <step> (<kind>)` 和 explain 的一样（从 githubsim 读评论）。
+  1. 工具报错：fault `tool_error`，内容带 ANSI 转义、换行和回车 → step_failed / tool_error / fetch_diff；文本输出没有原始的转义字符，原因留在一行里，伪造不出 `forged line` 这样一行。
+  2. 模型拒答（fake 的 `provider_refuses`）→ step_failed / model_refused / analyze，证据里有 model_calls 那一行，usage 里有一次拒答；工作流的报告调用里没有 outcome，只有 `reason: done`。
+  3. 策略拒绝（策略不许 fake 这个提供方）→ policy_denied / analyze。
+  4. 预算用尽：waiting / budget_exhausted / analyze，`next` 是 `agentctl budget extend <run> --usd …`；测试照着 next 执行，运行跑完 → ok，incident 里有这次暂停和追加它的人。
+  5. kill -9 Worker（先 SIGSTOP 让它领到工作流任务）→ ok，incident worker_stopped / analyze，证据是 WorkflowTaskTimedOut 事件。
+  6. kill -9 agentd（模型调用第 1 次尝试中）→ ok，incident agentd_stopped / analyze / attempt 1，证据是第二条 agentd.started。
+  7. kill -9 git 工具服务器，三个用到它的步骤各一次（第二轮）：fetch_diff、validate_patch、open_pr（open_pr 是在生成 payload、读补丁改的文件时）→ ok，incident tool_server_failed / 那个步骤 / attempt 1，证据是那次尝试的 error 记录，记录里 `error_cause: tool_server`。
+  8. 工作流自己的代码出错，四种（第二轮加了后两种）：缺键（fault 让 show_diff 返回空值）、5000 位的行号（modelsim 的脚本答复）、工作流自己的异常类型（`PatchUnreadable`）、名字不合规则的异常类型（`Fehlerä`）→ FAILED（不再一直 RUNNING），failed / workflow_error，claim 里有异常类型；报告发出去了，报告调用的参数是 `reason: workflow_error`，名字合规则的带 `error_type`，围栏里写着它；不合规则的不带，围栏里写“an error it did not name”。长整数那次，报告用的是运行被接受的答复，行号截到 20 位。
+  9. 报告调用的结果读不了（第二轮）：`status` 故障加 `value`（评论 ID 5000 位）→ FAILED，claim 写着“ValueError on its report's result”，历史里没有一个 WorkflowTaskFailed。
+  9a. 报告调用停住的时候取消运行（第二轮）：照样 CANCELLED（包住报告调用之后，取消仍是取消），explain 是 cancelled。
+  10. 审批人改的补丁被检查拒绝（第二轮）：补丁改到 `.github/`，validate_patch / tool_denied，原因里有 `.github`；报告一致。
+  11. 过期的尝试后来失败（第二轮，T8 那种）：show_diff 第 1 次尝试不发心跳、45 秒后以工具错误结束，第 2 次尝试已经 ok；等那条迟到的记录写进来再批准 → ok，incident activity_timeout / fetch_diff / 1，“ended later, with an error”；报告一致。
+  12. 卡住的运行（`FailsItsTasks` 在 run() 里抛异常，不经过安全审计的处理）→ stuck / workflow_task_failed / fetch_diff，证据是 WorkflowTaskFailed 事件。
+  13. 旧式的报告调用（带 outcome，没有分析，`OldStyleReport`）照样发出，outcome 不出现在评论里；第二轮起它是 `step_failed at analyze (step_missing)`。
+  14. 不是运行自己的报告（diff 的 blob 当 report_ref）、不是运行自己的目标（别的 commit），两种都被拒绝，报告没发出去：report_not_posted / post_report。
+  15. 不是 agentd 启动的运行：NotFound，agentctl 以 1 退出。
+  16. 敌意的历史（`Floods`：300 个调用，每个的活动 ID 900 个字符，带转义和换行，从不报告）：JSON 不到 64 KB；第二轮起判定是 report_not_posted / post_report，循环守卫的拒绝列成 incident（“before that”），它的活动 ID 截到 200 字节、转义成可见文字；文本输出每一行都是 agentctl 自己的，agentd 还活着。
+  17. 工作流的代码里抛出 Temporal 自己的 CancelledError：当作取消，不发报告。
+- **T13 里 runs explain 的部分**（`tests/test_t13_model_errors.py`）：三种接口各五种故障，explain 的 verdict、kind、step 和 incidents 都一样，也都是预期的值；每个运行的报告也一样。
+- **导出**（`tests/test_audit_export.py`，2 个）：两个运行（一个批准、一个拒绝）后导出，Python 自己按 netstring 重算每条记录的 sha256 和链接，和链头对上；记录和账本逐字段相同；每个历史用 Python SDK 的 `WorkflowHistory.from_json` 读回；每个 ActivityTaskCompleted 都列为锚，锚指向的记录是这个调用的；第二轮：锚的 `result_json` 的 sha256 就是记录里的 result_sha256，解析出来就是历史里的值去掉 `_audit`；正常重启 agentd 让它推一次链头，导出的 `pushed_heads` 每个都对得上那个 seq 的记录；`--run` 只有这个任务的，没有 pushed_heads；`-o json` 被拒绝；不认识的 run 报 NotFound。
+- **Go 测试**（第二轮新加和改过的）：
+  - `internal/explain`：原来的判定表（44 种）按新规则更新（拒绝都写明 refused_by，跑完整的流程，日志之前的结果去掉锚）；新加：结果算不算 agentd 的（`TestAResultAgentdDidNotSend` 等，见上）、kind 只看 refused_by 和 error_cause、步骤按种类和名字、文字伪造不了行、按字符截断、报告和 explain 的 15 种情形、读不到历史、崩溃推断的五个时间窗、incident 的顺序、正在取消 / 卡住 / 等待的顺序、只有 UNKNOWN 的副作用才等、等待的门槛两侧、取消了照样完成、日志之前的运行等预算、没有历史时的步骤、`ReadLedger` 用真的 SQLite（上限、Cut、启动记录的起点、不合 schema 的答复不读 blob），还有为改坏补的十几个小测试（报告发了两次、重用的活动 ID、最后一次尝试没有记录的失败、没有报告调用的任务、正好 10 万个事件、拒答取拒答的那次请求、拒绝取被拒绝的那张审批单、Worker 已领的工作流任务、还在启动的运行、没结束的报告调用、谁取消的、explanation 的各个上限、报告的上限、不是 agentd 发的结果里的数字不算、证据里的活动 ID 加引号、空字段不算有值）。
+  - `internal/control`：ExplainRun 用新的 Temporal 读法；`TestAPanicInAControlCallFailsTheCall`（真的 gRPC，一元和流都 panic）；导出的锚带 result_json；推送的链头；`TestAnExportHoldsNoTransactionWhileItSends`。
+  - `internal/gateway`：每种拒绝的 refused_by、结果里没有 `_refused_by`、ok 的结果带着它也不算；类型化的服务器错误才有 error_cause；`TestTheReportsVerdictIsRunsExplains`（假的 Temporal：任务起名的步骤、没起名的不出围栏、Temporal 读不了是 unknown、历史太长是 partial）；faults 的 value 经网关原样返回。
+  - `cmd/agentctl`：导出的 pushed_heads、result_json（base64）、两种新的乱序；`TestTheirWordsAreQuoted`。
+  - `internal/githubtool`：部分判定和 unknown 怎么显示；行号的上限两侧。
+  - `internal/tasks`（按种类和名字的步骤、Required）、`internal/faults`（`value`）、`internal/gitmcp`（`TestServerFailure`：包了几层也认得出，文字一样而没有类型的认不出）。
+- **跑过的**（macOS，第二轮的定稿代码）：`gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 24 个包全过；explain、control、gateway（改过的测试）、agentctl、faults、gitmcp、tasks 在 `-race` 下也过，新测试各连跑 5–10 遍没有不稳定的；Linux（arm64）交叉编译和 `go vet` 都过。黑盒：不加沙箱，T12（24）、导出（2）、T13（5）、重放和 T10、取消、`tests/test_eval_*`，179 passed；srt 下，T12、导出、T13、重放、T10、取消、dry run，40 passed。第一轮的完整套件（不加沙箱）是 234 passed、1 failed、29 skipped，失败的是 T5 的 `test_t5_a_payload_changed_after_the_approval_is_not_sent`，原因在 A 第 3 轮的基底上，B 没碰那段；三种环境的完整套件留给协调者。
+- **改坏检查**（脚本在会话的 scratchpad 里，没进仓库；第二轮重写了一份，`mutate2.py`）：
+  - 对抗性审查的 69 处，在新代码上重写（R6 拆成两处：explain 的步骤都算有名字、报告的步骤都算有名字；F5 我当成了修正，改成把旧的回退放回去）：65 处有测试失败；2 处的代码没了（`facts.cancelReq` 删了；按理由的文字判 kind 的代码没了，我自己的 K6 把它放回去，有测试失败）；3 处测试仍通过，都是等价的改坏：
+    - F9（`current()` 不再要求读到了历史）：没有历史的步骤只在 Temporal 还说得出这个执行、历史却在第一个事件之前就没了时才走到 `current()`，而且只在一个只有 call.started 的步骤不是最后一步时结论才不同。
+    - F22（取第一条 run.cancelled，不取最后一条）：一次运行只会有一条（MarkRunCancelled 只在 cancelled_at 为空时写，写了才记）。
+    - J28（预算的等待不看“之后接着走了”）：最后一步不可能“之后接着走了”，那要它后面还有调用。
+  - 我自己对第二轮新代码的 82 处（锚的每一条规则、refused_by 的每一种和网关的每个拒绝处、error_cause、按种类和名字的步骤、什么算接着走了、取消 / 卡住 / 等待的顺序、要求的步骤及其条件、报告读历史和读不到历史、部分判定、读账本的每个上限、空格和引号、导出的 result_json / 链头 / 快照、两个拦截器、faults 的 value）：全部有测试失败。第一遍有 4 处测试仍通过、2 处编译不过：编译不过的是改法让 import 或变量没人用了，换了写法；仍通过的，3 处补了测试（策略对一次运行写操作个数的上限也是策略拒绝、只有报告跟在后面的修改不算接着走了、报告在它自己的调用里生成时不把报告调用算进去），1 处是代码里多余的第二道检查（recordCall 和 callEvent 都只认拒绝时的 refused_by），删掉了 recordCall 的那道。
+  - 工作流和只有黑盒测试碰得到的 6 处（每处重新 make build，再跑点名的黑盒测试）：4 处有测试失败（`except Exception` 收窄成 `(KeyError, ValueError)`、`fullmatch` 改成 `match`——手动复核过，失败在 explain 的断言上：error_type 被发出去，报告被拒、没发出去——去掉报告调用之后那一段的 `except Exception`、open_pr 生成 payload 时不受 hold_in_tool 管）。2 处测试仍通过：报告那一段里重新抛出两种取消的两个分支，去掉哪一个，新的黑盒测试“报告调用停住时取消”都照样以 CANCELLED 结束。原因：活动默认的取消方式是 TRY_CANCEL，工作流被取消时 await 处收到的是 asyncio 的 CancelledError（BaseException，`except Exception` 本来就不拦），不是包着 CancelledError 的 ActivityError，也不是 temporalio 的 CancelledError。这两个分支在现在的 SDK 和取消方式下是走不到的，我留着它们和审计那一段的写法一致，也防将来改成 WAIT_CANCELLATION_COMPLETED。
+
+### 留到后面
+
+- **设计文档要改的地方**（给你的修改清单）：
+  - 第 3 节：评论的字段（outcome 由 agentd 按 runs explain 的规则，从运行的历史和自己的记录生成；读不到历史就是 unknown；报告取运行自己最新一个被接受的答复；工作流只给 reason 和 error_type；围栏外只有 agentd 的词）。
+  - 第 7 节：工作流的报告调用（不再发 outcome，发 reason、error_type）；`run()` 的异常处理（拦下自己代码的异常，发报告，再以 FAILED 结束；报告之后的任何错误也以 FAILED 结束）。
+  - 第 5 节第 9 项：explain 的字段和判定规则，结果要过锚这一关，kind 只看 agentd 自己的字段，任务配置里要求的步骤；第 4 节：审计导出的格式（推送的链头、锚的 result_json，历史是 agentd 的编码）；D12：任务配置里加了 Steps（按种类和名字）、Report、Required。
+- **被攻破的 Worker 在报告里还能决定的**：reason 二选一，和一个短的异常类型名（只在围栏里）。它也能少做步骤，但少了任务要求的那几个，判定就不是 ok。
+- **Temporal 命名空间里的人伪造的失败**：伪造的完成（结果）会被锚这一关拦下；伪造的失败（RespondActivityTaskFailedById）没有锚可查，explain 照历史说这一步失败了，用 agentd 对那次尝试的记录（如果有）说为什么。要查它，得把失败也带上记录的锚，网关返回错误时现在做不到。（第三轮做了：失败按那次尝试的记录和它的 error_type 判，见“第三轮”。）
+- **读账本的上限**：读的是每类行的前 N 条（按 seq 或时间），超了的运行，它后面的调用的结果不验锚，判定标为部分；不读后 N 条是因为前面的步骤也要过锚这一关。（第三轮改了：结果指的记录、失败那次尝试的记录都单独读，不受上限影响，见“第三轮”。）
+- **要求的步骤和 models.yaml 是连着的**：validate_patch、open_pr 的条件是 analyze 的结果里有 `patch_ref`，这个字段名来自 audit_v1 的 `blobs: [patch]`；改了那里，这里也要改，现在没有测试会提醒（可以让 agentd 启动时检查任务的条件字段在模型任务的输出里）。（第三轮做了：启动时检查，见“第三轮”。）
+- **Worker 在两个工作流任务之间死掉不留痕迹**：没有超时事件，只是慢；只有排队超过 1 分钟时 explain 报 no_worker。
+- **靠时间的推断**：agentd.started 的时间和 Temporal 事件的时间来自不同的进程，同一台机器上时钟一致才成立（v0.1 是这样）；有 call.started 的那条不靠时间。
+- **导出**：历史是 agentd 的编码，读的人没有 Temporal 就验不了这些事件真是 Temporal 的；能验的是链、每个锚、推送的链头。锚工作流里不是 agentd 的那些问题仍只有 VerifyAudit 报。
+- **“全部尝试都卡住”的黑盒测试**没有写（要五次 30 秒的心跳超时），Go 里有同样的情形。
+- **报告生成时 Temporal 一时读不了**：报告就永远写 unknown（payload 只生成一次）。可以考虑读不了时先让这次尝试失败、重试几次（Temporal 的重试本来就在），最后一次才写 unknown；要你定。（第三轮做了：在这次调用里重试约 30 秒，见“第三轮”。）
+
+### 第三轮（19d440a 之后）
+
+这一轮是协调者的三处、自动提交审查的两处、安全复审的三处、对抗性复审的五处，都在 19d440a 之上的一个提交里。上面“留到后面”里有四条这一轮做了，在那里注明了。
+
+#### 做了什么
+
+- **报告生成时 Temporal 一时读不了**（64def4d 的做法，最终对抗性审查之后改了，见“最终对抗性审查之后”）：`ReportVerdicts` 在这次调用里重试，不靠工作流的重试策略（那是 Worker 写的）。第一次暂停 250 毫秒，之后每次翻倍，最多 4 秒，一共约 30 秒（`ReadFor`、`Pause` 可以设，测试里调小）。心跳由网关的 `heartbeat()` 在整个 Invoke 期间发（活动的心跳超时 30 秒，StartToClose 10 分钟）。时间用完了才写 unknown。重试只在 Temporal 读不了时做（`Outcome.Retry`）。账本读不了照旧让这次调用失败。Temporal 说没有这个执行，也不重试，再读结果也一样。每次重试 agentd 的日志记一条 Warn，最后一次记 Error，都带完整的错误。
+- **伪造的失败**：失败事件没有锚，但 agentd 有那次尝试的记录。只有那次尝试的 call 记录以 error 结束，而且 error_type 和 Temporal 失败的类型一样，失败才算 agentd 的。旧记录没写 error_type 的，只看状态。不然就是一条 incident，kind `foreign_result`，写“a failure agentd did not send”，把失败当成命名空间里某人的说法加引号写出，这一步按记录判（比如记录说 ok，就按 ok 判）。下面这种原来也算 incident：没有记录、执行在日志开始之后、这次尝试期间（开始到结束后 1 秒）没有 agentd.started；最终对抗性审查之后改了说法，见“最终对抗性审查之后”。超时（TimedOut）是 Temporal 自己的，不变。为此网关每条 error 记录都写 `error_type`，算法和 Temporal Go SDK 的失败转换一样：ApplicationError 用它自己的类型；别的错误用 Go 类型名，去掉指针；errors.New 的为空。`TestTheRecordHasTheFailuresType` 拿 SDK 自己的转换来对。
+- **启动时检查 Required**（`gateway.CheckRequired`，在 CheckModels 之后）：任务要求的每个调用，agentd 都要有，就是 models.yaml 里的模型任务，或者注册了的工具。每个条件（When）读的字段，模型任务的输出要给得出：可以是 `report_ref`，可以是 blobs 里某个字段的 `<field>_ref`，也可以是输出 schema 里不是 blob 的字段。工具的条件，要求它是写操作工具，结果 schema 里有这个字段。有一条不满足，agentd 就拒绝启动，并说出是哪个任务、哪一步、哪个字段、为什么，比如“…holds patch_ref, which model task audit_v1 does not produce: its output's patch is not one of its blobs ([])…”。
+- **锚的点查**（自动提交审查第 1 条、安全复审第 1 条）：
+  - 结果的 `_audit` 指的那条记录，按 seq 单独读（`GetAuditRecord`），不靠有上限的批量读，然后照旧查 workflow ID（新加的：必须是这个运行的）、类型、activity ID、尝试。
+  - seq 超过链头，或者那条不是这个运行的，结果就不算 agentd 发的（foreign）。只有点查本身失败，结果才算“没验”：它的值不用来判，判定是 unknown（新的 kind `record_unreadable`），绝不会是 ok。
+  - 失败的尝试也一样：运行的记录被截断时，失败那次尝试的记录按 activity ID 和尝试单独读，读失败也是 unknown。
+- **公开评论里不放内部错误的原文**（自动提交审查第 2 条）：报告（Report，公开模式）里是这样写的：
+  - Temporal 读不了：只写“agentd could not read the run in Temporal; agentd's log has the details”。
+  - agentd 自己的错误、模型适配器的错误、账本的错误、git 工具服务器的失败：只写哪一步怎么了，后面加“agentd's log has the details”。
+  - 超时：只写 Temporal 的超时类型。
+  - 记录读不了：不写数据库的错误。
+  - 审批里写操作结果未知的那条（原因是 agentd 自己的错误，会带主机和端口）：只写去 agentd 的日志和 `agentctl reconcile show` 看。
+
+  工具自己的拒绝（tool_denied）和永久失败（ToolFailed）照旧把工具的话写在围栏里。本地的 runs explain 照旧给细节，转义过的。
+- **unknown-run 的记录单独计数**（安全复审第 1 条）：
+  - 运行自己的记录（`ListRunOwnAuditRecords`）只算这个执行的：actor 不是 unknown-run 的那些。还有 agentd 在 StartRun 记下执行 ID 之前拒绝的调用：记录的 actor 是 unknown-run，但 `temporal_run_id` 是这个执行的。
+  - 别的执行的记录（同一个工作流 ID 下、不是 agentd 启动的）只计数（`CountRunUnknownRecords`），不占上限；`missing` 里说有多少条没读。
+  - 失败那些尝试的记录（截断之后的那次读）用同一条规则，这样一大堆别的执行的记录挤不掉它们。
+- **部分报告**（安全复审第 2 条）：判定 ok 而别的证据被截断时，报告写明截了哪些（“Not read, past agentd's bounds: audit records past the first 5000; …”），并说这不改变结论：结论依据的是历史里的每个调用，每个都对照 agentd 自己的记录。判定是 unknown 时，只写截了哪些。要求的东西被截断或没验，判定就不是 ok：
+  - 历史超过 agentd 读的上限：现在是 unknown / history_unavailable，原来是部分判定。这一条对 runs explain 也适用：已经结束的运行，报告调用可能在没读的那部分里，所以不再说 report_not_posted。
+  - 记录读不了：unknown / record_unreadable。
+- **导出的快照**（安全复审第 3 条）：快照写在 agentd 的数据目录（0700）里，文件名前缀 `export-snapshot-`，权限 0600，导出完就删。agentd 启动时（拿到数据目录的锁之后）删掉上次没删掉的，日志里说删了几个。大小上限 1 GiB（`Server.MaxSnapshot` 可以调），到了就停在那条记录之前；链头的 `cut` 说从哪个 seq 起没有、为什么，agentctl 在 stderr 上说导出被截断了，并以 2 退出（64def4d 之后的提交，见下面“我定的几处”）。
+- **活运行里的 dry run**（对抗性复审第 1 条）：运行不是 dry run，写操作的结果却是 DRY_RUN（接手的 agentd 没配 GitHub，只能 dry-run），就是没发出去：不满足 Required，不说“went out”，用新的 kind `dry_ran`，点名的是那个写操作。dry run 自己的运行不变。
+- **取消落在写操作中途时谁拒绝的**（我写 refused_by 的测试时发现的，对抗性复审的列表里没有）：取消在 Invoke 读完运行之后、写操作发出之前到达时，有好几处会遇到：领取、等待审批之前、重发之前、恢复。这时写操作被放弃（ABANDONED），而 `effectResult` 对 ABANDONED 一律说是 agentd 拒绝的，explain 就会写“agentd refused open_pr”，而不是取消。改成：运行已经取消的，ABANDONED 的写操作说是 cancel 拒绝的。没取消的（比如批准的 payload 被改了）仍是 agentd。
+- **Temporal 说运行完成了，历史却没了**（查他们 FR18 那处改坏为什么没被拦下时发现的）：在 Describe 和读历史之间历史过了保留期就会这样。原来的判定是 step_failed / step_missing，“缺一个被接受的 fetch_diff”，其实不缺，只是历史没了，没法验。现在是 unknown / history_unavailable，cause 写“Temporal says the run completed, but no longer has its history”，再附上 agentd 的记录怎么说（没验过的），和 Temporal 已经没有这个执行时的说法一样。
+
+#### 我定的几处
+
+- **unknown 的意思**：协调者确认，是“不知道是谁拒绝的”，不是新的 verdict。
+- **报告读不到历史时的原因不写错误原文**：协调者先说要写，后来改了。
+- **历史超过上限算 unknown**，不再算部分判定：结论可能就在没读的那部分里。
+- **账本读不了不重试**：那是 agentd 自己的问题，这次调用失败，交给 Temporal 重试，和原来一样。
+- **error_type 每条 error 记录都写**，算法和 SDK 一样，测试拿 SDK 来对。不加的话，伪造的失败只能按状态判，挡不住“类型不对”的那种。
+- **unknown-run 里这个执行自己的早期拒绝算这个运行的**：不然最后一次尝试是这种拒绝（StartRun 记下执行 ID 之前 Invoke 一直拒绝，重试用完）时，会被说成“a failure agentd did not send”，冤枉了 agentd 自己的记录。别的执行的照旧不算、只计数。判断用记录里的 `temporal_run_id`：执行 ID 是 Temporal 服务器分配的，别的执行造不出这个值。
+- **快照上限 1 GiB**，截断时 agentctl 以 2 退出。64def4d 里还是 0，协调者定了改成 2，单独一个提交。2 的意思和 `audit verify` 的一样：不是全部都查到、导出了。文件照样是完整的 JSON，链头里有 `cut`，stderr 也照样有一句：agentctl 返回的错误就是这句话。没有导出时以 1 退出，和其他命令一样。
+- **dry_ran 的判定**：verdict 是 step_failed，kind 是 dry_ran，点名的是那个写操作。报告调用自己也只 dry-run 了（这时它本来就发不出去）。
+- **截断的说法**：判定是 unknown 时，报告不说“这不改变结论”。unknown 的原因已经写在 cause 里，“结论依据的是历史里的每个调用”这句话那时也不对。
+
+#### 复审（自动提交审查、安全复审、对抗性复审）
+
+**自动提交审查**：
+
+1. facts.go 的锚检查在读的窗口之外放行：锚指向读的上限之外的 seq，结果就“没验”，照它自己的状态算。改成点查，见“做了什么”。测试：
+   - `TestAResultsRecordIsReadOnItsOwn`：上限之外的照常验；seq 超过链头、别的运行的记录，算不是 agentd 发的；点查失败是 unknown，报告不带数据库的错误，explain 带；在它之前已经有一步改变了走向的，判定仍是那一步。
+   - `TestReadLedgerReadsWhatResultsName`：用真的 SQLite。
+2. 公开评论里有内部错误的原文。改：见“做了什么”。测试：
+   - `TestTheReportShowsNoInternalError`：模型适配器的错误、git 工具服务器的失败、工具自己的话、超时、Temporal 读不了。
+   - githubtool 的 `TestTheReportSaysWhatItsVerdictRestsOn`：写操作结果未知的审批。
+   - 网关的 `TestTheReportTriesTemporalAgain`：日志里有错误，报告里没有。
+
+**安全复审**：
+
+1. 中：截断之后伪造的锚被接受。他们的两个探针（`TestR2ForgedAnchorPastTheCutIsAccepted`、`TestR2ReportAcceptsTheForgedAnalysis`）改写成了我自己的 `TestAForgedAnchorPastTheCut`：用 unknown-run 的记录灌到上限以外，再用一个链里从没有过的 seq 把模型调用以 ok 完成；截断与否，explain 和报告都不说 ok，结果列成 incident。另外，unknown-run 的记录单独计数（见“做了什么”），测试是 `TestReadLedgerReadsWhatResultsName`：十条别的执行的记录，有的带别的执行 ID，有的不带，都不占上限；这个执行自己的早期拒绝要读；StartRun 还没记下执行 ID 时，一条都不算。
+2. 低：部分报告读起来像成功。改：见“做了什么”。测试：`TestWhatABoundLeavesOut`、githubtool 的 `TestTheReportSaysWhatItsVerdictRestsOn`（ok 时说不改变结论，unknown 时不说）、`TestAHistoryLongerThanExplainReads`。
+3. 低：导出的快照在 $TMPDIR，SIGKILL 会把它留下，也可能把 $TMPDIR 写满。改：见“做了什么”。测试：
+   - control 的 `TestAnExportsSnapshotIsAgentdsOwn`：导出时数据目录里有且只有一个带前缀、0600 的文件，导出完就没了。
+   - `TestAnExportStopsAtItsBound`：上限正好装下两条就是两条，少一个字节就是一条，链头不变，`cut` 说从哪个 seq 起。
+   - `TestRemoveSnapshots`：只删带前缀的。
+   - agentctl 的 `TestACutExportSaysSo` 和 `TestAgentctlSaysAnExportIsCut`：经一个假的 agentd 跑命令。截断的导出以 2 退出，错误（agentctl 印在 stderr 上的那句）说从哪条起、转义过，文件仍是完整的、链头带着 `cut`。完整的导出以 0 退出。退出码另有 4 处改坏（以 1 退出、以 0 退出、话不转义、完整的也以 2 退出），都有测试失败。
+   - 黑盒 `test_an_exports_snapshot_is_in_agentds_data_directory`：agentd 的 TMPDIR 指向一个不存在的目录，导出照样成功；启动时上次留下的快照被删掉。
+
+**对抗性复审**：
+
+1. 活运行里的 dry run 算 ok。改：见“做了什么”。测试：
+   - `TestAWriteOnlyDryRun`：活运行里是 dry_ran，dry run 自己的运行是 ok，报告也一样。
+   - 黑盒 `test_a_live_runs_write_that_was_only_dry_run_did_not_go_out`：他们的探针，批准之后 agentd 被杀，换一个没有 GitHub 的 agentd 接手，结果是 step_failed / dry_ran / open_pr，两个写操作都是 DRY_RUN，GitHub 没收到 POST。
+2. 每个 refused_by 用 Go 测试钉住：网关的 `TestEveryRefusalSaysWhoRefused`。
+   - GW2：要审批时每个运行写操作的上限，是 policy。
+   - GW2b：不要审批时的上限，是 policy。
+   - GW10：写操作发出时工具拒绝，再调一次，由已结束的副作用回答，都是 tool。
+   - GW11：批准之后取消，是 cancel。
+   - GW5：模型的提供方被策略拒绝，是 policy。
+   - 另加三种：领取前取消的写操作，以及它再被调用；要审批前取消的写操作，这两种原来是 agentd，现在是 cancel；没取消而被 agentd 放弃的（批准的 payload 被改了），仍是 agentd。
+3. 顺序（JG5：先查卡住再查取消）：`windows_test.go` 的“cancelled, and stuck”：取消了、工作流任务又一直失败的运行，是 cancelled，不是 stuck。
+4. Required 的匹配：`TestTheTasksCallsByKindAndName`。
+   - FR19：种类不对的同名调用不算。
+   - FR20：When 看最新一个被接受的 analyze，不看第一个。
+   - FR25：名字对、种类不对的不算报告。
+   - FR3：等待要同种类同名字的调用才算“接着走了”。
+5. RP4 / FR11 在点查之后重查：
+   - RP4（判定不看没验的结果）现在落在 `judge()` 的“没验就 unknown”上，有测试失败。
+   - FR11（“没读到”扩到任何 seq）落在 `anchored()` 的 NamedErr 上：改成任何缺记录的 seq 都算没读，伪造的锚就成了 unknown 而不是 foreign，`TestAForgedAnchorPastTheCut` 失败。
+
+#### 测试怎么测
+
+- **新的 Go 测试**，见上，另外还有：
+  - `TestAFailureAgentdDidNotSend`：记录说 ok、记录说是别的类型的错误、没有记录、记录对得上、没写类型的旧记录、尝试期间 agentd 重启、日志之前的执行、截断后单独读、单独读失败。
+  - `TestAFailureAgentdSentBeforeItKnewTheExecution`：这个执行的早期拒绝、别的执行的、没写执行 ID 的。
+  - `TestAResultNamingAnError`。
+  - 网关的 `TestTheReportTriesTemporalAgain`：读不了一次之后好了，就照常判；一直读不了，到时间写 unknown，日志里有每次的错误；DescribeWorkflowExecution 和取历史两处都注入。
+  - `TestTheRecordHasTheFailuresType`：五种错误和 SDK 的转换对。
+  - `TestCheckRequired`：少了 blob、字段不在 schema 里、读的工具、结果 schema 里没有字段、没有的模型任务和工具、别的种类。
+  - `TestARefusedCallHasItsRecord`：每条 error 记录有 error_type，别的没有。
+  - 网关的 `TestTheReportsRetriesAreBounded`：暂停一次比一次长（1.3 秒里不到 15 次）；最后一次暂停截到期限（第一次暂停 3 秒、期限 200 毫秒时 1.5 秒内结束）；调用的期限一到就停；Temporal 没有这个执行时只问一次；日志里最后那条 Error 带着错误。
+  - `TestReadLedgerSaysWhatItCouldNotRead`：真的 SQLite 里放两行读不出来的记录（peer_uid 不是数字），一行是结果指向的别的运行的记录，一行是截断之后失败那次尝试的记录：都写进 NamedErr、AttemptErr，ReadLedger 照样返回；已经读到的记录不再读一遍；上下文结束时 readWanted 失败。`TestReadLedger` 还查了 CutWhat 的每一条。
+  - `TestACompletedRunWithoutItsHistory`、`TestAHistoryLongerThanExplainReads`：见“做了什么”。
+- **新的黑盒测试**：
+  - `test_t12_agentd_refuses_models_its_task_cannot_be_held_to`：models.yaml 去掉 `blobs: [patch]`，agentd 拒绝启动，说出 patch_ref。
+  - `test_a_live_runs_write_that_was_only_dry_run_did_not_go_out`。
+  - `test_an_exports_snapshot_is_in_agentds_data_directory`。
+- **跑过的**（macOS，第三轮的定稿代码）：
+  - `gofmt -l`、`go vet ./...` 没有输出；Linux（arm64）的 `go vet` 也过。
+  - `go test ./...` 24 个包全过。explain、control、agentctl、ledger 和网关新的测试在 `-race` 下也过；重试的两个测试（靠时间）连跑 5 遍，都过。
+  - 黑盒，不加沙箱的完整套件：248 passed、1 failed、28 skipped。失败的是 T5 的 `test_t5_a_payload_changed_after_the_approval_is_not_sent`，和第一轮一样。它要 agentctl 的错误里有 “does not hash to”，而账本现在说 “the blob's bytes do not hash to its key”（A 第 3 轮的代码，在这个分支的基底上），B 没碰那段。协调者说，B 移到 main 上之后它就不在了。
+  - srt 下，T12、导出、T13、重放、T10、取消、dry run、T15、审批：47 passed。
+  - 最后几处改动（完成了的运行没有历史、历史截断、agentctl 的 stderr）是在完整套件开跑之后做的，所以定稿后又 make build，不加沙箱重跑了 T12、导出、dry run、T13、取消：39 passed。
+- **改坏检查**（脚本在会话的 scratchpad 里，没进仓库，`round3/mutate3.py`。在工作区的两份拷贝里并行跑，不碰工作区本身。先跑相关包里挑出的测试，仍通过的再对每个包的全部测试跑一遍）：
+  - 对抗性审查第二轮的 68 处，在新代码上重写，67 处有测试失败。他们第二轮时仍通过的 16 处，现在只剩 FR18。代码变了的几处是这样重写的：
+    - RP3：报告不说截断了什么。
+    - RP4：判定不看没验的结果，落在 `judge()` 上。
+    - FR4：读不了的记录当成不是 agentd 发的。
+    - FR11：任何缺记录的 seq 都当成没读到。
+    - FR16：落在 `failedBy()` 上。
+    - KB7：在报告里认不出工具自己的话。
+    - JG2：同一行多了截断的条件。
+
+    仍通过的 FR18（`accepted()` 不要求这一步有结束事件）是等价的改坏。有历史时，一步要有结束事件才会是 ok。没有历史时，现在不会走到 `accepted()`：完成了的运行没有历史就是 unknown，报告没有历史也是 unknown。
+  - 我自己对第三轮新代码的 90 处，87 处有测试失败：
+    - 覆盖的有：点查和它的三种结果、尝试的单独读、unknown-run 的 SQL 和计数、failedBy 的每个分支和 1 秒的余量、error_type 和 SDK 的类型算法、dry_ran、公开模式里每种错误的说法、重试的每个分支（不重试、暂停变长、最后一次暂停截到期限、取消、日志里的错误、没有历史不重试）、CheckRequired 的每个分支、取消落在写操作中途、导出的上限（正好装下、少一个字节、没算长度前缀）、快照的目录、前缀、删除、清理、agentctl 和报告怎么说截断。
+    - 第一遍是 88 处，20 处仍通过、6 处编译不过。编译不过的是改法让变量或 import 没人用了，换了写法。仍通过的，17 处补了测试。
+    - 另外加了 2 处（M89、M90），钉住这一轮查 FR18、复看截断时改的两处代码：
+      - 历史被截断时说没报告：报告调用可能就在没读的那部分里，现在是 unknown。
+      - 完成了的运行没有历史时说缺一步，见“做了什么”。
+    - 剩下 3 处是等价的改坏：
+      - M16：没验的结果保留它的值。判定在第一个没验或改变了走向的那一步就返回 unknown 或 step_failed，这个值没人读。
+      - M32：`accepted()` 不看没验。理由同上：有没验的步骤时，走不到要求的步骤那一步。
+      - M35：`ofTheRun` 不要求记录有执行 ID。只有记录和运行都没有执行 ID 时才不同，而运行没有执行 ID 时 explain 说它还在启动，任何一步都不判；SQL 也不会返回这种记录；agentd 的每条 unknown-run 记录都带执行 ID。
+  - 只有黑盒测试碰得到的 4 处（每处重新 make build，再跑点名的黑盒测试）：都有测试失败。分别是：
+    - agentd 启动时不做 Required 的检查。
+    - 快照不放进数据目录。
+    - 启动时不删留下的快照。
+    - 活运行里 dry-run 的写操作算 ok。
+
+#### 最终安全审查之后（c567eb8 之后的提交）
+
+最终安全审查（对 64def4d）没有中危以上的问题，有一条量过的低危要改：
+
+- **截断之后读失败的尝试是平方级的**：
+  - 原来的做法：运行自己的记录超过 5000 条时，`readWanted` 对每个以 FAILED 结束的步骤跑一次 `ListRunAttemptRecords`，每次都要用 `json_extract` 扫一遍这个运行的全部记录。
+  - 怎么触发：被攻破的 Worker 能做几千次参数不对的调用，每次一条记录（BadArguments 在循环保护之前就拒绝了），把记录撑过上限，最后由它自己的 comment_commit 的 Prepare 来付这个账。
+  - 他们量的：6,000 次 31 秒，12,000 次 3 分 14 秒，没有失败的尝试时约 10 毫秒。这些时间都花在一个读事务里（WAL 一直被占着），占着一个网关的位置，有心跳续着不会超时，报告每重试一次就再来一遍。
+- **改法**：截断之后，运行自己的 call 记录（call.started、call，这个执行的）在截断点之后按 seq 一次读完（`ListRunOwnCallRecords`），也有上限，2 万条（`maxAfterCut`）。要的尝试在 Go 里对。`ListRunAttemptRecords` 删了。
+  - 一次读也有上限，超过这个上限的尝试，记录可能没读到：算不知道，判定是 unknown / record_unreadable。cause 写“agentd's own record of how <step> ended is past its bound on the run's records it reads”，报告里也这么写，不说去看日志，因为这是上限，不是错误。`missing` 里加一条（“…call records after its first 5000 audit records…”），报告里截断的那句也列出来。
+  - 这次读失败了，它要找的那些尝试都没验，也是 unknown。上下文结束了就让 ReadLedger 失败。
+- **测试**：
+  - `TestReadLedgerReadsTheAttemptsInOnePass`：他们的形状，12,000 次 BadArguments 调用，每次一条记录，全部要找，用真的 SQLite。ReadLedger 在这台机器上（负载 10 左右）25 到 35 毫秒，不要这些尝试时 9 到 11 毫秒；断言是 1 秒以内，全部 12,000 条都找到。上限正好装下截断后的 7,000 条时不算截断，少一条就算。上限是 3 时，读到的找到了，没读到的不知道，Cut 和 CutWhat 都说了。
+  - `TestReadLedgerSaysWhatItCouldNotRead`：一次读失败，要找的尝试都没验；上下文结束时 readWanted 失败。
+  - `TestAFailureAgentdDidNotSend` 的最后一段：上限之外的尝试，explain 和报告都是 unknown，说的是上限，不提日志。
+- **改坏**：这次改的地方 11 处，10 处有测试失败：
+  - 从运行的第一条记录读起；
+  - 收进别的执行的记录；
+  - 读多一条来判断截断的那一条没了；
+  - 上限差一；
+  - 上限之外的尝试当成没有记录；
+  - 读到的记录不管要不要都收进来；
+  - 读失败了不标没验；
+  - 上下文的错误被吞掉；
+  - CutWhat 不说；
+  - 报告把上限说成错误。
+
+  仍通过的 1 处是等价的改坏：没截断时也读一次。没截断时，运行的记录在 Records 里都有了，同一个快照里截断点之后找不到任何一条。第三轮里改的代码，这次碰到的那几处改坏（M1、M2、M9、M10、M13、M40）重新对准，都有测试失败；M4、M12 的代码没了。
+
+#### 最终对抗性审查之后（c44881a 之后的提交）
+
+最终对抗性审查（对 64def4d）有一条中危：
+
+- **问题**：报告在调用里重试 30 秒，挡不住在这 30 秒之内就结束的 Temporal 中断，而它写下的 unknown 永远不会改。他们用真的开发服务器、真的 SDK 客户端，在 agentd 和 Temporal 之间放一个断开连接的 TCP 代理，用 Prepare 那 10 分钟的上下文复现了：
+  - 中断在第 12 秒结束：第 15.8 秒拿到判定；
+  - 第 18 秒结束：第 23.6 秒拿到；
+  - 第 25 秒结束（跑了两次）：第 30.8 秒写了 unknown。
+- **原因**：SDK 每次调用最多等 10 秒，在这 10 秒里自己重试 Unavailable，所以 30 秒里只试得了 3 次，不是假客户端模拟的 7 到 15 次。gRPC 重连的退避又让最后一次连不上已经恢复的服务器。payload 在第一次 Prepare 时就定了，公开评论就一直写 unknown。何况 agentd 和 Temporal 之间断开的时候，这次尝试的完成也报不到 Temporal，现在发出去什么也得不到。
+- **改法**：
+  - 读不到 Temporal 的时候（`explain.Unreachable`：Unavailable、DeadlineExceeded、ResourceExhausted、Canceled，gRPC 的状态码也算，还有上下文结束），`ReportVerdict` 返回一个可重试的错误。这时副作用和它的 payload 都还没记下（Prepare 在记之前），这次尝试失败，Temporal 等能连上了再试这个调用。
+  - 只有 Temporal 自己回了错误才写 unknown：没有这个执行（过了保留期）、它自己的错误（比如没有权限），或者历史超过上限。
+  - 调用里的重试（`ReadFor`、`Pause`，以及它们的默认值 30 秒、250 毫秒和最多 4 秒的暂停）删了：SDK 自己在每次调用里已经重试，再加一层只会在 10 分钟的上下文里多等。审查说的 RT2、RT4、RT5 这几处改坏就不存在了。
+  - 每次读的时长由 SDK 自己的上限管（每次调用 10 秒），一次就失败，不再用 30 秒的窗口。
+  - ResourceExhausted 不在审查列的那几种里，我也算作读不到：Temporal 说它现在太忙，并没有回答这个运行怎么样了，写 unknown 也会是永久的。
+- **测试**：
+  - 网关的 `TestTheReportWaitsForTemporal`：读不到的六种情形（Describe 时、读历史时、超时、太忙、连接断了、调用自己的时间到了）各只读一次就失败，错误是 Unreachable；读 Describe 的那种用 `delay` 模拟 SDK 每次调用的耗时，按比例缩小。Temporal 回来以后就有判定。Temporal 自己的回答（没有权限、没有这个执行）是 unknown，日志里有错误。
+  - `TestAReportWaitsForTemporalBeforeItIsRecorded`：经网关的 `effect`，用真的 `githubtool.CommentCommit`。读不到 Temporal 时这次调用失败，错误可重试，账本里没有这个副作用；Temporal 回来以后，下一次调用记下的 payload 是运行的判定（step_failed），不是 unknown。
+  - `TestTheReportWaitsForARealTemporal`：他们的形状，`temporal server start-dev` 加一个断开连接的代理，真的 SDK 客户端，要设 `AGENTOS_TEMPORAL=1` 才跑。中断 12 秒：第 10 秒那次失败，第 17.5 秒拿到判定。中断 25 秒：第 10、21、32 秒三次失败（第 32 秒那次是 gRPC 的重连退避），第 35.9 秒拿到判定。从来没有 unknown。
+  - explain 的 `TestUnreachable`：哪些算读不到，哪些是 Temporal 自己的回答。`TestTheReportNeedsTheHistory`：读历史时读不到，Report 失败，不写 unknown。
+  - 原来的 `TestTheReportTriesTemporalAgain`、`TestTheReportsRetriesAreBounded` 测的是删掉的那层重试，一起删了。
+
+另有三条低危：
+
+- **agentd 自己没记下的失败被说成伪造的**：Invoke 里 panic（SDK 的 PanicError），或者最后一次尝试时写不进记录（AuditUnavailable），都不留记录。这两种原来都判成 `foreign_result`、“a failure agentd did not send”，在 explain 里，也在报告围栏外的那一行里。B 移到 main 之后，A 的 recover 会把 panic 记下来，但说法还是要分开：
+  - 记录和事件对不上（记录说返回了别的，或者错误类型不一样）：照旧是“a failure agentd did not send”，`foreign_result`。
+  - 完全没有记录，也没有 agentd 重启能解释它：kind 是这个调用自己的错误（tool_error、model_error），cause 写“by a failure with no record of agentd's; it says "<type>"”，只是 Temporal 的说法，没有验过。explain 还加上它的消息（加引号），报告只给类型，因为消息可能是 agentd 内部的错误。incident 也这样写，不再说是伪造。
+  - 测试：`TestAFailureAgentdDidNotSend`（没有记录的那一种，加上 agentd 重启之后 1.5 秒的那一种）、`TestAFailureAgentdSentBeforeItKnewTheExecution`（别的执行的记录、没写执行 ID 的记录），`TestTheReportShowsNoInternalError` 加了一种：五次尝试都没有记录的 PanicError，报告只有类型，explain 有消息。改坏 5 处，都有测试失败；M25 跟着对准了新的分支，也有测试失败。
+- **改坏的空缺**：
+  - FB7（`error_type` 是空串的 error 记录被当成没写类型）：`TestAFailureAgentdDidNotSend` 加了一种，记录说类型是 ""，事件说 "Forged"，算对不上。这处改坏有测试失败。
+  - RT2、RT4、RT5（暂停的 4 秒上限，30 秒、250 毫秒两个默认值）：那层重试在上一个提交里删了，代码不在了。
+  - UC1、PR7：他们判为等价，和我的 M32、Q11 的结论一样。
+  - GT2（`failureType` 用 `errors.As` 拆包找 ApplicationError，不用类型断言）：他们判为等价，因为网关从不包装 ApplicationError。但 SDK 的转换是不拆包的，包起来的 ApplicationError 在 Temporal 那边是外层的类型（比如 wrapError）。所以 `TestTheRecordHasTheFailuresType` 加了一种包起来的，记录的类型跟着 SDK 走。这处改坏现在有测试失败，以后有人把它包起来也不会出错。
+- **导出写到一半被杀掉留下的临时文件**：只记下来，见“留到后面”。
+
+#### 留到后面
+
+- **`agentctl audit export -o FILE` 写到一半被杀掉**（最终对抗性审查，只记下来）：agentctl 先写同一目录下的临时文件 `.<FILE 的文件名>.<随机串>`，写完才改名成 FILE。进程被杀掉时这个文件会留下，权限 0600，里面是账本的记录。清理：`rm <FILE 所在的目录>/.<FILE 的文件名>.*`，比如 `rm ./.audit.json.*`。
+- **`ListRunOwnAuditRecords`、`CountRunUnknownRecords` 都要用 `json_extract` 扫这个工作流 ID 的全部记录**（最终安全审查的另一条低危，协调者定为留下）：命名空间里的人灌 unknown-run 的记录，每次 explain 和报告读账本都跟着变慢，跟灌的条数成正比。截断之后的那次读也一样，它跳过的是同样的记录。要改得加索引，就是一次新的迁移。
+- **参数不对的调用在循环保护之前就被拒绝了**，所以不算进循环保护的次数（协调者定为留下）：它们写的记录每个运行受 Temporal 历史的上限所限，Worker 也开不了新的运行。这个顺序是 A 的代码。
+- 运行的记录读到上限（5000 条）之后，失败的尝试和结果指向的记录都单独读，所以判定不受影响；但 incident（重试过的尝试、崩溃推断）只从读到的那部分来，超过上限的运行，路上的麻烦列得不全，`missing` 里有说明。
+- **记录写不进去的失败**（协调者定为留下的限制）：agentd 写不进那次尝试的 call 记录时（比如磁盘满了），这次尝试以错误结束却没有记录，也没有 agentd.started 来解释它，explain 就会说是“a failure agentd did not send”，冤枉 agentd 自己。“agentd 重启解释了没有记录的失败”这条规则，也只在重启发生在失败事件之后约 1 秒之内时管用。要分清这种情况，就得有一条“agentd 没写成记录”的记录，而这条记录同样可能写不进去。
+- 有 Temporal 命名空间权限的人还能做到两件事（协调者定为留下的限制）：
+  - 在被 agentd 重启打断的那次尝试上伪造失败。这时没有记录，有 agentd.started 解释它，文字是他们的，加了引号。agentd 自己失败过的尝试，cause 用的是 agentd 记录里的话，不是他们的。
+  - 让判定变成 unknown：让历史超过 10 万个事件。灌记录、让点查失败都做不到。
+
+### 搬到 main 上（2026-10-24）
+
+A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main`。B 自己的净改动（`git diff 6241d81 f1a9ff4`，60 个文件）用 `git apply --3way --index` 一次打上去，七个提交没有一个个重放。生成的文件不手工合并：proto 和 sqlc 的查询改好之后，用 `scripts/gen-proto.sh`、`sqlc generate` 重新生成。
+
+**冲突**（11 个文件），怎么解的：
+
+- `internal/gitmcp/client.go`：两边在同一处各加了一个函数，A 的 `blobID` 和 B 的 `ServerFailure`。两个都留。
+- `internal/ledger/queries/ledger.sql`：两边都在末尾加了查询，都留，名字没有重的。
+- `internal/gateway/approvals.go`：ApproveEffect 写了 0 行的那个分支，A 改成先查任务是不是取消了，没取消就是丢了的写（ErrWriteDropped）。B 的 `refused_by: cancel` 加在 A 的 abandon 上。
+- `internal/gateway/gateway.go`：
+  - callRecord：A 的 startedSeq、scheduledAt，加上 B 的 refusedBy。
+  - 工具调用被策略拒绝：A 把这个分支挪到了 call.started 之前，提前返回。B 的 `deny(audit.RefusedByPolicy, …)` 放到那里，switch 里 B 原来的那个 case 去掉了。
+  - 循环保护：scheduledAt 和 refusedBy 两个都设。
+- `internal/gateway/statemachine_test.go`、`cmd/agentd/main.go` 里的工具：A 的 `audit.RunBlobs`（blob 和它的 blob.owned 记录一起存），加上 B 报告用的 Verdicts、Task。
+- `internal/gateway/audit_test.go`：用 A 的“结果指向它那条记录的 seq”（前面多了 call.counted、call.started），注释用 B 的。
+- `internal/control/server.go`：B 去掉了 ExplainRun 的桩，A 给 lookup 加的注释留下。
+- `cmd/agentd/main.go` 的 Control：A 的 AnchorIdentity、StartRecord、Attempts，加上 B 的 SnapshotDir 和启动时清理留下的快照。
+- `tests/harness.py`：两边都给 `start_modelsim` 加了脚本答复。main 传的是规则的列表，B 传的是文件的文本，因为 5000 位的数字 Python 的 json 写不出来。现在两种都收。
+- `README.md` 的测试一行：用 B 的写法，再加上 main 的“model patches whose hunk headers are wrong”。
+- `docs/m5-notes.md`：两边都加在末尾。先放 A 后来的几条，再放 B 这一节。
+
+**对着 A 最后的代码改的**：
+
+- **导出**：A 的 `externalAnchors` 多了 allowChain、allowReplaced 两个参数，返回 5 个值。导出只要这条链自己的链头，两个参数传 nil。
+- **blob**：账本本身不再实现 `tools.BlobStore`，要经过 A 的 `audit.RunBlobs`，B 的测试跟着改了。A 的 `TestAgentdsOwnReadsAreRecordedFirst` 用到报告工具，B 的报告要有 Verdicts 和 Task，就给它补上了，也改用 `reason`。`InsertCall` 现在返回插了几行，ledger_test 跟着改。
+- **run.terminating**：A 在让 Temporal 终止之前写 run.terminating，之后写 run.terminated。agentd 在两者之间被杀，只剩前一条，verify 认它是 agentd 的终止。explain 原来只认 run.terminated，那样就会说“不是 agentd 终止的”。现在两条都认，要求是 agentd 写的、是这个运行的执行（temporal_run_id）。别的执行的那条不算。测试在 `explain_test.go` 的判定表里加了两种。
+- **panic 的记录**：A 的 deferred recover 会记下 panic，但错误没有类型（`fmt.Errorf`，记录里的 error_type 是 ""），而 Temporal 记的是 SDK 的 PanicError。照 B 的规则，类型对不上，每个记下的 panic 都会被说成“a failure agentd did not send”。现在 recover 记的错误按 SDK 的类型来（ApplicationError，类型 PanicError）。A 的 `TestAPanickingCallHasItsRecord` 加了断言：记录的 error_type 等于 SDK 给这次尝试的失败类型。
+- **call.started 和 agentd 崩溃的规则**（协调者说搬过来之后补的那个测试）：
+  - 网关的 `TestExplainTellsTheAttemptAgentdStoppedDuring`：用 A 真的 `callStarted` 和 `recordCall` 写出第 1 次尝试的 call.started，然后一条 agentd.started，然后第 2 次尝试的 call.started 和 call，后者指向前者（started_seq）。B 的 explain 说第 1 次尝试“began and never ended: agentd stopped during it”，证据是那条 call.started 和那条 agentd.started。
+  - 黑盒 T12 的 agentd 崩溃：现在模型调用之前就有 call.started，原来按时间推断的那条路（“Heartbeat”、“inferred”）在这个测试里走不到了。改成断言 call.started 这条路：原因是 began and never ended，证据有第 1 次尝试的 call.started 和第二条 agentd.started。
+- **新的记录类型**（call.counted、budget.*、model.*、blob.owned、agentd.read、run.terminating）：explain 只读它用得上的类型（`readRecords` 的 switch），别的照旧不管。run.terminating 上面用上了。别的几样，它们记的那几张表（calls、budget_entries、model_calls……）explain 本来就直接读。
+- **读事务里比模式**：explain 和报告读账本都经过 `Ledger.Read`，A 的每个读事务都先重新载入模式、和迁移比。B 只加了查询，没改模式。
+- **B 的字段和 A 的字段在同一条 call 记录里**：refused_by、error_type、error_cause、temporal_run_id 和 A 的 started_seq、scheduled_at、outcome 并存。A 的重放用 `json.Unmarshal` 读它认识的字段，不拒别的字段。下面的 verify 结果说明它们都接受。
+
+**`--verify-after-each`**：B 的黑盒测试都在里面。只有 `test_t12_agentd_refuses_models_its_task_cannot_be_held_to` 加了 `audit_verify(skip="agentd refuses to start, by design")`，因为 agentd 照设计就不启动。别的都以 0 通过。
+
+**跑过的**（macOS）：
+- `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过。
+- 完整黑盒套件，不加沙箱，带 `--verify-after-each`：272 passed、28 skipped。147 个栈、130 个测试：125 个以 0 通过，19 个按它们的标记（A 故意篡改的测试、T5、网关身份），0 个失败，3 个没验（agentd 照设计不启动）。原来 T5 那个失败在 main 上已经没了。
+- panic 那处改动是在完整套件开跑之后做的，所以重新 make build，带 `--verify-after-each` 又跑了 T12、审计日志、网关身份、导出、dry run 这几个文件：57 passed。58 个栈：39 个以 0 通过，18 个按标记，0 个失败，1 个没验（agentd 照设计不启动）。
+- srt 和 bwrap 由协调者跑。
+
+**改了的测试**：`TestAgentdsOwnReadsAreRecordedFirst`、`TestAPanickingCallHasItsRecord`（A 的，见上），`test_t12_agentd_crashes`（见上），`TestReadLedger`（InsertCall），`TestAReportWaitsForTemporalBeforeItIsRecorded`（RunBlobs）。新加的：`TestExplainTellsTheAttemptAgentdStoppedDuring`，`explain_test.go` 判定表里 run.terminating 的两种。

@@ -243,16 +243,106 @@ class ExplainRunRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ...) -> None: ...
 
 class Explanation(_message.Message):
-    __slots__ = ("run_id", "step", "cause", "evidence")
+    __slots__ = ("run_id", "step", "cause", "evidence", "state", "verdict", "kind", "activity_id", "call", "attempt", "next", "incidents", "sources", "cost", "usage", "claim", "missing", "incidents_omitted")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     STEP_FIELD_NUMBER: _ClassVar[int]
     CAUSE_FIELD_NUMBER: _ClassVar[int]
     EVIDENCE_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    VERDICT_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    CALL_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    NEXT_FIELD_NUMBER: _ClassVar[int]
+    INCIDENTS_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    COST_FIELD_NUMBER: _ClassVar[int]
+    USAGE_FIELD_NUMBER: _ClassVar[int]
+    CLAIM_FIELD_NUMBER: _ClassVar[int]
+    MISSING_FIELD_NUMBER: _ClassVar[int]
+    INCIDENTS_OMITTED_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     step: str
     cause: str
     evidence: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, run_id: _Optional[str] = ..., step: _Optional[str] = ..., cause: _Optional[str] = ..., evidence: _Optional[_Iterable[str]] = ...) -> None: ...
+    state: str
+    verdict: str
+    kind: str
+    activity_id: str
+    call: str
+    attempt: int
+    next: str
+    incidents: _containers.RepeatedCompositeFieldContainer[Incident]
+    sources: _containers.RepeatedCompositeFieldContainer[Evidence]
+    cost: Cost
+    usage: _containers.RepeatedCompositeFieldContainer[ModelUsage]
+    claim: str
+    missing: _containers.RepeatedScalarFieldContainer[str]
+    incidents_omitted: int
+    def __init__(self, run_id: _Optional[str] = ..., step: _Optional[str] = ..., cause: _Optional[str] = ..., evidence: _Optional[_Iterable[str]] = ..., state: _Optional[str] = ..., verdict: _Optional[str] = ..., kind: _Optional[str] = ..., activity_id: _Optional[str] = ..., call: _Optional[str] = ..., attempt: _Optional[int] = ..., next: _Optional[str] = ..., incidents: _Optional[_Iterable[_Union[Incident, _Mapping]]] = ..., sources: _Optional[_Iterable[_Union[Evidence, _Mapping]]] = ..., cost: _Optional[_Union[Cost, _Mapping]] = ..., usage: _Optional[_Iterable[_Union[ModelUsage, _Mapping]]] = ..., claim: _Optional[str] = ..., missing: _Optional[_Iterable[str]] = ..., incidents_omitted: _Optional[int] = ...) -> None: ...
+
+class Incident(_message.Message):
+    __slots__ = ("at", "step", "activity_id", "attempt", "kind", "cause", "evidence")
+    AT_FIELD_NUMBER: _ClassVar[int]
+    STEP_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    CAUSE_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_FIELD_NUMBER: _ClassVar[int]
+    at: str
+    step: str
+    activity_id: str
+    attempt: int
+    kind: str
+    cause: str
+    evidence: _containers.RepeatedCompositeFieldContainer[Evidence]
+    def __init__(self, at: _Optional[str] = ..., step: _Optional[str] = ..., activity_id: _Optional[str] = ..., attempt: _Optional[int] = ..., kind: _Optional[str] = ..., cause: _Optional[str] = ..., evidence: _Optional[_Iterable[_Union[Evidence, _Mapping]]] = ...) -> None: ...
+
+class Evidence(_message.Message):
+    __slots__ = ("source", "event_id", "seq", "table", "key", "what")
+    SOURCE_FIELD_NUMBER: _ClassVar[int]
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    TABLE_FIELD_NUMBER: _ClassVar[int]
+    KEY_FIELD_NUMBER: _ClassVar[int]
+    WHAT_FIELD_NUMBER: _ClassVar[int]
+    source: str
+    event_id: int
+    seq: int
+    table: str
+    key: str
+    what: str
+    def __init__(self, source: _Optional[str] = ..., event_id: _Optional[int] = ..., seq: _Optional[int] = ..., table: _Optional[str] = ..., key: _Optional[str] = ..., what: _Optional[str] = ...) -> None: ...
+
+class Cost(_message.Message):
+    __slots__ = ("spent_micros", "reserved_micros", "limit_micros")
+    SPENT_MICROS_FIELD_NUMBER: _ClassVar[int]
+    RESERVED_MICROS_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_MICROS_FIELD_NUMBER: _ClassVar[int]
+    spent_micros: int
+    reserved_micros: int
+    limit_micros: int
+    def __init__(self, spent_micros: _Optional[int] = ..., reserved_micros: _Optional[int] = ..., limit_micros: _Optional[int] = ...) -> None: ...
+
+class ModelUsage(_message.Message):
+    __slots__ = ("model", "requests", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "refusals")
+    MODEL_FIELD_NUMBER: _ClassVar[int]
+    REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    INPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    CACHE_READ_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    CACHE_WRITE_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    REFUSALS_FIELD_NUMBER: _ClassVar[int]
+    model: str
+    requests: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    refusals: int
+    def __init__(self, model: _Optional[str] = ..., requests: _Optional[int] = ..., input_tokens: _Optional[int] = ..., output_tokens: _Optional[int] = ..., cache_read_tokens: _Optional[int] = ..., cache_write_tokens: _Optional[int] = ..., refusals: _Optional[int] = ...) -> None: ...
 
 class VerifyAuditRequest(_message.Message):
     __slots__ = ("run_id", "allow_chains", "allow_replaced_ledgers")
@@ -413,3 +503,99 @@ class UnavailableRun(_message.Message):
     run_id: str
     why: str
     def __init__(self, run_id: _Optional[str] = ..., why: _Optional[str] = ...) -> None: ...
+
+class ExportAuditRequest(_message.Message):
+    __slots__ = ("run_id",)
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    def __init__(self, run_id: _Optional[str] = ...) -> None: ...
+
+class AuditExportPart(_message.Message):
+    __slots__ = ("head", "record", "history", "pushed_head")
+    HEAD_FIELD_NUMBER: _ClassVar[int]
+    RECORD_FIELD_NUMBER: _ClassVar[int]
+    HISTORY_FIELD_NUMBER: _ClassVar[int]
+    PUSHED_HEAD_FIELD_NUMBER: _ClassVar[int]
+    head: AuditExportHead
+    record: AuditRecord
+    history: ExecutionHistory
+    pushed_head: PushedHead
+    def __init__(self, head: _Optional[_Union[AuditExportHead, _Mapping]] = ..., record: _Optional[_Union[AuditRecord, _Mapping]] = ..., history: _Optional[_Union[ExecutionHistory, _Mapping]] = ..., pushed_head: _Optional[_Union[PushedHead, _Mapping]] = ...) -> None: ...
+
+class PushedHead(_message.Message):
+    __slots__ = ("anchor_workflow_id", "seq", "sha256")
+    ANCHOR_WORKFLOW_ID_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    anchor_workflow_id: str
+    seq: int
+    sha256: str
+    def __init__(self, anchor_workflow_id: _Optional[str] = ..., seq: _Optional[int] = ..., sha256: _Optional[str] = ...) -> None: ...
+
+class AuditExportHead(_message.Message):
+    __slots__ = ("seq", "sha256", "records", "exported_at", "run_id", "cut")
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    EXPORTED_AT_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    CUT_FIELD_NUMBER: _ClassVar[int]
+    seq: int
+    sha256: str
+    records: int
+    exported_at: str
+    run_id: str
+    cut: str
+    def __init__(self, seq: _Optional[int] = ..., sha256: _Optional[str] = ..., records: _Optional[int] = ..., exported_at: _Optional[str] = ..., run_id: _Optional[str] = ..., cut: _Optional[str] = ...) -> None: ...
+
+class AuditRecord(_message.Message):
+    __slots__ = ("seq", "at", "workflow_id", "type", "actor", "peer_uid", "payload", "prev_sha256", "sha256")
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    AT_FIELD_NUMBER: _ClassVar[int]
+    WORKFLOW_ID_FIELD_NUMBER: _ClassVar[int]
+    TYPE_FIELD_NUMBER: _ClassVar[int]
+    ACTOR_FIELD_NUMBER: _ClassVar[int]
+    PEER_UID_FIELD_NUMBER: _ClassVar[int]
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    PREV_SHA256_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    seq: int
+    at: str
+    workflow_id: str
+    type: str
+    actor: str
+    peer_uid: int
+    payload: str
+    prev_sha256: str
+    sha256: str
+    def __init__(self, seq: _Optional[int] = ..., at: _Optional[str] = ..., workflow_id: _Optional[str] = ..., type: _Optional[str] = ..., actor: _Optional[str] = ..., peer_uid: _Optional[int] = ..., payload: _Optional[str] = ..., prev_sha256: _Optional[str] = ..., sha256: _Optional[str] = ...) -> None: ...
+
+class ExecutionHistory(_message.Message):
+    __slots__ = ("run_id", "temporal_run_id", "history_json", "anchors", "unavailable")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    TEMPORAL_RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    HISTORY_JSON_FIELD_NUMBER: _ClassVar[int]
+    ANCHORS_FIELD_NUMBER: _ClassVar[int]
+    UNAVAILABLE_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    temporal_run_id: str
+    history_json: str
+    anchors: _containers.RepeatedCompositeFieldContainer[ExportedAnchor]
+    unavailable: str
+    def __init__(self, run_id: _Optional[str] = ..., temporal_run_id: _Optional[str] = ..., history_json: _Optional[str] = ..., anchors: _Optional[_Iterable[_Union[ExportedAnchor, _Mapping]]] = ..., unavailable: _Optional[str] = ...) -> None: ...
+
+class ExportedAnchor(_message.Message):
+    __slots__ = ("event_id", "activity_id", "attempt", "seq", "sha256", "result_json")
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    ACTIVITY_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    SEQ_FIELD_NUMBER: _ClassVar[int]
+    SHA256_FIELD_NUMBER: _ClassVar[int]
+    RESULT_JSON_FIELD_NUMBER: _ClassVar[int]
+    event_id: int
+    activity_id: str
+    attempt: int
+    seq: int
+    sha256: str
+    result_json: bytes
+    def __init__(self, event_id: _Optional[int] = ..., activity_id: _Optional[str] = ..., attempt: _Optional[int] = ..., seq: _Optional[int] = ..., sha256: _Optional[str] = ..., result_json: _Optional[bytes] = ...) -> None: ...

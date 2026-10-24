@@ -42,10 +42,11 @@ wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes
 | `internal/runtimeproxy` | the Worker's only way to Temporal; an allowlist of WorkflowService methods |
 | `internal/control` | the Control service on the 0700 control socket, which records the uid of each caller |
 | `internal/audit` | agentd's hash-chained audit log: each policy decision, side effect and approval, with who made it |
+| `internal/explain` | why a run is where it is: its history in Temporal read with the ledger, for `agentctl runs explain` and the run's report |
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement, model patches whose hunk headers are wrong |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand) and its export (every hash recomputed, every anchor checked against the exported history), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T12 (`runs explain` names the step and the cause of a tool error, a model refusal, a policy denial, a budget run out, a Worker and agentd killed, the git tool server killed in each of the three steps that run it, the workflow's own code failing (on a call's result, on its report's, or with an exception of its own), a reviewer's edit the patch check refuses, an attempt that ends after the next, and a stuck run; each run's report says the same), T13 (the model APIs map 429s, 5xx, cut-off answers, refusals and broken output alike, and `runs explain` concludes alike), T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement, model patches whose hunk headers are wrong |
 | `evals/`, `docs/eval/` | the first task's evaluation: the case set, its mirrors, the runner, the scoring and the per-model report (`python -m evals`); the reports |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
@@ -219,6 +220,10 @@ setting of its own.
 Point a task at either with `model`. Or list them in `cross_provider_fallback`, where they are
 asked, each in a request of its own, when the model declines.
 
+What a run must have done to have ended well reads its model task's output: the audit's patch
+(`blobs: [patch]`) and its output schema's fields. agentd checks at start that `config/models.yaml`
+still gives every field those rules read, and refuses to start, naming the field, if one is gone.
+
 ```bash
 printf 'add-generic-password -U -s agentos-openai-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
@@ -311,6 +316,72 @@ last push before it was killed (`kill -9`): what cuts those while agentd is down
 v0.1 whoever can write the ledger is the user agentd runs as, whom its threat model does not defend
 against.
 
+To share what the ledger and Temporal hold with someone who checks it without agentd:
+
+```bash
+bin/agentctl audit export -o audit.json
+```
+
+The file (readable by you only) holds each run's histories as agentd reads them from Temporal (its
+own JSON of Temporal's events), with which event carries which `_audit` anchor and the bytes the
+anchored record's `result_sha256` is of; the heads agentd pushed to the chain's anchor workflows in
+Temporal; then the chain's head and every record up to it, with every field its sha256 covers. Its
+`hashes` says how to recompute them. `--run <run-id>` exports one run's histories and records: their
+hashes check, the chain's links (through other runs' records) do not, and it holds no pushed heads. agentd
+takes the records as one snapshot into a file of its own, then sends them: a slow reader holds no
+transaction of the ledger open. The snapshot is a file in agentd's data directory, removed once
+the export is sent, or when agentd next starts. An export stops at 1 GiB: past that, its head's
+`cut` says from which record on it holds nothing, and agentctl says so on stderr and exits 2, as
+`audit verify` does when not everything could be checked: the file is whole JSON all the same.
+
+To see why a run is where it is:
+
+```bash
+bin/agentctl runs explain <run-id>
+```
+
+It reads the run's history with agentd's ledger and says: the verdict (`ok`, `step_failed`,
+`not_approved` for a write nobody approved, `failed`, `cancelled`, `terminated`, `waiting`, `stuck`,
+`running`, `unknown`), the step (`fetch_diff`, `analyze`, `validate_patch`, `open_pr`,
+`post_report`: the task names them by the call's kind and name; any other call shows as its kind and
+name, quoted), the kind of cause and the cause, with the audit log's records, the history's events
+and the ledger's rows behind it; for a run that waits, the command that lets it go on (none for a
+run being cancelled or stuck, which a decision would not move); the trouble along the way (a retried
+attempt, a crash, a budget pause, a result agentd did not send); and what the run's model requests
+cost, cache hits included. A run ended well only if every step the task requires has a result agentd
+sent (`fetch_diff` and `analyze`; `validate_patch` and `open_pr` once the audit proposed a patch)
+and its report went out. A result in the history counts only when it names agentd's record of it
+(its `_audit` anchor, which agentd reads by its seq); one that does not came from someone else with
+access to Temporal's namespace, and the call is judged by agentd's record. So does a failure: it is
+agentd's only when agentd's record of that attempt ended in an error of the same type, and one
+agentd has no record of at all (nor stopped during) is shown as Temporal's word only, its type
+quoted. When agentd cannot read the record a result names, how the call ended is not known, and
+neither is the verdict: `unknown` (`record_unreadable`), never `ok`. A write that was only dry-run,
+in a run that is not a dry run (an agentd started without GitHub took it up), did not reach GitHub:
+`dry_ran`. Who refused a call is the record's word (`refused_by`), not the refusal's text. Crashes
+leave no record of their own: one is inferred from what it left (a timed-out workflow task, an
+attempt without its record and a new start of agentd, the git tool server's error as agentd's git
+client types it), and the cause says so. What the workflow says of itself (its outcome, its failure)
+is shown apart, quoted, as its claim; so is what it chose (call names, activity IDs). A run whose
+records are longer than agentd reads is explained from the records it read, and `missing` says which
+were not (agentd's records of the calls that failed are read past that bound, to one of their own: a
+failure whose record is past both leaves the verdict `unknown`); a history longer than agentd reads
+makes the verdict `unknown` (`history_unavailable`), and so does a completed run whose history
+Temporal no longer has: no result can then be held to agentd's records. Records written for callers
+agentd does not know as runs (`unknown-run`) are counted apart, and never take the run's own past
+the bound. `-o json` has every field.
+
+The run's report on the commit says the same: agentd writes its outcome by the same rules, from the
+run's history and its own records of the calls before the report (without the history, the outcome
+is `unknown`, never `ok`: when Temporal answers that it has none, or with an error of its own; while
+agentd cannot reach Temporal, the report's call fails before anything of it is recorded, and
+Temporal tries it again once it answers), and takes the report from the run's own accepted audit;
+the workflow tells it only why it reports (done, or that its own code failed, and the error's type).
+The report shows no internal error's text: where agentd could not read something, or a tool's server
+failed, it says so and that agentd's log has the details; a model's or a tool's own words are shown
+fenced. When the outcome rests on everything it needs but other evidence was past agentd's bounds,
+the report says which, and that it does not change the outcome.
+
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 
 ```bash
@@ -369,7 +440,7 @@ there.
 ```bash
 AGENTOS_GITHUB=live AGENTOS_GITHUB_REPO=<owner>/<name> AGENTOS_SANDBOX=srt uv run pytest tests/test_t2_live.py -s
 ```
-`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation; approvals (the first of concurrent decisions wins, expiry, a payload changed after its approval, edits), the doorbell outbox, and the audit log (each record in the transaction of its change, the hash chain, each way of changing it by hand).
+`go test ./...` covers config, policy, prices and budget reservations (50 at once against one limit), the Claude adapter against a local stand-in for the API, keyring lookups, the loop guard and rate limits, argument canonicalization, the heartbeat interval, the proxy's method allowlist and request rules, patch checks, the GitHub tools against the simulator, and the effect protocol: one claimant sends (T16's compare-and-swap), recovery by class, reconciliation; approvals (the first of concurrent decisions wins, expiry, a payload changed after its approval, edits), the doorbell outbox, the audit log (each record in the transaction of its change, the hash chain, each way of changing it by hand), and `runs explain`'s verdict rules over made-up histories and records, the report's among them.
 
 After a workflow change that is meant to be compatible, the replay gate
 (`tests/test_replay.py`) must still pass. To add samples to it, run

@@ -1,9 +1,10 @@
 """T13: the two model interfaces, Claude-native and OpenAI-compatible (OpenAI's Responses API,
 and Chat Completions for Ollama and vLLM), map the same faults to the same outcome (design
 doc, section 11): a 429, a 500, an answer cut off on its way (as a timeout would), a refusal,
-and an answer that breaks the output schema. Which requests are retried, how each is settled
-and what the run ends with do not depend on the provider. (The part about agentctl runs
-explain waits, with T12, for M5.)
+and an answer that breaks the output schema. Which requests are retried, how each is settled,
+what the run ends with, and what agentctl runs explain concludes (its verdict, the kind of cause
+and the step, and the trouble along the way) do not depend on the provider; nor does the outcome
+the run's report shows, which agentd renders from the same records by the same rules.
 
 One simulator, internal/modelsim, speaks all three APIs and answers all three alike: the
 same report, the same usage. At the same prices the same answer costs the same; a Chat
@@ -14,6 +15,8 @@ it cannot count tokens before a request).
 import json
 
 import pytest
+
+import re
 
 from tests.harness import AUDIT_SCHEMA, TERMINAL, TEST_POLICY, Stack
 
@@ -47,6 +50,19 @@ EXPECTED = {
     "refusal": ("refused", ["usage"]),  # an answer, billed, not retried
     "invalid": ("ok", ["usage", "usage"]),  # breaks the schema: asked for again
 }
+
+
+# For each fault: what agentctl runs explain concludes (verdict, kind, step) and the trouble it lists
+# along the way (kind, step and attempt of each incident).
+EXPLAINED = {
+    "429": ("ok", "", "", [("model_error", "analyze", 1)]),  # the first attempt failed, the second answered
+    "500": ("ok", "", "", [("model_error", "analyze", 1)]),
+    "drop": ("ok", "", "", [("model_error", "analyze", 1)]),
+    "refusal": ("step_failed", "model_refused", "analyze", []),
+    "invalid": ("ok", "", "", [("model_invalid_output", "analyze", 1)]),  # asked again within the attempt
+}
+
+OUTCOME = re.compile(r"^Outcome: ([a-z_]+)(?: at ([a-z0-9_]+))?(?: \(([a-z0-9_]+)\))?$", re.M)
 
 
 def models_yaml(api: str, url: str, model: str | None = None) -> str:
@@ -87,6 +103,14 @@ def test_t13_every_interface_maps_faults_alike(stack: Stack, api: str) -> None:
         for e in settled:
             want = {"usage": usage, "rejected": 0, "outcome_unknown": reserved[e["request_id"]]}[e["reason"]]
             assert e["amount_micros"] == want, (fault, dict(e))
+
+        # What explain concludes, and what the report shows, is the same whichever API it was.
+        verdict, kind, step, trouble = EXPLAINED[fault]
+        x = stack.explain(run)
+        assert (x["verdict"], x["kind"], x["step"]) == (verdict, kind, step), (fault, x)
+        assert [(i["kind"], i["step"], i["attempt"]) for i in x["incidents"]] == trouble, (fault, x["incidents"])
+        m = OUTCOME.search(stack.report_comment(run).split("```")[0])
+        assert m and (m.group(1), m.group(2) or "", m.group(3) or "") == (verdict, step, kind), (fault, m and m.groups())
 
     # Every request asked for the task's max_tokens, and for its effort as the provider takes
     # it: Claude takes xhigh; the others list low and high, and get the highest not above it.

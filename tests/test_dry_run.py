@@ -43,3 +43,26 @@ def test_a_dry_run_asks_for_no_approval(stack: Stack) -> None:
     stack.start_worker()
     assert_dry(stack, stack.start_run(dry_run=True))
     assert stack.ledger("SELECT * FROM approvals") == []
+
+
+def test_a_live_runs_write_that_was_only_dry_run_did_not_go_out(stack: Stack) -> None:
+    """A run that is not a dry run, whose approved pull request an agentd without GitHub takes up: that
+    agentd can only dry-run it, so it did not reach GitHub, and the run did not end well (dry_ran)."""
+    hold = stack.tmp / "hold-doorbells"
+    stack.start_agentd(policy=approval_policy(), hold_doorbells=hold)
+    stack.start_worker()
+    run = stack.start_run()
+    item = stack.wait_approval(run)
+    hold.touch()  # the approval's doorbell waits for the next agentd
+    stack.decide(item, "approve")
+    stack.agentd.kill()
+    hold.unlink()
+    stack.start_agentd(policy=approval_policy(), extra={"github": None})
+    final = stack.wait_state(run, TERMINAL, timeout=120)
+    assert final["state"] == "SUCCEEDED" and json.loads(final["result_json"])["pr_url"].startswith("dry-run://"), final
+    writes = {e["tool"]: e["status"] for e in stack.effects(run) if e["tool"] in WRITES}
+    assert writes == {w: "DRY_RUN" for w in WRITES}, writes
+    assert [e for e in stack.github_requests() if e["method"] == "POST"] == []
+    e = stack.explain(run)
+    assert (e["verdict"], e["kind"], e["step"]) == ("step_failed", "dry_ran", "open_pr"), e
+    assert "went out" not in e["cause"] and "dry-run" in e["cause"], e["cause"]

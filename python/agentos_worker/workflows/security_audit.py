@@ -6,6 +6,7 @@ agentd executes; the workflow cannot reach the outside world any other way.
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -23,9 +24,11 @@ WAIT_STATES = {  # gateway status -> AgentState while waiting
     "needs_reconcile": "WAITING_RECONCILE",
     "budget_exhausted": "PAUSED_BUDGET",
 }
-# github.comment_commit refuses an outcome over 100,000 characters and shows 2,000 of it. An
-# error's text can be any length: the report must go out all the same.
+# The run's result keeps this much of its outcome: an error's text can be any length. (The report
+# says what agentd's records say of the run, not this: the workflow tells it only why it reports.)
 MAX_OUTCOME = 4000
+# What github.comment_commit takes as an exception's type: an identifier.
+ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 
 @dataclass
@@ -92,20 +95,52 @@ class SecurityAudit:
 
     @workflow.run
     async def run(self, a: AuditInput) -> dict:
+        raised: Exception | None = None
         try:
             outcome, report_ref, pr_url = await self.audit(a)
         except ActivityError as e:
             if isinstance(e.cause, CancelledError):
                 raise  # a cancelled run posts no report
             outcome, report_ref, pr_url = f"failed: {e.cause}", self.report_ref, None
+        except (asyncio.CancelledError, CancelledError):
+            raise  # nor does one cancelled while its own code ran
+        except Exception as e:  # noqa: BLE001 - the workflow's own code failed: report it, then fail the run
+            # Left to the SDK, it would fail every workflow task, and the run would stay RUNNING with
+            # no report: a result the code cannot read (a 5,000-digit integer) is enough.
+            raised = e
+            outcome = f"failed: the workflow raised {type(e).__name__}" + (f": {e}" if str(e) else "")
+            report_ref, pr_url = self.report_ref, None
         outcome = outcome[:MAX_OUTCOME]
-        # Every other end path posts a report (section 3).
-        status, _ = await self.call(
-            "tool", "github.comment_commit", repo=a.repo, commit=a.commit,
-            report_ref=report_ref, outcome=outcome, pr_url=pr_url,
-        )
+        # Every other end path posts a report (section 3). agentd writes its outcome from its own
+        # records; the workflow says only why it reports.
+        why = {"reason": "done"}
+        if raised is not None:
+            why = {"reason": "workflow_error"}
+            if ERROR_TYPE.fullmatch(type(raised).__name__):
+                why["error_type"] = type(raised).__name__
+        # From the report on, whatever goes wrong ends the run FAILED, with why: left to the SDK, an
+        # exception would fail every workflow task, and the run would stay RUNNING for good (a report's
+        # result the code cannot read is enough).
+        try:
+            status, _ = await self.call(
+                "tool", "github.comment_commit", repo=a.repo, commit=a.commit,
+                report_ref=report_ref, pr_url=pr_url, **why,
+            )
+        except ActivityError as e:
+            if isinstance(e.cause, CancelledError):
+                raise  # cancelled while it reported
+            raise ApplicationError(f"report not posted: {e.cause}"[:MAX_OUTCOME], non_retryable=True) from e
+        except (asyncio.CancelledError, CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001 - the workflow's own code failed on the report's result
+            raise ApplicationError(
+                (f"the workflow raised {type(e).__name__} on its report's result" + (f": {e}" if str(e) else ""))[:MAX_OUTCOME],
+                non_retryable=True) from e
         if status != "ok":  # a report that was not posted fails the run
             raise ApplicationError(f"report not posted: {status}", non_retryable=True)
+        if raised is not None:  # reported; the run still failed
+            raise ApplicationError(outcome.removeprefix("failed: "), type=type(raised).__name__,
+                                   non_retryable=True) from raised
         return {"outcome": outcome, "pr_url": pr_url}
 
     async def audit(self, a: AuditInput) -> tuple[str, str | None, str | None]:

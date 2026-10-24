@@ -413,3 +413,62 @@ SELECT workflow_id, sha256 FROM blob_owners ORDER BY workflow_id, sha256;
 -- name: ListResolutionsAll :many
 SELECT r.effect_id, r.resolve_key, r.executed, r.status, r.resolved_at, COALESCE(e.workflow_id, '') AS workflow_id
 FROM effect_resolutions r LEFT JOIN effects e ON e.effect_id = r.effect_id ORDER BY r.effect_id, r.resolve_key;
+
+-- name: ListAgentdStarts :many
+-- agentd's starts after the record at seq (agentd.started, agentd's own: workflow_id ''), at most
+-- limit: what runs explain holds a run's interrupted attempts against.
+SELECT * FROM audit_log WHERE workflow_id = '' AND type = 'agentd.started' AND seq > ? ORDER BY seq LIMIT ?;
+
+-- name: ListRunAuditRecordsPage :many
+-- A page of one run's records, from seq on, up to the head an export took.
+SELECT * FROM audit_log WHERE workflow_id = ? AND seq >= ? AND seq <= ? ORDER BY seq LIMIT ?;
+
+-- name: CountRunAuditRecords :one
+SELECT CAST(COUNT(*) AS INTEGER) FROM audit_log WHERE workflow_id = ? AND seq <= ?;
+
+-- name: ListRunModelCalls :many
+-- A run's model requests, in the order they were sent, at most limit.
+SELECT * FROM model_calls WHERE workflow_id = ? ORDER BY started_at, activity_id, attempt, request_seq LIMIT ?;
+
+-- name: ListRunEffects :many
+SELECT * FROM effects WHERE workflow_id = ? ORDER BY created_at, effect_id LIMIT ?;
+
+-- name: ListRunCalls :many
+SELECT * FROM calls WHERE workflow_id = ? ORDER BY created_at, activity_id LIMIT ?;
+
+-- name: ListRunOwnAuditRecords :many
+-- A run's records from seq on, at most max: those of its own execution (temporal_run_id), a call
+-- agentd refused before StartRun recorded the execution's ID among them (unknown-run, with the ID);
+-- not those of calls from executions agentd did not start, so that a flood of them cannot crowd out
+-- the run's own.
+SELECT * FROM audit_log
+WHERE workflow_id = sqlc.arg(workflow_id) AND seq >= sqlc.arg(seq)
+  AND (actor != 'unknown-run' OR (CAST(sqlc.arg(temporal_run_id) AS TEXT) != '' AND
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') = CAST(sqlc.arg(temporal_run_id) AS TEXT)))
+ORDER BY seq LIMIT sqlc.arg(max);
+
+-- name: CountRunUnknownRecords :one
+-- The records of calls from executions agentd did not start, under a run's workflow ID: those
+-- ListRunOwnAuditRecords leaves out.
+SELECT CAST(COUNT(*) AS INTEGER) FROM audit_log
+WHERE workflow_id = sqlc.arg(workflow_id) AND actor = 'unknown-run'
+  AND (CAST(sqlc.arg(temporal_run_id) AS TEXT) = '' OR
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') != CAST(sqlc.arg(temporal_run_id) AS TEXT));
+
+-- name: GetAuditRecord :one
+-- The record at seq, whichever run's: runs explain reads each record a result in Temporal names.
+SELECT * FROM audit_log WHERE seq = ?;
+
+-- name: ListRunOwnCallRecords :many
+-- The run's own call records (call.started, call) after seq, at most max, oldest first: of its own
+-- execution, as ListRunOwnAuditRecords's. runs explain reads those past the bound on the run's records
+-- in one pass, for the attempts that failed (a scan of them per attempt would cost the square).
+SELECT * FROM audit_log
+WHERE workflow_id = sqlc.arg(workflow_id) AND seq > sqlc.arg(seq) AND type IN ('call', 'call.started')
+  AND (actor != 'unknown-run' OR (CAST(sqlc.arg(temporal_run_id) AS TEXT) != '' AND
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') = CAST(sqlc.arg(temporal_run_id) AS TEXT)))
+ORDER BY seq LIMIT sqlc.arg(max);
+
+-- name: ListRunApprovalsLimit :many
+-- A run's approvals, oldest first, at most limit: what runs explain reads of them.
+SELECT * FROM approvals WHERE workflow_id = ? ORDER BY created_at, approval_id LIMIT ?;

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,8 +85,8 @@ func TestAPanickingCallHasItsRecord(t *testing.T) {
 	g, l, _ := invokable(t)
 	p := &panicker{writer{class: "idempotent"}}
 	g.Tools = tools.Registry{p.Name(): p}
-	if _, err := invoke(g, &agentosv1.Call{Kind: "tool", Name: p.Name(), ArgsJson: `{}`}); err == nil ||
-		!strings.Contains(err.Error(), "the tool fell over") {
+	_, err := invoke(g, &agentosv1.Call{Kind: "tool", Name: p.Name(), ArgsJson: `{}`})
+	if err == nil || !strings.Contains(err.Error(), "the tool fell over") {
 		t.Fatalf("err %v, want the panic", err)
 	}
 	last := lastRecord(t, l)
@@ -93,6 +94,12 @@ func TestAPanickingCallHasItsRecord(t *testing.T) {
 	if last.Type != "call" || pl["status"] != "error" || !strings.Contains(pl["error"].(string), "panic: the tool fell over") ||
 		pl["started_seq"] == nil {
 		t.Fatalf("the last record %s %v", last.Type, pl)
+	}
+	// Its error_type is the failure's Temporal records of the attempt (the SDK's PanicError), which runs
+	// explain holds the failure to: a panic of agentd's is agentd's failure, not one it did not send.
+	var panicked *temporal.PanicError
+	if !errors.As(err, &panicked) || pl["error_type"] != temporal.GetDefaultFailureConverter().ErrorToFailure(panicked).GetApplicationFailureInfo().GetType() {
+		t.Fatalf("error_type %v, the attempt's failure %v", pl["error_type"], err)
 	}
 	if g.Executing(testWorkflowID, testActivityID, 1) {
 		t.Fatal("still executing")

@@ -30,6 +30,7 @@ const (
 	Control_ExtendBudget_FullMethodName          = "/agentos.v1.Control/ExtendBudget"
 	Control_ExplainRun_FullMethodName            = "/agentos.v1.Control/ExplainRun"
 	Control_VerifyAudit_FullMethodName           = "/agentos.v1.Control/VerifyAudit"
+	Control_ExportAudit_FullMethodName           = "/agentos.v1.Control/ExportAudit"
 )
 
 // ControlClient is the client API for Control service.
@@ -50,6 +51,7 @@ type ControlClient interface {
 	ExtendBudget(ctx context.Context, in *ExtendBudgetRequest, opts ...grpc.CallOption) (*Run, error)
 	ExplainRun(ctx context.Context, in *ExplainRunRequest, opts ...grpc.CallOption) (*Explanation, error)
 	VerifyAudit(ctx context.Context, in *VerifyAuditRequest, opts ...grpc.CallOption) (*AuditReport, error)
+	ExportAudit(ctx context.Context, in *ExportAuditRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AuditExportPart], error)
 }
 
 type controlClient struct {
@@ -170,6 +172,25 @@ func (c *controlClient) VerifyAudit(ctx context.Context, in *VerifyAuditRequest,
 	return out, nil
 }
 
+func (c *controlClient) ExportAudit(ctx context.Context, in *ExportAuditRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AuditExportPart], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Control_ServiceDesc.Streams[0], Control_ExportAudit_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExportAuditRequest, AuditExportPart]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_ExportAuditClient = grpc.ServerStreamingClient[AuditExportPart]
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -188,6 +209,7 @@ type ControlServer interface {
 	ExtendBudget(context.Context, *ExtendBudgetRequest) (*Run, error)
 	ExplainRun(context.Context, *ExplainRunRequest) (*Explanation, error)
 	VerifyAudit(context.Context, *VerifyAuditRequest) (*AuditReport, error)
+	ExportAudit(*ExportAuditRequest, grpc.ServerStreamingServer[AuditExportPart]) error
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -230,6 +252,9 @@ func (UnimplementedControlServer) ExplainRun(context.Context, *ExplainRunRequest
 }
 func (UnimplementedControlServer) VerifyAudit(context.Context, *VerifyAuditRequest) (*AuditReport, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyAudit not implemented")
+}
+func (UnimplementedControlServer) ExportAudit(*ExportAuditRequest, grpc.ServerStreamingServer[AuditExportPart]) error {
+	return status.Error(codes.Unimplemented, "method ExportAudit not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -450,6 +475,17 @@ func _Control_VerifyAudit_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_ExportAudit_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExportAuditRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControlServer).ExportAudit(m, &grpc.GenericServerStream[ExportAuditRequest, AuditExportPart]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Control_ExportAuditServer = grpc.ServerStreamingServer[AuditExportPart]
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -502,6 +538,12 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_VerifyAudit_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ExportAudit",
+			Handler:       _Control_ExportAudit_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "agentos/v1/control.proto",
 }

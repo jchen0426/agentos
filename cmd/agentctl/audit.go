@@ -71,8 +71,8 @@ func verdict(r *agentosv1.AuditReport, allowUnavailable, allowBeforeLog bool) er
 
 // auditCmd is `agentctl audit`: agentd's hash-chained audit log (design doc, section 8).
 func auditCmd(g *globals) *cobra.Command {
-	c := &cobra.Command{Use: "audit", Short: "Check agentd's audit log"}
-	c.AddCommand(auditVerifyCmd(g))
+	c := &cobra.Command{Use: "audit", Short: "Check or export agentd's audit log"}
+	c.AddCommand(auditVerifyCmd(g), auditExportCmd(g))
 	return c
 }
 

@@ -23,6 +23,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sys/unix"
 
+	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gitenv"
 )
 
@@ -381,6 +382,7 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 		return failedOn(tool)
 	}
 	defer session.Close()
+	faults.StallInTool(callCtx) // a test's hold, with the server up (agentd's --fault-script)
 	res, err := session.CallTool(callCtx, &mcp.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		failure = err
@@ -488,11 +490,24 @@ func blobID(b []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// ServerFailure is the error of a call whose server failed: it did not start, stopped, timed out, or
+// answered nothing agentd could read. Wrapped (%w) by whatever reads through the server, it stays
+// one (IsServerFailure): the gateway records it as such, and agentctl runs explain tells it by that.
+type ServerFailure struct{ Tool string }
+
+func (e *ServerFailure) Error() string {
+	return "the git tool server failed on " + e.Tool + "; agentd's log has the details"
+}
+
 // failedOn is the error of a call that did not get an answer. What went wrong goes to agentd's
 // log only (logFailure): the error reaches the workflow, and from there maybe a public report,
 // and the server's stderr can name local paths (a launcher's "run npm ci in ..." does).
-func failedOn(tool string) error {
-	return fmt.Errorf("the git tool server failed on %s; agentd's log has the details", tool)
+func failedOn(tool string) error { return &ServerFailure{Tool: tool} }
+
+// IsServerFailure reports whether err is, or wraps, a ServerFailure.
+func IsServerFailure(err error) bool {
+	var f *ServerFailure
+	return errors.As(err, &f)
 }
 
 func (c *Client) logFailure(tool string, err error, stderr string) {

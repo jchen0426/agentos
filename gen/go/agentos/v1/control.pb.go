@@ -1358,14 +1358,52 @@ func (x *ExplainRunRequest) GetRunId() string {
 	return ""
 }
 
+// Why a run is where it is (design doc, section 5): Temporal's history and agentd's ledger, the
+// audit log among it, read together. The verdict, the step and the kind come from what agentd
+// recorded itself and from what Temporal recorded (event types, timeouts, attempts); a result in the
+// history counts only when its _audit names agentd's record of it. What the Worker wrote (its
+// result's outcome, its failure messages) is only its claim. Text from the Worker, a tool, a model or
+// the outside world leaves agentd bounded, quoted where agentd's words carry it, and without raw
+// control characters or runs of spaces.
 type Explanation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	Step          string                 `protobuf:"bytes,2,opt,name=step,proto3" json:"step,omitempty"` // the step that went wrong
-	Cause         string                 `protobuf:"bytes,3,opt,name=cause,proto3" json:"cause,omitempty"`
-	Evidence      []string               `protobuf:"bytes,4,rep,name=evidence,proto3" json:"evidence,omitempty"` // history events and ledger rows behind the conclusion
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	RunId    string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Step     string                 `protobuf:"bytes,2,opt,name=step,proto3" json:"step,omitempty"` // the step that went wrong, as the task names it (D12), else the call's kind and name, quoted
+	Cause    string                 `protobuf:"bytes,3,opt,name=cause,proto3" json:"cause,omitempty"`
+	Evidence []string               `protobuf:"bytes,4,rep,name=evidence,proto3" json:"evidence,omitempty"` // history events and ledger rows behind the conclusion, as lines (sources has them apart)
+	// CREATED, RUNNING, WAITING_APPROVAL, WAITING_RECONCILE, PAUSED_BUDGET, SUCCEEDED, FAILED, CANCELLED,
+	// UNKNOWN: as GetRun says.
+	State string `protobuf:"bytes,5,opt,name=state,proto3" json:"state,omitempty"`
+	// ok (ended well, every step its task requires done; trouble along the way is in incidents),
+	// step_failed (ended, but a step's result changed its course, or a step its task requires has no
+	// accepted result), not_approved (ended without a write a person did not approve), failed,
+	// cancelled, terminated, waiting (for a person: next says how), stuck, running, unknown.
+	Verdict string `protobuf:"bytes,6,opt,name=verdict,proto3" json:"verdict,omitempty"`
+	// The cause's category: model_refused, model_invalid_output, model_error, tool_error, tool_denied,
+	// tool_server_failed, policy_denied, denied, loop_guard, budget_exhausted, approval_pending,
+	// approval_rejected, approval_expired, approval_edited, reconcile_pending, report_not_posted,
+	// step_missing, foreign_result (a result or a failure in Temporal's history that agentd did not
+	// send), dry_ran (a write only dry-run, in a run that is not a dry run), workflow_error,
+	// workflow_task_failed, worker_stopped, no_worker, agentd_stopped, activity_timeout, cancelled,
+	// terminated, history_unavailable (the history is gone, or longer than agentd reads),
+	// record_unreadable (agentd could not read its own record of how a call ended). Empty when nothing
+	// went wrong.
+	Kind       string        `protobuf:"bytes,7,opt,name=kind,proto3" json:"kind,omitempty"`
+	ActivityId string        `protobuf:"bytes,8,opt,name=activity_id,json=activityId,proto3" json:"activity_id,omitempty"` // the step's gateway call, as the workflow named it
+	Call       string        `protobuf:"bytes,9,opt,name=call,proto3" json:"call,omitempty"`                               // the call's name, e.g. audit_v1
+	Attempt    int32         `protobuf:"varint,10,opt,name=attempt,proto3" json:"attempt,omitempty"`                       // the attempt the cause is of
+	Next       string        `protobuf:"bytes,11,opt,name=next,proto3" json:"next,omitempty"`                              // what to do next: for a wait, the agentctl command it waits for
+	Incidents  []*Incident   `protobuf:"bytes,12,rep,name=incidents,proto3" json:"incidents,omitempty"`                    // trouble along the way, apart from the verdict, oldest first
+	Sources    []*Evidence   `protobuf:"bytes,13,rep,name=sources,proto3" json:"sources,omitempty"`                        // the evidence behind the verdict, each with where it is
+	Cost       *Cost         `protobuf:"bytes,14,opt,name=cost,proto3" json:"cost,omitempty"`
+	Usage      []*ModelUsage `protobuf:"bytes,15,rep,name=usage,proto3" json:"usage,omitempty"` // by model: what the run's model requests were billed
+	Claim      string        `protobuf:"bytes,16,opt,name=claim,proto3" json:"claim,omitempty"` // the workflow's own words (its outcome, or its failure), as it wrote them: unchecked
+	// Sources that were not there, or not read: the run predates the audit log, Temporal no longer has
+	// it, the run's records past agentd's bound on what it reads.
+	Missing          []string `protobuf:"bytes,17,rep,name=missing,proto3" json:"missing,omitempty"`
+	IncidentsOmitted int32    `protobuf:"varint,18,opt,name=incidents_omitted,json=incidentsOmitted,proto3" json:"incidents_omitted,omitempty"` // incidents beyond those listed
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Explanation) Reset() {
@@ -1426,6 +1464,437 @@ func (x *Explanation) GetEvidence() []string {
 	return nil
 }
 
+func (x *Explanation) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *Explanation) GetVerdict() string {
+	if x != nil {
+		return x.Verdict
+	}
+	return ""
+}
+
+func (x *Explanation) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *Explanation) GetActivityId() string {
+	if x != nil {
+		return x.ActivityId
+	}
+	return ""
+}
+
+func (x *Explanation) GetCall() string {
+	if x != nil {
+		return x.Call
+	}
+	return ""
+}
+
+func (x *Explanation) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
+}
+
+func (x *Explanation) GetNext() string {
+	if x != nil {
+		return x.Next
+	}
+	return ""
+}
+
+func (x *Explanation) GetIncidents() []*Incident {
+	if x != nil {
+		return x.Incidents
+	}
+	return nil
+}
+
+func (x *Explanation) GetSources() []*Evidence {
+	if x != nil {
+		return x.Sources
+	}
+	return nil
+}
+
+func (x *Explanation) GetCost() *Cost {
+	if x != nil {
+		return x.Cost
+	}
+	return nil
+}
+
+func (x *Explanation) GetUsage() []*ModelUsage {
+	if x != nil {
+		return x.Usage
+	}
+	return nil
+}
+
+func (x *Explanation) GetClaim() string {
+	if x != nil {
+		return x.Claim
+	}
+	return ""
+}
+
+func (x *Explanation) GetMissing() []string {
+	if x != nil {
+		return x.Missing
+	}
+	return nil
+}
+
+func (x *Explanation) GetIncidentsOmitted() int32 {
+	if x != nil {
+		return x.IncidentsOmitted
+	}
+	return 0
+}
+
+// Trouble a run met along the way: a retried attempt, a crash inferred from what it left, a wait for
+// budget or a reconciliation.
+type Incident struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	At            string                 `protobuf:"bytes,1,opt,name=at,proto3" json:"at,omitempty"` // RFC 3339
+	Step          string                 `protobuf:"bytes,2,opt,name=step,proto3" json:"step,omitempty"`
+	ActivityId    string                 `protobuf:"bytes,3,opt,name=activity_id,json=activityId,proto3" json:"activity_id,omitempty"`
+	Attempt       int32                  `protobuf:"varint,4,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	Kind          string                 `protobuf:"bytes,5,opt,name=kind,proto3" json:"kind,omitempty"` // as Explanation.kind
+	Cause         string                 `protobuf:"bytes,6,opt,name=cause,proto3" json:"cause,omitempty"`
+	Evidence      []*Evidence            `protobuf:"bytes,7,rep,name=evidence,proto3" json:"evidence,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Incident) Reset() {
+	*x = Incident{}
+	mi := &file_agentos_v1_control_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Incident) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Incident) ProtoMessage() {}
+
+func (x *Incident) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Incident.ProtoReflect.Descriptor instead.
+func (*Incident) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *Incident) GetAt() string {
+	if x != nil {
+		return x.At
+	}
+	return ""
+}
+
+func (x *Incident) GetStep() string {
+	if x != nil {
+		return x.Step
+	}
+	return ""
+}
+
+func (x *Incident) GetActivityId() string {
+	if x != nil {
+		return x.ActivityId
+	}
+	return ""
+}
+
+func (x *Incident) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
+}
+
+func (x *Incident) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *Incident) GetCause() string {
+	if x != nil {
+		return x.Cause
+	}
+	return ""
+}
+
+func (x *Incident) GetEvidence() []*Evidence {
+	if x != nil {
+		return x.Evidence
+	}
+	return nil
+}
+
+// Where a piece of evidence is: an event of the run's history in Temporal, a record of the audit
+// log, or a row of another of agentd's tables.
+type Evidence struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Source        string                 `protobuf:"bytes,1,opt,name=source,proto3" json:"source,omitempty"`                   // temporal, audit or ledger
+	EventId       int64                  `protobuf:"varint,2,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"` // temporal: the event's ID
+	Seq           int64                  `protobuf:"varint,3,opt,name=seq,proto3" json:"seq,omitempty"`                        // audit: the record's seq
+	Table         string                 `protobuf:"bytes,4,opt,name=table,proto3" json:"table,omitempty"`                     // ledger: the table, e.g. model_calls
+	Key           string                 `protobuf:"bytes,5,opt,name=key,proto3" json:"key,omitempty"`                         // ledger: the row's key
+	What          string                 `protobuf:"bytes,6,opt,name=what,proto3" json:"what,omitempty"`                       // what it shows
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Evidence) Reset() {
+	*x = Evidence{}
+	mi := &file_agentos_v1_control_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Evidence) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Evidence) ProtoMessage() {}
+
+func (x *Evidence) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Evidence.ProtoReflect.Descriptor instead.
+func (*Evidence) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *Evidence) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *Evidence) GetEventId() int64 {
+	if x != nil {
+		return x.EventId
+	}
+	return 0
+}
+
+func (x *Evidence) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *Evidence) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *Evidence) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *Evidence) GetWhat() string {
+	if x != nil {
+		return x.What
+	}
+	return ""
+}
+
+type Cost struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	SpentMicros    int64                  `protobuf:"varint,1,opt,name=spent_micros,json=spentMicros,proto3" json:"spent_micros,omitempty"`
+	ReservedMicros int64                  `protobuf:"varint,2,opt,name=reserved_micros,json=reservedMicros,proto3" json:"reserved_micros,omitempty"` // held by requests not settled yet
+	LimitMicros    int64                  `protobuf:"varint,3,opt,name=limit_micros,json=limitMicros,proto3" json:"limit_micros,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *Cost) Reset() {
+	*x = Cost{}
+	mi := &file_agentos_v1_control_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Cost) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Cost) ProtoMessage() {}
+
+func (x *Cost) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Cost.ProtoReflect.Descriptor instead.
+func (*Cost) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *Cost) GetSpentMicros() int64 {
+	if x != nil {
+		return x.SpentMicros
+	}
+	return 0
+}
+
+func (x *Cost) GetReservedMicros() int64 {
+	if x != nil {
+		return x.ReservedMicros
+	}
+	return 0
+}
+
+func (x *Cost) GetLimitMicros() int64 {
+	if x != nil {
+		return x.LimitMicros
+	}
+	return 0
+}
+
+// What the run's model requests to one model were billed, as the ledger records each request.
+type ModelUsage struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Model            string                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`                                 // provider/model, as billed
+	Requests         int64                  `protobuf:"varint,2,opt,name=requests,proto3" json:"requests,omitempty"`                          // network requests billed to it (a call may make several)
+	InputTokens      int64                  `protobuf:"varint,3,opt,name=input_tokens,json=inputTokens,proto3" json:"input_tokens,omitempty"` // input that was neither written to nor read from the cache
+	OutputTokens     int64                  `protobuf:"varint,4,opt,name=output_tokens,json=outputTokens,proto3" json:"output_tokens,omitempty"`
+	CacheReadTokens  int64                  `protobuf:"varint,5,opt,name=cache_read_tokens,json=cacheReadTokens,proto3" json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64                  `protobuf:"varint,6,opt,name=cache_write_tokens,json=cacheWriteTokens,proto3" json:"cache_write_tokens,omitempty"`
+	Refusals         int64                  `protobuf:"varint,7,opt,name=refusals,proto3" json:"refusals,omitempty"` // requests to it the model declined to answer
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ModelUsage) Reset() {
+	*x = ModelUsage{}
+	mi := &file_agentos_v1_control_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelUsage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelUsage) ProtoMessage() {}
+
+func (x *ModelUsage) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelUsage.ProtoReflect.Descriptor instead.
+func (*ModelUsage) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ModelUsage) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *ModelUsage) GetRequests() int64 {
+	if x != nil {
+		return x.Requests
+	}
+	return 0
+}
+
+func (x *ModelUsage) GetInputTokens() int64 {
+	if x != nil {
+		return x.InputTokens
+	}
+	return 0
+}
+
+func (x *ModelUsage) GetOutputTokens() int64 {
+	if x != nil {
+		return x.OutputTokens
+	}
+	return 0
+}
+
+func (x *ModelUsage) GetCacheReadTokens() int64 {
+	if x != nil {
+		return x.CacheReadTokens
+	}
+	return 0
+}
+
+func (x *ModelUsage) GetCacheWriteTokens() int64 {
+	if x != nil {
+		return x.CacheWriteTokens
+	}
+	return 0
+}
+
+func (x *ModelUsage) GetRefusals() int64 {
+	if x != nil {
+		return x.Refusals
+	}
+	return 0
+}
+
 type VerifyAuditRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	RunId string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"` // check this run only; empty: every run. The chain is walked whole
@@ -1443,7 +1912,7 @@ type VerifyAuditRequest struct {
 
 func (x *VerifyAuditRequest) Reset() {
 	*x = VerifyAuditRequest{}
-	mi := &file_agentos_v1_control_proto_msgTypes[21]
+	mi := &file_agentos_v1_control_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1455,7 +1924,7 @@ func (x *VerifyAuditRequest) String() string {
 func (*VerifyAuditRequest) ProtoMessage() {}
 
 func (x *VerifyAuditRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[21]
+	mi := &file_agentos_v1_control_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1468,7 +1937,7 @@ func (x *VerifyAuditRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyAuditRequest.ProtoReflect.Descriptor instead.
 func (*VerifyAuditRequest) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{21}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *VerifyAuditRequest) GetRunId() string {
@@ -1550,7 +2019,7 @@ type AuditReport struct {
 
 func (x *AuditReport) Reset() {
 	*x = AuditReport{}
-	mi := &file_agentos_v1_control_proto_msgTypes[22]
+	mi := &file_agentos_v1_control_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1562,7 +2031,7 @@ func (x *AuditReport) String() string {
 func (*AuditReport) ProtoMessage() {}
 
 func (x *AuditReport) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[22]
+	mi := &file_agentos_v1_control_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1575,7 +2044,7 @@ func (x *AuditReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuditReport.ProtoReflect.Descriptor instead.
 func (*AuditReport) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{22}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *AuditReport) GetRecords() int64 {
@@ -1761,7 +2230,7 @@ type TerminatedExecution struct {
 
 func (x *TerminatedExecution) Reset() {
 	*x = TerminatedExecution{}
-	mi := &file_agentos_v1_control_proto_msgTypes[23]
+	mi := &file_agentos_v1_control_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1773,7 +2242,7 @@ func (x *TerminatedExecution) String() string {
 func (*TerminatedExecution) ProtoMessage() {}
 
 func (x *TerminatedExecution) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[23]
+	mi := &file_agentos_v1_control_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1786,7 +2255,7 @@ func (x *TerminatedExecution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TerminatedExecution.ProtoReflect.Descriptor instead.
 func (*TerminatedExecution) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{23}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *TerminatedExecution) GetRunId() string {
@@ -1837,7 +2306,7 @@ type UnrecordedAttempt struct {
 
 func (x *UnrecordedAttempt) Reset() {
 	*x = UnrecordedAttempt{}
-	mi := &file_agentos_v1_control_proto_msgTypes[24]
+	mi := &file_agentos_v1_control_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1849,7 +2318,7 @@ func (x *UnrecordedAttempt) String() string {
 func (*UnrecordedAttempt) ProtoMessage() {}
 
 func (x *UnrecordedAttempt) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[24]
+	mi := &file_agentos_v1_control_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1862,7 +2331,7 @@ func (x *UnrecordedAttempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnrecordedAttempt.ProtoReflect.Descriptor instead.
 func (*UnrecordedAttempt) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{24}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UnrecordedAttempt) GetRunId() string {
@@ -1911,7 +2380,7 @@ type Unread struct {
 
 func (x *Unread) Reset() {
 	*x = Unread{}
-	mi := &file_agentos_v1_control_proto_msgTypes[25]
+	mi := &file_agentos_v1_control_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1923,7 +2392,7 @@ func (x *Unread) String() string {
 func (*Unread) ProtoMessage() {}
 
 func (x *Unread) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[25]
+	mi := &file_agentos_v1_control_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1936,7 +2405,7 @@ func (x *Unread) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Unread.ProtoReflect.Descriptor instead.
 func (*Unread) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{25}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *Unread) GetWhat() string {
@@ -1970,7 +2439,7 @@ type UncheckedTable struct {
 
 func (x *UncheckedTable) Reset() {
 	*x = UncheckedTable{}
-	mi := &file_agentos_v1_control_proto_msgTypes[26]
+	mi := &file_agentos_v1_control_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1982,7 +2451,7 @@ func (x *UncheckedTable) String() string {
 func (*UncheckedTable) ProtoMessage() {}
 
 func (x *UncheckedTable) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[26]
+	mi := &file_agentos_v1_control_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1995,7 +2464,7 @@ func (x *UncheckedTable) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UncheckedTable.ProtoReflect.Descriptor instead.
 func (*UncheckedTable) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{26}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *UncheckedTable) GetName() string {
@@ -2025,7 +2494,7 @@ type CutShortAttempt struct {
 
 func (x *CutShortAttempt) Reset() {
 	*x = CutShortAttempt{}
-	mi := &file_agentos_v1_control_proto_msgTypes[27]
+	mi := &file_agentos_v1_control_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2037,7 +2506,7 @@ func (x *CutShortAttempt) String() string {
 func (*CutShortAttempt) ProtoMessage() {}
 
 func (x *CutShortAttempt) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[27]
+	mi := &file_agentos_v1_control_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2050,7 +2519,7 @@ func (x *CutShortAttempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CutShortAttempt.ProtoReflect.Descriptor instead.
 func (*CutShortAttempt) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{27}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *CutShortAttempt) GetRunId() string {
@@ -2099,7 +2568,7 @@ type StateMismatch struct {
 
 func (x *StateMismatch) Reset() {
 	*x = StateMismatch{}
-	mi := &file_agentos_v1_control_proto_msgTypes[28]
+	mi := &file_agentos_v1_control_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2111,7 +2580,7 @@ func (x *StateMismatch) String() string {
 func (*StateMismatch) ProtoMessage() {}
 
 func (x *StateMismatch) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[28]
+	mi := &file_agentos_v1_control_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2124,7 +2593,7 @@ func (x *StateMismatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateMismatch.ProtoReflect.Descriptor instead.
 func (*StateMismatch) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{28}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *StateMismatch) GetKind() string {
@@ -2163,7 +2632,7 @@ type AnchorMismatch struct {
 
 func (x *AnchorMismatch) Reset() {
 	*x = AnchorMismatch{}
-	mi := &file_agentos_v1_control_proto_msgTypes[29]
+	mi := &file_agentos_v1_control_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2175,7 +2644,7 @@ func (x *AnchorMismatch) String() string {
 func (*AnchorMismatch) ProtoMessage() {}
 
 func (x *AnchorMismatch) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[29]
+	mi := &file_agentos_v1_control_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2188,7 +2657,7 @@ func (x *AnchorMismatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnchorMismatch.ProtoReflect.Descriptor instead.
 func (*AnchorMismatch) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{29}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *AnchorMismatch) GetRunId() string {
@@ -2229,7 +2698,7 @@ type RunMismatch struct {
 
 func (x *RunMismatch) Reset() {
 	*x = RunMismatch{}
-	mi := &file_agentos_v1_control_proto_msgTypes[30]
+	mi := &file_agentos_v1_control_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2241,7 +2710,7 @@ func (x *RunMismatch) String() string {
 func (*RunMismatch) ProtoMessage() {}
 
 func (x *RunMismatch) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[30]
+	mi := &file_agentos_v1_control_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2254,7 +2723,7 @@ func (x *RunMismatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunMismatch.ProtoReflect.Descriptor instead.
 func (*RunMismatch) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{30}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *RunMismatch) GetRunId() string {
@@ -2281,7 +2750,7 @@ type UnavailableRun struct {
 
 func (x *UnavailableRun) Reset() {
 	*x = UnavailableRun{}
-	mi := &file_agentos_v1_control_proto_msgTypes[31]
+	mi := &file_agentos_v1_control_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2293,7 +2762,7 @@ func (x *UnavailableRun) String() string {
 func (*UnavailableRun) ProtoMessage() {}
 
 func (x *UnavailableRun) ProtoReflect() protoreflect.Message {
-	mi := &file_agentos_v1_control_proto_msgTypes[31]
+	mi := &file_agentos_v1_control_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2306,7 +2775,7 @@ func (x *UnavailableRun) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnavailableRun.ProtoReflect.Descriptor instead.
 func (*UnavailableRun) Descriptor() ([]byte, []int) {
-	return file_agentos_v1_control_proto_rawDescGZIP(), []int{31}
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *UnavailableRun) GetRunId() string {
@@ -2321,6 +2790,595 @@ func (x *UnavailableRun) GetWhy() string {
 		return x.Why
 	}
 	return ""
+}
+
+type ExportAuditRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"` // this run's records and histories only; empty: the whole chain and every run
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportAuditRequest) Reset() {
+	*x = ExportAuditRequest{}
+	mi := &file_agentos_v1_control_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportAuditRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportAuditRequest) ProtoMessage() {}
+
+func (x *ExportAuditRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportAuditRequest.ProtoReflect.Descriptor instead.
+func (*ExportAuditRequest) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *ExportAuditRequest) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+// One part of an export (agentctl audit export writes them as one JSON document), in order: each
+// execution's history; then, for the whole chain, the heads agentd pushed to the chain's anchor
+// workflows in Temporal; then the chain's head and every record up to it. A reader recomputes each
+// record's sha256 from its fields (internal/audit's Hash), checks each anchor's result_json against
+// its call record's result_sha256 and against the history, and each pushed head against the record
+// at its seq.
+type AuditExportPart struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Part:
+	//
+	//	*AuditExportPart_Head
+	//	*AuditExportPart_Record
+	//	*AuditExportPart_History
+	//	*AuditExportPart_PushedHead
+	Part          isAuditExportPart_Part `protobuf_oneof:"part"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuditExportPart) Reset() {
+	*x = AuditExportPart{}
+	mi := &file_agentos_v1_control_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditExportPart) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditExportPart) ProtoMessage() {}
+
+func (x *AuditExportPart) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditExportPart.ProtoReflect.Descriptor instead.
+func (*AuditExportPart) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *AuditExportPart) GetPart() isAuditExportPart_Part {
+	if x != nil {
+		return x.Part
+	}
+	return nil
+}
+
+func (x *AuditExportPart) GetHead() *AuditExportHead {
+	if x != nil {
+		if x, ok := x.Part.(*AuditExportPart_Head); ok {
+			return x.Head
+		}
+	}
+	return nil
+}
+
+func (x *AuditExportPart) GetRecord() *AuditRecord {
+	if x != nil {
+		if x, ok := x.Part.(*AuditExportPart_Record); ok {
+			return x.Record
+		}
+	}
+	return nil
+}
+
+func (x *AuditExportPart) GetHistory() *ExecutionHistory {
+	if x != nil {
+		if x, ok := x.Part.(*AuditExportPart_History); ok {
+			return x.History
+		}
+	}
+	return nil
+}
+
+func (x *AuditExportPart) GetPushedHead() *PushedHead {
+	if x != nil {
+		if x, ok := x.Part.(*AuditExportPart_PushedHead); ok {
+			return x.PushedHead
+		}
+	}
+	return nil
+}
+
+type isAuditExportPart_Part interface {
+	isAuditExportPart_Part()
+}
+
+type AuditExportPart_Head struct {
+	Head *AuditExportHead `protobuf:"bytes,1,opt,name=head,proto3,oneof"`
+}
+
+type AuditExportPart_Record struct {
+	Record *AuditRecord `protobuf:"bytes,2,opt,name=record,proto3,oneof"`
+}
+
+type AuditExportPart_History struct {
+	History *ExecutionHistory `protobuf:"bytes,3,opt,name=history,proto3,oneof"`
+}
+
+type AuditExportPart_PushedHead struct {
+	PushedHead *PushedHead `protobuf:"bytes,4,opt,name=pushed_head,json=pushedHead,proto3,oneof"`
+}
+
+func (*AuditExportPart_Head) isAuditExportPart_Part() {}
+
+func (*AuditExportPart_Record) isAuditExportPart_Part() {}
+
+func (*AuditExportPart_History) isAuditExportPart_Part() {}
+
+func (*AuditExportPart_PushedHead) isAuditExportPart_Part() {}
+
+// A head of the chain that agentd pushed to one of the chain's anchor workflows in Temporal (design
+// doc, section 8), out of reach of whoever can write the ledger: the record at seq had this sha256.
+type PushedHead struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	AnchorWorkflowId string                 `protobuf:"bytes,1,opt,name=anchor_workflow_id,json=anchorWorkflowId,proto3" json:"anchor_workflow_id,omitempty"`
+	Seq              int64                  `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"`
+	Sha256           string                 `protobuf:"bytes,3,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *PushedHead) Reset() {
+	*x = PushedHead{}
+	mi := &file_agentos_v1_control_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushedHead) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushedHead) ProtoMessage() {}
+
+func (x *PushedHead) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushedHead.ProtoReflect.Descriptor instead.
+func (*PushedHead) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *PushedHead) GetAnchorWorkflowId() string {
+	if x != nil {
+		return x.AnchorWorkflowId
+	}
+	return ""
+}
+
+func (x *PushedHead) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *PushedHead) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+// The chain as the export found it: its head, and how many records it exports.
+type AuditExportHead struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Seq        int64                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"` // the chain's head at export time: the last record exported is this one, unless cut
+	Sha256     string                 `protobuf:"bytes,2,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	Records    int64                  `protobuf:"varint,3,opt,name=records,proto3" json:"records,omitempty"`                        // the records the export holds: every one to seq, or the run's
+	ExportedAt string                 `protobuf:"bytes,4,opt,name=exported_at,json=exportedAt,proto3" json:"exported_at,omitempty"` // RFC 3339
+	RunId      string                 `protobuf:"bytes,5,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`                // as asked; empty for the whole chain
+	// Why the export holds fewer records than the chain's (or the run's) up to seq: it stops before the
+	// record that would take it past agentd's bound on an export's size. Empty when it holds them all.
+	Cut           string `protobuf:"bytes,6,opt,name=cut,proto3" json:"cut,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuditExportHead) Reset() {
+	*x = AuditExportHead{}
+	mi := &file_agentos_v1_control_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditExportHead) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditExportHead) ProtoMessage() {}
+
+func (x *AuditExportHead) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditExportHead.ProtoReflect.Descriptor instead.
+func (*AuditExportHead) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *AuditExportHead) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *AuditExportHead) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+func (x *AuditExportHead) GetRecords() int64 {
+	if x != nil {
+		return x.Records
+	}
+	return 0
+}
+
+func (x *AuditExportHead) GetExportedAt() string {
+	if x != nil {
+		return x.ExportedAt
+	}
+	return ""
+}
+
+func (x *AuditExportHead) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *AuditExportHead) GetCut() string {
+	if x != nil {
+		return x.Cut
+	}
+	return ""
+}
+
+// A record of the audit log, with every field its sha256 covers.
+type AuditRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Seq           int64                  `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	At            string                 `protobuf:"bytes,2,opt,name=at,proto3" json:"at,omitempty"`
+	WorkflowId    string                 `protobuf:"bytes,3,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Type          string                 `protobuf:"bytes,4,opt,name=type,proto3" json:"type,omitempty"`
+	Actor         string                 `protobuf:"bytes,5,opt,name=actor,proto3" json:"actor,omitempty"`
+	PeerUid       *int64                 `protobuf:"varint,6,opt,name=peer_uid,json=peerUid,proto3,oneof" json:"peer_uid,omitempty"` // unset when NULL: hashed as the empty string
+	Payload       string                 `protobuf:"bytes,7,opt,name=payload,proto3" json:"payload,omitempty"`                       // the JSON text as hashed
+	PrevSha256    string                 `protobuf:"bytes,8,opt,name=prev_sha256,json=prevSha256,proto3" json:"prev_sha256,omitempty"`
+	Sha256        string                 `protobuf:"bytes,9,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuditRecord) Reset() {
+	*x = AuditRecord{}
+	mi := &file_agentos_v1_control_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditRecord) ProtoMessage() {}
+
+func (x *AuditRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditRecord.ProtoReflect.Descriptor instead.
+func (*AuditRecord) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *AuditRecord) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *AuditRecord) GetAt() string {
+	if x != nil {
+		return x.At
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetActor() string {
+	if x != nil {
+		return x.Actor
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetPeerUid() int64 {
+	if x != nil && x.PeerUid != nil {
+		return *x.PeerUid
+	}
+	return 0
+}
+
+func (x *AuditRecord) GetPayload() string {
+	if x != nil {
+		return x.Payload
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetPrevSha256() string {
+	if x != nil {
+		return x.PrevSha256
+	}
+	return ""
+}
+
+func (x *AuditRecord) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+// One execution of a run, its history as agentd read it from Temporal, and the anchors in it: which
+// event carries which record (the _audit of a gateway call's result).
+type ExecutionHistory struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RunId         string                 `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	TemporalRunId string                 `protobuf:"bytes,2,opt,name=temporal_run_id,json=temporalRunId,proto3" json:"temporal_run_id,omitempty"`
+	// The history's events in protojson (temporal.api.history.v1.History): agentd's encoding of what
+	// Temporal returned, not Temporal's own bytes. A reader with access to Temporal compares the events.
+	HistoryJson   string            `protobuf:"bytes,3,opt,name=history_json,json=historyJson,proto3" json:"history_json,omitempty"`
+	Anchors       []*ExportedAnchor `protobuf:"bytes,4,rep,name=anchors,proto3" json:"anchors,omitempty"`
+	Unavailable   string            `protobuf:"bytes,5,opt,name=unavailable,proto3" json:"unavailable,omitempty"` // why there is no history: Temporal no longer has it
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecutionHistory) Reset() {
+	*x = ExecutionHistory{}
+	mi := &file_agentos_v1_control_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecutionHistory) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecutionHistory) ProtoMessage() {}
+
+func (x *ExecutionHistory) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecutionHistory.ProtoReflect.Descriptor instead.
+func (*ExecutionHistory) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *ExecutionHistory) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *ExecutionHistory) GetTemporalRunId() string {
+	if x != nil {
+		return x.TemporalRunId
+	}
+	return ""
+}
+
+func (x *ExecutionHistory) GetHistoryJson() string {
+	if x != nil {
+		return x.HistoryJson
+	}
+	return ""
+}
+
+func (x *ExecutionHistory) GetAnchors() []*ExportedAnchor {
+	if x != nil {
+		return x.Anchors
+	}
+	return nil
+}
+
+func (x *ExecutionHistory) GetUnavailable() string {
+	if x != nil {
+		return x.Unavailable
+	}
+	return ""
+}
+
+type ExportedAnchor struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	EventId    int64                  `protobuf:"varint,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"` // the ActivityTaskCompleted event that carries it
+	ActivityId string                 `protobuf:"bytes,2,opt,name=activity_id,json=activityId,proto3" json:"activity_id,omitempty"`
+	Attempt    int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"` // the attempt that completed the call
+	Seq        int64                  `protobuf:"varint,4,opt,name=seq,proto3" json:"seq,omitempty"`         // the record it names
+	Sha256     string                 `protobuf:"bytes,5,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	// The bytes whose sha256 the call's record holds (result_sha256): the result's value_json, as the
+	// history holds it, without its _audit, as agentd encodes it (internal/audit's ResultJSON). Empty
+	// when the value cannot be read.
+	ResultJson    []byte `protobuf:"bytes,6,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExportedAnchor) Reset() {
+	*x = ExportedAnchor{}
+	mi := &file_agentos_v1_control_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExportedAnchor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExportedAnchor) ProtoMessage() {}
+
+func (x *ExportedAnchor) ProtoReflect() protoreflect.Message {
+	mi := &file_agentos_v1_control_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExportedAnchor.ProtoReflect.Descriptor instead.
+func (*ExportedAnchor) Descriptor() ([]byte, []int) {
+	return file_agentos_v1_control_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *ExportedAnchor) GetEventId() int64 {
+	if x != nil {
+		return x.EventId
+	}
+	return 0
+}
+
+func (x *ExportedAnchor) GetActivityId() string {
+	if x != nil {
+		return x.ActivityId
+	}
+	return ""
+}
+
+func (x *ExportedAnchor) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
+}
+
+func (x *ExportedAnchor) GetSeq() int64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
+func (x *ExportedAnchor) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+func (x *ExportedAnchor) GetResultJson() []byte {
+	if x != nil {
+		return x.ResultJson
+	}
+	return nil
 }
 
 var File_agentos_v1_control_proto protoreflect.FileDescriptor
@@ -2445,12 +3503,57 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\ramount_micros\x18\x02 \x01(\x03R\famountMicros\x12'\n" +
 	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"*\n" +
 	"\x11ExplainRunRequest\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\"j\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xa6\x04\n" +
 	"\vExplanation\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x12\n" +
 	"\x04step\x18\x02 \x01(\tR\x04step\x12\x14\n" +
 	"\x05cause\x18\x03 \x01(\tR\x05cause\x12\x1a\n" +
-	"\bevidence\x18\x04 \x03(\tR\bevidence\"\x84\x01\n" +
+	"\bevidence\x18\x04 \x03(\tR\bevidence\x12\x14\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\x12\x18\n" +
+	"\averdict\x18\x06 \x01(\tR\averdict\x12\x12\n" +
+	"\x04kind\x18\a \x01(\tR\x04kind\x12\x1f\n" +
+	"\vactivity_id\x18\b \x01(\tR\n" +
+	"activityId\x12\x12\n" +
+	"\x04call\x18\t \x01(\tR\x04call\x12\x18\n" +
+	"\aattempt\x18\n" +
+	" \x01(\x05R\aattempt\x12\x12\n" +
+	"\x04next\x18\v \x01(\tR\x04next\x122\n" +
+	"\tincidents\x18\f \x03(\v2\x14.agentos.v1.IncidentR\tincidents\x12.\n" +
+	"\asources\x18\r \x03(\v2\x14.agentos.v1.EvidenceR\asources\x12$\n" +
+	"\x04cost\x18\x0e \x01(\v2\x10.agentos.v1.CostR\x04cost\x12,\n" +
+	"\x05usage\x18\x0f \x03(\v2\x16.agentos.v1.ModelUsageR\x05usage\x12\x14\n" +
+	"\x05claim\x18\x10 \x01(\tR\x05claim\x12\x18\n" +
+	"\amissing\x18\x11 \x03(\tR\amissing\x12+\n" +
+	"\x11incidents_omitted\x18\x12 \x01(\x05R\x10incidentsOmitted\"\xc5\x01\n" +
+	"\bIncident\x12\x0e\n" +
+	"\x02at\x18\x01 \x01(\tR\x02at\x12\x12\n" +
+	"\x04step\x18\x02 \x01(\tR\x04step\x12\x1f\n" +
+	"\vactivity_id\x18\x03 \x01(\tR\n" +
+	"activityId\x12\x18\n" +
+	"\aattempt\x18\x04 \x01(\x05R\aattempt\x12\x12\n" +
+	"\x04kind\x18\x05 \x01(\tR\x04kind\x12\x14\n" +
+	"\x05cause\x18\x06 \x01(\tR\x05cause\x120\n" +
+	"\bevidence\x18\a \x03(\v2\x14.agentos.v1.EvidenceR\bevidence\"\x8b\x01\n" +
+	"\bEvidence\x12\x16\n" +
+	"\x06source\x18\x01 \x01(\tR\x06source\x12\x19\n" +
+	"\bevent_id\x18\x02 \x01(\x03R\aeventId\x12\x10\n" +
+	"\x03seq\x18\x03 \x01(\x03R\x03seq\x12\x14\n" +
+	"\x05table\x18\x04 \x01(\tR\x05table\x12\x10\n" +
+	"\x03key\x18\x05 \x01(\tR\x03key\x12\x12\n" +
+	"\x04what\x18\x06 \x01(\tR\x04what\"u\n" +
+	"\x04Cost\x12!\n" +
+	"\fspent_micros\x18\x01 \x01(\x03R\vspentMicros\x12'\n" +
+	"\x0freserved_micros\x18\x02 \x01(\x03R\x0ereservedMicros\x12!\n" +
+	"\flimit_micros\x18\x03 \x01(\x03R\vlimitMicros\"\xfc\x01\n" +
+	"\n" +
+	"ModelUsage\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
+	"\brequests\x18\x02 \x01(\x03R\brequests\x12!\n" +
+	"\finput_tokens\x18\x03 \x01(\x03R\vinputTokens\x12#\n" +
+	"\routput_tokens\x18\x04 \x01(\x03R\foutputTokens\x12*\n" +
+	"\x11cache_read_tokens\x18\x05 \x01(\x03R\x0fcacheReadTokens\x12,\n" +
+	"\x12cache_write_tokens\x18\x06 \x01(\x03R\x10cacheWriteTokens\x12\x1a\n" +
+	"\brefusals\x18\a \x01(\x03R\brefusals\"\x84\x01\n" +
 	"\x12VerifyAuditRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12!\n" +
 	"\fallow_chains\x18\x02 \x03(\tR\vallowChains\x124\n" +
@@ -2525,7 +3628,57 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\x03why\x18\x02 \x01(\tR\x03why\"9\n" +
 	"\x0eUnavailableRun\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x10\n" +
-	"\x03why\x18\x02 \x01(\tR\x03why2\xab\x06\n" +
+	"\x03why\x18\x02 \x01(\tR\x03why\"+\n" +
+	"\x12ExportAuditRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\"\xf4\x01\n" +
+	"\x0fAuditExportPart\x121\n" +
+	"\x04head\x18\x01 \x01(\v2\x1b.agentos.v1.AuditExportHeadH\x00R\x04head\x121\n" +
+	"\x06record\x18\x02 \x01(\v2\x17.agentos.v1.AuditRecordH\x00R\x06record\x128\n" +
+	"\ahistory\x18\x03 \x01(\v2\x1c.agentos.v1.ExecutionHistoryH\x00R\ahistory\x129\n" +
+	"\vpushed_head\x18\x04 \x01(\v2\x16.agentos.v1.PushedHeadH\x00R\n" +
+	"pushedHeadB\x06\n" +
+	"\x04part\"d\n" +
+	"\n" +
+	"PushedHead\x12,\n" +
+	"\x12anchor_workflow_id\x18\x01 \x01(\tR\x10anchorWorkflowId\x12\x10\n" +
+	"\x03seq\x18\x02 \x01(\x03R\x03seq\x12\x16\n" +
+	"\x06sha256\x18\x03 \x01(\tR\x06sha256\"\x9f\x01\n" +
+	"\x0fAuditExportHead\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x16\n" +
+	"\x06sha256\x18\x02 \x01(\tR\x06sha256\x12\x18\n" +
+	"\arecords\x18\x03 \x01(\x03R\arecords\x12\x1f\n" +
+	"\vexported_at\x18\x04 \x01(\tR\n" +
+	"exportedAt\x12\x15\n" +
+	"\x06run_id\x18\x05 \x01(\tR\x05runId\x12\x10\n" +
+	"\x03cut\x18\x06 \x01(\tR\x03cut\"\xfa\x01\n" +
+	"\vAuditRecord\x12\x10\n" +
+	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x0e\n" +
+	"\x02at\x18\x02 \x01(\tR\x02at\x12\x1f\n" +
+	"\vworkflow_id\x18\x03 \x01(\tR\n" +
+	"workflowId\x12\x12\n" +
+	"\x04type\x18\x04 \x01(\tR\x04type\x12\x14\n" +
+	"\x05actor\x18\x05 \x01(\tR\x05actor\x12\x1e\n" +
+	"\bpeer_uid\x18\x06 \x01(\x03H\x00R\apeerUid\x88\x01\x01\x12\x18\n" +
+	"\apayload\x18\a \x01(\tR\apayload\x12\x1f\n" +
+	"\vprev_sha256\x18\b \x01(\tR\n" +
+	"prevSha256\x12\x16\n" +
+	"\x06sha256\x18\t \x01(\tR\x06sha256B\v\n" +
+	"\t_peer_uid\"\xcc\x01\n" +
+	"\x10ExecutionHistory\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12&\n" +
+	"\x0ftemporal_run_id\x18\x02 \x01(\tR\rtemporalRunId\x12!\n" +
+	"\fhistory_json\x18\x03 \x01(\tR\vhistoryJson\x124\n" +
+	"\aanchors\x18\x04 \x03(\v2\x1a.agentos.v1.ExportedAnchorR\aanchors\x12 \n" +
+	"\vunavailable\x18\x05 \x01(\tR\vunavailable\"\xb1\x01\n" +
+	"\x0eExportedAnchor\x12\x19\n" +
+	"\bevent_id\x18\x01 \x01(\x03R\aeventId\x12\x1f\n" +
+	"\vactivity_id\x18\x02 \x01(\tR\n" +
+	"activityId\x12\x18\n" +
+	"\aattempt\x18\x03 \x01(\x05R\aattempt\x12\x10\n" +
+	"\x03seq\x18\x04 \x01(\x03R\x03seq\x12\x16\n" +
+	"\x06sha256\x18\x05 \x01(\tR\x06sha256\x12\x1f\n" +
+	"\vresult_json\x18\x06 \x01(\fR\n" +
+	"resultJson2\xf9\x06\n" +
 	"\aControl\x128\n" +
 	"\bStartRun\x12\x1b.agentos.v1.StartRunRequest\x1a\x0f.agentos.v1.Run\x124\n" +
 	"\x06GetRun\x12\x19.agentos.v1.GetRunRequest\x1a\x0f.agentos.v1.Run\x12E\n" +
@@ -2538,7 +3691,8 @@ const file_agentos_v1_control_proto_rawDesc = "" +
 	"\fExtendBudget\x12\x1f.agentos.v1.ExtendBudgetRequest\x1a\x0f.agentos.v1.Run\x12D\n" +
 	"\n" +
 	"ExplainRun\x12\x1d.agentos.v1.ExplainRunRequest\x1a\x17.agentos.v1.Explanation\x12F\n" +
-	"\vVerifyAudit\x12\x1e.agentos.v1.VerifyAuditRequest\x1a\x17.agentos.v1.AuditReportB:Z8github.com/jchen0426/agentos/gen/go/agentos/v1;agentosv1b\x06proto3"
+	"\vVerifyAudit\x12\x1e.agentos.v1.VerifyAuditRequest\x1a\x17.agentos.v1.AuditReport\x12L\n" +
+	"\vExportAudit\x12\x1e.agentos.v1.ExportAuditRequest\x1a\x1b.agentos.v1.AuditExportPart0\x01B:Z8github.com/jchen0426/agentos/gen/go/agentos/v1;agentosv1b\x06proto3"
 
 var (
 	file_agentos_v1_control_proto_rawDescOnce sync.Once
@@ -2552,7 +3706,7 @@ func file_agentos_v1_control_proto_rawDescGZIP() []byte {
 	return file_agentos_v1_control_proto_rawDescData
 }
 
-var file_agentos_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
+var file_agentos_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
 var file_agentos_v1_control_proto_goTypes = []any{
 	(*StartRunRequest)(nil),               // 0: agentos.v1.StartRunRequest
 	(*GetRunRequest)(nil),                 // 1: agentos.v1.GetRunRequest
@@ -2575,65 +3729,88 @@ var file_agentos_v1_control_proto_goTypes = []any{
 	(*ExtendBudgetRequest)(nil),           // 18: agentos.v1.ExtendBudgetRequest
 	(*ExplainRunRequest)(nil),             // 19: agentos.v1.ExplainRunRequest
 	(*Explanation)(nil),                   // 20: agentos.v1.Explanation
-	(*VerifyAuditRequest)(nil),            // 21: agentos.v1.VerifyAuditRequest
-	(*AuditReport)(nil),                   // 22: agentos.v1.AuditReport
-	(*TerminatedExecution)(nil),           // 23: agentos.v1.TerminatedExecution
-	(*UnrecordedAttempt)(nil),             // 24: agentos.v1.UnrecordedAttempt
-	(*Unread)(nil),                        // 25: agentos.v1.Unread
-	(*UncheckedTable)(nil),                // 26: agentos.v1.UncheckedTable
-	(*CutShortAttempt)(nil),               // 27: agentos.v1.CutShortAttempt
-	(*StateMismatch)(nil),                 // 28: agentos.v1.StateMismatch
-	(*AnchorMismatch)(nil),                // 29: agentos.v1.AnchorMismatch
-	(*RunMismatch)(nil),                   // 30: agentos.v1.RunMismatch
-	(*UnavailableRun)(nil),                // 31: agentos.v1.UnavailableRun
-	nil,                                   // 32: agentos.v1.StartRunRequest.ParamsEntry
-	nil,                                   // 33: agentos.v1.Run.ParamsEntry
+	(*Incident)(nil),                      // 21: agentos.v1.Incident
+	(*Evidence)(nil),                      // 22: agentos.v1.Evidence
+	(*Cost)(nil),                          // 23: agentos.v1.Cost
+	(*ModelUsage)(nil),                    // 24: agentos.v1.ModelUsage
+	(*VerifyAuditRequest)(nil),            // 25: agentos.v1.VerifyAuditRequest
+	(*AuditReport)(nil),                   // 26: agentos.v1.AuditReport
+	(*TerminatedExecution)(nil),           // 27: agentos.v1.TerminatedExecution
+	(*UnrecordedAttempt)(nil),             // 28: agentos.v1.UnrecordedAttempt
+	(*Unread)(nil),                        // 29: agentos.v1.Unread
+	(*UncheckedTable)(nil),                // 30: agentos.v1.UncheckedTable
+	(*CutShortAttempt)(nil),               // 31: agentos.v1.CutShortAttempt
+	(*StateMismatch)(nil),                 // 32: agentos.v1.StateMismatch
+	(*AnchorMismatch)(nil),                // 33: agentos.v1.AnchorMismatch
+	(*RunMismatch)(nil),                   // 34: agentos.v1.RunMismatch
+	(*UnavailableRun)(nil),                // 35: agentos.v1.UnavailableRun
+	(*ExportAuditRequest)(nil),            // 36: agentos.v1.ExportAuditRequest
+	(*AuditExportPart)(nil),               // 37: agentos.v1.AuditExportPart
+	(*PushedHead)(nil),                    // 38: agentos.v1.PushedHead
+	(*AuditExportHead)(nil),               // 39: agentos.v1.AuditExportHead
+	(*AuditRecord)(nil),                   // 40: agentos.v1.AuditRecord
+	(*ExecutionHistory)(nil),              // 41: agentos.v1.ExecutionHistory
+	(*ExportedAnchor)(nil),                // 42: agentos.v1.ExportedAnchor
+	nil,                                   // 43: agentos.v1.StartRunRequest.ParamsEntry
+	nil,                                   // 44: agentos.v1.Run.ParamsEntry
 }
 var file_agentos_v1_control_proto_depIdxs = []int32{
-	32, // 0: agentos.v1.StartRunRequest.params:type_name -> agentos.v1.StartRunRequest.ParamsEntry
+	43, // 0: agentos.v1.StartRunRequest.params:type_name -> agentos.v1.StartRunRequest.ParamsEntry
 	5,  // 1: agentos.v1.ListRunsResponse.runs:type_name -> agentos.v1.Run
-	33, // 2: agentos.v1.Run.params:type_name -> agentos.v1.Run.ParamsEntry
+	44, // 2: agentos.v1.Run.params:type_name -> agentos.v1.Run.ParamsEntry
 	8,  // 3: agentos.v1.ListPendingResponse.items:type_name -> agentos.v1.PendingItem
 	12, // 4: agentos.v1.ResolveApprovalRequest.approve:type_name -> agentos.v1.Approve
 	13, // 5: agentos.v1.ResolveApprovalRequest.approve_with_edits:type_name -> agentos.v1.ApproveWithEdits
 	14, // 6: agentos.v1.ResolveApprovalRequest.reject:type_name -> agentos.v1.Reject
-	29, // 7: agentos.v1.AuditReport.anchors_mismatched:type_name -> agentos.v1.AnchorMismatch
-	31, // 8: agentos.v1.AuditReport.runs_unavailable:type_name -> agentos.v1.UnavailableRun
-	30, // 9: agentos.v1.AuditReport.runs_mismatched:type_name -> agentos.v1.RunMismatch
-	28, // 10: agentos.v1.AuditReport.state_mismatched:type_name -> agentos.v1.StateMismatch
-	31, // 11: agentos.v1.AuditReport.runs_before_log:type_name -> agentos.v1.UnavailableRun
-	27, // 12: agentos.v1.AuditReport.attempts_cut_short:type_name -> agentos.v1.CutShortAttempt
-	26, // 13: agentos.v1.AuditReport.unchecked_tables:type_name -> agentos.v1.UncheckedTable
-	25, // 14: agentos.v1.AuditReport.unread:type_name -> agentos.v1.Unread
-	24, // 15: agentos.v1.AuditReport.attempts_unrecorded:type_name -> agentos.v1.UnrecordedAttempt
-	23, // 16: agentos.v1.AuditReport.terminated_outside_agentd:type_name -> agentos.v1.TerminatedExecution
-	0,  // 17: agentos.v1.Control.StartRun:input_type -> agentos.v1.StartRunRequest
-	1,  // 18: agentos.v1.Control.GetRun:input_type -> agentos.v1.GetRunRequest
-	2,  // 19: agentos.v1.Control.ListRuns:input_type -> agentos.v1.ListRunsRequest
-	4,  // 20: agentos.v1.Control.CancelRun:input_type -> agentos.v1.CancelRunRequest
-	6,  // 21: agentos.v1.Control.ListPending:input_type -> agentos.v1.ListPendingRequest
-	9,  // 22: agentos.v1.Control.GetApproval:input_type -> agentos.v1.GetApprovalRequest
-	11, // 23: agentos.v1.Control.ResolveApproval:input_type -> agentos.v1.ResolveApprovalRequest
-	16, // 24: agentos.v1.Control.ResolveReconciliation:input_type -> agentos.v1.ResolveReconciliationRequest
-	18, // 25: agentos.v1.Control.ExtendBudget:input_type -> agentos.v1.ExtendBudgetRequest
-	19, // 26: agentos.v1.Control.ExplainRun:input_type -> agentos.v1.ExplainRunRequest
-	21, // 27: agentos.v1.Control.VerifyAudit:input_type -> agentos.v1.VerifyAuditRequest
-	5,  // 28: agentos.v1.Control.StartRun:output_type -> agentos.v1.Run
-	5,  // 29: agentos.v1.Control.GetRun:output_type -> agentos.v1.Run
-	3,  // 30: agentos.v1.Control.ListRuns:output_type -> agentos.v1.ListRunsResponse
-	5,  // 31: agentos.v1.Control.CancelRun:output_type -> agentos.v1.Run
-	7,  // 32: agentos.v1.Control.ListPending:output_type -> agentos.v1.ListPendingResponse
-	10, // 33: agentos.v1.Control.GetApproval:output_type -> agentos.v1.Approval
-	15, // 34: agentos.v1.Control.ResolveApproval:output_type -> agentos.v1.ResolveApprovalResponse
-	17, // 35: agentos.v1.Control.ResolveReconciliation:output_type -> agentos.v1.ResolveReconciliationResponse
-	5,  // 36: agentos.v1.Control.ExtendBudget:output_type -> agentos.v1.Run
-	20, // 37: agentos.v1.Control.ExplainRun:output_type -> agentos.v1.Explanation
-	22, // 38: agentos.v1.Control.VerifyAudit:output_type -> agentos.v1.AuditReport
-	28, // [28:39] is the sub-list for method output_type
-	17, // [17:28] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	21, // 7: agentos.v1.Explanation.incidents:type_name -> agentos.v1.Incident
+	22, // 8: agentos.v1.Explanation.sources:type_name -> agentos.v1.Evidence
+	23, // 9: agentos.v1.Explanation.cost:type_name -> agentos.v1.Cost
+	24, // 10: agentos.v1.Explanation.usage:type_name -> agentos.v1.ModelUsage
+	22, // 11: agentos.v1.Incident.evidence:type_name -> agentos.v1.Evidence
+	33, // 12: agentos.v1.AuditReport.anchors_mismatched:type_name -> agentos.v1.AnchorMismatch
+	35, // 13: agentos.v1.AuditReport.runs_unavailable:type_name -> agentos.v1.UnavailableRun
+	34, // 14: agentos.v1.AuditReport.runs_mismatched:type_name -> agentos.v1.RunMismatch
+	32, // 15: agentos.v1.AuditReport.state_mismatched:type_name -> agentos.v1.StateMismatch
+	35, // 16: agentos.v1.AuditReport.runs_before_log:type_name -> agentos.v1.UnavailableRun
+	31, // 17: agentos.v1.AuditReport.attempts_cut_short:type_name -> agentos.v1.CutShortAttempt
+	30, // 18: agentos.v1.AuditReport.unchecked_tables:type_name -> agentos.v1.UncheckedTable
+	29, // 19: agentos.v1.AuditReport.unread:type_name -> agentos.v1.Unread
+	28, // 20: agentos.v1.AuditReport.attempts_unrecorded:type_name -> agentos.v1.UnrecordedAttempt
+	27, // 21: agentos.v1.AuditReport.terminated_outside_agentd:type_name -> agentos.v1.TerminatedExecution
+	39, // 22: agentos.v1.AuditExportPart.head:type_name -> agentos.v1.AuditExportHead
+	40, // 23: agentos.v1.AuditExportPart.record:type_name -> agentos.v1.AuditRecord
+	41, // 24: agentos.v1.AuditExportPart.history:type_name -> agentos.v1.ExecutionHistory
+	38, // 25: agentos.v1.AuditExportPart.pushed_head:type_name -> agentos.v1.PushedHead
+	42, // 26: agentos.v1.ExecutionHistory.anchors:type_name -> agentos.v1.ExportedAnchor
+	0,  // 27: agentos.v1.Control.StartRun:input_type -> agentos.v1.StartRunRequest
+	1,  // 28: agentos.v1.Control.GetRun:input_type -> agentos.v1.GetRunRequest
+	2,  // 29: agentos.v1.Control.ListRuns:input_type -> agentos.v1.ListRunsRequest
+	4,  // 30: agentos.v1.Control.CancelRun:input_type -> agentos.v1.CancelRunRequest
+	6,  // 31: agentos.v1.Control.ListPending:input_type -> agentos.v1.ListPendingRequest
+	9,  // 32: agentos.v1.Control.GetApproval:input_type -> agentos.v1.GetApprovalRequest
+	11, // 33: agentos.v1.Control.ResolveApproval:input_type -> agentos.v1.ResolveApprovalRequest
+	16, // 34: agentos.v1.Control.ResolveReconciliation:input_type -> agentos.v1.ResolveReconciliationRequest
+	18, // 35: agentos.v1.Control.ExtendBudget:input_type -> agentos.v1.ExtendBudgetRequest
+	19, // 36: agentos.v1.Control.ExplainRun:input_type -> agentos.v1.ExplainRunRequest
+	25, // 37: agentos.v1.Control.VerifyAudit:input_type -> agentos.v1.VerifyAuditRequest
+	36, // 38: agentos.v1.Control.ExportAudit:input_type -> agentos.v1.ExportAuditRequest
+	5,  // 39: agentos.v1.Control.StartRun:output_type -> agentos.v1.Run
+	5,  // 40: agentos.v1.Control.GetRun:output_type -> agentos.v1.Run
+	3,  // 41: agentos.v1.Control.ListRuns:output_type -> agentos.v1.ListRunsResponse
+	5,  // 42: agentos.v1.Control.CancelRun:output_type -> agentos.v1.Run
+	7,  // 43: agentos.v1.Control.ListPending:output_type -> agentos.v1.ListPendingResponse
+	10, // 44: agentos.v1.Control.GetApproval:output_type -> agentos.v1.Approval
+	15, // 45: agentos.v1.Control.ResolveApproval:output_type -> agentos.v1.ResolveApprovalResponse
+	17, // 46: agentos.v1.Control.ResolveReconciliation:output_type -> agentos.v1.ResolveReconciliationResponse
+	5,  // 47: agentos.v1.Control.ExtendBudget:output_type -> agentos.v1.Run
+	20, // 48: agentos.v1.Control.ExplainRun:output_type -> agentos.v1.Explanation
+	26, // 49: agentos.v1.Control.VerifyAudit:output_type -> agentos.v1.AuditReport
+	37, // 50: agentos.v1.Control.ExportAudit:output_type -> agentos.v1.AuditExportPart
+	39, // [39:51] is the sub-list for method output_type
+	27, // [27:39] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_agentos_v1_control_proto_init() }
@@ -2646,13 +3823,20 @@ func file_agentos_v1_control_proto_init() {
 		(*ResolveApprovalRequest_ApproveWithEdits)(nil),
 		(*ResolveApprovalRequest_Reject)(nil),
 	}
+	file_agentos_v1_control_proto_msgTypes[37].OneofWrappers = []any{
+		(*AuditExportPart_Head)(nil),
+		(*AuditExportPart_Record)(nil),
+		(*AuditExportPart_History)(nil),
+		(*AuditExportPart_PushedHead)(nil),
+	}
+	file_agentos_v1_control_proto_msgTypes[40].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentos_v1_control_proto_rawDesc), len(file_agentos_v1_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   34,
+			NumMessages:   45,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

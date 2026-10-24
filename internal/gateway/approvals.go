@@ -292,7 +292,7 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 				got, cur.PayloadSha256)
 			g.Log.Error("an approved payload changed; not sending it", "workflow_id", ce.WorkflowID, "effect_id", ce.EffectID,
 				"approval_id", cur.ApprovalID, "recorded_sha256", got, "approved_sha256", cur.PayloadSha256)
-			return abandon(StatusDenied, map[string]any{}, reason)
+			return abandon(StatusDenied, map[string]any{refusedByKey: audit.RefusedByAgentd}, reason)
 		}
 		n, err := q.ApproveEffect(ctx, db.ApproveEffectParams{UpdatedAt: now, EffectID: ce.EffectID, Version: ce.Version})
 		if err != nil {
@@ -306,7 +306,8 @@ func (g *Gateway) approved(ctx context.Context, e db.Effect, a db.Approval) (*ag
 			if !run.CancelledAt.Valid {
 				return fmt.Errorf("%w: effect %s let go after its approval", ledger.ErrWriteDropped, ce.EffectID)
 			}
-			return abandon(StatusDenied, map[string]any{}, "the run was cancelled before the approved write was sent")
+			return abandon(StatusDenied, map[string]any{refusedByKey: audit.RefusedByCancel},
+				"the run was cancelled before the approved write was sent")
 		}
 		if n, err := q.UseApproval(ctx, db.UseApprovalParams{UsedAt: valid(now), ApprovalID: cur.ApprovalID}); err != nil || n == 0 {
 			return cmp.Or(err, errChanged) // never the effect let go without its approval used
@@ -495,9 +496,9 @@ func approvalResult(t tools.Writer, a db.Approval, e db.Effect) (*agentosv1.Resu
 		if ed, ok := t.(tools.Editable); ok {
 			return result(StatusEdited, map[string]any{"approval_id": a.ApprovalID, ed.EditArg(): a.EditedPatchBlob.String})
 		}
-		return result(StatusDenied, map[string]any{"approval_id": a.ApprovalID, "reason": t.Name() + " takes no edits"})
+		return deny(audit.RefusedByAgentd, map[string]any{"approval_id": a.ApprovalID, "reason": t.Name() + " takes no edits"})
 	}
-	return result(StatusDenied, map[string]any{"approval_id": a.ApprovalID, "effect_id": e.EffectID, "reason": e.Reason.String})
+	return deny(audit.RefusedByAgentd, map[string]any{"approval_id": a.ApprovalID, "effect_id": e.EffectID, "reason": e.Reason.String})
 }
 
 // expire ends a PENDING approval whose time is up, as a rejection (design doc, section 10): its

@@ -16,14 +16,16 @@
 // left, and uses it up. An answer is {"report": {...}} (the model's output), {"fault": "refusal"}
 // (any of the faults above), or both (an "invalid" answer is its report without the summary),
 // and may set the usage it reports: {"usage": {"input": 200, "cache_read": 800, "output": 500}},
-// input being what was not read from the cache. A fault in the faults file comes first; a
-// request no rule answers gets the fixture report.
+// input being what was not read from the cache. A report's numbers go out as they are written
+// in the file, a 5,000-digit line among them. A fault in the faults file comes first; a request
+// no rule answers gets the fixture report.
 //
 // Like Ollama it answers /api/show, about any model: a model whose name starts with "cloud"
 // is one of Ollama's cloud models, which run on Ollama's servers whatever a user names them.
 package modelsim
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -269,7 +271,9 @@ func (s *Server) takeAnswer(model string, body []byte) (Scripted, error) {
 		return Scripted{}, err
 	}
 	var rules []Rule
-	if err := json.Unmarshal(b, &rules); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber() // a report's numbers as written, however long
+	if err := dec.Decode(&rules); err != nil {
 		return Scripted{}, fmt.Errorf("answers %s: %w", s.AnswersPath, err)
 	}
 	for i, r := range rules {

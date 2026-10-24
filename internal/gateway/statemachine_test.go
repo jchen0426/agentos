@@ -1162,7 +1162,8 @@ func (m *machine) check() {
 // approvals as the ledger has it.
 func (m *machine) checkReport(r *runModel) {
 	led := m.cur.led
-	cc := &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: audit.RunBlobs{Ledger: led}, Effects: RunRecords{led}}
+	cc := &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: audit.RunBlobs{Ledger: led},
+		Effects: RunRecords{led}, Verdicts: ReportVerdicts{Ledger: led}, Task: "audit_v1"}
 	b, err := cc.Prepare(m.ctx, tools.Request{WorkflowID: r.id, EffectID: strings.Repeat("c", 64),
 		Args: map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "outcome": "done"}})
 	if err != nil {

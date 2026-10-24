@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -18,21 +19,47 @@ import (
 )
 
 // CommentCommit is github.comment_commit: the audit report, posted as a comment on the
-// audited commit (section 3). agentd renders it from a fixed template, so a model can put
-// neither links nor mentions in it.
+// audited commit (section 3). agentd renders it from a fixed template and from its own records:
+// the outcome is its verdict on the run's calls before the report (runs explain's rules), the
+// report the run's latest accepted answer of its model task, the pull request its own effect's.
+// The workflow says only why it reports (reason), and a model can put neither links nor mentions in
+// it.
 type CommentCommit struct {
-	Client  *Client
-	Repos   map[string]Repo
-	Blobs   tools.BlobStore
-	Effects Effects
+	Client   *Client
+	Repos    map[string]Repo
+	Blobs    tools.BlobStore
+	Effects  Effects
+	Verdicts Verdicts
+	Task     string // the model task whose latest accepted answer is the report: audit_v1
 }
 
-// Effects reads agentd's own record of a run's effects.
+// Effects reads agentd's own record of a run's effects and answers.
 type Effects interface {
 	// LatestEffectResult is the result of the run's latest finished effect of tool.
 	LatestEffectResult(ctx context.Context, workflowID, tool string) (map[string]any, bool, error)
 	// RunApprovals is the run's approvals, oldest first (design doc, section 10).
 	RunApprovals(ctx context.Context, workflowID string) ([]Approval, error)
+	// ModelOutputs is what the workflow got from each of the run's accepted answers of a model task,
+	// newest first.
+	ModelOutputs(ctx context.Context, workflowID, task string) ([]map[string]any, error)
+}
+
+// Verdicts says how a run went, for its report: agentd's verdict on the run's calls before the
+// report, from the run's history and agentd's own records (internal/explain's Report). reason is why
+// the workflow says it reports: done, or workflow_error with its exception's type (errorType).
+type Verdicts interface {
+	ReportVerdict(ctx context.Context, workflowID, reason, errorType string) (Verdict, error)
+}
+
+// Verdict is what the report says of how the run went.
+type Verdict struct {
+	Verdict, Kind string // runs explain's words: ok, step_failed, not_approved, failed, unknown; model_refused, ...
+	Step          string // the step the verdict names, when it is one of the task's names; "" otherwise
+	Cause         string // agentd's words, which quote tools, models and people: shown in the fence
+	Claim         string // what the workflow says of itself, as its own: shown in the fence
+	// Cut is the run's evidence agentd did not read, past its bounds, besides what the verdict rests on:
+	// the report names it, and says it does not change the outcome.
+	Cut []string
 }
 
 // Approval is one approval of a run's write, and how it was decided, as agentd recorded it. The
@@ -56,12 +83,17 @@ type Approval struct {
 // characters, and the fenced text has its own bound.
 const maxApprovalLines = 20
 
+// commentArgs: what the workflow may say of its report. reason is why it reports, error_type its
+// exception's type when its own code failed. Older Workers send an outcome of their own: taken, and
+// not shown.
 var commentArgs = tools.MustSchema(`{
-  "type": "object", "additionalProperties": false, "required": ["repo", "commit", "outcome"],
+  "type": "object", "additionalProperties": false, "required": ["repo", "commit"],
   "properties": {
     "repo": {"type": "string", "minLength": 1},
     "commit": {"type": "string", "pattern": "` + tools.CommitPattern + `"},
     "report_ref": {"anyOf": [{"type": "string", "pattern": "` + tools.BlobPattern + `"}, {"type": "null"}]},
+    "reason": {"enum": ["done", "workflow_error"]},
+    "error_type": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,63}$"},
     "outcome": {"type": "string", "maxLength": 100000},
     "pr_url": {"anyOf": [{"type": "string"}, {"type": "null"}]}
   }
@@ -94,13 +126,16 @@ type report struct {
 }
 
 type finding struct {
-	Severity    string `json:"severity"`
-	CWE         string `json:"cwe"`
-	File        string `json:"file"`
-	Line        int64  `json:"line"`
-	Title       string `json:"title"`
-	Explanation string `json:"explanation"`
+	Severity    string      `json:"severity"`
+	CWE         string      `json:"cwe"`
+	File        string      `json:"file"`
+	Line        json.Number `json:"line"` // as the model wrote it: the schema bounds nothing, 5,000 digits included
+	Title       string      `json:"title"`
+	Explanation string      `json:"explanation"`
 }
+
+// maxLineDigits is how much of a finding's line number the report shows.
+const maxLineDigits = 20
 
 var severities = []string{"critical", "high", "medium", "low"}
 
@@ -109,22 +144,46 @@ func (t *CommentCommit) Prepare(ctx context.Context, req tools.Request) (json.Ra
 	if !ok {
 		return nil, &tools.DeniedError{Reason: "no GitHub repository is configured for " + tools.String(req.Args, "repo")}
 	}
+	// The report is the run's latest accepted answer of its model task, whether the workflow names it
+	// or not: one it names otherwise is refused.
+	outputs, err := t.Effects.ModelOutputs(ctx, req.WorkflowID, t.Task)
+	if err != nil {
+		return nil, err
+	}
+	var latest string
+	if len(outputs) > 0 {
+		latest, _ = outputs[0]["report_ref"].(string)
+	}
+	if ref := tools.String(req.Args, "report_ref"); ref != "" && ref != latest {
+		return nil, &tools.DeniedError{Reason: "report_ref is not the run's latest accepted answer of " + t.Task}
+	}
 	var rep *report
-	if ref := tools.String(req.Args, "report_ref"); ref != "" {
-		b, err := t.Blobs.GetRunBlob(ctx, req.WorkflowID, ref)
+	if latest != "" {
+		b, err := t.Blobs.GetRunBlob(ctx, req.WorkflowID, latest)
 		if err != nil {
-			return nil, &tools.DeniedError{Reason: "report_ref: " + err.Error()}
+			return nil, &tools.DeniedError{Reason: "the run's report: " + err.Error()}
 		}
 		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
 		rep = &report{}
 		if err := dec.Decode(rep); err != nil {
-			return nil, &tools.DeniedError{Reason: "report_ref is not an audit report: " + err.Error()}
+			return nil, &tools.DeniedError{Reason: "the run's report is not an audit report: " + err.Error()}
 		}
 		for _, f := range rep.Findings {
 			if !slices.Contains(severities, f.Severity) {
-				return nil, &tools.DeniedError{Reason: fmt.Sprintf("report_ref is not an audit report: severity %q", f.Severity)}
+				return nil, &tools.DeniedError{Reason: fmt.Sprintf("the run's report is not an audit report: severity %q", f.Severity)}
 			}
 		}
+	}
+	// How the run went is agentd's verdict on its calls, from its own records; the workflow says only
+	// why it reports.
+	reason, errorType := tools.String(req.Args, "reason"), tools.String(req.Args, "error_type")
+	if errorType != "" && reason != "workflow_error" {
+		return nil, &tools.DeniedError{Reason: "error_type goes only with reason workflow_error"}
+	}
+	verdict, err := t.Verdicts.ReportVerdict(ctx, req.WorkflowID, reason, errorType)
+	if err != nil {
+		return nil, err
 	}
 	// The pull request comes from agentd's own record of this run, never from the workflow.
 	var pr int64
@@ -144,7 +203,7 @@ func (t *CommentCommit) Prepare(ctx context.Context, req tools.Request) (json.Ra
 	m := marker(req.EffectID)
 	return json.Marshal(commentPayload{
 		Owner: repo.Owner, Repo: repo.Name, Commit: commit, Marker: m,
-		Body: render(commit, tools.String(req.Args, "outcome"), rep, pr, approvals, m),
+		Body: render(commit, verdict, rep, pr, approvals, m),
 	})
 }
 
@@ -156,13 +215,37 @@ const (
 	maxOutcome   = 2000
 )
 
-// render builds the comment from what agentd checked itself (the commit, the severities, the
-// pull request's number, how each approval ended), and puts everything a model, the workflow or a
-// reviewer wrote into one code fence, longer than any run of backticks inside it: GitHub renders
-// neither links nor mentions there.
-func render(commit, outcome string, rep *report, pr int64, approvals []Approval, marker string) string {
+// word is what the report shows of agentd's verdict outside its fence: its own vocabulary, and the
+// task's step names.
+var word = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+// render builds the comment from what agentd checked itself (the commit, its verdict on the run, the
+// severities, the pull request's number, how each approval ended), and puts everything a model, a
+// tool, the workflow or a reviewer wrote into one code fence, longer than any run of backticks
+// inside it: GitHub renders neither links nor mentions there.
+func render(commit string, v Verdict, rep *report, pr int64, approvals []Approval, marker string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**agentos security audit** of commit `%s`\n\n", commit)
+	outcome := "unknown"
+	if word.MatchString(v.Verdict) {
+		outcome = v.Verdict
+	}
+	if word.MatchString(v.Step) {
+		outcome += " at " + v.Step
+	}
+	if word.MatchString(v.Kind) {
+		outcome += " (" + v.Kind + ")"
+	}
+	fmt.Fprintf(&b, "Outcome: %s\n\n", outcome)
+	switch {
+	case len(v.Cut) == 0:
+	case v.Verdict == "unknown": // it rests on nothing the cut would change: the cause says why it is not known
+		fmt.Fprintf(&b, "Not read, past agentd's bounds: %s\n\n", strings.Join(v.Cut, "; "))
+	default:
+		// agentd's own words: what it did not read, and why the outcome stands.
+		fmt.Fprintf(&b, "Not read, past agentd's bounds: %s. That does not change the outcome, which rests on every call in "+
+			"the run's history, each held to agentd's own record of it\n\n", strings.Join(v.Cut, "; "))
+	}
 	if rep != nil {
 		counts := map[string]int{}
 		for _, f := range rep.Findings {
@@ -194,12 +277,16 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 		}
 		fmt.Fprintf(&b, "Approval of %s: %s\n\n", a.Tool, status)
 	}
-	// The workflow's outcome may carry a long error: cut it rather than refuse the report.
-	if len(outcome) > maxOutcome {
-		outcome = strings.ToValidUTF8(outcome[:maxOutcome], "") + " [truncated]"
+	// agentd's words may quote a long error: cut them rather than refuse the report.
+	cause := v.Cause
+	if len(cause) > maxOutcome {
+		cause = strings.ToValidUTF8(cause[:maxOutcome], "") + " [truncated]"
 	}
 	var text strings.Builder
-	text.WriteString("Outcome: " + outcome)
+	text.WriteString("Outcome: " + cause)
+	if v.Claim != "" {
+		text.WriteString("\nThe workflow says, as its own claim: " + v.Claim)
+	}
 	if len(approvals) > 0 {
 		text.WriteString("\n\nApprovals:")
 		for _, a := range approvals {
@@ -216,7 +303,13 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 			default:
 				fmt.Fprintf(&text, " by %s at %s", a.DecidedBy, a.DecidedAt)
 			}
-			if a.Write != "" {
+			switch a.Write {
+			case "":
+			case "outcome unknown":
+				// Why nobody knows is an error of agentd's own (a request that got no answer, a lookup
+				// that failed), whose text can name hosts and ports: the report says where it is.
+				fmt.Fprintf(&text, "; %s: agentd's log and agentctl reconcile show have the details", a.Write)
+			default:
 				fmt.Fprintf(&text, "; %s: %s", a.Write, a.WriteReason)
 			}
 		}
@@ -224,7 +317,11 @@ func render(commit, outcome string, rep *report, pr int64, approvals []Approval,
 	if rep != nil {
 		text.WriteString("\n\nSummary:\n" + rep.Summary)
 		for i, f := range rep.Findings {
-			fmt.Fprintf(&text, "\n\n%d. [%s] %s at %s:%d\n%s\n%s", i+1, f.Severity, f.CWE, f.File, f.Line, f.Title, f.Explanation)
+			line := f.Line.String()
+			if len(line) > maxLineDigits {
+				line = line[:maxLineDigits] + "…"
+			}
+			fmt.Fprintf(&text, "\n\n%d. [%s] %s at %s:%s\n%s\n%s", i+1, f.Severity, f.CWE, f.File, line, f.Title, f.Explanation)
 		}
 	}
 	body := shortenRuns(clean(text.String()), '`', maxBackticks)

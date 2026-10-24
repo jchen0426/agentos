@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/faults"
+	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
@@ -139,11 +141,12 @@ func (g *Gateway) Invoke(ctx context.Context, c *agentosv1.Call) (*agentosv1.Res
 	defer func() {
 		// A panic in a tool or an adapter: the SDK recovers it and fails the attempt, and the call's
 		// record would never be written, its call.started left open. It is recorded here, with the
-		// panic as its error, and the panic goes on to the SDK.
+		// panic as its error, and the panic goes on to the SDK. The error is typed as the SDK types the
+		// attempt's failure (its PanicError): runs explain holds a failure to its record's error_type.
 		if p := recover(); p != nil {
 			if !recording {
 				log.Error("the call panicked", "panic", fmt.Sprint(p))
-				_, _ = g.recordCall(ctx, info, c, log, rec, nil, fmt.Errorf("panic: %v", p))
+				_, _ = g.recordCall(ctx, info, c, log, rec, nil, temporal.NewApplicationError(fmt.Sprintf("panic: %v", p), "PanicError"))
 			}
 			panic(p)
 		}
@@ -260,7 +263,7 @@ func (g *Gateway) invoke(ctx context.Context, info activity.Info, c *agentosv1.C
 		// CancelRun recorded this before asking Temporal: whatever the workflow does with the
 		// cancel request, nothing more of this run goes out.
 		log.Info("invoke refused: run cancelled", "cancelled_at", run.CancelledAt.String)
-		return result(StatusDenied, map[string]any{"reason": "run cancelled"})
+		return deny(audit.RefusedByCancel, map[string]any{"reason": "run cancelled"})
 	}
 	if argsErr != nil {
 		return nil, temporal.NewNonRetryableApplicationError("args_json must be a JSON object", "BadArguments", argsErr)
@@ -303,6 +306,32 @@ type callRecord struct {
 	head          *audit.Head     // the record, when the loop guard wrote it with its refusal
 	startedSeq    int64           // its call.started, once the policy let it past
 	scheduledAt   string          // its logical call's, once the loop guard counted it (calls)
+	refusedBy     string          // who refused a call that ended denied (audit.RefusedBy*)
+}
+
+// refusedByKey carries who refused a call from where it was refused to its record, in the result's
+// value (deny): recordCall takes it out, and the workflow never gets it.
+const refusedByKey = "_refused_by"
+
+// deny is the result of a call refused by by (audit.RefusedBy*), with the value the workflow gets.
+func deny(by string, value map[string]any) (*agentosv1.Result, error) {
+	if value == nil {
+		value = map[string]any{}
+	}
+	value[refusedByKey] = by
+	return result(StatusDenied, value)
+}
+
+// faultResult is the result a fault script's status gives instead of executing the call (tests only).
+func faultResult(fx faults.Effect) (*agentosv1.Result, error) {
+	v, err := fx.Result()
+	switch {
+	case err != nil:
+		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "BadFaultScript", err)
+	case v == nil:
+		return result(fx.Status, nil)
+	}
+	return result(fx.Status, v)
 }
 
 // agentdStatuses are the statuses whose reason agentd wrote: the reason an ok result carries is a
@@ -360,18 +389,41 @@ func callEvent(info activity.Info, c *agentosv1.Call, rec *callRecord, status st
 		if reason, ok := value["reason"].(string); ok && agentdStatuses[status] {
 			p["reason"] = audit.Text(reason)
 		}
+		if status == StatusDenied && rec.refusedBy != "" {
+			p["refused_by"] = rec.refusedBy
+		}
 	} else {
 		p["error"] = audit.Text(callErr.Error())
-		var failed *temporal.ApplicationError
-		if errors.As(callErr, &failed) && failed.NonRetryable() {
-			p["error_type"] = failed.Type()
+		if gitmcp.IsServerFailure(callErr) {
+			p["error_cause"] = audit.ErrorCauseToolServer
 		}
+		// The type of the failure Temporal records of the attempt, which runs explain holds it to: a
+		// failure in the history that is not of it is not agentd's.
+		p["error_type"] = failureType(callErr)
 	}
 	actor := audit.Run
 	if rec.unknown {
 		actor = audit.UnknownRun
 	}
 	return audit.Event{WorkflowID: info.WorkflowExecution.ID, Type: "call", Actor: actor, Payload: p}, nil
+}
+
+// failureType is the type Temporal's Go SDK gives the failure of an attempt that returns err (its
+// failure converter, by the error itself, not what it wraps): an application error's own type, else
+// the name of the error's Go type, without pointers, and none for errors.New's.
+// TestTheRecordHasTheFailuresType holds it to the SDK's.
+func failureType(err error) string {
+	if app, ok := err.(*temporal.ApplicationError); ok {
+		return app.Type()
+	}
+	t := reflect.TypeOf(err)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == reflect.TypeOf(errors.New("")).Elem() {
+		return ""
+	}
+	return t.Name()
 }
 
 // recordCall appends the attempt's record to the audit log once it has ended, whatever ended it: in
@@ -393,6 +445,10 @@ func (g *Gateway) recordCall(ctx context.Context, info activity.Info, c *agentos
 			return nil, fmt.Errorf("the call's result: %w", err)
 		}
 		delete(value, "_audit")
+		if by, ok := value[refusedByKey].(string); ok {
+			rec.refusedBy = by // the record says it of a denial only (callEvent)
+		}
+		delete(value, refusedByKey)
 	}
 	head := rec.head
 	if head == nil {
@@ -587,6 +643,94 @@ func CheckModels(p *policy.Policy, m *models.Config) error {
 	return nil
 }
 
+// CheckRequired checks what every task requires of its runs (tasks.Task.Required) against what agentd
+// is configured with, before any run: each call a requirement names is a model task models.yaml has
+// or a tool agentd has, and each field a requirement's condition reads is one the call's accepted
+// result holds. A model task's result holds report_ref, <field>_ref for each of its blob fields, and
+// its output schema's other fields; a write's, its result schema's. A condition on a field nothing
+// produces would never hold, and the step it requires would go unchecked: agentd refuses to start.
+func CheckRequired(reg tasks.Registry, m *models.Config, tl tools.Registry) error {
+	for _, name := range slices.Sorted(maps.Keys(reg)) {
+		t := reg[name]
+		for _, r := range t.Required {
+			if err := checkCall(m, tl, r.Call); err != nil {
+				return fmt.Errorf("task %s requires %s: %w", name, stepOf(t, r.Call), err)
+			}
+			w := r.When
+			if w == nil {
+				continue
+			}
+			if err := checkCall(m, tl, w.Call); err != nil {
+				return fmt.Errorf("task %s requires %s once %s's result holds %s: %w", name, stepOf(t, r.Call),
+					stepOf(t, w.Call), w.Field, err)
+			}
+			if err := produces(m, tl, w.Call, w.Field); err != nil {
+				return fmt.Errorf("task %s requires %s once %s's result holds %s, which %w", name, stepOf(t, r.Call),
+					stepOf(t, w.Call), w.Field, err)
+			}
+		}
+	}
+	return nil
+}
+
+// stepOf names the step call c makes in task t, with the call.
+func stepOf(t tasks.Task, c tasks.Call) string {
+	if s, ok := t.Step(c); ok {
+		return fmt.Sprintf("%s (%s %s)", s, c.Kind, c.Name)
+	}
+	return c.Kind + " " + c.Name
+}
+
+// checkCall reports whether c is a call agentd can make: a model task it has, or a tool.
+func checkCall(m *models.Config, tl tools.Registry, c tasks.Call) error {
+	switch c.Kind {
+	case "model":
+		if _, ok := m.Tasks[c.Name]; !ok {
+			return fmt.Errorf("models.yaml has no model task %s", c.Name)
+		}
+	case "tool":
+		if _, ok := tl[c.Name]; !ok {
+			return fmt.Errorf("agentd has no tool %s", c.Name)
+		}
+	default:
+		return fmt.Errorf("a call of kind %q, which agentd does not make", c.Kind)
+	}
+	return nil
+}
+
+// produces reports whether the accepted result of call c holds field (accept, for a model task).
+func produces(m *models.Config, tl tools.Registry, c tasks.Call, field string) error {
+	if c.Kind == "tool" {
+		w, ok := tl[c.Name].(tools.Writer)
+		if !ok {
+			return fmt.Errorf("agentd cannot tell from tool %s, which only reads, as its result has no schema", c.Name)
+		}
+		if !slices.Contains(w.Result().Props(), field) {
+			return fmt.Errorf("tool %s's result schema does not have", c.Name)
+		}
+		return nil
+	}
+	route, err := m.Route(c.Name)
+	if err != nil {
+		return err
+	}
+	props, _ := route.Schema["properties"].(map[string]any)
+	blob, isRef := strings.CutSuffix(field, "_ref")
+	switch {
+	case field == "report_ref":
+		return nil
+	case isRef && slices.Contains(route.Blobs, blob):
+		return nil // each blob field is in the output schema, as models.yaml's check makes sure
+	case props[field] != nil && !slices.Contains(route.Blobs, field):
+		return nil
+	case isRef && props[blob] != nil:
+		return fmt.Errorf("model task %s does not produce: its output's %s is not one of its blobs (%v), which it gives as "+
+			"<field>_ref", c.Name, blob, route.Blobs)
+	}
+	return fmt.Errorf("model task %s does not produce: it is not report_ref, a blob field's <field>_ref (blobs %v), nor a "+
+		"field of its output schema", c.Name, route.Blobs)
+}
+
 // dispatch runs the call, and notes the policy's verdict in its record (rec).
 func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, c *agentosv1.Call,
 	args map[string]any, canon []byte, fx faults.Effect, rec *callRecord) (*agentosv1.Result, error) {
@@ -599,23 +743,23 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		v := g.Policy.EvaluateModel(c.GetName(), route.Provider)
 		rec.policy = &v
 		if v.Decision != policy.Allow {
-			return result(StatusDenied, map[string]any{"reason": v.Reason})
+			return deny(audit.RefusedByPolicy, map[string]any{"reason": v.Reason})
 		}
 		if err := g.callStarted(ctx, info, c, rec); err != nil {
 			return nil, err
 		}
 		if fx.Status != "" {
-			return result(fx.Status, nil)
+			return faultResult(fx)
 		}
 		return g.callModel(ctx, info, run, route, args, sha256Hex(canon), fx)
 	case "tool":
 		t, ok := g.Tools[c.GetName()]
 		if !ok {
-			return result(StatusDenied, map[string]any{"reason": "no such tool"})
+			return deny(audit.RefusedByAgentd, map[string]any{"reason": "no such tool"})
 		}
 		scope, err := g.scope(run)
 		if err != nil {
-			return result(StatusDenied, map[string]any{"reason": err.Error()})
+			return deny(audit.RefusedByAgentd, map[string]any{"reason": err.Error()})
 		}
 		// A call that leaves part of its run's scope out gets the run's own value, never the
 		// tool's default (the default branch, the latest commit). One that names another
@@ -632,7 +776,7 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		v := g.Policy.EvaluateTool(c.GetName(), args, scope)
 		rec.policy = &v
 		if v.Decision == policy.Deny {
-			return result(StatusDenied, map[string]any{"reason": v.Reason})
+			return deny(audit.RefusedByPolicy, map[string]any{"reason": v.Reason})
 		}
 		if err := g.callStarted(ctx, info, c, rec); err != nil {
 			return nil, err
@@ -645,7 +789,7 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 			// dry-runs. A read has no effect to approve; CheckTools refuses such a policy at start.
 			w, ok := t.(tools.Writer)
 			if !ok {
-				return result(StatusDenied, map[string]any{"reason": "approval applies to writes only"})
+				return deny(audit.RefusedByAgentd, map[string]any{"reason": "approval applies to writes only"})
 			}
 			if run.DryRun == 0 && w.Live() {
 				rule = &approvalRule{ttl: v.ApprovalTTL}
@@ -656,7 +800,7 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 			return nil, temporal.NewNonRetryableApplicationError(err.Error(), "BadPolicy", err)
 		}
 		if fx.Status != "" {
-			return result(fx.Status, nil)
+			return faultResult(fx)
 		}
 		// A write may have one effect per run unless the policy allows more: a workflow that
 		// varies its arguments gets new effects, and each would reach the outside world.
@@ -997,6 +1141,7 @@ func (g *Gateway) guard(ctx context.Context, run db.Run, info activity.Info, c *
 		// The refused call's record goes with the count that refused it: one write, not two, for a
 		// flood of calls past the limit.
 		rec.scheduledAt = scheduled
+		rec.refusedBy = audit.RefusedByLoopGuard
 		ev, err := callEvent(info, c, rec, StatusDenied, map[string]any{"reason": reason}, nil)
 		if err != nil {
 			return err
