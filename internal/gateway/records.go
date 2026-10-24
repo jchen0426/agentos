@@ -69,8 +69,15 @@ type ReportVerdicts struct {
 }
 
 func (r ReportVerdicts) ReportVerdict(ctx context.Context, workflowID, reason, errorType string) (githubtool.Verdict, error) {
-	run, err := r.Ledger.Q.GetRun(ctx, workflowID)
-	if err != nil {
+	// The run's row, as one of the ledger's read transactions reads it (Ledger.Read checks the schema
+	// first): it names the execution and the task the report judges, which ReadLedger holds the
+	// snapshot it reads after Temporal to.
+	var run db.Run
+	if err := r.Ledger.Read(ctx, func(q *db.Queries) error {
+		var err error
+		run, err = q.GetRun(ctx, workflowID)
+		return err
+	}); err != nil {
 		return githubtool.Verdict{}, err
 	}
 	log := r.Log
@@ -79,7 +86,7 @@ func (r ReportVerdicts) ReportVerdict(ctx context.Context, workflowID, reason, e
 	}
 	log = log.With("workflow_id", workflowID)
 	in := explain.Input{RunID: run.WorkflowID, Task: r.Tasks[run.Task], Run: run, Now: ledger.Clock()}
-	err = explain.ReadTemporal(ctx, r.Temporal, &in)
+	err := explain.ReadTemporal(ctx, r.Temporal, &in)
 	if err != nil && !explain.Unreachable(err) {
 		in.Unread = err.Error() // Temporal's own answer: the verdict is unknown
 	}

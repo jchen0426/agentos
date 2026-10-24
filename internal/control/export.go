@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
@@ -88,11 +89,14 @@ func (s *Server) ExportAudit(req *agentosv1.ExportAuditRequest, stream agentosv1
 			}
 		}
 	}
+	var headsCut string // why the export may not hold every head this chain pushed, as verify says it
 	if id == "" && len(first) == 1 {
-		heads, _, _, _, err := s.externalAnchors(ctx, audit.AnchorChain(first[0].Sha256), nil, nil)
+		chain := audit.AnchorChain(first[0].Sha256)
+		heads, bad, _, unread, err := s.externalAnchors(ctx, chain, nil, nil)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "the heads pushed to Temporal: %v", err)
 		}
+		headsCut = pushedCut(chain, bad, unread)
 		for _, h := range heads {
 			if err := stream.Send(&agentosv1.AuditExportPart{Part: &agentosv1.AuditExportPart_PushedHead{PushedHead: &agentosv1.PushedHead{
 				AnchorWorkflowId: h.workflowID, Seq: h.head.Seq, Sha256: h.head.Sha256}}}); err != nil {
@@ -121,8 +125,12 @@ func (s *Server) ExportAudit(req *agentosv1.ExportAuditRequest, stream agentosv1
 	if _, err := snapshot.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	cut := c.cut
+	if headsCut != "" {
+		cut = strings.TrimPrefix(cut+"; "+headsCut, "; ")
+	}
 	if err := stream.Send(&agentosv1.AuditExportPart{Part: &agentosv1.AuditExportPart_Head{Head: &agentosv1.AuditExportHead{
-		Seq: c.head.Seq, Sha256: c.head.Sha256, Records: c.records, ExportedAt: ledger.Now(), RunId: id, Cut: c.cut}}}); err != nil {
+		Seq: c.head.Seq, Sha256: c.head.Sha256, Records: c.records, ExportedAt: ledger.Now(), RunId: id, Cut: cut}}}); err != nil {
 		return err
 	}
 	r := bufio.NewReader(snapshot)
@@ -139,6 +147,38 @@ func (s *Server) ExportAudit(req *agentosv1.ExportAuditRequest, stream agentosv1
 		}
 	}
 }
+
+// pushedCut says what of the heads chain pushed the export may not hold, as verify reads the anchor
+// workflows (externalAnchors): those past its bounds (more anchor workflows than it reads, more events
+// in one of this chain's than it reads), and this chain's anchor workflows it does not take heads from
+// (not agentd's anchor workflow, a signal that is not a head, a head out of order). Other chains'
+// workflows say nothing of this chain's heads. At most maxPushedCut of them, and how many more.
+func pushedCut(chain string, bad []*agentosv1.AnchorMismatch, unread []*agentosv1.Unread) string {
+	mine := audit.AnchorPrefix(chain)
+	var why []string
+	for _, u := range unread {
+		if u.GetWhat() == "anchor workflows" || strings.HasPrefix(u.GetWhat(), `events of anchor workflow "`+mine) {
+			why = append(why, u.GetWhat()+": "+u.GetWhy())
+		}
+	}
+	for _, m := range bad {
+		if strings.HasPrefix(m.GetRunId(), mine) {
+			why = append(why, fmt.Sprintf("anchor workflow %q: %s", m.GetRunId(), m.GetWhy()))
+		}
+	}
+	if len(why) == 0 {
+		return ""
+	}
+	more := ""
+	if len(why) > maxPushedCut {
+		more = fmt.Sprintf("; and %d more", len(why)-maxPushedCut)
+		why = why[:maxPushedCut]
+	}
+	return "the heads pushed to Temporal may not all be in the export, as verify reads them: " + strings.Join(why, "; ") + more
+}
+
+// maxPushedCut bounds what an export's head says of the pushed heads it may not hold.
+const maxPushedCut = 5
 
 // exportHistory is one execution's history in Temporal, and the anchors in it.
 func (s *Server) exportHistory(ctx context.Context, workflowID, runID string) (*agentosv1.ExecutionHistory, error) {

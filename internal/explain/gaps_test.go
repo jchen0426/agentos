@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/sdk/converter"
@@ -414,5 +415,37 @@ func TestAResultNamingAnError(t *testing.T) {
 	w.completed("failed")
 	if e := w.explain(); len(incidentsOf(e, KindForeignResult, "whose call ended error")) != 1 {
 		t.Fatalf("%v", e.GetIncidents())
+	}
+}
+
+// An attempt that began (its call.started) and left no record of its end, Temporal saying it failed:
+// an error agentd could not record (AuditUnavailable, when the record cannot be written), or a
+// failure someone else made of it. Said as Temporal's, unverified, not as a timeout; one Temporal says
+// timed out did.
+func TestABegunAttemptThatFailedWithoutItsRecord(t *testing.T) {
+	for name, tc := range map[string]struct {
+		last *failurepb.Failure
+		kind string
+		says string
+	}{
+		"failed": {appFailure("agentd could not record the call; retry", "AuditUnavailable", false), KindModelError,
+			`attempt 1 began and left no record of its end; Temporal says it failed with "AuditUnavailable: agentd could not record the call; retry", unverified`},
+		"timed out": {timeoutFailure(enumspb.TIMEOUT_TYPE_HEARTBEAT), KindActivityTimeout,
+			"attempt 1 began and left no record of its end: it timed out"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			w.ok("git.show_diff")
+			c := w.schedule("audit_v1")
+			w.rec("call.started", audit.Run, map[string]any{"activity_id": c.id, "attempt": 1, "kind": c.kind, "name": c.name})
+			c.completes(2, statusOK, nil, nil, tc.last)
+			w.ok("github.comment_commit")
+			w.completed("ok")
+			e := w.explain()
+			incs := incidentsOf(e, tc.kind, tc.says)
+			if len(incs) != 1 || incs[0].GetAttempt() != 1 || e.GetVerdict() != VerdictOK {
+				t.Fatalf("%s: incidents %v", e.GetVerdict(), e.GetIncidents())
+			}
+		})
 	}
 }

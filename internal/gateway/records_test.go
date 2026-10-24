@@ -658,3 +658,22 @@ func TestExplainTellsTheAttemptAgentdStoppedDuring(t *testing.T) {
 		t.Fatalf("evidence %v, want seqs %d and %d", stopped.GetEvidence(), began.Seq, restarted.Seq)
 	}
 }
+
+// A ledger whose schema is not its migrations' is read by nothing a report says: the report refuses
+// (its call fails), before it asks Temporal of the run whose row it read, and judges nothing. The run's
+// row names the execution and the task the report judges: it is read as the rest is, through a read
+// transaction, which checks the schema first.
+func TestTheReportRefusesALedgerWhoseSchemaChanged(t *testing.T) {
+	g, l, w := invokable(t)
+	registry := tasks.Registry{"security-audit": {Name: "security-audit"}}
+	g.Policy.Tools[w.Name()] = policy.Tool{Decision: "deny"}
+	var h fakeHistory
+	h.called(t, g, l, &agentosv1.Call{Kind: "tool", Name: w.Name(), ArgsJson: `{}`})
+	if _, err := l.DB.Exec(`CREATE VIEW v AS SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	v, err := ReportVerdicts{Ledger: l, Temporal: &h, Tasks: registry}.ReportVerdict(context.Background(), testWorkflowID, "done", "")
+	if !errors.Is(err, ledger.ErrSchemaMismatch) || v.Verdict != "" || h.describes != 0 {
+		t.Fatalf("%+v %v, %d descriptions", v, err, h.describes)
+	}
+}

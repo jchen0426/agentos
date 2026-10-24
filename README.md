@@ -327,12 +327,15 @@ own JSON of Temporal's events), with which event carries which `_audit` anchor a
 anchored record's `result_sha256` is of; the heads agentd pushed to the chain's anchor workflows in
 Temporal; then the chain's head and every record up to it, with every field its sha256 covers. Its
 `hashes` says how to recompute them. `--run <run-id>` exports one run's histories and records: their
-hashes check, the chain's links (through other runs' records) do not, and it holds no pushed heads. agentd
-takes the records as one snapshot into a file of its own, then sends them: a slow reader holds no
-transaction of the ledger open. The snapshot is a file in agentd's data directory, removed once
-the export is sent, or when agentd next starts. An export stops at 1 GiB: past that, its head's
+hashes check, the chain's links (through other runs' records) do not, and it holds no pushed heads.
+agentd takes the records as one snapshot into a file of its own, then sends them: a slow reader
+holds no transaction of the ledger open. The snapshot is a file in agentd's data directory, removed
+once the export is sent, or when agentd next starts. An export stops at 1 GiB: past that, its head's
 `cut` says from which record on it holds nothing, and agentctl says so on stderr and exits 2, as
-`audit verify` does when not everything could be checked: the file is whole JSON all the same.
+`audit verify` does when not everything could be checked: the file is whole JSON all the same. `cut`
+also says which of the heads the chain pushed to Temporal the export may not hold: those past
+verify's bounds on the anchor workflows, or in one of the chain's that is not agentd's anchor
+workflow.
 
 To see why a run is where it is:
 

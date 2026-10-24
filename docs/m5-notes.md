@@ -1400,3 +1400,34 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - srt 和 bwrap 由协调者跑。
 
 **改了的测试**：`TestAgentdsOwnReadsAreRecordedFirst`、`TestAPanickingCallHasItsRecord`（A 的，见上），`test_t12_agentd_crashes`（见上），`TestReadLedger`（InsertCall），`TestAReportWaitsForTemporalBeforeItIsRecorded`（RunBlobs）。新加的：`TestExplainTellsTheAttemptAgentdStoppedDuring`，`explain_test.go` 判定表里 run.terminating 的两种。
+
+**两份最终审查之后**（对 5eadee1，没有中危以上；四条低危，5eadee1 之后的一个提交）：
+
+1. **一次尝试的失败被说成超时**（对抗性审查）：
+   - 什么情形：一次尝试有 call.started，没有 call 记录，而 Temporal 记的失败是应用错误，比如写不进记录时的 AuditUnavailable，或者 recordCall 里的 panic。这时 incident 写的是 `activity_timeout`，“it timed out (Temporal: AuditUnavailable…)”。
+   - 原因：call.started 那条路不看 Temporal 记的上一次失败。搬过来之前这些尝试走的是默认那条路，那条路看。
+   - 改法：有 Temporal 的失败、又不是超时，就照它说：“began and left no record of its end; Temporal says it failed with …, unverified”，kind 是这个调用自己的错误。超时照旧是超时。
+   - 测试：`TestABegunAttemptThatFailedWithoutItsRecord`（他们探针的形状，加上超时的那一种）。
+2. **只有 run.terminating 也被说成是 agentd 终止的**（两份审查都提了）：
+   - 问题：agentd 的 TerminateWorkflow 失败了，后来别人终止了运行，explain 也会这么说。
+   - 改法：只有 run.terminated，或者后面有一条 agentd.started 关上的 run.terminating（verify 也是这么读的），才说“agentd terminated the run”。只有 run.terminating 时，照知道的说：“agentd asked Temporal to terminate the run (<why>), and has no record of how that went”，并把终止事件里的身份和原因当成调用方自己的说法，加引号写进 claim。取消之后被终止的运行也一样。
+   - 测试：判定表里三种：被下一次启动关上的、只有 run.terminating 的、取消之后只有 run.terminating 的。
+3. **报告在 `Ledger.Read` 之外读运行的那一行**（安全审查）：
+   - 问题：`records.go` 用的是 `Ledger.Q.GetRun`，跳过了 A 每个读事务的模式检查，也不在报告的快照里，可报告评判哪个执行、哪个任务，正是由这一行定的。ExplainRun 读那一行和读账本也是两个快照。
+   - 改法：报告读那一行改在读事务里。`ReadLedger` 在它的快照里再读一次那一行，执行或任务和调用方读 Temporal 之前读到的不一样，或者那一行没了，就失败（`ErrRunChanged`）：报告的调用失败，explain 返回 Unavailable。
+   - 测试：
+     - `TestTheReportRefusesALedgerWhoseSchemaChanged`：建一个 view，报告拒绝，而且还没问 Temporal（describe 0 次）。旧代码会先读 Temporal。
+     - `TestExplainRunRefusesALedgerWhoseSchemaChanged`：一样。
+     - `TestReadLedgerHoldsTheSnapshotToTheRunJudged`：别的任务、没有这一行、别的执行。
+     - 原有的账本测试改成传账本里的那一行（`setExecution`）。
+   - 报告读的别的东西（审批、副作用、模型的答复、blob）还是走 `Ledger.Q`。A 的笔记把网关自己的读写在了读事务之外的留下的限制里，这次没动。
+4. **导出丢了 `unread` 和 `bad`**（安全审查）：
+   - 问题：这条链推出去的链头，超过 A 的上限的，或者在放错了的锚工作流里的，在导出里没了，也没有一句说明，而 verify 会报出来。
+   - 改法：这些写进链头的 `cut`（`pushedCut`），所以这样的导出也以 2 退出。写进去的有：
+     - 锚工作流太多，verify 读不完；
+     - 这条链的某个锚工作流里事件太多；
+     - 这条链的某个工作流不是 agentd 的锚工作流，或者里面的信号不是链头，或者链头的顺序不对。
+   - 别的链的工作流不算，说的不是这条链的链头。最多写 5 条，再多就说还有几条。没有改 proto：协调者的套件正在用这个工作区的 Python，生成的代码不能动。
+   - 测试：`TestAnExportSaysWhichPushedHeadsItMayNotHold`（事件太多、放错的工作流、列表读不完，别的链的不算），`TestPushedCutIsBounded`。README 也说了。
+- **改坏**：这次改的 20 处，都有测试失败。第一遍有 3 处编译不过，换了写法。
+- **跑过的**：`go test` 跑了 explain、control、gateway、agentctl，`go vet ./...` 和 `gofmt -l` 都过。协调者的三套完整套件正在用这个工作区的 `bin/`，所以没有 make build，也没有跑黑盒，黑盒由协调者等套件跑完再跑。

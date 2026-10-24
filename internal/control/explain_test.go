@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"google.golang.org/grpc"
@@ -33,6 +35,7 @@ import (
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/explain"
+	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/tasks"
 )
@@ -496,5 +499,89 @@ func TestRemoveSnapshots(t *testing.T) {
 	}
 	if err != nil || n != 2 || !slices.Equal(left, []string{"export-snapshot", "ledger.db", "other"}) {
 		t.Fatalf("removed %d (%v), left %v", n, err, left)
+	}
+}
+
+// describeCounter is Temporal that counts the descriptions asked of it.
+type describeCounter struct {
+	*fakeTemporal
+	n int
+}
+
+func (c *describeCounter) DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	c.n++
+	return c.fakeTemporal.DescribeWorkflowExecution(ctx, workflowID, runID)
+}
+
+// A ledger whose schema is not its migrations' is read by nothing explain says: runs explain refuses,
+// before it asks Temporal of the run, and judges nothing.
+func TestExplainRunRefusesALedgerWhoseSchemaChanged(t *testing.T) {
+	f := newVerifyFixture(t)
+	run := f.run(t, 0)
+	f.called(t, run, 1, "git.show_diff", "ok")
+	c := &describeCounter{fakeTemporal: f.tc}
+	f.s.Temporal = c
+	if _, err := f.s.Ledger.DB.Exec(`CREATE VIEW v AS SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := f.s.ExplainRun(context.Background(), &agentosv1.ExplainRunRequest{RunId: run.GetRunId()}); !errors.Is(err, ledger.ErrSchemaMismatch) ||
+		e != nil || c.n != 0 {
+		t.Fatalf("%v %v, %d descriptions", e, err, c.n)
+	}
+}
+
+// An export says which of the heads its chain pushed it may not hold, as verify reads the anchor
+// workflows: past verify's bounds (more events in one of the chain's anchor workflows, more anchor
+// workflows, than it reads), or in one of the chain's that is not agentd's anchor workflow. Another
+// chain's workflows say nothing of this chain's heads. A cut export exits 2 (agentctl).
+func TestAnExportSaysWhichPushedHeadsItMayNotHold(t *testing.T) {
+	f := newVerifyFixture(t)
+	f.run(t, 1)
+	all := auditRecords(t, f.s)
+	head := audit.Head{Seq: all[len(all)-1].Seq, Sha256: all[len(all)-1].Sha256}
+	chain := f.chain(t)
+	today := audit.AnchorWorkflowID(chain, time.Now())
+	f.anchorWorkflow(today, [2]string{}, signaled(t, 2, head))
+	f.anchorWorkflow(audit.AnchorWorkflowID("fedcba9876543210", time.Now()), [2]string{}, signaled(t, 2, audit.Head{Seq: 99}))
+	if h, _, _ := exportOf(t, f.s, ""); h.GetCut() != "" {
+		t.Fatalf("cut %q", h.GetCut())
+	}
+	maxAnchorWorkflows, maxAnchorEvents = 3, 1
+	t.Cleanup(func() { maxAnchorWorkflows, maxAnchorEvents = 2000, 20000 })
+	f.tc.histories[today+"/r1"] = slices.Repeat(f.tc.histories[today+"/r1"], 2)
+	h, _, _ := exportOf(t, f.s, "")
+	if !strings.Contains(h.GetCut(), "the heads pushed to Temporal may not all be in the export") ||
+		!strings.Contains(h.GetCut(), fmt.Sprintf("events of anchor workflow %q: verify reads at most 1 events", today)) {
+		t.Fatalf("cut %q", h.GetCut())
+	}
+	f.tc.histories[today+"/r1"] = f.tc.histories[today+"/r1"][:1]
+	misplaced := audit.AnchorWorkflowID(chain, time.Now().Add(-48*time.Hour))
+	f.anchorWorkflow(misplaced, [2]string{"SomethingElse", "elsewhere"})
+	if h, _, _ := exportOf(t, f.s, ""); !strings.Contains(h.GetCut(), fmt.Sprintf("anchor workflow %q: execution", misplaced)) ||
+		!strings.Contains(h.GetCut(), "not agentd's anchor workflow") || strings.Contains(h.GetCut(), "fedcba9876543210") {
+		t.Fatalf("cut %q", h.GetCut())
+	}
+	f.tc.pageSize = 1
+	for _, key := range []string{"1111111111111111", "2222222222222222", "3333333333333333"} {
+		f.anchorWorkflow(audit.AnchorWorkflowID(key, time.Now()), [2]string{})
+	}
+	if h, _, _ := exportOf(t, f.s, ""); !strings.Contains(h.GetCut(), "anchor workflows: verify reads at most 3 anchor workflows") {
+		t.Fatalf("cut %q", h.GetCut())
+	}
+}
+
+// Past its bound, what an export says of the pushed heads it may not hold says how many more.
+func TestPushedCutIsBounded(t *testing.T) {
+	var bad []*agentosv1.AnchorMismatch
+	for i := range maxPushedCut + 3 {
+		bad = append(bad, &agentosv1.AnchorMismatch{RunId: audit.AnchorPrefix("c") + fmt.Sprint(i), Why: "x"})
+	}
+	bad = append(bad, &agentosv1.AnchorMismatch{RunId: audit.AnchorPrefix("other") + "*", Why: "another chain's"})
+	if got := pushedCut("c", bad, nil); strings.Count(got, "anchor workflow") != maxPushedCut || !strings.HasSuffix(got, "; and 3 more") ||
+		strings.Contains(got, "another chain's") {
+		t.Fatalf("%q", got)
+	}
+	if got := pushedCut("c", nil, []*agentosv1.Unread{{What: `events of anchor workflow "` + audit.AnchorPrefix("other") + `x"`}}); got != "" {
+		t.Fatalf("another chain's events: %q", got)
 	}
 }

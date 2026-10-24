@@ -898,12 +898,24 @@ func (f *facts) current() *step {
 	return f.lastStep()
 }
 
-// lastTerminated is agentd's latest termination of the run.
-func (f *facts) lastTerminated() *rec {
+// termination is agentd's latest termination of the run's execution, and whether its records say it
+// was done: its run.terminated, after Temporal did it; or its run.terminating, before agentd asked,
+// closed by a later start of agentd (the agentd that asked stopped before it could record the rest),
+// as verify reads them. A run.terminating alone says agentd asked, not how that went.
+func (f *facts) termination() (t *rec, done bool) {
 	if len(f.terminations) == 0 {
-		return nil
+		return nil, false
 	}
-	return f.terminations[len(f.terminations)-1]
+	t = f.terminations[len(f.terminations)-1]
+	if t.typ == "run.terminated" {
+		return t, true
+	}
+	for _, x := range f.starts {
+		if x.seq > t.seq {
+			return t, true
+		}
+	}
+	return t, false
 }
 
 // pendingAttempt is the attempt of the step under way, as Temporal describes it: 0 when it is not.

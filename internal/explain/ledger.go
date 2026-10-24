@@ -37,6 +37,15 @@ var (
 func ReadLedger(ctx context.Context, q *db.Queries, run db.Run, want Wanted) (Ledger, error) {
 	workflowID, execution := run.WorkflowID, run.RunID.String
 	var l Ledger
+	// The run judged is the run in this snapshot: its execution and its task, which the caller read
+	// before it read Temporal.
+	switch cur, err := q.GetRun(ctx, workflowID); {
+	case err != nil:
+		return l, fmt.Errorf("run %s: %w", workflowID, err)
+	case cur.RunID != run.RunID || cur.Task != run.Task:
+		return l, fmt.Errorf("%w: run %s is execution %q of task %q, not %q of %q", ErrRunChanged, workflowID, cur.RunID.String,
+			cur.Task, run.RunID.String, run.Task)
+	}
 	cut := l.cut
 	// The run's own records: those of calls from executions agentd did not start are not the run's,
 	// and a flood of them must not crowd its own out of the bound. They are counted.
@@ -205,6 +214,10 @@ func readWanted(ctx context.Context, q *db.Queries, run db.Run, want Wanted, l *
 	}
 	return nil
 }
+
+// ErrRunChanged: the run's row is not the one the caller read before it read Temporal (another
+// execution, or another task): what was read of Temporal is not of the run in the ledger now.
+var ErrRunChanged = errors.New("the run changed while it was read")
 
 // readAnswer reads a model request's answer from its response blob: its status, and a refusal's
 // words. A blob the ledger no longer has leaves them empty: what the answer was is not essential.

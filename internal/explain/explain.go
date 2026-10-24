@@ -376,10 +376,16 @@ func (f *facts) cancelled(e *agentosv1.Explanation, st enumspb.WorkflowExecution
 	e.Verdict, e.Kind = VerdictCancelled, KindCancelled
 	e.Cause = f.whoCancelled(e)
 	if st == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED {
-		if t := f.lastTerminated(); t != nil {
+		switch t, done := f.termination(); {
+		case t != nil && done:
 			e.Cause += fmt.Sprintf("; it did not stop in time, and agentd terminated it (%s)", t.why)
 			e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-		} else {
+		case t != nil:
+			e.Cause += fmt.Sprintf("; it did not stop in time, and agentd asked Temporal to terminate it (%s), and has no "+
+				"record of how that went", t.why)
+			e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
+			f.terminatedClaim(e)
+		default:
 			e.Cause += "; it was terminated after that, not by agentd"
 		}
 	}
@@ -407,20 +413,32 @@ func (f *facts) whoCancelled(e *agentosv1.Explanation) string {
 // someone else's, whose reason is theirs to claim.
 func (f *facts) terminated(e *agentosv1.Explanation) {
 	e.Verdict, e.Kind = VerdictTerminated, KindTerminated
-	if t := f.lastTerminated(); t != nil {
+	switch t, done := f.termination(); {
+	case t != nil && done:
 		e.Cause = "agentd terminated the run: " + t.why
 		e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-	} else {
+	case t != nil:
+		// agentd asked, and its record of the outcome is missing: Temporal may have refused it, and
+		// someone else have terminated the run since. Who did is the history's word, their claim.
+		e.Cause = fmt.Sprintf("agentd asked Temporal to terminate the run (%s), and has no record of how that went", t.why)
+		e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
+		f.terminatedClaim(e)
+	default:
 		e.Cause = "the run was terminated, not by agentd: agentd has no record of it"
-		if c := f.closed; c != nil && c.typ == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED {
-			e.Claim = fmt.Sprintf("terminated by %q: %q", c.identity, c.reason)
-		}
+		f.terminatedClaim(e)
 	}
 	if s := f.current(); s != nil {
 		e.Cause += fmt.Sprintf("; it was at %s", s.step)
 		f.point(e, s)
 	}
 	f.sourceClose(e)
+}
+
+// terminatedClaim is who the history says terminated the run, and why: the caller's own words.
+func (f *facts) terminatedClaim(e *agentosv1.Explanation) {
+	if c := f.closed; c != nil && c.typ == enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED {
+		e.Claim = fmt.Sprintf("terminated by %q: %q", c.identity, c.reason)
+	}
 }
 
 // running: the run is being cancelled, is stuck, waits for a person (as agentd's own tables say), or

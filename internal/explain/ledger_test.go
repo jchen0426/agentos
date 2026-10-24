@@ -36,7 +36,11 @@ func TestReadLedger(t *testing.T) {
 		var got Ledger
 		if err := l.Read(ctx, func(q *db.Queries) error {
 			var err error
-			got, err = ReadLedger(ctx, q, db.Run{WorkflowID: "run-1"}, Wanted{})
+			run, err := q.GetRun(ctx, "run-1")
+			if err != nil {
+				return err
+			}
+			got, err = ReadLedger(ctx, q, run, Wanted{})
 			return err
 		}); err != nil {
 			t.Fatal(err)
@@ -141,7 +145,11 @@ func TestReadLedgerSaysWhatItCouldNotRead(t *testing.T) {
 	var got Ledger
 	if err := l.Read(ctx, func(q *db.Queries) error {
 		var err error
-		got, err = ReadLedger(ctx, q, db.Run{WorkflowID: "run-1"}, Wanted{Seqs: []int64{1 << 30, own[0]},
+		run, err := q.GetRun(ctx, "run-1")
+		if err != nil {
+			return err
+		}
+		got, err = ReadLedger(ctx, q, run, Wanted{Seqs: []int64{1 << 30, own[0]},
 			Attempts: []Attempt{{ActivityID: "1:x", Attempt: 9}, {ActivityID: "1:x", Attempt: 1}}})
 		return err
 	}); err != nil {
@@ -214,7 +222,7 @@ func TestReadLedgerReadsWhatResultsName(t *testing.T) {
 	other := record("run-2", audit.Run, map[string]any{"activity_id": "1:x", "attempt": 1, "status": "ok"})
 	defer func(n int) { maxRecords = n }(maxRecords)
 	maxRecords = 4
-	run := db.Run{WorkflowID: "run-1", RunID: sql.NullString{String: "exec-1", Valid: true}}
+	run := setExecution(t, l, "run-1", "exec-1")
 	read := func(want Wanted) Ledger {
 		var got Ledger
 		if err := l.Read(ctx, func(q *db.Queries) error {
@@ -241,7 +249,7 @@ func TestReadLedgerReadsWhatResultsName(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 	// Before StartRun recorded the execution's ID, none of its records is the run's but agentd's own.
-	run.RunID = sql.NullString{}
+	run = setExecution(t, l, "run-1", "")
 	maxRecords = 10
 	if got = read(Wanted{}); len(got.Records) != 3 || got.Unknown != 11 {
 		t.Fatalf("%+v", got)
@@ -260,13 +268,13 @@ func TestReadLedgerReadsTheAttemptsInOnePass(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	run := db.Run{WorkflowID: "run-1", RunID: sql.NullString{String: "exec-1", Valid: true}}
 	if err := l.Tx(ctx, func(q *db.Queries) error {
 		return q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "run-1", Task: "security-audit", ParamsJson: "{}",
 			BudgetLimitMicros: 1, CreatedAt: ledger.Now()})
 	}); err != nil {
 		t.Fatal(err)
 	}
+	run := setExecution(t, l, "run-1", "exec-1")
 	const calls = 12000
 	var want Wanted
 	for done := 0; done < calls; {
@@ -323,5 +331,60 @@ func TestReadLedgerReadsTheAttemptsInOnePass(t *testing.T) {
 		!slices.Contains(got.CutWhat, "call records past the first 3 after those") ||
 		!slices.ContainsFunc(got.Cut, func(c string) bool { return strings.Contains(c, "more than 3 call records after its first") }) {
 		t.Fatalf("named %v, unread %v, cut %q", got.Named, got.AttemptErr, got.Cut)
+	}
+}
+
+// setExecution records execution as the run's in Temporal ("" for none yet), as StartRun does, and
+// returns the run's row.
+func setExecution(t *testing.T, l *ledger.Ledger, workflowID, execution string) db.Run {
+	t.Helper()
+	id := sql.NullString{String: execution, Valid: execution != ""}
+	if _, err := l.DB.Exec(`UPDATE runs SET run_id = ? WHERE workflow_id = ?`, id, workflowID); err != nil {
+		t.Fatal(err)
+	}
+	r, err := l.Q.GetRun(context.Background(), workflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// The run judged is the run in the snapshot: one whose row names another execution or task now, or
+// none, is not read (the caller read Temporal for the other).
+func TestReadLedgerHoldsTheSnapshotToTheRunJudged(t *testing.T) {
+	ctx := context.Background()
+	l, err := ledger.Open(ctx, filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	if err := l.Tx(ctx, func(q *db.Queries) error {
+		return q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "run-1", Task: "security-audit", ParamsJson: "{}",
+			BudgetLimitMicros: 1, CreatedAt: ledger.Now()})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	judged := setExecution(t, l, "run-1", "exec-1")
+	read := func(run db.Run) error {
+		return l.Read(ctx, func(q *db.Queries) error {
+			_, err := ReadLedger(ctx, q, run, Wanted{})
+			return err
+		})
+	}
+	if err := read(judged); err != nil {
+		t.Fatal(err)
+	}
+	other := judged
+	other.Task = "another"
+	gone := judged
+	gone.WorkflowID = "run-2"
+	for name, run := range map[string]db.Run{"another task": other, "no such run": gone} {
+		if err := read(run); err == nil {
+			t.Errorf("%s: read", name)
+		}
+	}
+	setExecution(t, l, "run-1", "exec-2")
+	if err := read(judged); !errors.Is(err, ErrRunChanged) {
+		t.Errorf("another execution: %v", err)
 	}
 }

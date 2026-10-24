@@ -375,8 +375,39 @@ func TestVerdicts(t *testing.T) {
 			seq := w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s",
 				"temporal_run_id": "exec-1"})
 			w.terminated("cancel not honoured within 1m0s", "agentd@host")
+			w.start("agentd.started", audit.Agentd, nil) // the next agentd closes it, as verify reads it
 			return want{verdict: VerdictTerminated, kind: KindTerminated, cause: []string{"agentd terminated the run: cancel not"},
 				seqs: []int64{seq}}
+		},
+	}, {
+		name: "agentd asked Temporal to terminate the run, and has no record of how that went",
+		world: func(w *world) want {
+			seq := w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s",
+				"temporal_run_id": "exec-1"})
+			w.terminated("someone else's reason", "mallory@laptop")
+			return want{verdict: VerdictTerminated, kind: KindTerminated, cause: []string{
+				"agentd asked Temporal to terminate the run (cancel not honoured within 1m0s), and has no record of how that went"},
+				seqs: []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if strings.Contains(e.GetCause(), "agentd terminated") || !strings.Contains(e.GetClaim(), `"mallory@laptop"`) {
+					t.Errorf("cause %q, claim %q", e.GetCause(), e.GetClaim())
+				}
+			})
+		},
+	}, {
+		name: "a cancelled run agentd asked Temporal to terminate, with no record of how that went",
+		world: func(w *world) want {
+			c := w.ok("git.show_diff")
+			w.cancel("operator:dave")
+			seq := w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s",
+				"temporal_run_id": "exec-1"})
+			w.terminated("someone else's reason", "mallory@laptop")
+			return want{verdict: VerdictCancelled, kind: KindCancelled, step: "fetch_diff", activity: c.id, attempt: 1,
+				cause: []string{"dave cancelled", "agentd asked Temporal to terminate it (cancel not honoured"},
+				seqs:  []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if strings.Contains(e.GetCause(), "agentd terminated it") || !strings.Contains(e.GetClaim(), `"mallory@laptop"`) {
+					t.Errorf("cause %q, claim %q", e.GetCause(), e.GetClaim())
+				}
+			})
 		},
 	}, {
 		name: "another execution's termination is not the run's",

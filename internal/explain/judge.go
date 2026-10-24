@@ -600,6 +600,12 @@ func (f *facts) attemptIncidents(s *step) []*agentosv1.Incident {
 				inc.Cause = fmt.Sprintf("attempt %d began and never ended: agentd stopped during it, and started again at %s",
 					k, stamp(x.at))
 				inc.Evidence = append(inc.Evidence, auditSource(x.seq, "agentd.started"))
+			} else if fl := f.lastFailure(s, k); fl != nil && fl.GetTimeoutFailureInfo() == nil {
+				// Temporal says it failed, not that it timed out: an error agentd could not record (its
+				// record's write failed), or a failure someone else made of the attempt. Unverified.
+				inc.Kind = errorKind(s, nil)
+				inc.Cause = fmt.Sprintf("attempt %d began and left no record of its end; Temporal says it failed%s, unverified",
+					k, quoted(" with ", failureText(fl)))
 			} else {
 				inc.Kind = KindActivityTimeout
 				inc.Cause = fmt.Sprintf("attempt %d began and left no record of its end: it timed out%s", k,
