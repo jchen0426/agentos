@@ -15,7 +15,7 @@ import pytest
 from tests.harness import Stack, TERMINAL, gateway_calls, wait_for
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["runs_mismatched"])
 def test_gateway_refuses_an_execution_that_reuses_a_finished_runs_workflow_id(stack: Stack) -> None:
     stack.start_agentd()
     stack.start_worker()

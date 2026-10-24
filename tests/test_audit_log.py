@@ -298,7 +298,7 @@ def signal_head(stack: Stack, head: dict) -> None:
     stack._temporal(lambda c: c.get_workflow_handle(workflow_id).signal("anchor", head))
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched", "state_mismatched:call", "state_mismatched:effect"])
 def test_a_ledger_cut_while_agentd_was_down(stack: Stack) -> None:
     """Someone with the ledger cuts the audit log's last records while agentd is down, and someone
     signals the anchor workflow a head of what is left, after the one agentd pushed as it stopped. A
@@ -328,7 +328,7 @@ def test_a_ledger_cut_while_agentd_was_down(stack: Stack) -> None:
     assert code == 1 and "does not have" in whys[head["seq"]] and "went backwards" in whys[left["seq"]], rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_a_flood_of_forged_heads(stack: Stack) -> None:
     """Someone with Temporal's API floods the anchor workflow with signals that are no head agentd
     pushes: agentd starts, and its start's record names at most 20 of them, copies nothing of them,
@@ -350,7 +350,7 @@ def test_a_flood_of_forged_heads(stack: Stack) -> None:
     assert "script" not in json.dumps(outside(rep), ensure_ascii=False), rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_many_anchor_workflows_made_by_someone_else(stack: Stack) -> None:
     """Someone with Temporal's API makes many workflows with anchor workflows' IDs of the day: agentd's
     start check reads at most 50 of them, its own chain's first, says how many it did not read, and
@@ -378,7 +378,7 @@ async def _count(c: Client, query: str) -> list:
     return [w async for w in c.list_workflows(query)]
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_a_head_signalled_by_someone_else(stack: Stack) -> None:
     """Someone with Temporal's API signals the anchor workflow a head the ledger never reached: it
     does not keep agentd from starting, which records it, and verify fails on it."""
@@ -392,7 +392,7 @@ def test_a_head_signalled_by_someone_else(stack: Stack) -> None:
     assert code == 1 and any(int(m["seq"]) == 10**9 for m in outside(rep)), rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched", "state_mismatched:call"])
 def test_a_ledger_cut_while_agentd_runs(stack: Stack) -> None:
     """Someone with the ledger cuts the audit log's last record while agentd runs: agentd appends
     nothing more to it, and pushes no head of it, and says so; verify says the log no longer holds
@@ -414,7 +414,7 @@ def test_a_ledger_cut_while_agentd_runs(stack: Stack) -> None:
     assert code == 1 and any(m["why"].startswith("the last record this agentd appended") for m in rep["anchors_mismatched"]), rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["state_mismatched:budget", "state_mismatched:call"])
 def test_tables_changed_without_their_records(stack: Stack) -> None:
     """What agentd's limits count is in the records too: the calls the loop guard counts and the
     budget's entries, emptied by someone with the ledger, are differences. The report names the
@@ -519,7 +519,7 @@ def test_a_run_cancelled_while_its_model_call_runs(stack: Stack) -> None:
     assert code == 0, rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_a_decision_appended_by_someone_else(stack: Stack) -> None:
     """While a run waits for approval, someone with the ledger appends a decision nobody gave, chained
     as agentd chains its records, and changes the approval to match, without touching Temporal.
@@ -557,7 +557,7 @@ def test_a_decision_appended_by_someone_else(stack: Stack) -> None:
     assert any(w.startswith("agentd found the audit log changed under it") for w in whys), rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched", "state_mismatched:run"])
 def test_a_changed_ledger_does_not_verify(stack: Stack) -> None:
     stack.start_agentd()
     stack.start_worker()
@@ -643,7 +643,8 @@ def test_a_changed_ledger_does_not_verify(stack: Stack) -> None:
     assert "does not verify" in r.stderr, r.stderr
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched", "runs_mismatched", "state_mismatched:budget",
+                                         "state_mismatched:call", "state_mismatched:effect", "state_mismatched:model"])
 def test_a_run_dropped_from_the_ledger_does_not_verify(stack: Stack) -> None:
     """Whoever can rewrite the ledger can drop a run from it: its row, and its records, with the chain
     made whole again after them. The ledger then says nothing of the run; Temporal still has it, and
@@ -827,7 +828,8 @@ def test_the_chains_head_goes_to_temporal(stack: Stack) -> None:
     assert r.returncode == 0 and "heads pushed to Temporal checked" in r.stdout, r.stdout
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"], stack="other")
 def test_two_agentds_on_one_temporal_each_verify_their_own(stack: Stack, tmp_path: Path) -> None:
     """Two agentds, with ledgers of their own, on one Temporal namespace: each pushes its chain's head
     to anchor workflows of the chain's own, and each verifies clean, counting the other's workflows.
@@ -836,7 +838,7 @@ def test_two_agentds_on_one_temporal_each_verify_their_own(stack: Stack, tmp_pat
     stack.start_agentd()
     stack.start_worker()
     (tmp_path / "other").mkdir()
-    other = Stack(tmp_path / "other")
+    other = Stack(tmp_path / "other", name="other")
     try:
         other.temporal_address = stack.temporal_address  # the first stack's Temporal, not its own
         other.start_agentd(extra={"task_queues": {"gateway": "gateway-other", "workflows": "agentos-workflows-other"}})
@@ -871,7 +873,7 @@ def test_two_agentds_on_one_temporal_each_verify_their_own(stack: Stack, tmp_pat
         other.close()
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_an_anchor_workflow_made_by_someone_else(stack: Stack) -> None:
     """Someone with Temporal's API makes the day's anchor workflow of agentd's chain before agentd's
     first push, as a workflow of their own: SignalWithStart signals it all the same. agentd looks at
@@ -888,7 +890,8 @@ def test_an_anchor_workflow_made_by_someone_else(stack: Stack) -> None:
     assert rep["external_anchors_checked"] == 0, rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched", "state_mismatched:budget", "state_mismatched:call",
+                                         "state_mismatched:effect", "state_mismatched:model", "state_mismatched:run"])
 def test_an_emptied_log_does_not_verify(stack: Stack) -> None:
     """Someone with the ledger empties the audit log, while agentd runs: a log with no records is no
     agentd's, and what Temporal holds of it, the heads agentd pushed and the results that name
@@ -915,7 +918,7 @@ def test_an_emptied_log_does_not_verify(stack: Stack) -> None:
     assert any(m["kind"] == "run" and m["id"] == run["run_id"] for m in rep["state_mismatched"]), rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_a_chain_rewritten_from_its_first_record(stack: Stack) -> None:
     """The whole chain rewritten from record 1, every hash made again, while agentd is down: it is
     whole, and has a new key, so it has no anchor workflows of its own yet. The old key's are still
@@ -964,7 +967,7 @@ def test_a_chain_rewritten_from_its_first_record(stack: Stack) -> None:
     assert code == 0 and rep["other_anchor_workflows"] >= 1, rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_two_ledgers_of_one_agentd_live_at_once(stack: Stack) -> None:
     """One agentd, two ledgers taking turns in its data directory: the first, then a new one, then
     the first again. Each pushes its chain's heads under the same agentd. The first's verify finds
@@ -994,7 +997,7 @@ def test_two_ledgers_of_one_agentd_live_at_once(stack: Stack) -> None:
     assert code == 1 and "two ledgers of this agentd were live at once" in m["why"], rep
 
 
-@pytest.mark.audit_verify(exit=2)
+@pytest.mark.audit_verify(exit=2, kinds=["runs_before_log"])
 def test_runs_from_before_the_log_are_unchecked(stack: Stack) -> None:
     """A dev ledger keeps runs of an older agentd (M1 to M4), made before the audit log began: no
     record of theirs, and nothing left in Temporal. agentctl counts them unchecked (exit 2), unless
@@ -1014,7 +1017,7 @@ def test_runs_from_before_the_log_are_unchecked(stack: Stack) -> None:
     assert code == 0, rep
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])
 def test_a_lost_anchor_workflow_is_found(stack: Stack) -> None:
     """Someone with Temporal's API deletes the anchor workflow agentd pushed the chain's head to. Once
     agentd has run longer than two pushes, records older than that which no pushed head covers are

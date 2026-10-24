@@ -350,6 +350,19 @@ def make_mirror(path: Path, live_repo: str = "") -> str:
     return FIXTURE_COMMIT
 
 
+
+class Watch:
+    """Who hears of every agentd a Stack starts, and of every Stack closing: --verify-after-each
+    (tests/verify_each.py) while a test runs, to verify each agentd's log before it stops; nobody
+    otherwise. A stack is heard of whatever built it: a fixture, a test, or code a test calls."""
+
+    on_start: Callable[[Stack], None] | None = None
+    on_close: Callable[[Stack], None] | None = None
+
+
+WATCH = Watch()
+
+
 class Stack:
     """One Temporal dev server, one agentd and its Workers, isolated in a temporary directory.
     With fixture=False there is neither the audit fixture's mirror nor the simulated GitHub: the
@@ -362,8 +375,9 @@ class Stack:
     agentd_tls: dict | None = None
 
     def __init__(self, tmp: Path, live_repo: str = "", temporal_db: bool = False, fixture: bool = True,
-                 hold_fds: tuple[int, ...] = ()) -> None:
+                 hold_fds: tuple[int, ...] = (), name: str = "stack") -> None:
         self.tmp = tmp
+        self.name = name  # what an audit_verify mark calls it (tests/verify_each.py)
         self.live_repo = live_repo  # a real GitHub repository to write to, instead of the simulator
         # Temporal's dev server keeps everything in memory unless it has a database file: with one,
         # restart_temporal() keeps the runs.
@@ -566,6 +580,8 @@ class Stack:
         self.procs.append(p)
         self._remember()
         self.agentd = p
+        if WATCH.on_start is not None:
+            WATCH.on_start(self)
         wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd")
         assert p.alive(), p.text()
         return p
@@ -618,6 +634,8 @@ class Stack:
                                                    for p in self.procs]))
 
     def close(self) -> None:
+        if WATCH.on_close is not None:
+            WATCH.on_close(self)  # while its agentd still runs
         errors = []
         for p in reversed(self.procs):
             try:

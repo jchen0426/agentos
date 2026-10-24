@@ -42,7 +42,7 @@ def edit(stack: Stack, approval: dict, patch: str) -> dict:
     return stack.decide(approval, "edit", "--patch-file", str(path), "--as", "carol")
 
 
-@pytest.mark.audit_verify(exit=1)
+@pytest.mark.audit_verify(exit=1, kinds=["state_mismatched:blob"])
 def test_t5_a_payload_changed_after_the_approval_is_not_sent(stack: Stack) -> None:
     hold = stack.tmp / "hold-doorbells"
     stack.start_agentd(policy=approval_policy(), hold_doorbells=hold)
