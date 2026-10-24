@@ -8,6 +8,8 @@ import hashlib
 import json
 import sqlite3
 
+import pytest
+
 from tests.harness import TERMINAL, Stack, approval_policy, gateway_calls
 
 PR = "github.open_draft_pr"
@@ -40,6 +42,7 @@ def edit(stack: Stack, approval: dict, patch: str) -> dict:
     return stack.decide(approval, "edit", "--patch-file", str(path), "--as", "carol")
 
 
+@pytest.mark.audit_verify(exit=1)
 def test_t5_a_payload_changed_after_the_approval_is_not_sent(stack: Stack) -> None:
     hold = stack.tmp / "hold-doorbells"
     stack.start_agentd(policy=approval_policy(), hold_doorbells=hold)

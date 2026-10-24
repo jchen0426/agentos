@@ -10,9 +10,12 @@ StartRun records the run ID once Temporal has started the run, and a Worker that
 polling can send the run's first call before that: the gateway waits for the run ID.
 """
 
+import pytest
+
 from tests.harness import Stack, TERMINAL, gateway_calls, wait_for
 
 
+@pytest.mark.audit_verify(exit=1)
 def test_gateway_refuses_an_execution_that_reuses_a_finished_runs_workflow_id(stack: Stack) -> None:
     stack.start_agentd()
     stack.start_worker()

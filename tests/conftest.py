@@ -3,7 +3,16 @@ from pathlib import Path
 
 import pytest
 
+from tests import verify_each
 from tests.harness import GITHUB_LIVE_REPO, Stack
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    verify_each.add_option(parser)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    verify_each.configure(config)  # --verify-after-each, opt-in
 
 
 @pytest.hookimpl(hookwrapper=True)

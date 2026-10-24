@@ -647,6 +647,11 @@ class Stack:
     def agentctl_args(self, *args: str) -> list:
         return [BIN / "agentctl", "--socket", self.control_socket, "-o", "json", *args]
 
+    def audit_verify(self, *args: str) -> subprocess.CompletedProcess:
+        """agentctl audit verify against this stack's agentd, as a person reads it, as it ended."""
+        return subprocess.run([BIN / "agentctl", "--socket", self.control_socket, "audit", "verify", *args],
+                              capture_output=True, text=True, timeout=360)
+
     def approvals(self) -> list[dict]:
         """What waits for approval, as agentctl approvals list shows it."""
         return self.agentctl("approvals", "list")["items"]

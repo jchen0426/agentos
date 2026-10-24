@@ -119,6 +119,7 @@ def test_t13_a_cloud_model_is_never_sent_the_diff(stack: Stack) -> None:
     assert stack.budget_entries(run) == [], "nothing is reserved for a request that is never sent"
 
 
+@pytest.mark.audit_verify(skip="agentd refuses to start, by design")
 def test_t13_agentd_refuses_prices_for_a_chat_server(stack: Stack) -> None:
     # Its tokens are only estimated before the request: a reservation is a bound only at 0.
     with pytest.raises(AssertionError, match="api chat, whose input is only estimated"):
