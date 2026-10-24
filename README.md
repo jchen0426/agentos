@@ -422,6 +422,9 @@ AGENTOS_SANDBOX=srt uv run python -m evals run --profile claude --profile openai
 uv run python -m evals report --out docs/eval/<name>
 ```
 
+The first report, for all three profiles, is [`docs/eval/2026-10-audit-v1.md`](docs/eval/2026-10-audit-v1.md)
+(2026-10-22).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
