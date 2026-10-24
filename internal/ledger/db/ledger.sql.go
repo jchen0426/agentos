@@ -177,6 +177,22 @@ func (q *Queries) ClaimEffect(ctx context.Context, arg ClaimEffectParams) (int64
 	return result.RowsAffected()
 }
 
+const countRunAuditRecords = `-- name: CountRunAuditRecords :one
+SELECT CAST(COUNT(*) AS INTEGER) FROM audit_log WHERE workflow_id = ? AND seq <= ?
+`
+
+type CountRunAuditRecordsParams struct {
+	WorkflowID string
+	Seq        int64
+}
+
+func (q *Queries) CountRunAuditRecords(ctx context.Context, arg CountRunAuditRecordsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunAuditRecords, arg.WorkflowID, arg.Seq)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countRunEffects = `-- name: CountRunEffects :one
 SELECT CAST(COUNT(*) AS INTEGER) FROM effects
 WHERE workflow_id = ? AND tool = ? AND effect_id <> ? AND status NOT IN ('ABANDONED', 'FAILED')
@@ -192,6 +208,27 @@ type CountRunEffectsParams struct {
 // send them (DENIED: its checks may have cost requests), other than the one asked about.
 func (q *Queries) CountRunEffects(ctx context.Context, arg CountRunEffectsParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRunEffects, arg.WorkflowID, arg.Tool, arg.EffectID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countRunUnknownRecords = `-- name: CountRunUnknownRecords :one
+SELECT CAST(COUNT(*) AS INTEGER) FROM audit_log
+WHERE workflow_id = ?1 AND actor = 'unknown-run'
+  AND (CAST(?2 AS TEXT) = '' OR
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') != CAST(?2 AS TEXT))
+`
+
+type CountRunUnknownRecordsParams struct {
+	WorkflowID    string
+	TemporalRunID string
+}
+
+// The records of calls from executions agentd did not start, under a run's workflow ID: those
+// ListRunOwnAuditRecords leaves out.
+func (q *Queries) CountRunUnknownRecords(ctx context.Context, arg CountRunUnknownRecordsParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunUnknownRecords, arg.WorkflowID, arg.TemporalRunID)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
@@ -395,6 +432,28 @@ func (q *Queries) GetApprovalByEffect(ctx context.Context, effectID string) (App
 		&i.Supersedes,
 		&i.SupersededBy,
 		&i.UsedAt,
+	)
+	return i, err
+}
+
+const getAuditRecord = `-- name: GetAuditRecord :one
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE seq = ?
+`
+
+// The record at seq, whichever run's: runs explain reads each record a result in Temporal names.
+func (q *Queries) GetAuditRecord(ctx context.Context, seq int64) (AuditLog, error) {
+	row := q.db.QueryRowContext(ctx, getAuditRecord, seq)
+	var i AuditLog
+	err := row.Scan(
+		&i.Seq,
+		&i.At,
+		&i.WorkflowID,
+		&i.Type,
+		&i.Actor,
+		&i.PeerUid,
+		&i.Payload,
+		&i.PrevSha256,
+		&i.Sha256,
 	)
 	return i, err
 }
@@ -1032,6 +1091,50 @@ func (q *Queries) LastAuditRecord(ctx context.Context) (AuditLog, error) {
 		&i.Sha256,
 	)
 	return i, err
+}
+
+const listAgentdStarts = `-- name: ListAgentdStarts :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE workflow_id = '' AND type = 'agentd.started' AND seq > ? ORDER BY seq LIMIT ?
+`
+
+type ListAgentdStartsParams struct {
+	Seq   int64
+	Limit int64
+}
+
+// agentd's starts after the record at seq (agentd.started, agentd's own: workflow_id ”), at most
+// limit: what runs explain holds a run's interrupted attempts against.
+func (q *Queries) ListAgentdStarts(ctx context.Context, arg ListAgentdStartsParams) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listAgentdStarts, arg.Seq, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listAllRuns = `-- name: ListAllRuns :many
@@ -2028,6 +2131,59 @@ func (q *Queries) ListRunApprovals(ctx context.Context, workflowID string) ([]Ap
 	return items, nil
 }
 
+const listRunApprovalsLimit = `-- name: ListRunApprovalsLimit :many
+SELECT approval_id, effect_id, workflow_id, tool, args_json, payload_sha256, context_blob, status, created_at, expires_at, decided_by, decided_at, decision_key, reason, edited_patch_blob, edited_args_sha256, supersedes, superseded_by, used_at FROM approvals WHERE workflow_id = ? ORDER BY created_at, approval_id LIMIT ?
+`
+
+type ListRunApprovalsLimitParams struct {
+	WorkflowID string
+	Limit      int64
+}
+
+// A run's approvals, oldest first, at most limit: what runs explain reads of them.
+func (q *Queries) ListRunApprovalsLimit(ctx context.Context, arg ListRunApprovalsLimitParams) ([]Approval, error) {
+	rows, err := q.db.QueryContext(ctx, listRunApprovalsLimit, arg.WorkflowID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Approval
+	for rows.Next() {
+		var i Approval
+		if err := rows.Scan(
+			&i.ApprovalID,
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.ArgsJson,
+			&i.PayloadSha256,
+			&i.ContextBlob,
+			&i.Status,
+			&i.CreatedAt,
+			&i.ExpiresAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.DecisionKey,
+			&i.Reason,
+			&i.EditedPatchBlob,
+			&i.EditedArgsSha256,
+			&i.Supersedes,
+			&i.SupersededBy,
+			&i.UsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunAuditRecords = `-- name: ListRunAuditRecords :many
 SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE workflow_id = ? ORDER BY seq
 `
@@ -2051,6 +2207,147 @@ func (q *Queries) ListRunAuditRecords(ctx context.Context, workflowID string) ([
 			&i.Payload,
 			&i.PrevSha256,
 			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunAuditRecordsPage = `-- name: ListRunAuditRecordsPage :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log WHERE workflow_id = ? AND seq >= ? AND seq <= ? ORDER BY seq LIMIT ?
+`
+
+type ListRunAuditRecordsPageParams struct {
+	WorkflowID string
+	Seq        int64
+	Seq_2      int64
+	Limit      int64
+}
+
+// A page of one run's records, from seq on, up to the head an export took.
+func (q *Queries) ListRunAuditRecordsPage(ctx context.Context, arg ListRunAuditRecordsPageParams) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listRunAuditRecordsPage,
+		arg.WorkflowID,
+		arg.Seq,
+		arg.Seq_2,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunCalls = `-- name: ListRunCalls :many
+SELECT workflow_id, activity_id, scheduled_at, kind, name, args_sha256, created_at, outcome FROM calls WHERE workflow_id = ? ORDER BY created_at, activity_id LIMIT ?
+`
+
+type ListRunCallsParams struct {
+	WorkflowID string
+	Limit      int64
+}
+
+func (q *Queries) ListRunCalls(ctx context.Context, arg ListRunCallsParams) ([]Call, error) {
+	rows, err := q.db.QueryContext(ctx, listRunCalls, arg.WorkflowID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Call
+	for rows.Next() {
+		var i Call
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.ScheduledAt,
+			&i.Kind,
+			&i.Name,
+			&i.ArgsSha256,
+			&i.CreatedAt,
+			&i.Outcome,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunEffects = `-- name: ListRunEffects :many
+SELECT effect_id, workflow_id, tool, effect_class, payload_sha256, idempotency_key, status, result_blob, created_at, updated_at, payload_blob, claimed_by, claimed_at, version, reason, maybe_sent, last_request_at FROM effects WHERE workflow_id = ? ORDER BY created_at, effect_id LIMIT ?
+`
+
+type ListRunEffectsParams struct {
+	WorkflowID string
+	Limit      int64
+}
+
+func (q *Queries) ListRunEffects(ctx context.Context, arg ListRunEffectsParams) ([]Effect, error) {
+	rows, err := q.db.QueryContext(ctx, listRunEffects, arg.WorkflowID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Effect
+	for rows.Next() {
+		var i Effect
+		if err := rows.Scan(
+			&i.EffectID,
+			&i.WorkflowID,
+			&i.Tool,
+			&i.EffectClass,
+			&i.PayloadSha256,
+			&i.IdempotencyKey,
+			&i.Status,
+			&i.ResultBlob,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.PayloadBlob,
+			&i.ClaimedBy,
+			&i.ClaimedAt,
+			&i.Version,
+			&i.Reason,
+			&i.MaybeSent,
+			&i.LastRequestAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2113,6 +2410,167 @@ SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256
 // Each run's creation, start and discard, as the audit log has them: what the runs table must agree with.
 func (q *Queries) ListRunLifeRecords(ctx context.Context) ([]AuditLog, error) {
 	rows, err := q.db.QueryContext(ctx, listRunLifeRecords)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunModelCalls = `-- name: ListRunModelCalls :many
+SELECT workflow_id, activity_id, attempt, request_seq, request_blob, response_blob, provider, model, prompt_version, effort, stop_reason, usage_json, started_at, finished_at FROM model_calls WHERE workflow_id = ? ORDER BY started_at, activity_id, attempt, request_seq LIMIT ?
+`
+
+type ListRunModelCallsParams struct {
+	WorkflowID string
+	Limit      int64
+}
+
+// A run's model requests, in the order they were sent, at most limit.
+func (q *Queries) ListRunModelCalls(ctx context.Context, arg ListRunModelCallsParams) ([]ModelCall, error) {
+	rows, err := q.db.QueryContext(ctx, listRunModelCalls, arg.WorkflowID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ModelCall
+	for rows.Next() {
+		var i ModelCall
+		if err := rows.Scan(
+			&i.WorkflowID,
+			&i.ActivityID,
+			&i.Attempt,
+			&i.RequestSeq,
+			&i.RequestBlob,
+			&i.ResponseBlob,
+			&i.Provider,
+			&i.Model,
+			&i.PromptVersion,
+			&i.Effort,
+			&i.StopReason,
+			&i.UsageJson,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunOwnAuditRecords = `-- name: ListRunOwnAuditRecords :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log
+WHERE workflow_id = ?1 AND seq >= ?2
+  AND (actor != 'unknown-run' OR (CAST(?3 AS TEXT) != '' AND
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') = CAST(?3 AS TEXT)))
+ORDER BY seq LIMIT ?4
+`
+
+type ListRunOwnAuditRecordsParams struct {
+	WorkflowID    string
+	Seq           int64
+	TemporalRunID string
+	Max           int64
+}
+
+// A run's records from seq on, at most max: those of its own execution (temporal_run_id), a call
+// agentd refused before StartRun recorded the execution's ID among them (unknown-run, with the ID);
+// not those of calls from executions agentd did not start, so that a flood of them cannot crowd out
+// the run's own.
+func (q *Queries) ListRunOwnAuditRecords(ctx context.Context, arg ListRunOwnAuditRecordsParams) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listRunOwnAuditRecords,
+		arg.WorkflowID,
+		arg.Seq,
+		arg.TemporalRunID,
+		arg.Max,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditLog
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.At,
+			&i.WorkflowID,
+			&i.Type,
+			&i.Actor,
+			&i.PeerUid,
+			&i.Payload,
+			&i.PrevSha256,
+			&i.Sha256,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunOwnCallRecords = `-- name: ListRunOwnCallRecords :many
+SELECT seq, at, workflow_id, type, actor, peer_uid, payload, prev_sha256, sha256 FROM audit_log
+WHERE workflow_id = ?1 AND seq > ?2 AND type IN ('call', 'call.started')
+  AND (actor != 'unknown-run' OR (CAST(?3 AS TEXT) != '' AND
+       IFNULL(CAST(json_extract(payload, '$.temporal_run_id') AS TEXT), '') = CAST(?3 AS TEXT)))
+ORDER BY seq LIMIT ?4
+`
+
+type ListRunOwnCallRecordsParams struct {
+	WorkflowID    string
+	Seq           int64
+	TemporalRunID string
+	Max           int64
+}
+
+// The run's own call records (call.started, call) after seq, at most max, oldest first: of its own
+// execution, as ListRunOwnAuditRecords's. runs explain reads those past the bound on the run's records
+// in one pass, for the attempts that failed (a scan of them per attempt would cost the square).
+func (q *Queries) ListRunOwnCallRecords(ctx context.Context, arg ListRunOwnCallRecordsParams) ([]AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, listRunOwnCallRecords,
+		arg.WorkflowID,
+		arg.Seq,
+		arg.TemporalRunID,
+		arg.Max,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -19,6 +19,7 @@ import (
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/audit"
+	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/policy"
@@ -439,18 +440,20 @@ func TestARefusedCallHasItsRecord(t *testing.T) {
 			if _, err := l.DB.Exec(`UPDATE runs SET cancelled_at = ?`, ledger.Now()); err != nil {
 				t.Fatal(err)
 			}
-		}, map[string]any{"status": StatusDenied, "reason": "run cancelled"}},
+		}, map[string]any{"status": StatusDenied, "reason": "run cancelled", "refused_by": audit.RefusedByCancel}},
 		"the loop guard": {noSuchTool, func(g *Gateway, l *ledger.Ledger) {
 			g.Limits.GatewayCalls = 1
 			if _, err := l.Q.InsertCall(context.Background(), db.InsertCallParams{WorkflowID: testWorkflowID, ActivityID: "0:x",
 				ScheduledAt: ledger.Now(), Kind: "tool", Name: "x", ArgsSha256: "x", CreatedAt: ledger.Now()}); err != nil {
 				t.Fatal(err)
 			}
-		}, map[string]any{"status": StatusDenied, "reason": "loop guard: more than 1 calls in one run"}},
-		"no such tool": {noSuchTool, nil, map[string]any{"status": StatusDenied, "reason": "no such tool"}},
+		}, map[string]any{"status": StatusDenied, "reason": "loop guard: more than 1 calls in one run",
+			"refused_by": audit.RefusedByLoopGuard}},
+		"no such tool": {noSuchTool, nil, map[string]any{"status": StatusDenied, "reason": "no such tool",
+			"refused_by": audit.RefusedByAgentd}},
 		"the policy denies it": {&agentosv1.Call{Kind: "tool", Name: "test.write", ArgsJson: `{}`}, func(g *Gateway, l *ledger.Ledger) {
 			g.Policy.Tools["test.write"] = policy.Tool{Decision: "deny"}
-		}, map[string]any{"status": StatusDenied, "reason": "denied by policy",
+		}, map[string]any{"status": StatusDenied, "reason": "denied by policy", "refused_by": audit.RefusedByPolicy,
 			"policy": map[string]any{"decision": "deny", "reason": "denied by policy"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -474,8 +477,9 @@ func TestARefusedCallHasItsRecord(t *testing.T) {
 			if _, ok := tc.want["policy"]; !ok && p["policy"] != nil {
 				t.Errorf("a policy verdict, though the policy was never asked: %v", p)
 			}
-			if _, ok := tc.want["error_type"]; !ok && p["error_type"] != nil {
-				t.Errorf("an error type, though the call may be retried or did not fail: %v", p)
+			// Every error says the type of the failure Temporal has of it; a result says none.
+			if _, has := p["error_type"]; has != (p["status"] == "error") {
+				t.Errorf("error_type %v for a call that ended %v: %v", p["error_type"], p["status"], p)
 			}
 			// A call from an execution agentd did not start, or cannot tell it did, is by nobody it knows.
 			actor := audit.Run
@@ -485,11 +489,59 @@ func TestARefusedCallHasItsRecord(t *testing.T) {
 			if rows[0].Type != "call" || rows[0].Actor != actor || rows[0].WorkflowID != testWorkflowID {
 				t.Errorf("record %+v, want it by %s", rows[0], actor)
 			}
-			// A result names its record; an error has none to carry.
+			// A result names its record; an error has none to carry. Who refused it is the record's.
 			if callErr == nil && !strings.Contains(res.GetValueJson(), fmt.Sprintf(`"_audit":{"seq":%d,`, rows[0].Seq)) {
 				t.Errorf("the result names no record: %s", res.GetValueJson())
 			}
+			if strings.Contains(res.GetValueJson(), refusedByKey) || (tc.want["refused_by"] == nil) != (p["refused_by"] == nil) {
+				t.Errorf("result %s, record %v", res.GetValueJson(), p)
+			}
 		})
+	}
+}
+
+// Who refused a call, and where an error came from, are agentd's words in the call's record, which
+// runs explain judges by: a tool's refusal is the tool's, whatever it says, and the git tool server's
+// failure is its own by the type agentd's git client gives it, not by its words. The workflow gets
+// neither.
+func TestTheRecordSaysWhoRefusedAndWhereAnErrorCameFrom(t *testing.T) {
+	g, l, _ := invokable(t)
+	info := activity.Info{ActivityID: "9:x", Attempt: 1}
+	info.WorkflowExecution.ID, info.WorkflowExecution.RunID = testWorkflowID, testRunID
+	ctx := context.Background()
+	res, err := toolError("git.apply_check", &tools.DeniedError{Reason: "loop guard: run cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := g.recordCall(ctx, info, noSuchTool, g.Log, &callRecord{argsSHA256: "x"}, res, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := payloadOf(t, lastRecord(t, l)); p["refused_by"] != audit.RefusedByTool || strings.Contains(got.GetValueJson(), refusedByKey) ||
+		!strings.Contains(got.GetValueJson(), `"reason":"loop guard: run cancelled"`) {
+		t.Fatalf("record %v, result %s", p, got.GetValueJson())
+	}
+	// An ok result that says it was refused is not one.
+	ok, _ := result(StatusOK, map[string]any{refusedByKey: audit.RefusedByPolicy})
+	if _, err := g.recordCall(ctx, info, noSuchTool, g.Log, &callRecord{argsSHA256: "x"}, ok, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p := payloadOf(t, lastRecord(t, l)); p["refused_by"] != nil {
+		t.Fatalf("record %v", p)
+	}
+	for _, tc := range []struct {
+		err   error
+		cause any
+	}{
+		{fmt.Errorf("read the files at the commit: %w", &gitmcp.ServerFailure{Tool: "read_files"}), audit.ErrorCauseToolServer},
+		{errors.New((&gitmcp.ServerFailure{Tool: "read_files"}).Error()), nil},
+	} {
+		if _, err := g.recordCall(ctx, info, noSuchTool, g.Log, &callRecord{argsSHA256: "x"}, nil, tc.err); err != tc.err {
+			t.Fatalf("got %v", err)
+		}
+		if p := payloadOf(t, lastRecord(t, l)); p["error_cause"] != tc.cause || p["error"] != tc.err.Error() {
+			t.Fatalf("%v: record %v", tc.err, p)
+		}
 	}
 }
 

@@ -56,6 +56,20 @@ const (
 // the operating system names them.
 func Operator(name string) string { return "operator:" + name }
 
+// Who refused a call that ended denied, as its record's refused_by says: agentd's own word, never a
+// tool's text (agentctl runs explain judges by it).
+const (
+	RefusedByPolicy    = "policy"     // the policy's decision, or its limit on a run's writes
+	RefusedByLoopGuard = "loop_guard" // agentd's loop guard
+	RefusedByCancel    = "cancel"     // the run was cancelled
+	RefusedByTool      = "tool"       // the tool refused the call as it stood
+	RefusedByAgentd    = "agentd"     // agentd, otherwise
+)
+
+// ErrorCauseToolServer is a call record's error_cause when the git tool server failed: it did not
+// start, stopped, timed out, or answered nothing agentd could read.
+const ErrorCauseToolServer = "tool_server"
+
 // Event is one record to append.
 type Event struct {
 	WorkflowID string        // the run's; "" for agentd's own events

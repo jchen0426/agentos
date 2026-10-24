@@ -359,23 +359,6 @@ func reconcileResolveCmd(g *globals) *cobra.Command {
 	return cmd
 }
 
-func explainCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
-		Use:   "explain <run-id>",
-		Short: "Point at the step that went wrong and why (M5)",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(g, func(ctx context.Context, c agentosv1.ControlClient) error {
-				e, err := c.ExplainRun(ctx, &agentosv1.ExplainRunRequest{RunId: args[0]})
-				if err != nil {
-					return err
-				}
-				return printJSON(e)
-			})
-		},
-	}
-}
-
 func withClient(g *globals, fn func(context.Context, agentosv1.ControlClient) error) error {
 	return withClientTimeout(g, 30*time.Second, fn)
 }

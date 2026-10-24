@@ -1,6 +1,6 @@
 // Package tasks registers the tasks agentd can start. The platform knows a task only
-// through this registration (D12): its parameters, how to check them, and the workflow
-// type that runs it.
+// through this registration (D12): its parameters, how to check them, the workflow type that
+// runs it, and the names of its steps.
 package tasks
 
 import (
@@ -29,6 +29,36 @@ type Task struct {
 	// beyond what the write itself describes, from what agentd recorded of the run and the call's
 	// arguments (design doc, section 10). Best-effort: what it cannot read, it says.
 	ApprovalContext func(ctx context.Context, run RunOutputs, args map[string]any) map[string]any
+	// Steps names the task's steps by the gateway call (kind and name) that makes each, as agentctl
+	// runs explain and the run's report show them.
+	Steps map[Call]string
+	// Report is the call that reports a run's end, if the task has one: a run that ends without it
+	// ok has not reported (runs explain).
+	Report Call
+	// Required are the calls a run must have an accepted result of to have ended well (runs explain).
+	Required []Requirement
+}
+
+// Call is a gateway call by its kind and name: a step of a task is the call that makes it.
+type Call struct{ Kind, Name string }
+
+// Step is the task's name for the step c makes, if it names one.
+func (t Task) Step(c Call) (string, bool) {
+	s, ok := t.Steps[c]
+	return s, ok
+}
+
+// Requirement is a call a run must have an accepted result of to have ended well: always, or When
+// another call's accepted result holds a field.
+type Requirement struct {
+	Call Call
+	When *Holds
+}
+
+// Holds is a condition on a call's accepted result: that its value holds Field, not empty.
+type Holds struct {
+	Call  Call
+	Field string
 }
 
 // RunOutputs reads what agentd recorded of one run.
@@ -56,6 +86,17 @@ type AuditInput struct {
 
 var commitRe = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
+// AuditModel is the security audit's model task: its accepted answer is the audit's report.
+const AuditModel = "audit_v1"
+
+// The security audit's calls (design doc, section 3).
+var (
+	showDiff   = Call{"tool", "git.show_diff"}
+	analyze    = Call{"model", AuditModel}
+	applyCheck = Call{"tool", "git.apply_check"}
+	openPR     = Call{"tool", "github.open_draft_pr"}
+)
+
 // SecurityAudit is the first task (design doc, section 3). repos maps logical repo ids to
 // read-only mirrors; arbitrary paths are never accepted. git is the git tool server, which
 // resolves the commit in its sandbox.
@@ -66,6 +107,16 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Calle
 		DefaultBudget:   5_000_000,
 		Scope:           map[string]string{"repo": "repo", "commit": "commit", "base_branch": "base"},
 		ApprovalContext: auditFindings,
+		// The pipeline of section 3 of the design doc, step by step: the diff and the audit always; the
+		// patch's check and its pull request when the audit proposed a patch.
+		Steps: map[Call]string{
+			showDiff: "fetch_diff", analyze: "analyze", applyCheck: "validate_patch", openPR: "open_pr",
+			{"tool", "github.comment_commit"}: "post_report",
+		},
+		Report: Call{"tool", "github.comment_commit"},
+		Required: []Requirement{{Call: showDiff}, {Call: analyze},
+			{Call: applyCheck, When: &Holds{Call: analyze, Field: "patch_ref"}},
+			{Call: openPR, When: &Holds{Call: analyze, Field: "patch_ref"}}},
 		Resolve: func(ctx context.Context, params map[string]string) (any, map[string]string, error) {
 			for k := range params {
 				if !slices.Contains([]string{"repo", "commit", "base"}, k) {
@@ -101,7 +152,7 @@ func SecurityAudit(pol *policy.Policy, repos map[string]string, git gitmcp.Calle
 // under review. A patch no audit of the run proposed (a reviewer's edit) gets the latest audit's,
 // and says so: a workflow can ask for several audits, and show one's patch with another's findings.
 func auditFindings(ctx context.Context, run RunOutputs, args map[string]any) map[string]any {
-	answers, err := run.ModelOutputs(ctx, "audit_v1")
+	answers, err := run.ModelOutputs(ctx, AuditModel)
 	switch {
 	case err != nil:
 		return map[string]any{"findings_error": "agentd could not read the run's audits: " + err.Error()}

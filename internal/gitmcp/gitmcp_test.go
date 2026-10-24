@@ -1225,3 +1225,12 @@ func TestClientKillsAServerThatHangs(t *testing.T) {
 		t.Errorf("the server's child still runs: %s", out)
 	}
 }
+
+// The error of a call whose server failed is told by its type, wrapped or not, never by its words.
+func TestServerFailure(t *testing.T) {
+	failed := failedOn("read_files")
+	if !IsServerFailure(failed) || !IsServerFailure(fmt.Errorf("read the files at the commit: %w", failed)) ||
+		IsServerFailure(errors.New(failed.Error())) || IsServerFailure(&ToolError{Msg: "fatal: bad object"}) {
+		t.Fatal("IsServerFailure tells wrong")
+	}
+}

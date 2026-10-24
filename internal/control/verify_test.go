@@ -1422,3 +1422,51 @@ func TestVerifyAuditOfTerminatedExecutions(t *testing.T) {
 		t.Fatalf("mismatched %v; terminated outside agentd %v", rep.GetRunsMismatched(), rep.GetTerminatedOutsideAgentd())
 	}
 }
+
+// A termination Temporal did not do is recorded so (run.terminate_failed, with its error): it closes
+// agentd's run.terminating, which is then no termination of agentd's. An execution Temporal says was
+// terminated after it was terminated by someone else, as far as agentd's records go.
+func TestVerifyAuditOfATerminationThatFailed(t *testing.T) {
+	f := newVerifyFixture(t)
+	run := f.run(t, 1)
+	key := run.GetRunId() + "/" + run.GetTemporalRunId()
+	f.tc.mu.Lock()
+	f.tc.statuses = map[string]enumspb.WorkflowExecutionStatus{key: enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED}
+	f.tc.histories[key] = append(f.tc.histories[key], &historypb.HistoryEvent{EventId: 99,
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED, EventTime: timestamppb.Now(),
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionTerminatedEventAttributes{
+			WorkflowExecutionTerminatedEventAttributes: &historypb.WorkflowExecutionTerminatedEventAttributes{
+				Reason: "mine now", Identity: "mallory@laptop"}}})
+	f.tc.terminateErr = errors.New("rpc error: code = Unavailable desc = connection refused" + strings.Repeat(" and more", 1000))
+	f.tc.mu.Unlock()
+	before := len(auditRecords(t, f.s))
+	if err := f.s.terminate(context.Background(), run.GetRunId(), run.GetTemporalRunId(), "a test"); err == nil {
+		t.Fatal("a termination Temporal refused succeeded")
+	}
+	rows := auditRecords(t, f.s)[before:]
+	if len(rows) != 2 || rows[0].Type != "run.terminating" || rows[1].Type != "run.terminate_failed" || rows[1].Actor != audit.Agentd {
+		t.Fatalf("records %+v", rows)
+	}
+	var p struct {
+		TemporalRunID string `json:"temporal_run_id"`
+		Error         string `json:"error"`
+	}
+	// The error as agentd got it, bounded as every text of a record is (audit.Text).
+	if err := json.Unmarshal([]byte(rows[1].Payload), &p); err != nil || p.TemporalRunID != run.GetTemporalRunId() ||
+		!strings.Contains(p.Error, "connection refused") || len(p.Error) > 2100 {
+		t.Fatalf("payload %s %v", rows[1].Payload, err)
+	}
+	rep := f.verify(t)
+	if len(rep.GetRunsMismatched()) != 0 || len(rep.GetStateMismatched()) != 0 || len(rep.GetTerminatedOutsideAgentd()) != 1 ||
+		rep.GetTerminatedOutsideAgentd()[0].GetClaimedIdentity() != "mallory@laptop" {
+		t.Fatalf("report %v", rep)
+	}
+	// A run.terminated says Temporal did it (alone, as an agentd from before run.terminating wrote it).
+	if _, err := audit.Record(context.Background(), f.s.Ledger, audit.Event{WorkflowID: run.GetRunId(), Type: "run.terminated",
+		Actor: audit.Agentd, Payload: map[string]any{"temporal_run_id": run.GetTemporalRunId(), "why": "a test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if rep := f.verify(t); len(rep.GetTerminatedOutsideAgentd()) != 0 {
+		t.Fatalf("report %v", rep)
+	}
+}

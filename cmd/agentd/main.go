@@ -300,7 +300,7 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	// Starts take slots of their own, so that slow tool calls of running runs never hold up
 	// another run's start.
 	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors(), git.WithOwnSlots(2))}
-	toolset, err := buildTools(cfg, pol, led, git, testTools, log)
+	toolset, err := buildTools(cfg, pol, led, tc, git, registry, testTools, log)
 	if err != nil {
 		return err
 	}
@@ -308,6 +308,9 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return err
 	}
 	if err := gateway.CheckModels(pol, mods); err != nil {
+		return err
+	}
+	if err := gateway.CheckRequired(registry, mods, toolset); err != nil {
 		return err
 	}
 	gw := &gateway.Gateway{
@@ -407,6 +410,13 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		CancelGrace:    cfg.CancelGrace,
 		Faults:         script,
 		Log:            log.With("component", "control"),
+		SnapshotDir:    cfg.DataDir,
+	}
+	// An export's snapshot left by an agentd that stopped mid-export: nobody reads it any more.
+	if n, err := control.RemoveSnapshots(cfg.DataDir); err != nil {
+		return fmt.Errorf("remove stale export snapshots: %w", err)
+	} else if n > 0 {
+		log.Info("removed export snapshots a stopped agentd left", "count", n)
 	}
 	if err := ctl.RecoverStarts(ctx); err != nil {
 		return fmt.Errorf("recover interrupted starts: %w", err)
@@ -416,7 +426,8 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	}
 	// Every call carries the uid of the process at the other end of the socket, which the audit log
 	// records with each change it makes.
-	controlSrv := grpc.NewServer(grpc.Creds(control.PeerCredentials()))
+	// A panic in any call is logged and fails the call, not agentd (control.RecoverUnary).
+	controlSrv := grpc.NewServer(control.ServerOptions(log.With("component", "control"))...)
 	agentosv1.RegisterControlServer(controlSrv, ctl)
 	defer controlSrv.Stop()
 
@@ -554,7 +565,8 @@ func lockDataDir(dir string) (*os.File, error) {
 
 // buildTools makes the tools agentd offers. The GitHub tools need the github section of the
 // config and a token; without them they only dry-run.
-func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git *gitmcp.Client, testTools bool, log *slog.Logger) (tools.Registry, error) {
+func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, tc client.Client, git *gitmcp.Client,
+	registry tasks.Registry, testTools bool, log *slog.Logger) (tools.Registry, error) {
 	var gh *githubtool.Client
 	if g := cfg.GitHub; g != nil {
 		var token string
@@ -587,7 +599,10 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, git 
 		pol.Tools["github.open_draft_pr"].DenyPaths)
 	reg.Add(&tools.ApplyCheck{Blobs: audit.RunBlobs{Ledger: led}, Mirrors: cfg.Mirrors(), DenyPaths: applyDeny, Git: git})
 	reg.Add(&githubtool.OpenDraftPR{Client: gh, Repos: repos, Blobs: audit.RunBlobs{Ledger: led}, DenyPaths: pol.Tools["github.open_draft_pr"].DenyPaths, Git: git})
-	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: audit.RunBlobs{Ledger: led}, Effects: gateway.RunRecords{Ledger: led}})
+	// The report says what the run's history and agentd's records say of it, by runs explain's rules.
+	reg.Add(&githubtool.CommentCommit{Client: gh, Repos: repos, Blobs: audit.RunBlobs{Ledger: led}, Effects: gateway.RunRecords{Ledger: led},
+		Verdicts: gateway.ReportVerdicts{Ledger: led, Temporal: tc, Tasks: registry, Log: log.With("component", "report")},
+		Task:     tasks.AuditModel})
 	if testTools {
 		log.Warn("TEST TOOLS ENABLED: never run this outside tests")
 		reg.Add(&tools.TestWrite{Log: tools.NewExternalLog(filepath.Join(cfg.DataDir, "test-external.jsonl"))})

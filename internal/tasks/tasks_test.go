@@ -173,3 +173,37 @@ func TestApprovalContextShowsTheFindingsOfThePatchsAudit(t *testing.T) {
 		}
 	}
 }
+
+// The security audit names its steps as the design doc's section 3 does, by the call (kind and name)
+// that makes each, reports with the commit comment, and requires the diff and the audit, and the
+// patch's check and pull request when the audit proposed a patch.
+func TestTheSecurityAuditsSteps(t *testing.T) {
+	task := SecurityAudit(nil, nil, nil)
+	want := map[Call]string{{"tool", "git.show_diff"}: "fetch_diff", {"model", "audit_v1"}: "analyze",
+		{"tool", "git.apply_check"}: "validate_patch", {"tool", "github.open_draft_pr"}: "open_pr",
+		{"tool", "github.comment_commit"}: "post_report"}
+	for call, step := range want {
+		if got, ok := task.Step(call); !ok || got != step {
+			t.Errorf("%v: step %q, want %q", call, got, step)
+		}
+	}
+	// A call of another kind under a step's name is no step of the task.
+	for _, c := range []Call{{"model", "git.show_diff"}, {"tool", "audit_v1"}, {"tool", "analyze"}, {"", ""}} {
+		if s, ok := task.Step(c); ok {
+			t.Errorf("%v is step %q", c, s)
+		}
+	}
+	patch := &Holds{Call: Call{"model", "audit_v1"}, Field: "patch_ref"}
+	wantRequired := []Requirement{{Call: Call{"tool", "git.show_diff"}}, {Call: Call{"model", "audit_v1"}},
+		{Call: Call{"tool", "git.apply_check"}, When: patch}, {Call: Call{"tool", "github.open_draft_pr"}, When: patch}}
+	if len(task.Steps) != len(want) || task.Report != (Call{"tool", "github.comment_commit"}) || AuditModel != "audit_v1" ||
+		len(task.Required) != len(wantRequired) {
+		t.Fatalf("%+v, %v, %+v", task.Steps, task.Report, task.Required)
+	}
+	for i, r := range wantRequired {
+		got := task.Required[i]
+		if got.Call != r.Call || (got.When == nil) != (r.When == nil) || got.When != nil && *got.When != *r.When {
+			t.Errorf("requirement %d: %+v, want %+v", i, got, r)
+		}
+	}
+}

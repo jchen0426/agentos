@@ -269,7 +269,9 @@ def started_at(pid: int) -> str:
 
 
 def command_of(pid: int) -> str:
-    return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+    # -ww: no width at all. Without it, a ps that finds a terminal width (an 80-column pty, a
+    # COLUMNS) cuts the line there, and a long checkout path leaves argv[0] a stub ("…/bin/li").
+    return subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                           start_new_session=True).stdout
 
 
@@ -462,18 +464,19 @@ class Stack:
         assert p.alive(), p.text()
         self.github_url = f"http://{addr.read_text()}/"
 
-    def start_modelsim(self, answers: list[dict] | None = None) -> str:
+    def start_modelsim(self, answers: list[dict] | str | None = None) -> str:
         """The simulated model providers T13 injects faults through (internal/modelsim): one
         server for Anthropic's Messages API, OpenAI's Responses API and Chat Completions, which
-        answer as `answers` scripts (modelsim's rules), or with the fixture's report. Returns its
-        base URL."""
+        answer as `answers` scripts (modelsim's rules), or with the fixture's report. `answers` is
+        the rules, or the text of a file of them (a number too long for Python's json to write, say).
+        Returns its base URL."""
         addr = self.tmp / "modelsim.addr"
         self.modelsim_log = self.tmp / "modelsim.jsonl"
         self.modelsim_faults = self.tmp / "modelsim-faults.json"
         args = ["--listen", "127.0.0.1:0", "--addr-file", addr, "--log", self.modelsim_log,
                 "--faults", self.modelsim_faults]
         if answers is not None:
-            (self.tmp / "modelsim-answers.json").write_text(json.dumps(answers))
+            (self.tmp / "modelsim-answers.json").write_text(answers if isinstance(answers, str) else json.dumps(answers))
             args += ["--answers", self.tmp / "modelsim-answers.json"]
         p = Proc("modelsim", [BIN / "modelsim", *args], self.tmp / "modelsim.log")
         self.procs.append(p)
@@ -518,6 +521,17 @@ class Stack:
         url = f"{self.github_url}repos/acme/payments/commits/{self.commit}/comments?per_page=100"
         with urllib.request.urlopen(url, timeout=10) as r:
             return json.load(r)
+
+    def report_comment(self, run: dict) -> str:
+        """The body of the run's report, as the simulated GitHub shows it: the comment whose last line
+        is the marker of the run's github.comment_commit effect."""
+        markers = {f"<!-- agent-effect:{e['effect_id']} -->" for e in self.effects(run) if e["tool"] == "github.comment_commit"}
+        [body] = [c["body"] for c in self.github_comments() if c["body"].rstrip().splitlines()[-1] in markers]
+        return body
+
+    def explain(self, run: dict) -> dict:
+        """agentctl runs explain, as JSON."""
+        return self.agentctl("runs", "explain", run["run_id"])
 
     def runtime_listen(self) -> str:
         if SANDBOX == "bwrap":

@@ -70,6 +70,10 @@ type Server struct {
 	CancelGrace time.Duration  // how long a cancelled run may keep running before it is terminated
 	Faults      *faults.Script // nil unless agentd runs with --fault-script
 	Log         *slog.Logger
+	// SnapshotDir is where an export's snapshot of the chain goes: agentd's data directory. MaxSnapshot
+	// bounds the snapshot (1 GiB unless set): an export of a chain larger stops short, and says so.
+	SnapshotDir string
+	MaxSnapshot int64
 }
 
 // Reconciler records a person's finding about an effect whose outcome nobody knew: the
@@ -214,17 +218,23 @@ func (s *Server) RecoverStarts(ctx context.Context) error {
 }
 
 // terminate has Temporal end an execution, and records it. The change is Temporal's, so its records
-// have transactions of their own: run.terminating before agentd asks, run.terminated after.
-// verify takes every terminated execution for agentd's only with a run.terminating of it, and an
-// agentd killed between the two leaves that one behind, which the next agentd.started closes. A
-// termination is the cancel's last resort: one whose run.terminating cannot be written goes ahead
-// all the same, and verify reports it.
+// have transactions of their own: run.terminating before agentd asks, run.terminated after, or
+// run.terminate_failed when Temporal did not (the run may be terminated later, by someone else).
+// verify takes every terminated execution for agentd's only with a run.terminating of it that no
+// run.terminate_failed closed, and an agentd killed between the two leaves that one behind, which
+// the next agentd.started closes. A termination is the cancel's last resort: one whose
+// run.terminating cannot be written goes ahead all the same, and verify reports it.
 func (s *Server) terminate(ctx context.Context, workflowID, runID, why string) error {
 	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminating",
 		Actor: audit.Agentd, Payload: map[string]any{"temporal_run_id": runID, "why": audit.Text(why)}}); err != nil {
 		s.Log.Error("terminating a run without its record", "workflow_id", workflowID, "error", err)
 	}
 	if err := s.Temporal.TerminateWorkflow(ctx, workflowID, runID, why); err != nil {
+		if _, rerr := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID,
+			Type: "run.terminate_failed", Actor: audit.Agentd,
+			Payload: map[string]any{"temporal_run_id": runID, "error": audit.Text(err.Error())}}); rerr != nil {
+			s.Log.Error("could not record a termination that failed", "workflow_id", workflowID, "error", rerr)
+		}
 		return err
 	}
 	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminated",
@@ -710,10 +720,6 @@ func (s *Server) ExtendBudget(ctx context.Context, req *agentosv1.ExtendBudgetRe
 		}
 	}
 	return s.getRun(ctx, r.WorkflowID)
-}
-
-func (s *Server) ExplainRun(context.Context, *agentosv1.ExplainRunRequest) (*agentosv1.Explanation, error) {
-	return nil, status.Error(codes.Unimplemented, "runs explain arrives in M5")
 }
 
 // lookup is the run's row, as one of the ledger's read transactions reads it (ledger.Read checks the

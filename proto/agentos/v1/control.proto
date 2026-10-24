@@ -18,6 +18,7 @@ service Control {
   rpc ExtendBudget(ExtendBudgetRequest) returns (Run);                                            // M2a, backs `agentctl budget extend`
   rpc ExplainRun(ExplainRunRequest) returns (Explanation);           // M5, backs `agentctl runs explain`
   rpc VerifyAudit(VerifyAuditRequest) returns (AuditReport);         // M5, backs `agentctl audit verify`
+  rpc ExportAudit(ExportAuditRequest) returns (stream AuditExportPart); // M5, backs `agentctl audit export`
 }
 
 message StartRunRequest {
@@ -162,11 +163,89 @@ message ExplainRunRequest {
   string run_id = 1;
 }
 
+// Why a run is where it is (design doc, section 5): Temporal's history and agentd's ledger, the
+// audit log among it, read together. The verdict, the step and the kind come from what agentd
+// recorded itself and from what Temporal recorded (event types, timeouts, attempts); a result in the
+// history counts only when its _audit names agentd's record of it. What the Worker wrote (its
+// result's outcome, its failure messages) is only its claim. Text from the Worker, a tool, a model or
+// the outside world leaves agentd bounded, quoted where agentd's words carry it, and without raw
+// control characters or runs of spaces.
 message Explanation {
   string run_id = 1;
-  string step = 2;                  // the step that went wrong
+  string step = 2;                  // the step that went wrong, as the task names it (D12), else the call's kind and name, quoted
   string cause = 3;
-  repeated string evidence = 4;     // history events and ledger rows behind the conclusion
+  repeated string evidence = 4;     // history events and ledger rows behind the conclusion, as lines (sources has them apart)
+  // CREATED, RUNNING, WAITING_APPROVAL, WAITING_RECONCILE, PAUSED_BUDGET, SUCCEEDED, FAILED, CANCELLED,
+  // UNKNOWN: as GetRun says.
+  string state = 5;
+  // ok (ended well, every step its task requires done; trouble along the way is in incidents),
+  // step_failed (ended, but a step's result changed its course, or a step its task requires has no
+  // accepted result), not_approved (ended without a write a person did not approve), failed,
+  // cancelled, terminated, waiting (for a person: next says how), stuck, running, unknown.
+  string verdict = 6;
+  // The cause's category: model_refused, model_invalid_output, model_error, tool_error, tool_denied,
+  // tool_server_failed, policy_denied, denied, loop_guard, budget_exhausted, approval_pending,
+  // approval_rejected, approval_expired, approval_edited, reconcile_pending, report_not_posted,
+  // step_missing, foreign_result (a result or a failure in Temporal's history that agentd did not
+  // send), dry_ran (a write only dry-run, in a run that is not a dry run), workflow_error,
+  // workflow_task_failed, worker_stopped, no_worker, agentd_stopped, activity_timeout, cancelled,
+  // terminated, history_unavailable (the history is gone, or longer than agentd reads),
+  // record_unreadable (agentd could not read its own record of how a call ended). Empty when nothing
+  // went wrong.
+  string kind = 7;
+  string activity_id = 8;           // the step's gateway call, as the workflow named it
+  string call = 9;                  // the call's name, e.g. audit_v1
+  int32 attempt = 10;               // the attempt the cause is of
+  string next = 11;                 // what to do next: for a wait, the agentctl command it waits for
+  repeated Incident incidents = 12; // trouble along the way, apart from the verdict, oldest first
+  repeated Evidence sources = 13;   // the evidence behind the verdict, each with where it is
+  Cost cost = 14;
+  repeated ModelUsage usage = 15;   // by model: what the run's model requests were billed
+  string claim = 16;                // the workflow's own words (its outcome, or its failure), as it wrote them: unchecked
+  // Sources that were not there, or not read: the run predates the audit log, Temporal no longer has
+  // it, the run's records past agentd's bound on what it reads.
+  repeated string missing = 17;
+  int32 incidents_omitted = 18;     // incidents beyond those listed
+}
+
+// Trouble a run met along the way: a retried attempt, a crash inferred from what it left, a wait for
+// budget or a reconciliation.
+message Incident {
+  string at = 1;                    // RFC 3339
+  string step = 2;
+  string activity_id = 3;
+  int32 attempt = 4;
+  string kind = 5;                  // as Explanation.kind
+  string cause = 6;
+  repeated Evidence evidence = 7;
+}
+
+// Where a piece of evidence is: an event of the run's history in Temporal, a record of the audit
+// log, or a row of another of agentd's tables.
+message Evidence {
+  string source = 1;                // temporal, audit or ledger
+  int64 event_id = 2;               // temporal: the event's ID
+  int64 seq = 3;                    // audit: the record's seq
+  string table = 4;                 // ledger: the table, e.g. model_calls
+  string key = 5;                   // ledger: the row's key
+  string what = 6;                  // what it shows
+}
+
+message Cost {
+  int64 spent_micros = 1;
+  int64 reserved_micros = 2;        // held by requests not settled yet
+  int64 limit_micros = 3;
+}
+
+// What the run's model requests to one model were billed, as the ledger records each request.
+message ModelUsage {
+  string model = 1;                 // provider/model, as billed
+  int64 requests = 2;               // network requests billed to it (a call may make several)
+  int64 input_tokens = 3;           // input that was neither written to nor read from the cache
+  int64 output_tokens = 4;
+  int64 cache_read_tokens = 5;
+  int64 cache_write_tokens = 6;
+  int64 refusals = 7;               // requests to it the model declined to answer
 }
 
 message VerifyAuditRequest {
@@ -295,4 +374,80 @@ message RunMismatch {
 message UnavailableRun {
   string run_id = 1;
   string why = 2;
+}
+
+message ExportAuditRequest {
+  string run_id = 1;                // this run's records and histories only; empty: the whole chain and every run
+}
+
+// One part of an export (agentctl audit export writes them as one JSON document), in order: each
+// execution's history; then, for the whole chain, the heads agentd pushed to the chain's anchor
+// workflows in Temporal; then the chain's head and every record up to it. A reader recomputes each
+// record's sha256 from its fields (internal/audit's Hash), checks each anchor's result_json against
+// its call record's result_sha256 and against the history, and each pushed head against the record
+// at its seq.
+message AuditExportPart {
+  oneof part {
+    AuditExportHead head = 1;
+    AuditRecord record = 2;
+    ExecutionHistory history = 3;
+    PushedHead pushed_head = 4;
+  }
+}
+
+// A head of the chain that agentd pushed to one of the chain's anchor workflows in Temporal (design
+// doc, section 8), out of reach of whoever can write the ledger: the record at seq had this sha256.
+message PushedHead {
+  string anchor_workflow_id = 1;
+  int64 seq = 2;
+  string sha256 = 3;
+}
+
+// The chain as the export found it: its head, and how many records it exports.
+message AuditExportHead {
+  int64 seq = 1;                    // the chain's head at export time: the last record exported is this one, unless cut
+  string sha256 = 2;
+  int64 records = 3;                // the records the export holds: every one to seq, or the run's
+  string exported_at = 4;           // RFC 3339
+  string run_id = 5;                // as asked; empty for the whole chain
+  // Why the export holds fewer records than the chain's (or the run's) up to seq: it stops before the
+  // record that would take it past agentd's bound on an export's size. Empty when it holds them all.
+  string cut = 6;
+}
+
+// A record of the audit log, with every field its sha256 covers.
+message AuditRecord {
+  int64 seq = 1;
+  string at = 2;
+  string workflow_id = 3;
+  string type = 4;
+  string actor = 5;
+  optional int64 peer_uid = 6;      // unset when NULL: hashed as the empty string
+  string payload = 7;               // the JSON text as hashed
+  string prev_sha256 = 8;
+  string sha256 = 9;
+}
+
+// One execution of a run, its history as agentd read it from Temporal, and the anchors in it: which
+// event carries which record (the _audit of a gateway call's result).
+message ExecutionHistory {
+  string run_id = 1;
+  string temporal_run_id = 2;
+  // The history's events in protojson (temporal.api.history.v1.History): agentd's encoding of what
+  // Temporal returned, not Temporal's own bytes. A reader with access to Temporal compares the events.
+  string history_json = 3;
+  repeated ExportedAnchor anchors = 4;
+  string unavailable = 5;           // why there is no history: Temporal no longer has it
+}
+
+message ExportedAnchor {
+  int64 event_id = 1;               // the ActivityTaskCompleted event that carries it
+  string activity_id = 2;
+  int32 attempt = 3;                // the attempt that completed the call
+  int64 seq = 4;                    // the record it names
+  string sha256 = 5;
+  // The bytes whose sha256 the call's record holds (result_sha256): the result's value_json, as the
+  // history holds it, without its _audit, as agentd encodes it (internal/audit's ResultJSON). Empty
+  // when the value cannot be read.
+  bytes result_json = 6;
 }

@@ -91,7 +91,10 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 			exec, cancel := detach(ctx, info)
 			defer cancel()
 			fx.Stall(exec.Done())
-			return r.Read(exec, req)
+			if fx.ToolError != "" {
+				return nil, &tools.RefusedError{Reason: fx.ToolError}
+			}
+			return r.Read(fx.InTool(exec), req)
 		})
 		if err != nil {
 			return toolError(t.Name(), err)
@@ -121,7 +124,7 @@ func toolError(tool string, err error) (*agentosv1.Result, error) {
 	var refused *tools.RefusedError
 	switch {
 	case errors.As(err, &denied):
-		return result(StatusDenied, map[string]any{"reason": denied.Reason})
+		return deny(audit.RefusedByTool, map[string]any{"reason": denied.Reason})
 	case errors.As(err, &refused) && !refused.Retryable:
 		return nil, temporal.NewNonRetryableApplicationError(fmt.Sprintf("tool %s: %s", tool, refused.Reason), "ToolFailed", nil)
 	}
@@ -136,7 +139,9 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 	rule *approvalRule, req tools.Request, canon []byte, fx faults.Effect) (*agentosv1.Result, error) {
 	e, err := g.Ledger.Q.GetEffect(ctx, req.EffectID)
 	if errors.Is(err, sql.ErrNoRows) {
-		if res, err := g.record(ctx, run, t, class, maxPerRun, rule, req, canon); res != nil || err != nil {
+		// Rendering the payload may call the git tool server (github.open_draft_pr reads the files its
+		// patch changes): a fault's hold in it goes with the context.
+		if res, err := g.record(fx.InTool(ctx), run, t, class, maxPerRun, rule, req, canon); res != nil || err != nil {
 			return res, err
 		}
 		e, err = g.Ledger.Q.GetEffect(ctx, req.EffectID)
@@ -256,7 +261,7 @@ func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class 
 		if n, err := g.writesBefore(ctx, run, t, req.EffectID, canon); err != nil {
 			return nil, err
 		} else if maxPerRun > 0 && n >= int64(maxPerRun) {
-			return result(StatusDenied, map[string]any{"reason": fmt.Sprintf(
+			return deny(audit.RefusedByPolicy, map[string]any{"reason": fmt.Sprintf(
 				"the run already has %d %s write(s); the policy allows %d per run", n, t.Name(), maxPerRun)})
 		}
 		card, err := g.describe(ctx, run, t, req, payload)
@@ -313,7 +318,7 @@ func (g *Gateway) record(ctx context.Context, run db.Run, t tools.Writer, class 
 	})
 	switch {
 	case errors.Is(err, errAtLimit):
-		return result(StatusDenied, map[string]any{"reason": fmt.Sprintf(
+		return deny(audit.RefusedByPolicy, map[string]any{"reason": fmt.Sprintf(
 			"the run already has %d %s write(s); the policy allows %d per run", already, t.Name(), maxPerRun)})
 	case errors.Is(err, errChanged):
 		return nil, nil
@@ -710,8 +715,18 @@ func (g *Gateway) effectResult(ctx context.Context, e db.Effect) (*agentosv1.Res
 		return nil, temporal.NewNonRetryableApplicationError(fmt.Sprintf("tool %s failed: %s", e.Tool, e.Reason.String), "ToolFailed", nil)
 	case effectUnknown:
 		return result(StatusNeedsReconcile, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
-	case effectAbandoned, effectDenied:
-		return result(StatusDenied, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
+	case effectDenied: // the tool refused the payload
+		return deny(audit.RefusedByTool, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
+	case effectAbandoned:
+		// Never sent: the run's cancel kept it back (one that landed after Invoke read the run, as
+		// the write found it), or agentd did.
+		by := audit.RefusedByAgentd
+		if cancelled, err := g.runCancelled(ctx, e.WorkflowID); err != nil {
+			return nil, err
+		} else if cancelled {
+			by = audit.RefusedByCancel
+		}
+		return deny(by, map[string]any{"effect_id": e.EffectID, "reason": e.Reason.String})
 	case effectAwaitingApproval:
 		return result(StatusNeedsApproval, map[string]any{"effect_id": e.EffectID})
 	}

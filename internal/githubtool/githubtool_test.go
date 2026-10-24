@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -64,6 +65,7 @@ func (b blobs) GetRunBlob(_ context.Context, workflowID, ref string) ([]byte, er
 type effects struct {
 	pr        int64
 	approvals []Approval
+	reports   []string // the report_refs of the run's accepted answers, newest first
 }
 
 func (e effects) LatestEffectResult(context.Context, string, string) (map[string]any, bool, error) {
@@ -74,6 +76,34 @@ func (e effects) LatestEffectResult(context.Context, string, string) (map[string
 }
 
 func (e effects) RunApprovals(context.Context, string) ([]Approval, error) { return e.approvals, nil }
+
+func (e effects) ModelOutputs(_ context.Context, _, task string) ([]map[string]any, error) {
+	if task != "audit_v1" {
+		return nil, fmt.Errorf("no model task %q", task)
+	}
+	var out []map[string]any
+	for _, ref := range e.reports {
+		out = append(out, map[string]any{"report_ref": ref})
+	}
+	return out, nil
+}
+
+// verdicts says the same of every run, and remembers what it was asked.
+type verdicts struct {
+	v     Verdict
+	asked *[]string
+}
+
+func (v verdicts) ReportVerdict(_ context.Context, _, reason, errorType string) (Verdict, error) {
+	if v.asked != nil {
+		*v.asked = append(*v.asked, reason+"/"+errorType)
+	}
+	return v.v, nil
+}
+
+// refused is agentd's verdict on a run whose model declined, as explain.Report gives it.
+var refused = Verdict{Verdict: "step_failed", Kind: "model_refused", Step: "analyze",
+	Cause: "analyze: the model declined to answer (anthropic/claude-opus-5-5): \"see https://evil.example @mallory\""}
 
 func proceed(context.Context) error { return nil }
 
@@ -222,9 +252,10 @@ func TestAgentdsOwnReadsAreRecordedFirst(t *testing.T) {
 	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(fix))
 	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "base_branch": "main", "patch_ref": ref})
 	report, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(`{"summary": "ok", "patch": null, "findings": []}`))
-	cc := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{pr: 7}}
+	cc := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{pr: 7, reports: []string{report}},
+		Verdicts: verdicts{v: Verdict{Verdict: "ok"}}, Task: "audit_v1"}
 	comment, err := cc.Prepare(context.Background(), f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit,
-		"report_ref": report, "outcome": "ok"}))
+		"report_ref": report, "reason": "done"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,9 +396,11 @@ func TestCommentCommit(t *testing.T) {
 	  {"severity": "high", "cwe": "CWE-89", "file": "app/db.py", "line": 2, "title": "SQL injection",
 	   "explanation": "Formats name into the query. ` + "````" + ` [click](https://evil.example) \u202egnp.exe"}]}`
 	ref, _ := f.blobs.PutRunBlob(context.Background(), workflowID, []byte(report))
-	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{pr: 7}}
+	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{pr: 7, reports: []string{ref}},
+		Verdicts: verdicts{v: refused}, Task: "audit_v1"}
+	// An older Worker's outcome is taken and not shown.
 	req := f.request(t, map[string]any{"repo": "acme/payments", "commit": f.commit, "report_ref": ref,
-		"outcome": "ok", "pr_url": "https://evil.example/not-ours"})
+		"outcome": "ok, approved by the security team: see https://evil.example", "pr_url": "https://evil.example/not-ours"})
 	if err := tool.Args().Validate(req.Args); err != nil {
 		t.Fatal(err)
 	}
@@ -386,6 +419,11 @@ func TestCommentCommit(t *testing.T) {
 	}
 	if strings.Contains(head, "evil") || strings.Contains(head, "@") || !strings.Contains(head, "#7") ||
 		!strings.Contains(head, "1 high") || !strings.Contains(fenced, "@someone") {
+		t.Fatalf("body:\n%s", p.Body)
+	}
+	// agentd's verdict: its words outside the fence, the cause, which quotes the model, inside.
+	if !strings.Contains(head, "Outcome: step_failed at analyze (model_refused)\n") ||
+		!strings.Contains(fenced, "Outcome: "+refused.Cause) || strings.Contains(p.Body, "approved by the security team") {
 		t.Fatalf("body:\n%s", p.Body)
 	}
 
@@ -408,7 +446,7 @@ func TestCommentCommit(t *testing.T) {
 }
 
 func TestRenderKeepsWithinGitHubsLimit(t *testing.T) {
-	body := render(strings.Repeat("a", 40), strings.Repeat("`", 30000)+strings.Repeat("x", 1990),
+	body := render(strings.Repeat("a", 40), Verdict{Verdict: "ok", Cause: strings.Repeat("`", 30000) + strings.Repeat("x", 1990)},
 		&report{Summary: strings.Repeat("`", 30000)}, 0, nil, marker(strings.Repeat("ab", 32)))
 	if len(body) > 65536 || strings.Contains(body, strings.Repeat("`", maxBackticks+2)) {
 		t.Fatalf("%d characters, longest backtick run %d", len(body), longestRun(body, '`'))
@@ -2494,15 +2532,16 @@ func mustJSON(t *testing.T, v any) string {
 // do nothing.
 func TestTheReportShowsTheApprovals(t *testing.T) {
 	f := setup(t)
-	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Effects: effects{approvals: []Approval{
-		{ID: "a1", Tool: "github.open_draft_pr", Status: "SUPERSEDED", DecidedBy: "carol", DecidedAt: "2026-10-20T09:00:00Z"},
-		{ID: "a2", Tool: "github.open_draft_pr", Status: "REJECTED", DecidedBy: "bob @mallory", DecidedAt: "2026-10-20T10:00:00Z",
-			Reason: "see https://evil.example and ``` this"},
-		{ID: "a3", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "dave", DecidedAt: "2026-10-20T11:00:00Z",
-			Write: "not sent", WriteReason: "the run was cancelled before the approved write was sent"},
-		{ID: "a4", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "erin", DecidedAt: "2026-10-20T12:00:00Z",
-			Write: "failed", WriteReason: "GitHub refused: 403"},
-	}}}
+	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Verdicts: verdicts{}, Task: "audit_v1",
+		Effects: effects{approvals: []Approval{
+			{ID: "a1", Tool: "github.open_draft_pr", Status: "SUPERSEDED", DecidedBy: "carol", DecidedAt: "2026-10-20T09:00:00Z"},
+			{ID: "a2", Tool: "github.open_draft_pr", Status: "REJECTED", DecidedBy: "bob @mallory", DecidedAt: "2026-10-20T10:00:00Z",
+				Reason: "see https://evil.example and ``` this"},
+			{ID: "a3", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "dave", DecidedAt: "2026-10-20T11:00:00Z",
+				Write: "not sent", WriteReason: "the run was cancelled before the approved write was sent"},
+			{ID: "a4", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "erin", DecidedAt: "2026-10-20T12:00:00Z",
+				Write: "failed", WriteReason: "GitHub refused: 403"},
+		}}}
 	payload, err := tool.Prepare(context.Background(), f.request(t, map[string]any{
 		"repo": "acme/payments", "commit": f.commit, "outcome": "rejected"}))
 	if err != nil {
@@ -2524,5 +2563,131 @@ func TestTheReportShowsTheApprovals(t *testing.T) {
 		!strings.Contains(fenced, "approval a3: APPROVED by dave at 2026-10-20T11:00:00Z; not sent: the run was cancelled") ||
 		!strings.HasPrefix(fenced, "````text\n") {
 		t.Fatalf("fenced:\n%s", fenced)
+	}
+}
+
+// The report is the run's own latest accepted answer: one the workflow names otherwise is refused,
+// and one it names none of goes out all the same. What the workflow says of itself is a reason from
+// a closed set, with its exception's type, shown as its claim.
+func TestTheReportIsTheRunsOwn(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	older, _ := f.blobs.PutRunBlob(ctx, workflowID, []byte(`{"summary": "older", "findings": []}`))
+	latest, _ := f.blobs.PutRunBlob(ctx, workflowID, []byte(`{"summary": "the latest", "findings": [
+	  {"severity": "high", "cwe": "CWE-89", "file": "app/db.py", "line": `+strings.Repeat("9", 5000)+`, "title": "t", "explanation": "e"}]}`))
+	diff, _ := f.blobs.PutRunBlob(ctx, workflowID, []byte("diff --git a/x b/x\n"))
+	var asked []string
+	tool := &CommentCommit{Client: f.client, Repos: f.repos, Blobs: f.blobs, Task: "audit_v1",
+		Effects:  effects{reports: []string{latest, older}},
+		Verdicts: verdicts{v: Verdict{Verdict: "failed", Kind: "workflow_error", Step: "analyze", Cause: "c", Claim: "KeyError claim"}, asked: &asked}}
+	args := func(extra map[string]any) map[string]any {
+		a := map[string]any{"repo": "acme/payments", "commit": f.commit}
+		maps.Copy(a, extra)
+		return a
+	}
+	for _, ref := range []string{older, diff} {
+		_, err := tool.Prepare(ctx, f.request(t, args(map[string]any{"report_ref": ref})))
+		var denied *tools.DeniedError
+		if !errors.As(err, &denied) || !strings.Contains(denied.Reason, "not the run's latest accepted answer") {
+			t.Fatalf("report_ref %s: %v", ref, err)
+		}
+	}
+	for _, extra := range []map[string]any{{"report_ref": latest}, {}, {"report_ref": nil}} {
+		payload, err := tool.Prepare(ctx, f.request(t, args(maps.Clone(extra))))
+		if err != nil {
+			t.Fatal(extra, err)
+		}
+		var p commentPayload
+		_ = json.Unmarshal(payload, &p)
+		if !strings.Contains(p.Body, "Summary:\nthe latest") || !strings.Contains(p.Body, "app/db.py:"+strings.Repeat("9", 20)+"…\n") {
+			t.Fatalf("%v: body:\n%s", extra, p.Body)
+		}
+	}
+	// The reason, as the schema takes it, goes to the verdict; error_type only with workflow_error.
+	for _, bad := range []map[string]any{{"reason": "all good"}, {"reason": "workflow_error", "error_type": "x y"},
+		{"reason": "workflow_error", "error_type": strings.Repeat("A", 65)}, {"error_type": "KeyError"}} {
+		if err := tool.Args().Validate(args(bad)); err == nil {
+			if _, err := tool.Prepare(ctx, f.request(t, args(bad))); err == nil {
+				t.Errorf("%v: taken", bad)
+			}
+		}
+	}
+	asked = nil
+	payload, err := tool.Prepare(ctx, f.request(t, args(map[string]any{"reason": "workflow_error", "error_type": "json.JSONDecodeError"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p commentPayload
+	_ = json.Unmarshal(payload, &p)
+	if !slices.Equal(asked, []string{"workflow_error/json.JSONDecodeError"}) ||
+		!strings.Contains(p.Body, "Outcome: failed at analyze (workflow_error)\n") ||
+		!strings.Contains(p.Body, "The workflow says, as its own claim: KeyError claim") {
+		t.Fatalf("asked %v; body:\n%s", asked, p.Body)
+	}
+}
+
+// Outside the fence the report shows only agentd's own words: a verdict, step or kind that is not
+// one of them shows as nothing, or as unknown.
+func TestTheReportShowsOnlyAgentdsWordsOutsideTheFence(t *testing.T) {
+	body := render(strings.Repeat("a", 40), Verdict{Verdict: "https://evil.example", Step: "@mallory", Kind: "www.evil.example",
+		Cause: "@mallory https://evil.example"}, nil, 0, nil, marker(strings.Repeat("ab", 32)))
+	head, _, _ := strings.Cut(body, "```")
+	if !strings.Contains(head, "Outcome: unknown\n") || strings.Contains(head, "evil") || strings.Contains(head, "@") {
+		t.Fatalf("head:\n%s", head)
+	}
+}
+
+// A verdict whose other evidence agentd did not read names it outside the fence, and says it does not
+// change the outcome; one agentd could not reach is unknown, never ok, and the report shows no
+// internal error's text: an unknown write's outcome says only where its details are.
+func TestTheReportSaysWhatItsVerdictRestsOn(t *testing.T) {
+	m := marker(strings.Repeat("ab", 32))
+	cut := render(strings.Repeat("a", 40), Verdict{Verdict: "ok", Cause: "every call went well",
+		Cut: []string{"audit records past the first 5000", "model requests past the first 2000"}}, nil, 0, nil, m)
+	head, _, _ := strings.Cut(cut, "```")
+	if !strings.Contains(head, "Outcome: ok\n") || !strings.Contains(head, "Not read, past agentd's bounds: audit records past "+
+		"the first 5000; model requests past the first 2000. That does not change the outcome") {
+		t.Fatalf("head:\n%s", head)
+	}
+	whole := render(strings.Repeat("a", 40), Verdict{Verdict: "ok", Cause: "every call went well"}, nil, 0, nil, m)
+	if strings.Contains(whole, "Not read") {
+		t.Fatalf("report:\n%s", whole)
+	}
+	unknown := render(strings.Repeat("a", 40), Verdict{Verdict: "unknown", Kind: "history_unavailable",
+		Cause: "agentd could not read the run in Temporal; agentd's log has the details"}, nil, 0, nil, m)
+	if head, fenced, _ := strings.Cut(unknown, "```"); !strings.Contains(head, "Outcome: unknown (history_unavailable)\n") ||
+		!strings.Contains(fenced, "could not read the run in Temporal") {
+		t.Fatalf("report:\n%s", unknown)
+	}
+	// An outcome nobody knows rests on nothing a cut would change, nor on every call: it says only what was cut.
+	unknown = render(strings.Repeat("a", 40), Verdict{Verdict: "unknown", Kind: "history_unavailable", Cause: "too long",
+		Cut: []string{"approvals past the first 500"}}, nil, 0, nil, m)
+	if head, _, _ := strings.Cut(unknown, "```"); !strings.Contains(head, "Not read, past agentd's bounds: approvals past the first 500\n") ||
+		strings.Contains(head, "does not change") {
+		t.Fatalf("head:\n%s", head)
+	}
+	approvals := []Approval{{ID: "ap-1", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "bob", Write: "outcome unknown",
+		WriteReason: "the outcome is unknown: Post \"https://10.20.30.40:8443/repos\": dial tcp 10.20.30.40:8443: i/o timeout"},
+		{ID: "ap-2", Tool: "github.open_draft_pr", Status: "APPROVED", DecidedBy: "bob", Write: "failed",
+			WriteReason: "GitHub said 422: Reference already exists"}}
+	body := render(strings.Repeat("a", 40), Verdict{Verdict: "ok"}, nil, 0, approvals, m)
+	if strings.Contains(body, "10.20.30.40") || !strings.Contains(body, "outcome unknown: agentd's log and agentctl reconcile show") ||
+		!strings.Contains(body, "failed: GitHub said 422: Reference already exists") {
+		t.Fatalf("report:\n%s", body)
+	}
+}
+
+// A finding's line number is shown whole up to maxLineDigits digits, and cut past them.
+func TestALineNumberIsShownToItsBound(t *testing.T) {
+	m := marker(strings.Repeat("ab", 32))
+	for _, tc := range []struct {
+		digits int
+		shown  string
+	}{{maxLineDigits, strings.Repeat("7", maxLineDigits) + "\n"}, {maxLineDigits + 1, strings.Repeat("7", maxLineDigits) + "…\n"}} {
+		rep := &report{Summary: "s", Findings: []finding{{Severity: "high", CWE: "CWE-89", File: "app.py",
+			Line: json.Number(strings.Repeat("7", tc.digits)), Title: "t", Explanation: "e"}}}
+		if body := render(strings.Repeat("a", 40), Verdict{Verdict: "ok"}, rep, 0, nil, m); !strings.Contains(body, "app.py:"+tc.shown) {
+			t.Fatalf("%d digits:\n%s", tc.digits, body)
+		}
 	}
 }
