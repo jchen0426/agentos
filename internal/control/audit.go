@@ -407,22 +407,31 @@ func terminatedOutside(workflowID, runID string, last *historypb.HistoryEvent) *
 }
 
 // terminatedByAgentd reports whether the run's records hold agentd's run.terminating of execution
-// runID, or its run.terminated (alone in the records of an agentd from before run.terminating).
+// runID that no run.terminate_failed of it closed (Temporal did not terminate it then), or its
+// run.terminated (alone in the records of an agentd from before run.terminating).
 func terminatedByAgentd(ctx context.Context, q *db.Queries, workflowID, runID string) (bool, error) {
 	records, err := q.ListRunAuditRecords(ctx, workflowID)
 	if err != nil {
 		return false, err
 	}
+	asked := false // a run.terminating of it, not closed since
 	for _, r := range records {
 		var p struct {
 			TemporalRunID string `json:"temporal_run_id"`
 		}
-		if (r.Type == "run.terminating" || r.Type == "run.terminated") && r.Actor == audit.Agentd &&
-			json.Unmarshal([]byte(r.Payload), &p) == nil && p.TemporalRunID == runID {
+		if r.Actor != audit.Agentd || json.Unmarshal([]byte(r.Payload), &p) != nil || p.TemporalRunID != runID {
+			continue
+		}
+		switch r.Type {
+		case "run.terminated":
 			return true, nil
+		case "run.terminating":
+			asked = true
+		case "run.terminate_failed":
+			asked = false
 		}
 	}
-	return false, nil
+	return asked, nil
 }
 
 // quote is s inside a visibility query's single quotes.

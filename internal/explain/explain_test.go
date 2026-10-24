@@ -380,6 +380,68 @@ func TestVerdicts(t *testing.T) {
 				seqs: []int64{seq}}
 		},
 	}, {
+		name: "agentd's termination Temporal did not do, and someone else's after it",
+		world: func(w *world) want {
+			w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s", "temporal_run_id": "exec-1"})
+			seq := w.rec("run.terminate_failed", audit.Agentd, map[string]any{"temporal_run_id": "exec-1",
+				"error": "rpc error: code = Unavailable desc = connection refused"})
+			w.terminated("mine now", "mallory@laptop")
+			w.start("agentd.started", audit.Agentd, nil)
+			return want{verdict: VerdictTerminated, kind: KindTerminated, cause: []string{
+				"the run was terminated, not by agentd as far as its records go: agentd asked Temporal to terminate it (cancel " +
+					`not honoured within 1m0s), which Temporal did not: "rpc error: code = Unavailable desc = connection refused"`},
+				seqs: []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if !strings.Contains(e.GetClaim(), `terminated by "mallory@laptop": "mine now"`) {
+					t.Errorf("claim %q", e.GetClaim())
+				}
+			})
+		},
+	}, {
+		name: "agentd asked Temporal to terminate the run, kept running, and started again much later",
+		world: func(w *world) want {
+			seq := w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s",
+				"temporal_run_id": "exec-1"})
+			w.other("run-2", "call", map[string]any{"activity_id": "1:x", "attempt": 1, "status": "ok"}) // its agentd went on
+			w.terminated("mine now", "mallory@laptop")
+			w.start("agentd.started", audit.Agentd, nil)
+			return want{verdict: VerdictTerminated, kind: KindTerminated, cause: []string{
+				"agentd asked Temporal to terminate the run (cancel not honoured within 1m0s), and has no record of how that went"},
+				seqs: []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if strings.Contains(e.GetCause(), "agentd terminated") || !strings.Contains(e.GetClaim(), `"mallory@laptop"`) {
+					t.Errorf("cause %q, claim %q", e.GetCause(), e.GetClaim())
+				}
+			})
+		},
+	}, {
+		name: "terminated by agentd, the history's caller shown all the same",
+		world: func(w *world) want {
+			w.rec("run.terminating", audit.Agentd, map[string]any{"why": "agentd could not record the run", "temporal_run_id": "exec-1"})
+			seq := w.rec("run.terminated", audit.Agentd, map[string]any{"why": "agentd could not record the run", "temporal_run_id": "exec-1"})
+			w.terminated("agentd could not record the run", "4242@agentd-host@")
+			return want{verdict: VerdictTerminated, kind: KindTerminated, cause: []string{"agentd terminated the run"},
+				seqs: []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if !strings.Contains(e.GetClaim(), `terminated by "4242@agentd-host@"`) {
+					t.Errorf("claim %q", e.GetClaim())
+				}
+			})
+		},
+	}, {
+		name: "a cancelled run whose termination Temporal did not do",
+		world: func(w *world) want {
+			c := w.ok("git.show_diff")
+			w.cancel("operator:dave")
+			w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s", "temporal_run_id": "exec-1"})
+			seq := w.rec("run.terminate_failed", audit.Agentd, map[string]any{"temporal_run_id": "exec-1", "error": "refused"})
+			w.terminated("mine now", "mallory@laptop")
+			return want{verdict: VerdictCancelled, kind: KindCancelled, step: "fetch_diff", activity: c.id, attempt: 1,
+				cause: []string{`which Temporal did not: "refused": it was terminated after that, not by agentd as far as its records go`},
+				seqs:  []int64{seq}}.with(func(e *agentosv1.Explanation) {
+				if !strings.Contains(e.GetClaim(), `"mallory@laptop"`) {
+					t.Errorf("claim %q", e.GetClaim())
+				}
+			})
+		},
+	}, {
 		name: "agentd asked Temporal to terminate the run, and has no record of how that went",
 		world: func(w *world) want {
 			seq := w.rec("run.terminating", audit.Agentd, map[string]any{"why": "cancel not honoured within 1m0s",

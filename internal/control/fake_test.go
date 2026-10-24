@@ -45,7 +45,8 @@ type fakeTemporal struct {
 	status     enumspb.WorkflowExecutionStatus            // what DescribeWorkflowExecution says
 	statuses   map[string]enumspb.WorkflowExecutionStatus // by workflowID/runID: listed with this status
 	// onTerminate runs as TerminateWorkflow is asked, with the fake's lock held.
-	onTerminate func()
+	onTerminate  func()
+	terminateErr error // what TerminateWorkflow answers
 }
 
 type fakeRun struct {
@@ -94,7 +95,7 @@ func (f *fakeTemporal) TerminateWorkflow(_ context.Context, workflowID, _, _ str
 	if f.onTerminate != nil {
 		f.onTerminate()
 	}
-	return nil
+	return f.terminateErr
 }
 
 func (f *fakeTemporal) ListWorkflow(_ context.Context, req *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {

@@ -535,6 +535,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
   | run.refused | 操作者（workflow_id 为空串：没有建任务） | task、params、why | StartRun 拒绝启动时（任务不认识、参数解析失败、预算为负），自己一个事务 |
   | run.terminating | agentd | temporal_run_id、why | 第五轮：enforceCancel 或 StartRun 让 Temporal 终止执行之前，自己一个事务；写不进去也照样终止（这是取消的最后一招），verify 会报出来 |
   | run.terminated | agentd | temporal_run_id、why | 终止之后，自己一个事务（改的是 Temporal 的状态） |
+  | run.terminate_failed | agentd | temporal_run_id、error（按 `audit.Text` 截短） | B 搬到 main 之后加的：TerminateWorkflow 返回错误时，自己一个事务，不改任何表。它关上前面那条 run.terminating：verify 不再把这个执行算作 agentd 终止的，explain 也不说是 agentd 终止的 |
   | effect.recorded | run | effect_id、tool、class、payload_sha256、status；第五轮起还有 idempotency_key（重发时用的幂等键） | `record` 的事务 |
   | effect.claimed | agentd | effect_id、by、version | 领取 |
   | effect.sending | agentd | effect_id | `proceed`，每个外人看得到的请求之前 |
@@ -793,7 +794,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
    - 改法：Invoke 里 defer 一个 recover，把这次调用记下来（错误就是那个 panic），再把 panic 交给 SDK。记录因为故障没写成的（不只是 panic：写了几次都失败），单列在报告的 `attempts_unrecorded` 里，agentctl 以 2 退出，不是 1：不是有人改了账本，而是 agentd 自己没写成，日志里有。
    - 测试：网关里 panic 的工具留下 call 记录、带着 panic；写记录一直失败的尝试被记成故障；Control 里故障丢的记录单列、不算对不上；agentctl 的退出码（丢了记录为 2，同时有对不上为 1）。
 5. **Temporal 里被终止的执行，日志里看不出是谁终止的**（按代码指出）。
-   - 改法：见“做了什么”的“终止”和“我定的几处”的“终止先记后做”。verify 里 Temporal 说被终止的执行要有 run.terminating。
+   - 改法：见“做了什么”的“终止”和“我定的几处”的“终止先记后做”。verify 里 Temporal 说被终止的执行要有 run.terminating。（B 搬到 main 之后：这条 run.terminating 不能被 run.terminate_failed 关上，见 B 的“搬到 main 上”。）
    - 测试：Control 里没有 run.terminating 的终止报对不上；agentd 终止时，问 Temporal 的那一刻 run.terminating 已经在账本里，run.terminated 在它之后，之后 verify 通过。
 6. **改坏检查里活下来的几处**：
    - “只数 call.started 里最新的那次尝试”（control/audit.go:595）：第四轮把这段改成按任务算，代码已经没有了，去掉。
@@ -1431,3 +1432,18 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
    - 测试：`TestAnExportSaysWhichPushedHeadsItMayNotHold`（事件太多、放错的工作流、列表读不完，别的链的不算），`TestPushedCutIsBounded`。README 也说了。
 - **改坏**：这次改的 20 处，都有测试失败。第一遍有 3 处编译不过，换了写法。
 - **跑过的**：`go test` 跑了 explain、control、gateway、agentctl，`go vet ./...` 和 `gofmt -l` 都过。协调者的三套完整套件正在用这个工作区的 `bin/`，所以没有 make build，也没有跑黑盒，黑盒由协调者等套件跑完再跑。
+
+**自动提交审查（对 fca81c3，中危）之后**（730f68f 之后的一个提交）：
+
+- **问题**：后面任何一条 agentd.started 都会关上 run.terminating。比如这样一串：agentd 写下 run.terminating，它的 TerminateWorkflow 失败了，agentd 照常跑着，后来别人终止了运行，很久以后 agentd 重启。explain 就会说“agentd terminated the run”，把那个人藏起来了。
+- **改法**：
+  1. **记下失败**：`terminate` 里（enforceCancel 和 StartRun 都走它）TerminateWorkflow 返回错误时，写一条 `run.terminate_failed`：actor agentd，这个执行的 temporal_run_id，错误按 `audit.Text` 截短。它不改任何表，A 的重放照旧不管它不认识的类型。run.terminating 后面跟着它，就不是 agentd 的终止。A 的事件表里加了这一行。
+  2. **只有真的崩溃才关上**：agentd 下一次的 agentd.started 关上一条 run.terminating，只在两者之间没有那个 agentd 的别的记录时成立，也就是日志里紧接着它的下一条（seq + 1）就是那次启动，agentd 写完它就停了。不然怎么样了不知道，就说“agentd asked Temporal to terminate the run (<why>), and has no record of how that went”。run.terminate_failed 说的是“which Temporal did not: "<error>"”，运行是被别人终止的（就 agentd 的记录所知）。取消之后被终止的运行一样。
+  3. **另一方一定写出来**：只要历史里有终止事件，就把它的身份和原因当成调用方自己的说法，加引号写进 claim，agentd 自己也有记录的时候也一样。我没法只在“身份不是 agentd 的”时才写：agentd 的 Temporal 客户端没有设身份，用的是 SDK 默认的“pid@主机@”，explain 认不出哪个是 agentd 的。所以总是写，这样谁也藏不住。要只在不是 agentd 时写，得先给 agentd 的客户端设一个固定的身份，比如 A 的 agentd 身份，再把它记进 run.terminating。这个留给你定。
+  4. **verify 跟上**：`terminatedByAgentd` 按顺序读这个执行的记录：run.terminated 算；run.terminating 算，除非后面有它的 run.terminate_failed；别的执行的、不是 agentd 写的都不算。Temporal 说被终止、而 agentd 的那次被 run.terminate_failed 关上的执行，列进“terminated outside agentd”（不算对不上），带着历史里调用方的身份和原因。
+- **测试**：
+  - explain 的判定表加了四种：Temporal 没终止成、别人后来终止的；agentd 接着跑、很久以后才重启的；agentd 终止的、历史里的调用方照样写出来；取消之后 Temporal 没终止成的。被下一次启动紧接着关上的那一种照旧算 agentd 的。
+  - A 的 verify 加了 `TestVerifyAuditOfATerminationThatFailed`：假的 Temporal 让 TerminateWorkflow 失败，记录是 run.terminating、run.terminate_failed（带错误、截短），verify 把这个执行列为 agentd 之外终止的；后面一条单独的 run.terminated 又算 agentd 的。
+- **改坏**：12 处都有测试失败（verify 3 处、`terminate` 2 处、explain 7 处）。第一遍有 2 处编译不过，换了写法。
+- **跑过的**：`go test ./...`、`go vet ./...`、`gofmt -l`。黑盒由协调者跑。
+

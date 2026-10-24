@@ -251,30 +251,30 @@ It walks the chain, checks each run's results and the pushed heads against the r
 for the runs Temporal lists and the audit log records as well as the ledger's, and compares the
 ledger's tables, and the bytes of every blob, with what the records say. It exits 0 when all of it
 was checked and matches, 1 on any mismatch, 3 when it could not verify at all, and 2 when some runs
-could not be checked: Temporal no longer keeps their histories (`--allow-unavailable` accepts
-that; keep the namespace's retention at 7 days or more, or agentd warns at start), they were made
-before the audit log began (`--allow-before-log` accepts those), or a fault lost a call's record
-after its `call.started` (agentd's log says which; once agentd restarts, the attempt counts as cut
-short). agentd records each termination before it asks Temporal for it: an execution Temporal says
-was terminated with no such record was ended outside agentd, from Temporal's UI or CLI, or by
-Temporal itself (a workflow task too large for it). That changes nothing in the ledger, so it is no
-mismatch and does not change the exit status; the report lists it, with when, and who its caller
-said it was and why, which is that caller's own word. The pushed heads go to
-workflows named by the chain's key, its first record's sha256; another chain's workflows in the
-namespace are a mismatch, since a chain rewritten from its first record has a new key and leaves
-the old one's behind. Each head names the agentd that pushed it, by the sha256 of its Worker's task
-queue and its data directory as the file system resolves it: no ledger says that. A chain that
-pushed after this one's first push, by Temporal's times, is a second agentd beside this one:
-`--allow-chain <key>` (as often as needed) accepts it, which the mismatch suggests when its heads
-name another agentd; when they name this one, two ledgers of one agentd were live at once, which
-no flag accepts. Any other chain, whatever agentd its heads name (a name that comes from
-configuration), is of a ledger replaced: a reset, or a rewrite from its first record, which only
-you can tell apart. Its mismatch says when each chain pushed and suggests no flag; `--allow-chain`
-does not accept it, `--allow-replaced-ledger <key>` does (the reset above). So does a second
-agentd's chain that has not pushed since this one began. A head pushed
-after a higher one is a mismatch too: agentd pushes them in order, so the ledger went backwards
-in between. The report names the tables it does not check, and why: the outbox, which holds the
-runs' doorbells only, and the schema's own two, which agentd checks as it opens the ledger.
+could not be checked: Temporal no longer keeps their histories (`--allow-unavailable` accepts that;
+keep the namespace's retention at 7 days or more, or agentd warns at start), they were made before
+the audit log began (`--allow-before-log` accepts those), or a fault lost a call's record after its
+`call.started` (agentd's log says which; once agentd restarts, the attempt counts as cut short).
+agentd records each termination before it asks Temporal for it, and records it if Temporal does not
+do it: an execution Temporal says was terminated with no such record, or only with one Temporal did
+not do, was ended outside agentd, from Temporal's UI or CLI, or by Temporal itself (a workflow task
+too large for it). That changes nothing in the ledger, so it is no mismatch and does not change the
+exit status; the report lists it, with when, and who its caller said it was and why, which is that
+caller's own word. The pushed heads go to workflows named by the chain's key, its first record's
+sha256; another chain's workflows in the namespace are a mismatch, since a chain rewritten from its
+first record has a new key and leaves the old one's behind. Each head names the agentd that pushed
+it, by the sha256 of its Worker's task queue and its data directory as the file system resolves it:
+no ledger says that. A chain that pushed after this one's first push, by Temporal's times, is a
+second agentd beside this one: `--allow-chain <key>` (as often as needed) accepts it, which the
+mismatch suggests when its heads name another agentd; when they name this one, two ledgers of one
+agentd were live at once, which no flag accepts. Any other chain, whatever agentd its heads name (a
+name that comes from configuration), is of a ledger replaced: a reset, or a rewrite from its first
+record, which only you can tell apart. Its mismatch says when each chain pushed and suggests no
+flag; `--allow-chain` does not accept it, `--allow-replaced-ledger <key>` does (the reset above). So
+does a second agentd's chain that has not pushed since this one began. A head pushed after a higher
+one is a mismatch too: agentd pushes them in order, so the ledger went backwards in between. The
+report names the tables it does not check, and why: the outbox, which holds the runs' doorbells
+only, and the schema's own two, which agentd checks as it opens the ledger.
 
 agentd opens a ledger only when SQLite finds its file sound (`PRAGMA quick_check`) and its schema
 is the one its migrations make, row for row of `sqlite_master`, SQLite's own objects too (only the

@@ -245,9 +245,9 @@ func (f *facts) readRecords() {
 			f.calls = append(f.calls, x)
 		case "run.cancelled":
 			f.cancel = x
-		case "run.terminating", "run.terminated":
+		case "run.terminating", "run.terminated", "run.terminate_failed":
 			// agentd's termination of the run's execution: run.terminating before it asked Temporal,
-			// run.terminated after (an agentd killed between leaves the first alone, as verify allows).
+			// then run.terminated, or run.terminate_failed when Temporal did not (termination).
 			if x.actor == audit.Agentd && (x.execution == "" || x.execution == f.in.Run.RunID.String) {
 				f.terminations = append(f.terminations, x)
 			}
@@ -898,24 +898,45 @@ func (f *facts) current() *step {
 	return f.lastStep()
 }
 
-// termination is agentd's latest termination of the run's execution, and whether its records say it
-// was done: its run.terminated, after Temporal did it; or its run.terminating, before agentd asked,
-// closed by a later start of agentd (the agentd that asked stopped before it could record the rest),
-// as verify reads them. A run.terminating alone says agentd asked, not how that went.
-func (f *facts) termination() (t *rec, done bool) {
-	if len(f.terminations) == 0 {
-		return nil, false
-	}
-	t = f.terminations[len(f.terminations)-1]
-	if t.typ == "run.terminated" {
-		return t, true
-	}
-	for _, x := range f.starts {
-		if x.seq > t.seq {
-			return t, true
+// What agentd's records say of its latest termination of the run's execution (termination).
+const (
+	terminationDone    = "done"    // run.terminated; or run.terminating, and agentd stopped right after it
+	terminationFailed  = "failed"  // run.terminating, then run.terminate_failed: Temporal did not
+	terminationUnknown = "unknown" // run.terminating, and nothing of how it went
+)
+
+// termination is agentd's latest termination of the run's execution, by its records: what it asked
+// (the run.terminating, or a run.terminated alone, of an agentd from before run.terminating), how
+// that went, and the run.terminate_failed when Temporal did not. A run.terminating is closed by its
+// run.terminated, or by its run.terminate_failed; or by agentd's next start only when no other record
+// of the agentd that wrote it comes between them (the next record of the log is that start: agentd
+// stopped right after it asked). Otherwise how it went is not known: agentd kept running, and
+// recorded nothing of it.
+func (f *facts) termination() (t *rec, outcome string, failed *rec) {
+	for _, x := range f.terminations {
+		switch x.typ {
+		case "run.terminating":
+			t, outcome, failed = x, "", nil
+		case "run.terminate_failed":
+			if t != nil && outcome == "" {
+				outcome, failed = terminationFailed, x
+			}
+		case "run.terminated":
+			if t == nil || outcome != "" {
+				t = x
+			}
+			outcome, failed = terminationDone, nil
 		}
 	}
-	return t, false
+	if t == nil || outcome != "" {
+		return t, outcome, failed
+	}
+	for _, x := range f.starts {
+		if x.seq == t.seq+1 {
+			return t, terminationDone, nil
+		}
+	}
+	return t, terminationUnknown, nil
 }
 
 // pendingAttempt is the attempt of the step under way, as Temporal describes it: 0 when it is not.

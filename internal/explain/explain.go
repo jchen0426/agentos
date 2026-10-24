@@ -376,18 +376,20 @@ func (f *facts) cancelled(e *agentosv1.Explanation, st enumspb.WorkflowExecution
 	e.Verdict, e.Kind = VerdictCancelled, KindCancelled
 	e.Cause = f.whoCancelled(e)
 	if st == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED {
-		switch t, done := f.termination(); {
-		case t != nil && done:
+		switch t, outcome, failed := f.termination(); {
+		case t == nil:
+			e.Cause += "; it was terminated after that, not by agentd"
+		case outcome == terminationDone:
 			e.Cause += fmt.Sprintf("; it did not stop in time, and agentd terminated it (%s)", t.why)
-			e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-		case t != nil:
+		case outcome == terminationFailed:
+			e.Cause += fmt.Sprintf("; it did not stop in time, and agentd asked Temporal to terminate it (%s), which Temporal "+
+				"did not%s: it was terminated after that, not by agentd as far as its records go", t.why, quoted(": ", failed.err))
+		default:
 			e.Cause += fmt.Sprintf("; it did not stop in time, and agentd asked Temporal to terminate it (%s), and has no "+
 				"record of how that went", t.why)
-			e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-			f.terminatedClaim(e)
-		default:
-			e.Cause += "; it was terminated after that, not by agentd"
 		}
+		f.terminationSources(e)
+		f.terminatedClaim(e)
 	}
 	if s := f.current(); s != nil {
 		e.Cause += fmt.Sprintf("; it was at %s", s.step)
@@ -413,25 +415,39 @@ func (f *facts) whoCancelled(e *agentosv1.Explanation) string {
 // someone else's, whose reason is theirs to claim.
 func (f *facts) terminated(e *agentosv1.Explanation) {
 	e.Verdict, e.Kind = VerdictTerminated, KindTerminated
-	switch t, done := f.termination(); {
-	case t != nil && done:
-		e.Cause = "agentd terminated the run: " + t.why
-		e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-	case t != nil:
-		// agentd asked, and its record of the outcome is missing: Temporal may have refused it, and
-		// someone else have terminated the run since. Who did is the history's word, their claim.
-		e.Cause = fmt.Sprintf("agentd asked Temporal to terminate the run (%s), and has no record of how that went", t.why)
-		e.Sources = append(e.Sources, auditSource(t.seq, t.typ+": "+t.why))
-		f.terminatedClaim(e)
-	default:
+	switch t, outcome, failed := f.termination(); {
+	case t == nil:
 		e.Cause = "the run was terminated, not by agentd: agentd has no record of it"
-		f.terminatedClaim(e)
+	case outcome == terminationDone:
+		e.Cause = "agentd terminated the run: " + t.why
+	case outcome == terminationFailed:
+		e.Cause = fmt.Sprintf("the run was terminated, not by agentd as far as its records go: agentd asked Temporal to "+
+			"terminate it (%s), which Temporal did not%s", t.why, quoted(": ", failed.err))
+	default:
+		// agentd asked, and kept running without a record of the outcome: Temporal may have refused
+		// it, and someone else have terminated the run since.
+		e.Cause = fmt.Sprintf("agentd asked Temporal to terminate the run (%s), and has no record of how that went", t.why)
 	}
+	f.terminationSources(e)
+	// Who did it is the history's word, its caller's own claim, shown whoever agentd's records say
+	// it was: so that someone else is never hidden behind agentd's record.
+	f.terminatedClaim(e)
 	if s := f.current(); s != nil {
 		e.Cause += fmt.Sprintf("; it was at %s", s.step)
 		f.point(e, s)
 	}
 	f.sourceClose(e)
+}
+
+// terminationSources are agentd's records of its termination of the run's execution, as evidence.
+func (f *facts) terminationSources(e *agentosv1.Explanation) {
+	for _, x := range f.terminations {
+		what := x.typ + ": " + x.why
+		if x.typ == "run.terminate_failed" {
+			what = x.typ + ": " + x.err
+		}
+		e.Sources = append(e.Sources, auditSource(x.seq, what))
+	}
 }
 
 // terminatedClaim is who the history says terminated the run, and why: the caller's own words.

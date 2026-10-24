@@ -218,17 +218,23 @@ func (s *Server) RecoverStarts(ctx context.Context) error {
 }
 
 // terminate has Temporal end an execution, and records it. The change is Temporal's, so its records
-// have transactions of their own: run.terminating before agentd asks, run.terminated after.
-// verify takes every terminated execution for agentd's only with a run.terminating of it, and an
-// agentd killed between the two leaves that one behind, which the next agentd.started closes. A
-// termination is the cancel's last resort: one whose run.terminating cannot be written goes ahead
-// all the same, and verify reports it.
+// have transactions of their own: run.terminating before agentd asks, run.terminated after, or
+// run.terminate_failed when Temporal did not (the run may be terminated later, by someone else).
+// verify takes every terminated execution for agentd's only with a run.terminating of it that no
+// run.terminate_failed closed, and an agentd killed between the two leaves that one behind, which
+// the next agentd.started closes. A termination is the cancel's last resort: one whose
+// run.terminating cannot be written goes ahead all the same, and verify reports it.
 func (s *Server) terminate(ctx context.Context, workflowID, runID, why string) error {
 	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminating",
 		Actor: audit.Agentd, Payload: map[string]any{"temporal_run_id": runID, "why": audit.Text(why)}}); err != nil {
 		s.Log.Error("terminating a run without its record", "workflow_id", workflowID, "error", err)
 	}
 	if err := s.Temporal.TerminateWorkflow(ctx, workflowID, runID, why); err != nil {
+		if _, rerr := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID,
+			Type: "run.terminate_failed", Actor: audit.Agentd,
+			Payload: map[string]any{"temporal_run_id": runID, "error": audit.Text(err.Error())}}); rerr != nil {
+			s.Log.Error("could not record a termination that failed", "workflow_id", workflowID, "error", rerr)
+		}
 		return err
 	}
 	if _, err := audit.Record(context.WithoutCancel(ctx), s.Ledger, audit.Event{WorkflowID: workflowID, Type: "run.terminated",
