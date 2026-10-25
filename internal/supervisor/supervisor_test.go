@@ -710,7 +710,7 @@ func TestTheDrainEnds(t *testing.T) {
 // stops the supervisor in the window a timing rarely hits: once the delay before the second
 // generation is over (so pause has gone by), before its launcher starts.
 func TestNoGenerationAfterStop(t *testing.T) {
-	s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond}, "AGENTOS_TEST_PLAN=re")
+	s, l, r, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond}, "AGENTOS_TEST_PLAN=re")
 	stopped := make(chan struct{})
 	s.beforeStart = func(n int) {
 		if n != 2 {
@@ -733,6 +733,117 @@ func TestNoGenerationAfterStop(t *testing.T) {
 	}
 	if n := len(l.entries("worker started")); n != 1 {
 		t.Errorf("%d generations started, the last after Stop: %v", n, l.entries(""))
+	}
+	// Nor is the start that Stop prevented taken for one that failed: one record, of the first's exit.
+	if events, _ := r.all(); len(events) != 1 || len(l.entries("could not start the Worker")) != 0 {
+		t.Errorf("records %v, logs %v", events, l.entries(""))
+	}
+}
+
+// The defaults are the ones Timing's comments, and README.md, give.
+func TestTheDefaults(t *testing.T) {
+	want := Timing{ReadyWithin: time.Minute, BackoffMin: time.Second, BackoffMax: time.Minute, ResetAfter: time.Minute,
+		StopGrace: 5 * time.Second, TermGrace: time.Second, RecordEvery: time.Minute, Drain: 5 * time.Second}
+	if got := (Timing{}).withDefaults(); got != want {
+		t.Errorf("%+v, want %+v", got, want)
+	}
+}
+
+// listFDs, in sh, prints the shell's open file descriptors of 0 to 40, without opening one.
+const listFDs = `for fd in $(seq 0 40); do [ -e /dev/fd/$fd ] && printf "%s " $fd; done; echo`
+
+// The Worker gets stdin (its stop channel), stdout and stderr, and fd 3 with a lifeline: nothing else
+// of agentd's. A child agentd starts beside it gets none of either pipe's ends, so the stop channel
+// ends for the Worker while that child still runs.
+func TestTheWorkerGetsNoOtherFiles(t *testing.T) {
+	for _, lifeline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lifeline %v", lifeline), func(t *testing.T) {
+			var l logs
+			s := New(Options{Argv: []string{"/bin/sh", "-c", "printf 'fds: '; " + listFDs + "; echo 'worker ready'; exec cat >/dev/null"},
+				Env: []string{"PATH=/usr/bin:/bin"}, Dir: t.TempDir(), Lifeline: lifeline,
+				Log: slog.New(slog.NewJSONHandler(&l, nil)), Timing: Timing{StopGrace: 3 * time.Second}})
+			t.Cleanup(s.Stop)
+			s.Start()
+			readied(t, s)
+			// A child of agentd's own, started while the generation runs, as a git tool server is.
+			sibling := exec.Command("/bin/sh", "-c", "printf 'fds: '; "+listFDs+"; exec sleep 30")
+			sibling.Env = []string{"PATH=/usr/bin:/bin"}
+			out, err := sibling.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sibling.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = sibling.Process.Kill()
+				_ = sibling.Wait()
+			})
+			theirs, err := bufio.NewReader(out).ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			s.Stop() // while the sibling runs
+			took := time.Since(start)
+			want := "fds: 0 1 2"
+			if lifeline {
+				want += " 3"
+			}
+			var mine string
+			for _, e := range l.entries("worker output") {
+				if line, _ := e["line"].(string); strings.HasPrefix(line, "fds:") {
+					mine = strings.TrimSpace(line)
+				}
+			}
+			if mine != want {
+				t.Errorf("the Worker's files: %q, want %q", mine, want)
+			}
+			if theirs = strings.TrimSpace(theirs); theirs != "fds: 0 1 2" {
+				t.Errorf("the sibling's files: %q, want %q", theirs, "fds: 0 1 2")
+			}
+			if took > 2*time.Second || len(l.entries("the Worker did not stop when asked: SIGTERM")) != 0 {
+				t.Errorf("the stop channel did not end for the Worker while the sibling ran: Stop took %s", took)
+			}
+		})
+	}
+}
+
+// openFiles counts this process's open file descriptors, without opening one to count them.
+func openFiles() int {
+	n := 0
+	for fd := range 4096 {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// Each generation's files are closed once it is over, whether it exited or was stopped: generations
+// that crash, one after another, leave agentd no more files open than it had before them.
+func TestEachGenerationClosesItsFiles(t *testing.T) {
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	var l logs
+	s := New(Options{Argv: []string{bin}, Env: []string{helperEnv + "=planned", "AGENTOS_TEST_FILE=" + filepath.Join(dir, "report"), root(),
+		"AGENTOS_TEST_PLAN=re,re,re,re,re,ready"}, Lifeline: true, PIDFile: filepath.Join(dir, "worker.pid"),
+		Log: slog.New(slog.NewJSONHandler(&l, nil)), Timing: Timing{BackoffMin: 10 * time.Millisecond, BackoffMax: 10 * time.Millisecond}})
+	t.Cleanup(s.Stop)
+	if r, w, err := os.Pipe(); err == nil { // the runtime's poller opens a descriptor of its own with the first pipe
+		r.Close()
+		w.Close()
+	}
+	before := openFiles()
+	s.Start()
+	readied(t, s)
+	wait(t, "the sixth generation", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 6 })
+	s.Stop()
+	if after := openFiles(); after > before {
+		t.Errorf("%d files open after five generations exited and a sixth was stopped, %d before", after, before)
 	}
 }
 

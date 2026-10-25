@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -61,11 +62,24 @@ func TestDevConfigLoads(t *testing.T) {
 		w.Python != filepath.Join(repo, ".venv") || w.Code != filepath.Join(repo, "python") || w.Workflows != DefaultWorkflows {
 		t.Errorf("worker: %+v", w)
 	}
-	if _, err := os.Stat(filepath.Join(repo, ".venv/bin/python")); err == nil { // made by uv sync
+	// The dev Worker as agentd checks it on macOS, where the check applies: to a .venv (made by uv sync)
+	// whose Python is outside the home directory, as python.org's and Homebrew's are. A Python under
+	// $HOME (uv's own) is refused on macOS, as it should be; elsewhere the check is not macOS's.
+	t.Run("the dev Worker", func(t *testing.T) {
+		python := filepath.Join(repo, ".venv/bin/python")
+		real, err := filepath.EvalSymlinks(python)
+		if err != nil {
+			t.Skipf("no dev Worker to check: %v", err)
+		}
+		home, _ := os.UserHomeDir()
+		realHome, _ := filepath.EvalSymlinks(home)
+		if runtime.GOOS != "darwin" || home != "" && (within(real, home) || within(real, realHome)) {
+			t.Skipf("%s leads to %s: the macOS check applies on macOS, to a Python outside $HOME (%s)", python, real, home)
+		}
 		if err := c.CheckWorker("darwin", true); err != nil {
 			t.Errorf("the dev Worker: %v", err)
 		}
-	}
+	})
 	if _, err := policy.Load(c.PolicyFile); err != nil {
 		t.Error(err)
 	}
@@ -527,12 +541,12 @@ func TestCheckWorker(t *testing.T) {
 	// A home directory with a Python in it, as uv keeps its own; a venv elsewhere whose python leads
 	// there; and a code directory at home with a venv inside it.
 	t.Setenv("HOME", filepath.Join(dir, "home"))
-	for _, d := range []string{"home/.local/python/bin", "homevenv/bin", "home/code/venv/bin"} {
+	for _, d := range []string{"home/.local/python/bin", "homevenv/bin", "home/code/venv/bin", "home/code/runtime/bin", "codevenv/bin"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, f := range []string{"home/.local/python/bin/python3.12", "home/code/venv/bin/python3.12"} {
+	for _, f := range []string{"home/.local/python/bin/python3.12", "home/code/venv/bin/python3.12", "home/code/runtime/bin/python3.12"} {
 		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -541,6 +555,10 @@ func TestCheckWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("python3.12", filepath.Join(dir, "home/code/venv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
+	// A venv outside the home directory whose python leads into the code directory, at home.
+	if err := os.Symlink(filepath.Join(dir, "home/code/runtime/bin/python3.12"), filepath.Join(dir, "codevenv/bin/python")); err != nil {
 		t.Fatal(err)
 	}
 	load := func(body string) *Config {
@@ -598,6 +616,8 @@ func TestCheckWorker(t *testing.T) {
 		"macOS, a Python at home, unsandboxed":  {"data_dir: data\n" + tcp + "worker: {python: homevenv, code: code}\n", "darwin", false, ""},
 		"Linux, a Python at home":               {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: homevenv, code: code}\n", "linux", true, ""},
 		"macOS, a Python in the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: home/code/venv, code: home/code}\n", "darwin", true, ""},
+		"macOS, a Python leading into the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: codevenv, code: home/code}\n",
+			"darwin", true, ""},
 	} {
 		err := load(c.body).CheckWorker(c.goos, c.sandboxed)
 		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {

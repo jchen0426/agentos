@@ -1854,3 +1854,57 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - 就绪和期限同时到达时的竞争：期限的那一支可能先被选中。
 - 输出里任何一行带 "worker ready" 都算就绪：工作流或 Worker 自己能提前打开这道门（只影响 agentd 什么时候说自己就绪）。
 - Linux 上 agentd 如果在启动脚本扫描目录的那几秒里死了，bwrap 起来时父进程已经是 init，PDEATHSIG 设在了 init 上，永远不会触发；这时只能靠停止通道（诚实的 Worker）或下一个 agentd 的清扫。
+
+### 第三轮（704bb9f 之上）
+
+三种完整套件（你跑的，704bb9f，`--verify-after-each`）：none 296 通过、31 跳过；srt 322 通过、5 跳过；bwrap 309 通过、18 跳过；verify 都没有失败。停止通道在 bwrap 下也管用。第二轮的两份审查都没有中等及以上的问题。下面是最后一小轮：生产代码只改了 Worker 的那一段（`python/agentos_worker/__main__.py`），其余是测试和这份笔记。
+
+- **R2-1. 在途任务的测试原来证明不了停止通道**：把停止通道整个去掉（N1），它照样通过：5 秒的 StopGrace 比 1 秒的停顿长，任务自己做完、报上去，SIGTERM 5 秒后才来。现在加了两条断言：
+  - Worker 自己的 SDK 那一行 "Beginning worker shutdown" 在 `SLOW_HELD` 之前：只有停止通道能让它在停顿结束之前就开始停；
+  - agentd 没有打 "the Worker did not stop when asked: SIGTERM"。
+
+  docstring 跟着改了。黑盒改坏 N1：srt、none 下都在顺序那一条断言上失败。
+- **R2-2. 启动时停止通道已经结束**：
+  - 你给的办法是 `watch_stop_channel` 之后让出一次（`await asyncio.sleep(0)`），再查 `stop.is_set()`。实测（macOS，kqueue）让出一次不够：事件循环在同一轮里先恢复让出的任务，后跑 reader，让出一次之后 stop 还没设，让出两次才设。Linux 的 epoll 走的是同一个 `_run_once`，结果一样。
+  - 所以改成：`watch_stop_channel` 注册 reader 之后，用 `select.select([0], [], [], 0)` 同步看一眼，可读就当场调一次 reader，是 EOF 就当场设 stop。`main` 在 `async with worker` 之前查 `stop.is_set()`（启动时来的信号也算），设了就打一行 "worker stopped before it polled" 返回，不 poll。
+  - 测试：手动起的 Worker，stdin 是写端已经关掉的管道：以 0 退出，打了那一行，没有 "worker ready"。改坏（去掉提前返回；去掉同步看的那一眼）测试都失败。
+- **R2-3. stdin 是 /dev/null**：`add_reader(0)` 在 kqueue 上是 EINVAL，在 epoll 上是 EPERM，Worker 原来直接崩。现在捕获 OSError，打一行 warning，不盯 stdin，只有信号能停它。
+  - 测试：手动起的 Worker，`--stop-on-stdin-eof`，stdin 是 /dev/null：那一行只出现一次，照常服务（一次运行成功）。改坏（不捕获）测试失败。
+  - 记一笔：macOS 的 kqueue 接受普通文件，stdin 是文件时，Worker 读到文件尾就停；Linux 的 epoll 不接受，走上面的 warning。没人这样用。
+- **R2-4. `TestDevConfigLoads`**：它不管在哪台机器上都按 macOS 的规则查 dev 配置的 Python，`.venv` 的 Python 在 `$HOME` 下（uv 自己的 Python，Linux 的 CI 上常见）就失败。现在这一条挪进子测试，只在 macOS、`.venv` 的 Python 不在 `$HOME` 下时查，否则跳过并说明原因；后面的检查照跑。
+- **fd 的测试**（Go）：
+  - `TestTheWorkerGetsNoOtherFiles`：Worker 只有 0、1、2，有生命线时加 3；agentd 同时起的另一个子进程（像 git 工具服务器）只有 0、1、2；那个子进程还在跑时，停止通道照样对 Worker 结束（Stop 不到 2 秒，没有 SIGTERM）。办法照安全审查的 scratch 测试：sh 列 /dev/fd。改坏：把写端也交给 Worker（N16），抓到。
+  - `TestEachGenerationClosesItsFiles`：五代崩掉、第六代被停之后，测试进程打开的 fd 不比之前多（用 fcntl 数，不开新的 fd）。杀掉 N9（cleanup 不关停止通道的写端），以及另外两个：cleanup 不关生命线的写端、launch 不关自己那份读端。
+- **顺带钉住的几个审查留下的改坏**：
+  - N7、N8（StopGrace、TermGrace 的默认值）：`TestTheDefaults`；
+  - N13（errStopped 被当成启动失败）：`TestNoGenerationAfterStop` 多查一条，只有第一代的退出记录，没有 "could not start the Worker"；
+  - Y4（只把 python 目录当可读）：CheckWorker 加一个用例，venv 在家目录外、Python 通到家目录里的 code 目录，照收。
+
+#### 还剩的（第三轮之后）
+
+- **审查留下的低**，两处都是放过去以后在启动时失败，失败是关着的：
+  - 家目录换了大小写的写法（APFS 不分大小写，`/Users/JoeChen` 和 `/Users/joechen` 是同一个目录）：`within` 按字节比，认不出 Python 在家目录下，就放过去了。启动脚本跑起来时沙箱读不到它，Worker 起不来，agentd 报第一个 Worker 没起来，自己也退出。
+  - `--copies` 建的 venv：bin/python 是复制来的，不是符号链接，顺着找不到家目录里的基础 Python（标准库在那里），同样放过去，启动时失败。
+- **审查的改坏里活下来的**：
+  - S12（不 LockOSThread）：只在 Linux 上有影响，而且要 Go 运行时恰好退掉启动 bwrap 的那个线程（一个 goroutine 锁着线程结束时才会这样），测试没法让它按时发生。靠注释和 go#27505。
+  - N7、N8：现在被 `TestTheDefaults` 钉住。黑盒里 frozen 的停止用例（5 ≤ took < 20）本来也钉着它们，只有 N8 在 bwrap 下例外：bwrap 吃了 SIGTERM 就死。
+  - N10（查 stop 和启动之间不加锁）：窗口在“查 stop”和 `cmd.Start` 之间，只有几微秒。测试的钩子在查之前；钩子要是放进锁里，对的代码会死锁（Stop 要拿那把锁）。靠锁和注释。
+  - N13：现在钉住了，见上。
+  - O2（关闭时不走 `stopInOrder`）：Go 的测试只测 `stopInOrder` 本身；黑盒的停止用例按日志核对 "worker stopped" 在 "the Runtime entry is closed" 之前，抓得到。
+  - O4（worker.exited 走 refusals 的队列）：只有队列丢东西时才看得出来（`dropped` 记到别的记录上），测试不会把队列塞满，main.go 的接线也没有单元测试。靠两个队列分开的名字和注释。
+  - Y4：现在钉住了，见上。
+- **不理 EOF 的 Worker 现在最多有 6 秒**：5 秒的 StopGrace，再 1 秒的 TermGrace，然后 SIGKILL；原来是 5 秒。agentd 的关闭最多也就慢这么多。
+- **逃出进程组的子进程也读到 EOF**：停止通道的读端被 Worker 起的所有进程继承，setsid 或两次 fork 逃出去的也一样，agentd 关掉写端或者死掉时，它们也读到 EOF。诚实的会停，不诚实的可以不理：这不是隔离。另一面，它们拿着读端，也挡不住 Worker 读到 EOF：EOF 只看写端，写端只有 agentd 有。
+
+#### 第三轮跑过的
+
+- **改坏检查**：Go 新的 8 处（N9、cleanup 不关生命线的写端、launch 不关自己那份读端、N16、N7、N8、N13、Y4）都抓到。黑盒 4 处都抓到：N1 在 srt、none 下；Worker 的三处（不提前返回、不同步看那一眼、不捕获 `add_reader` 的错误）在 none 下。
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。ruff 只报三处原来就有的（生成的 proto 两处，T16 一个没用上的 import），没动。
+- macOS，`test_worker_supervision.py`，`--verify-after-each`，两种环境同时跑；bwrap 和 Linux VM 由你跑：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 20 | 3 | 20 | 15 | 0 | 5 |
+  | macOS，srt | 23 | 0 | 21 | 15 | 0 | 6 |
+
+  跑完没有留下 Worker、agentd 或状态目录。
