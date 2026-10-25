@@ -17,6 +17,11 @@ from temporalio.client import Client
 from temporalio.service import HttpConnectProxyConfig
 from temporalio.worker import Worker
 
+# Workflow tasks at once, and so the threads the SDK runs them on: unset, its executor may grow to
+# 500 threads (its slots are 100), on top of one thread a CPU for the SDK's core. The sandbox's
+# task limit (M5 C3) counts threads.
+MAX_WORKFLOW_TASKS = 100
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="agentos-worker", description=__doc__.splitlines()[0])
@@ -64,7 +69,7 @@ async def main() -> None:
     # Sticky execution off: the Runtime proxy refuses sticky queues, whose names the Worker
     # picks and Temporal does not tie to a task queue. Each workflow task replays the history.
     worker = Worker(client, task_queue=args.task_queue, workflows=load_workflows(args.workflows),
-                    max_cached_workflows=0)
+                    max_cached_workflows=0, max_concurrent_workflow_tasks=MAX_WORKFLOW_TASKS)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
