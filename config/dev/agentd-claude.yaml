@@ -12,3 +12,8 @@ repos:
 # agentd reads repositories through the git tool server, run per call in this sandbox (macOS;
 # on Linux, ../../sandbox/linux/run-tool.sh). It needs `npm ci` in sandbox/macos.
 git_tools: {sandbox: [../../sandbox/macos/run-tool.sh]}
+# agentd starts the Worker itself, in this sandbox (macOS; on Linux, ../../sandbox/linux/run-worker.sh,
+# with the unix:// Runtime socket), and starts it again whenever it exits. It needs `npm ci` in
+# sandbox/macos, and a Python outside the home directory, which the sandbox cannot read: the
+# environment's bin/python must lead there. With --no-worker agentd starts none (README).
+worker: {sandbox: [../../sandbox/macos/run-worker.sh], python: ../../.venv, code: ../../python}

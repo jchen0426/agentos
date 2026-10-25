@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -38,6 +39,8 @@ type Config struct {
 	// written anywhere.
 	GitHub   *GitHub  `yaml:"github"`
 	GitTools GitTools `yaml:"git_tools"`
+	// Worker is how agentd runs the Python Worker, unless it is started with --no-worker.
+	Worker Worker `yaml:"worker"`
 	// How long a cancelled run may keep running before agentd terminates it: Temporal's
 	// cancel is a request the workflow can ignore.
 	CancelGrace time.Duration `yaml:"cancel_grace"`
@@ -95,6 +98,31 @@ type GitTools struct {
 	// ../sandbox/linux/run-tool.sh. Leaving it out needs agentd's --insecure-dev.
 	Sandbox []string      `yaml:"sandbox"`
 	Timeout time.Duration `yaml:"timeout"` // per call; default 60s
+}
+
+// DefaultWorkflows is what a Worker serves when the configuration does not say.
+const DefaultWorkflows = "agentos_worker.workflows:WORKFLOWS"
+
+// Worker is how agentd runs the Python Worker: through its sandbox launcher, once the Runtime
+// entry serves, and again whenever it exits.
+type Worker struct {
+	// Sandbox is the launcher and its leading arguments: ../sandbox/macos/run-worker.sh or
+	// ../sandbox/linux/run-worker.sh. Leaving it out needs agentd's --insecure-dev.
+	Sandbox []string `yaml:"sandbox"`
+	// Python is the Worker's Python environment, a virtual environment: <python>/bin/python runs
+	// the Worker. Code is its code directory, its working directory and where it imports from. The
+	// Worker can read all of both.
+	Python string `yaml:"python"`
+	Code   string `yaml:"code"`
+	// Workflows is what the Worker serves, module:attribute (a list, or one workflow class);
+	// DefaultWorkflows when left out.
+	Workflows string `yaml:"workflows"`
+	// DenyRead lists more paths the macOS sandbox keeps from the Worker, on top of the launcher's
+	// own rules and what agentd denies of itself. Linux mounts only what the Worker is given.
+	DenyRead []string `yaml:"deny_read"`
+	// Limits is kept for the Worker's resource limits, which this agentd does not set yet: a
+	// configuration that names any is refused rather than taken for enforced.
+	Limits map[string]any `yaml:"limits"`
 }
 
 type Temporal struct {
@@ -227,6 +255,20 @@ func Load(path string) (*Config, error) {
 	if len(c.GitTools.Sandbox) > 0 {
 		c.GitTools.Sandbox[0] = abs(c.GitTools.Sandbox[0])
 	}
+	w := &c.Worker
+	if len(w.Sandbox) > 0 {
+		w.Sandbox[0] = abs(w.Sandbox[0])
+	}
+	w.Python, w.Code = abs(w.Python), abs(w.Code)
+	for i, p := range w.DenyRead {
+		w.DenyRead[i] = abs(p)
+	}
+	if w.Workflows == "" {
+		w.Workflows = DefaultWorkflows
+	}
+	if len(w.Limits) > 0 {
+		return nil, fmt.Errorf("config %s: worker.limits: this agentd sets no limits on the Worker yet; leave it out", path)
+	}
 	if tildeErr != nil {
 		return nil, fmt.Errorf("config %s: %w", path, tildeErr)
 	}
@@ -277,24 +319,7 @@ func Load(path string) (*Config, error) {
 // doc, section 8). A mirror may be inside one of them: the dev configs keep theirs in the data
 // directory.
 func (c *Config) checkMirrors() error {
-	type named struct {
-		what   string
-		mirror bool   // a repo's mirror
-		repo   string // whose mirror it is
-		place
-	}
-	paths := []named{{what: "the data directory", place: locate(c.DataDir)},
-		{what: "the Control socket's directory", place: locate(filepath.Dir(c.ControlSocket))}}
-	if p, ok := strings.CutPrefix(c.RuntimeListen, "unix://"); ok {
-		paths = append(paths, named{what: "the Runtime socket's directory", place: locate(filepath.Dir(p))})
-	}
-	if t := c.Temporal.TLS; t != nil {
-		paths = append(paths, named{what: "the Temporal client certificate", place: locate(t.CertFile)},
-			named{what: "the Temporal client key", place: locate(t.KeyFile)})
-	}
-	for _, id := range slices.Sorted(maps.Keys(c.Repos)) {
-		paths = append(paths, named{what: "repo " + id + "'s mirror", mirror: true, repo: id, place: locate(c.Repos[id].Mirror)})
-	}
+	paths := c.private()
 	for _, p := range paths {
 		if p.err != nil && len(c.Repos) > 0 {
 			return fmt.Errorf("cannot tell where %s %s leads, to check it against the mirrors: %w", p.what, p.path, p.err)
@@ -319,6 +344,108 @@ func (c *Config) checkMirrors() error {
 					m.repo, m.path, p.what, p.path, via)
 			}
 		}
+	}
+	return nil
+}
+
+// named is one of the paths agentd keeps from the sandboxes, and what it is.
+type named struct {
+	what   string
+	mirror bool   // a repo's mirror
+	repo   string // whose mirror it is
+	place
+}
+
+// private is what the git tool server and the Worker must not read, located: agentd's data
+// directory, its sockets' directories, the Temporal client certificate and key (what agentd's
+// toolDenyRead denies), and every repo's mirror.
+func (c *Config) private() []named {
+	paths := []named{{what: "the data directory", place: locate(c.DataDir)},
+		{what: "the Control socket's directory", place: locate(filepath.Dir(c.ControlSocket))}}
+	if p, ok := strings.CutPrefix(c.RuntimeListen, "unix://"); ok {
+		paths = append(paths, named{what: "the Runtime socket's directory", place: locate(filepath.Dir(p))})
+	}
+	if t := c.Temporal.TLS; t != nil {
+		paths = append(paths, named{what: "the Temporal client certificate", place: locate(t.CertFile)},
+			named{what: "the Temporal client key", place: locate(t.KeyFile)})
+	}
+	for _, id := range slices.Sorted(maps.Keys(c.Repos)) {
+		paths = append(paths, named{what: "repo " + id + "'s mirror", mirror: true, repo: id, place: locate(c.Repos[id].Mirror)})
+	}
+	return paths
+}
+
+// workflowsSpec is module:attribute, as the Worker's --workflows takes it.
+var workflowsSpec = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$`)
+
+// CheckWorker refuses a Worker agentd cannot run as the configuration says, on the platform goos,
+// sandboxed (worker.sandbox is set) or not; agentd checks it unless it runs no Worker. The Worker can
+// read all of its Python environment and code directory: neither may hold anything agentd keeps
+// from it (private), by whatever name. And its launcher reaches the Runtime entry only one way: on
+// macOS through a loopback port on 127.0.0.1, on Linux through the socket, whose directory it mounts.
+func (c *Config) CheckWorker(goos string, sandboxed bool) error {
+	w := c.Worker
+	if w.Python == "" || w.Code == "" {
+		return errors.New("worker.python and worker.code are required (or start agentd with --no-worker and run a Worker yourself)")
+	}
+	if !workflowsSpec.MatchString(w.Workflows) {
+		return fmt.Errorf("worker.workflows: %q is not module:attribute", w.Workflows)
+	}
+	held := c.private()
+	for _, d := range []struct{ what, path string }{{"worker.python", w.Python}, {"worker.code", w.Code}} {
+		dir := locate(d.path)
+		if dir.err != nil {
+			return fmt.Errorf("%s: cannot tell where %s leads: %w", d.what, d.path, dir.err)
+		}
+		for _, p := range held {
+			if p.err != nil {
+				return fmt.Errorf("cannot tell where %s %s leads, to check it against %s: %w", p.what, p.path, d.what, p.err)
+			}
+			if dir.holds(p.place) {
+				via := ""
+				if !within(p.path, dir.path) {
+					via = fmt.Sprintf(" (real paths: %s, %s)", dir.real, p.real)
+				}
+				return fmt.Errorf("%s %s holds %s %s%s, and the Worker may read all of it", d.what, d.path, p.what, p.path, via)
+			}
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(w.Python, "bin", "python")); err != nil || fi.IsDir() {
+		return fmt.Errorf("worker.python: %s/bin/python does not run the Worker: %v", w.Python, err)
+	}
+	if fi, err := os.Stat(w.Code); err != nil || !fi.IsDir() {
+		return fmt.Errorf("worker.code: %s is not a directory: %v", w.Code, err)
+	}
+	if sandboxed {
+		if _, err := os.Stat(w.Sandbox[0]); err != nil {
+			return fmt.Errorf("worker.sandbox: %w", err)
+		}
+	}
+	socket, unixListen := strings.CutPrefix(c.RuntimeListen, "unix://")
+	hostport, tcpListen := strings.CutPrefix(c.RuntimeListen, "tcp://")
+	host, _, _ := net.SplitHostPort(hostport)
+	switch {
+	case !sandboxed && !tcpListen:
+		return fmt.Errorf("runtime_listen %s: a Worker without a sandbox reaches the Runtime entry by host:port only: "+
+			"give it tcp://127.0.0.1:<port>", c.RuntimeListen)
+	case !sandboxed:
+	case goos == "darwin" && (!tcpListen || host != "127.0.0.1"):
+		return fmt.Errorf("runtime_listen %s: the macOS launcher lets the Worker reach 127.0.0.1:<port> only: "+
+			"give it tcp://127.0.0.1:<port>", c.RuntimeListen)
+	case goos == "linux" && !unixListen:
+		return fmt.Errorf("runtime_listen %s: the Linux sandbox has no network, and its launcher forwards to a socket: "+
+			"give it unix:///<path>", c.RuntimeListen)
+	case goos == "linux":
+		// The launcher mounts the socket's directory into the sandbox, all of it.
+		dir := locate(filepath.Dir(socket))
+		for _, p := range held[:2] { // the data directory and the Control socket's
+			if dir.holds(p.place) {
+				return fmt.Errorf("runtime_listen %s: the Linux launcher mounts the socket's directory into the Worker's "+
+					"sandbox, and it holds %s %s: give the socket a directory of its own", c.RuntimeListen, p.what, p.path)
+			}
+		}
+	case goos != "darwin":
+		return fmt.Errorf("worker.sandbox: agentd has no Worker launcher for %s", goos)
 	}
 	return nil
 }
