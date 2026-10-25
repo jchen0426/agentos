@@ -2,6 +2,14 @@
 // session of its own, started again whenever it exits, and stopped before agentd closes the
 // Runtime entry. Each run of the Worker is a generation. There is no liveness probe: the tests stop
 // a Worker on purpose (SIGSTOP), and a stopped Worker is left so.
+//
+// Each generation's stdin is its stop channel: a pipe whose write end only this process holds
+// (close-on-exec) and never writes. Closing it asks the Worker to stop (agentos_worker's
+// --stop-on-stdin-eof): it finishes the workflow tasks it holds and reports them through the
+// Runtime entry, which still serves. Signals cannot do that through a launcher: srt drops every
+// connection it proxies, the Worker's included, before it passes SIGTERM on, and bwrap dies of
+// SIGTERM, the sandbox with it. The channel also closes when agentd dies, however it ends: an
+// honest Worker then stops by itself, on every platform.
 package supervisor
 
 import (
@@ -40,7 +48,8 @@ type Timing struct {
 	BackoffMin  time.Duration // the first restart's delay, doubled for each next: 1 s
 	BackoffMax  time.Duration // and at most this: 60 s
 	ResetAfter  time.Duration // a generation up this long starts the delays over: 60 s
-	StopGrace   time.Duration // between SIGTERM and SIGKILL: 5 s
+	StopGrace   time.Duration // between closing the stop channel and SIGTERM: 5 s
+	TermGrace   time.Duration // between SIGTERM and SIGKILL: 1 s
 	RecordEvery time.Duration // at most one record of an exit this often: 1 min
 	Drain       time.Duration // for the output's end, once the process group is gone: 5 s
 }
@@ -50,8 +59,8 @@ func (t Timing) withDefaults() Timing {
 		v   *time.Duration
 		def time.Duration
 	}{{&t.ReadyWithin, 60 * time.Second}, {&t.BackoffMin, time.Second}, {&t.BackoffMax, 60 * time.Second},
-		{&t.ResetAfter, 60 * time.Second}, {&t.StopGrace, 5 * time.Second}, {&t.RecordEvery, time.Minute},
-		{&t.Drain, 5 * time.Second}} {
+		{&t.ResetAfter, 60 * time.Second}, {&t.StopGrace, 5 * time.Second}, {&t.TermGrace, time.Second},
+		{&t.RecordEvery, time.Minute}, {&t.Drain, 5 * time.Second}} {
 		if *f.v <= 0 {
 			*f.v = f.def
 		}
@@ -60,7 +69,8 @@ func (t Timing) withDefaults() Timing {
 }
 
 // Output limits: the Worker writes what it likes, and agentd's log holds what agentd says. Every
-// line is read (a Worker never waits for agentd to read its output), and what is logged is cut.
+// line is read as it comes, so that the Worker waits no longer than agentd takes to read it (it
+// writes as if its pipe were in blocking mode, whatever srt makes of it), and what is logged is cut.
 const (
 	maxLine        = 2 << 10 // bytes of a line logged; the rest is cut
 	linesPerSecond = 20      // lines logged, in bursts of as many
@@ -98,7 +108,7 @@ type Supervisor struct {
 	lines *rate.Limiter
 
 	stopOnce sync.Once
-	stop     chan struct{} // closed by Stop
+	stop     chan struct{} // closed by Stop, under mu: launch starts no generation once it is
 	done     chan struct{} // closed once the loop has returned
 	ready    chan struct{} // closed once the first generation is ready
 	failed   chan error    // why the first generation never was
@@ -106,7 +116,9 @@ type Supervisor struct {
 	mu      sync.Mutex
 	started bool
 	gen     int
-	pid     int
+	pid     int // the running generation's launcher; 0 between generations
+	starts  int // generations started, and how many had when stop closed (tests)
+	atStop  int
 
 	outMu     sync.Mutex
 	dropped   int         // lines not logged since the last one logged
@@ -142,7 +154,8 @@ func (s *Supervisor) Ready() <-chan struct{} { return s.ready }
 // first, or did not say it was ready in time and was stopped. No generation follows it.
 func (s *Supervisor) Failed() <-chan error { return s.failed }
 
-// Current is the running generation and its launcher's pid: 0 for none yet.
+// Current is the last generation started, and its launcher's pid while it runs: 0 for none yet, and
+// 0 between generations.
 func (s *Supervisor) Current() (generation, pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -150,14 +163,19 @@ func (s *Supervisor) Current() (generation, pid int) {
 }
 
 // Stop stops the supervisor, before agentd closes the Runtime entry: no generation starts after it,
-// and the running one gets SIGTERM, then after the grace SIGKILL with its whole process group.
-// Then its state directory goes, and its pid file. It returns once all of that is done. A nil
-// Supervisor stops at once.
+// and the running one is asked to stop (its stop channel closes); after the grace it gets SIGTERM,
+// then SIGKILL with its whole process group. Then its state directory goes, and its pid file. It
+// returns once all of that is done. A nil Supervisor stops at once.
 func (s *Supervisor) Stop() {
 	if s == nil {
 		return
 	}
-	s.stopOnce.Do(func() { close(s.stop) })
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		close(s.stop)
+		s.atStop = s.starts
+		s.mu.Unlock()
+	})
 	s.mu.Lock()
 	started := s.started
 	s.mu.Unlock()
@@ -174,6 +192,7 @@ type generation struct {
 	started  time.Time
 	state    string   // its state directory, if any
 	lifeline *os.File // the lifeline's write end, if any
+	stopper  *os.File // the stop channel's write end; nil once closed
 	out      *os.File // the read end of its stdout and stderr
 
 	ready      chan struct{} // closed by the reader at the ready mark
@@ -193,6 +212,9 @@ func (s *Supervisor) loop() {
 			return
 		}
 		g, err := s.launch(n)
+		if errors.Is(err, errStopped) {
+			return
+		}
 		if err != nil {
 			at := time.Now()
 			if n == 1 {
@@ -299,6 +321,9 @@ func (s *Supervisor) next(prev, ran time.Duration) time.Duration {
 	return min(2*prev, s.t.BackoffMax)
 }
 
+// errStopped is launch's answer once Stop has been called: it starts no generation then.
+var errStopped = errors.New("the supervisor stopped")
+
 // launch starts generation n.
 func (s *Supervisor) launch(n int) (*generation, error) {
 	if len(s.o.Argv) == 0 {
@@ -320,8 +345,15 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 		return nil, err
 	}
 	g.out = out
+	stdin, stopper, err := os.Pipe() // the stop channel: agentd holds the write end, close-on-exec
+	if err != nil {
+		w.Close()
+		s.discard(g)
+		return nil, err
+	}
+	g.stopper = stopper
 	cmd := exec.Command(s.o.Argv[0], s.o.Argv[1:]...)
-	cmd.Dir, cmd.Stdout, cmd.Stderr = s.o.Dir, w, w
+	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = s.o.Dir, stdin, w, w
 	// A session of its own, and so a process group: the group is killed whole, and the session has
 	// no controlling terminal, which sandbox-runtime would let the Worker ioctl (TIOCSTI). The
 	// terminal agentd runs on does not send it Ctrl-C either: agentd stops it, in order.
@@ -330,6 +362,7 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 	if s.o.Lifeline {
 		if lifeline, g.lifeline, err = os.Pipe(); err != nil {
 			w.Close()
+			stdin.Close()
 			s.discard(g)
 			return nil, err
 		}
@@ -344,7 +377,19 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 		// ends, not the process (go#27505): this goroutine keeps its thread until the launcher has.
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		if err := cmd.Start(); err != nil {
+		// No generation starts once Stop has been called: Stop closes the channel under the same lock.
+		s.mu.Lock()
+		if closed(s.stop) {
+			s.mu.Unlock()
+			started <- errStopped
+			return
+		}
+		err := cmd.Start()
+		if err == nil {
+			s.starts++
+		}
+		s.mu.Unlock()
+		if err != nil {
 			started <- err
 			return
 		}
@@ -363,6 +408,7 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 	}()
 	err = <-started
 	w.Close()
+	stdin.Close()
 	if lifeline != nil {
 		lifeline.Close()
 	}
@@ -374,9 +420,10 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 	s.gen, s.pid = n, g.pid
 	s.mu.Unlock()
 	// The environment is safe to log, and the log says what the Worker was given: agentd builds it
-	// from scratch (PATH, HOME, LANG and the AGENTOS_SANDBOX_* variables of its own: cmd/agentd's
-	// workerLaunch, whose test pins the keys), inherits none of its own, and never hands a Worker a
-	// secret. A secret here would be one the Worker has, which is the bug to fix, not the log.
+	// from scratch (its own PATH and HOME, LANG, and the AGENTOS_SANDBOX_* variables of its own:
+	// cmd/agentd's workerLaunch, whose test pins the keys), inherits nothing else of its own, and never
+	// hands a Worker a secret. A secret here would be one the Worker has, which is the bug to fix, not
+	// the log.
 	s.log.Info("worker started", "generation", n, "pid", g.pid, "argv", s.o.Argv, "env", env)
 	go s.read(g)
 	return g, nil
@@ -384,7 +431,7 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 
 // discard undoes what launch made of a generation that did not start.
 func (s *Supervisor) discard(g *generation) {
-	for _, f := range []*os.File{g.out, g.lifeline} {
+	for _, f := range []*os.File{g.out, g.lifeline, g.stopper} {
 		if f != nil {
 			f.Close()
 		}
@@ -394,30 +441,54 @@ func (s *Supervisor) discard(g *generation) {
 	}
 }
 
-// terminate ends a generation: SIGTERM to its launcher, which passes it on; after the grace,
-// SIGKILL to its whole process group. It returns once the launcher has been reaped.
+// terminate ends a generation: it closes the stop channel, and the Worker stops by itself; after the
+// grace, SIGTERM to its launcher; after a little more, SIGKILL to its whole process group. It returns
+// once the launcher has been reaped.
 func (s *Supervisor) terminate(g *generation) {
 	if closed(g.exited) {
 		return
 	}
+	g.closeStopper()
+	if g.exitsWithin(s.t.StopGrace) {
+		return
+	}
+	s.log.Warn("the Worker did not stop when asked: SIGTERM", "generation", g.n, "pid", g.pid, "grace", s.t.StopGrace.String())
 	_ = g.cmd.Process.Signal(syscall.SIGTERM)
-	t := time.NewTimer(s.t.StopGrace)
+	if g.exitsWithin(s.t.TermGrace) {
+		return
+	}
+	s.log.Warn("the Worker did not stop on SIGTERM: killing its process group", "generation", g.n, "pid", g.pid,
+		"grace", s.t.TermGrace.String())
+	_ = syscall.Kill(-g.pid, syscall.SIGKILL)
+	_ = g.cmd.Process.Kill()
+	<-g.exited
+}
+
+// exitsWithin reports whether the generation's launcher exits within d.
+func (g *generation) exitsWithin(d time.Duration) bool {
+	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-g.exited:
+		return true
 	case <-t.C:
-		s.log.Warn("the Worker did not stop on SIGTERM: killing its process group", "generation", g.n, "pid", g.pid,
-			"grace", s.t.StopGrace.String())
-		_ = syscall.Kill(-g.pid, syscall.SIGKILL)
-		_ = g.cmd.Process.Kill()
-		<-g.exited
+		return false
+	}
+}
+
+// closeStopper closes the stop channel's write end, once.
+func (g *generation) closeStopper() {
+	if g.stopper != nil {
+		g.stopper.Close()
+		g.stopper = nil
 	}
 }
 
 // cleanup ends what is left of a generation whose launcher has exited: its process group, its
-// output, its lifeline, its state directory and its pid file.
+// output, its stop channel and lifeline, its state directory and its pid file.
 func (s *Supervisor) cleanup(g *generation) {
-	// Anything of the group still running: the launcher's watcher, socat, a child of the Worker's.
+	// Anything of the group still running: the macOS launcher's watcher, a child of the Worker's.
+	// (On Linux the sandbox is a session of its own, which bwrap's --die-with-parent ends.)
 	_ = syscall.Kill(-g.pid, syscall.SIGKILL)
 	t := time.NewTimer(s.t.Drain)
 	defer t.Stop()
@@ -432,9 +503,13 @@ func (s *Supervisor) cleanup(g *generation) {
 	}
 	g.out.Close()
 	s.notLogged()
+	g.closeStopper()
 	if g.lifeline != nil {
 		g.lifeline.Close()
 	}
+	s.mu.Lock()
+	s.pid = 0
+	s.mu.Unlock()
 	if g.state != "" {
 		if err := statedir.Remove(g.state); err != nil {
 			s.log.Warn("could not remove the Worker's state directory; the next agentd tries again", "dir", g.state, "error", err)

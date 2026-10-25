@@ -41,45 +41,77 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// rootEnv names the test binary's pid to the helpers it starts: each ends when that process does, so
+// that a test that fails or times out (or a mutant's) leaves none behind. They run in sessions of
+// their own, where nothing else would end them.
+const rootEnv = "AGENTOS_TEST_ROOT"
+
 // helper is a Worker: it writes its output to stdout and stderr as a Worker does, and ends as the
-// mode says. AGENTOS_TEST_FILE is where it reports.
+// mode says; as the real Worker does, it stops when its stdin (the stop channel) ends or on
+// SIGTERM, unless its mode is deaf to them. AGENTOS_TEST_FILE is where it reports.
 func helper(mode string) {
+	if root, _ := strconv.Atoi(os.Getenv(rootEnv)); root > 0 {
+		go func() {
+			for {
+				time.Sleep(200 * time.Millisecond)
+				if errors.Is(syscall.Kill(root, 0), syscall.ESRCH) {
+					os.Exit(4)
+				}
+			}
+		}()
+	}
 	file := os.Getenv("AGENTOS_TEST_FILE")
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, syscall.SIGTERM)
 	ready := func() {
 		fmt.Fprintln(os.Stderr, "2026-10-25 12:00:00,000 INFO root worker ready: endpoint=x task_queue=y")
 	}
-	hold := func() {
-		<-term
-		os.Exit(0)
+	// hold runs until the stop channel ends (if heeded) or SIGTERM (if heeded), then exits 0.
+	hold := func(stdin, term bool) {
+		if stdin {
+			go func() {
+				_, _ = io.Copy(io.Discard, os.Stdin)
+				os.Exit(0)
+			}()
+		}
+		if term {
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, syscall.SIGTERM)
+			<-c
+			os.Exit(0)
+		}
+		signal.Ignore(syscall.SIGTERM)
+		time.Sleep(time.Hour)
+	}
+	child := func() int { // a child in this process group, reported
+		c := exec.Command("/bin/sleep", "30") // a Worker has no PATH here
+		if err := c.Start(); err != nil {
+			os.Exit(1)
+		}
+		_ = os.WriteFile(file, []byte(strconv.Itoa(c.Process.Pid)), 0o600)
+		return c.Process.Pid
 	}
 	switch mode {
 	case "ready":
 		ready()
-		hold()
+		hold(true, true)
 	case "exit":
 		fmt.Println("starting")
 		fmt.Fprintln(os.Stderr, "ModuleNotFoundError: No module named 'x'")
 		os.Exit(3)
 	case "never":
 		fmt.Println("connecting")
-		hold()
-	case "stubborn": // ready, deaf to SIGTERM, with a child in its process group
-		signal.Ignore(syscall.SIGTERM)
-		child := exec.Command("/bin/sleep", "60") // a Worker has no PATH here
-		if err := child.Start(); err != nil {
-			os.Exit(1)
-		}
-		_ = os.WriteFile(file, []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+		hold(true, true)
+	case "stdin-only": // ready; stops when its stdin ends, deaf to SIGTERM
 		ready()
-		time.Sleep(time.Hour)
+		hold(true, false)
+	case "deaf-stdin": // ready; does not read its stdin, stops on SIGTERM
+		ready()
+		hold(false, true)
+	case "stubborn": // ready, deaf to its stop channel and to SIGTERM, with a child in its process group
+		child()
+		ready()
+		hold(false, false)
 	case "leaves-child": // ready, then exits, leaving a child in its process group
-		child := exec.Command("/bin/sleep", "60")
-		if err := child.Start(); err != nil {
-			os.Exit(1)
-		}
-		_ = os.WriteFile(file, []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+		child()
 		ready()
 		time.Sleep(200 * time.Millisecond)
 		os.Exit(1)
@@ -92,35 +124,17 @@ func helper(mode string) {
 		w.Flush()
 		ready()
 		fmt.Print("a last line with no newline")
-		hold()
-	case "report": // where it runs, and what it was given
-		sid, _ := unix.Getsid(0)
-		cwd, _ := os.Getwd()
-		tty := "none"
-		if f, err := os.Open("/dev/tty"); err == nil {
-			tty, _ = "one", f.Close()
-		}
-		var st unix.Stat_t
-		fd3 := "closed"
-		if unix.Fstat(3, &st) == nil {
-			fd3 = "open"
-			if st.Mode&unix.S_IFMT == unix.S_IFIFO {
-				fd3 = "pipe"
-			}
-		}
-		state := os.Getenv("AGENTOS_SANDBOX_STATE")
-		if state != "" {
-			_ = os.WriteFile(filepath.Join(state, "mine"), []byte("x"), 0o600)
-		}
-		b, _ := json.Marshal(map[string]any{"pid": os.Getpid(), "sid": sid, "pgid": syscall.Getpgrp(), "tty": tty, "cwd": cwd,
-			"env": os.Environ(), "fd3": fd3})
-		_ = os.WriteFile(file, b, 0o600)
+		hold(true, true)
+	case "report":
+		report(file, false)
 		ready()
-		hold()
+		hold(true, true)
 	case "lifeline": // as the macOS launcher's watcher: ends when fd 3 reads EOF
 		ready()
 		_, _ = io.Copy(io.Discard, os.NewFile(3, "lifeline"))
 		_ = os.WriteFile(file, []byte("eof"), 0o600)
+	case "holds-output": // a process of its own session that keeps the output open, at most a while
+		time.Sleep(30 * time.Second)
 	case "planned": // each start is one step of AGENTOS_TEST_PLAN, in turn
 		f, _ := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 		b, _ := io.ReadAll(f)
@@ -132,17 +146,82 @@ func helper(mode string) {
 		case "re": // ready, then exits
 			ready()
 			os.Exit(1)
+		case "early": // exits before it says it is ready
+			fmt.Println("starting")
+			os.Exit(1)
+		case "never": // never says it is ready
+			fmt.Println("connecting")
+			hold(true, true)
 		case "long": // ready, up a while, then exits
 			ready()
 			time.Sleep(500 * time.Millisecond)
 			os.Exit(1)
+		case "late-long": // ready late, up long enough only counted from its start, then exits
+			time.Sleep(300 * time.Millisecond)
+			ready()
+			time.Sleep(250 * time.Millisecond)
+			os.Exit(1)
+		case "report-re": // reports where it runs, ready, then exits
+			report(file+".gen", true)
+			ready()
+			os.Exit(1)
+		case "report": // reports where it runs, and stays
+			report(file+".gen", true)
+			ready()
+			hold(true, true)
+		case "escapes": // leaves a process of its own session behind with the output, ready, then exits
+			bin, _ := os.Executable()
+			c := exec.Command(bin)
+			c.Env = []string{helperEnv + "=holds-output", rootEnv + "=" + os.Getenv(rootEnv)}
+			c.Stdout, c.Stderr = os.Stdout, os.Stderr
+			c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			if err := c.Start(); err != nil {
+				os.Exit(1)
+			}
+			_ = os.WriteFile(file+".escaped", []byte(strconv.Itoa(c.Process.Pid)), 0o600)
+			ready()
+			os.Exit(1)
 		default:
 			ready()
-			hold()
+			hold(true, true)
 		}
 	case "supervise":
 		supervise()
 	}
+}
+
+// report writes where the helper runs, and what it was given, to path: as the whole file, or as one
+// more line of it.
+func report(path string, appendLine bool) {
+	sid, _ := unix.Getsid(0)
+	cwd, _ := os.Getwd()
+	tty := "none"
+	if f, err := os.Open("/dev/tty"); err == nil {
+		tty, _ = "one", f.Close()
+	}
+	fd := func(n int) string {
+		var st unix.Stat_t
+		if unix.Fstat(n, &st) != nil {
+			return "closed"
+		}
+		if st.Mode&unix.S_IFMT == unix.S_IFIFO {
+			return "pipe"
+		}
+		return "open"
+	}
+	state := os.Getenv("AGENTOS_SANDBOX_STATE")
+	if state != "" {
+		_ = os.WriteFile(filepath.Join(state, "mine"), []byte("x"), 0o600)
+	}
+	b, _ := json.Marshal(map[string]any{"pid": os.Getpid(), "sid": sid, "pgid": syscall.Getpgrp(), "tty": tty, "cwd": cwd,
+		"env": os.Environ(), "fd0": fd(0), "fd3": fd(3), "state": state})
+	if !appendLine {
+		_ = os.WriteFile(path, b, 0o600)
+		return
+	}
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	fmt.Fprintln(f, string(b))
+	f.Close()
 }
 
 // supervise is an agentd that runs a supervisor of the Worker AGENTOS_TEST_CHILD names, with a
@@ -152,8 +231,9 @@ func supervise() {
 	file := os.Getenv("AGENTOS_TEST_FILE")
 	child := os.Getenv("AGENTOS_TEST_CHILD")
 	bin, _ := os.Executable()
-	s := New(Options{Argv: []string{bin}, Env: []string{helperEnv + "=" + child, "AGENTOS_TEST_FILE=" + file + ".worker"},
-		Lifeline: os.Getenv("AGENTOS_TEST_LIFELINE") == "1", PIDFile: os.Getenv("AGENTOS_TEST_PIDFILE")})
+	s := New(Options{Argv: []string{bin}, Env: []string{helperEnv + "=" + child, "AGENTOS_TEST_FILE=" + file + ".worker",
+		rootEnv + "=" + os.Getenv(rootEnv)}, Lifeline: os.Getenv("AGENTOS_TEST_LIFELINE") == "1",
+		PIDFile: os.Getenv("AGENTOS_TEST_PIDFILE")})
 	s.Start()
 	<-s.Ready()
 	_ = os.WriteFile(file, []byte("ready"), 0o600)
@@ -214,11 +294,14 @@ func worker(t *testing.T, mode string, timing Timing, env ...string) (*Superviso
 	file := filepath.Join(t.TempDir(), "report")
 	var l logs
 	var r recorded
-	s := New(Options{Argv: []string{bin}, Env: append([]string{helperEnv + "=" + mode, "AGENTOS_TEST_FILE=" + file}, env...),
+	s := New(Options{Argv: []string{bin}, Env: append([]string{helperEnv + "=" + mode, "AGENTOS_TEST_FILE=" + file, root()}, env...),
 		Dir: t.TempDir(), Log: slog.New(slog.NewJSONHandler(&l, nil)), Record: r.add, Timing: timing})
 	t.Cleanup(s.Stop)
 	return s, &l, &r, file
 }
+
+// root names this test binary to a helper: it ends when the test binary does.
+func root() string { return rootEnv + "=" + strconv.Itoa(os.Getpid()) }
 
 func wait(t *testing.T, what string, timeout time.Duration, ok func() bool) {
 	t.Helper()
@@ -331,7 +414,7 @@ func TestTheFirstWorker(t *testing.T) {
 		if !strings.Contains(err.Error(), "did not say it was ready within 300ms") || !strings.Contains(err.Error(), "connecting") {
 			t.Errorf("%v", err)
 		}
-		_, pid := s.Current()
+		pid := int(l.entries("worker started")[0]["pid"].(float64))
 		time.Sleep(100 * time.Millisecond)
 		if !gone(pid) || len(l.entries("worker started")) != 1 {
 			t.Errorf("the Worker %d is there, or another started: %v", pid, l.entries(""))
@@ -358,28 +441,46 @@ func TestTheFirstWorker(t *testing.T) {
 
 // Stop: no Worker after it; the running one gets SIGTERM, then after the grace SIGKILL with its whole
 // process group. A stop while the supervisor waits to restart returns at once.
+// Stop: no Worker after it. The running one is asked to stop (its stop channel, stdin, ends); after
+// the grace it gets SIGTERM; after a little more SIGKILL, with its whole process group. A stop while
+// the supervisor waits to restart returns at once.
 func TestStop(t *testing.T) {
-	t.Run("on SIGTERM", func(t *testing.T) {
-		s, l, _, _ := worker(t, "ready", Timing{StopGrace: 3 * time.Second})
+	stops := func(t *testing.T, mode string, timing Timing, status string, least, most time.Duration) *logs {
+		t.Helper()
+		s, l, _, _ := worker(t, mode, timing)
 		s.Start()
 		readied(t, s)
 		_, pid := s.Current()
 		start := time.Now()
 		s.Stop()
-		if took := time.Since(start); took > 2*time.Second {
-			t.Errorf("Stop took %s", took)
+		if took := time.Since(start); took < least || took > most {
+			t.Errorf("Stop took %s, want %s to %s", took, least, most)
 		}
 		stopped := l.entries("worker stopped")
-		if len(stopped) != 1 || stopped[0]["status"] != "exit status 0" || !gone(pid) || len(l.entries("worker exited")) != 0 {
+		if len(stopped) != 1 || stopped[0]["status"] != status || !gone(pid) || len(l.entries("worker exited")) != 0 {
 			t.Errorf("logs %v", l.entries(""))
+		}
+		if _, now := s.Current(); now != 0 {
+			t.Errorf("a pid %d once it is gone", now)
 		}
 		time.Sleep(100 * time.Millisecond)
 		if len(l.entries("worker started")) != 1 {
 			t.Error("a Worker started after Stop")
 		}
+		return l
+	}
+	t.Run("when asked", func(t *testing.T) { // its stop channel: no signal, which it would not heed
+		l := stops(t, "stdin-only", Timing{StopGrace: 3 * time.Second}, "exit status 0", 0, 2*time.Second)
+		if len(l.entries("the Worker did not stop when asked: SIGTERM")) != 0 {
+			t.Error("SIGTERM for a Worker that stopped when asked")
+		}
 	})
-	t.Run("deaf to SIGTERM", func(t *testing.T) {
-		s, l, _, file := worker(t, "stubborn", Timing{StopGrace: 300 * time.Millisecond})
+	t.Run("on SIGTERM, deaf to its stop channel", func(t *testing.T) {
+		stops(t, "deaf-stdin", Timing{StopGrace: 300 * time.Millisecond, TermGrace: 3 * time.Second}, "exit status 0",
+			300*time.Millisecond, 2*time.Second)
+	})
+	t.Run("deaf to both", func(t *testing.T) {
+		s, l, _, file := worker(t, "stubborn", Timing{StopGrace: 200 * time.Millisecond, TermGrace: 200 * time.Millisecond})
 		s.Start()
 		readied(t, s)
 		_, pid := s.Current()
@@ -391,7 +492,7 @@ func TestStop(t *testing.T) {
 		})
 		start := time.Now()
 		s.Stop()
-		if took := time.Since(start); took < 300*time.Millisecond || took > 5*time.Second {
+		if took := time.Since(start); took < 400*time.Millisecond || took > 5*time.Second {
 			t.Errorf("Stop took %s", took)
 		}
 		if !gone(pid) {
@@ -490,6 +591,201 @@ func TestNextLine(t *testing.T) {
 	}
 }
 
+// The supervisor never gives up after the first generation: one that exits before it says it is
+// ready is followed by the next, and so is one whose launcher cannot start; and only the first must
+// say it is ready in time.
+func TestLaterGenerations(t *testing.T) {
+	t.Run("exit before they are ready", func(t *testing.T) {
+		s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond, BackoffMax: 10 * time.Millisecond},
+			"AGENTOS_TEST_PLAN=re,early,early,ready")
+		s.Start()
+		readied(t, s)
+		wait(t, "the fourth generation, ready", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 2 })
+		if gen, _ := s.Current(); gen != 4 || len(l.entries("worker exited")) != 3 {
+			t.Errorf("generation %d, logs %v", gen, l.entries(""))
+		}
+		select {
+		case err := <-s.Failed():
+			t.Errorf("a later generation failed the supervisor: %v", err)
+		default:
+		}
+	})
+	t.Run("cannot start", func(t *testing.T) {
+		bin, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		launcher := filepath.Join(dir, "launcher")
+		if err := os.Symlink(bin, launcher); err != nil {
+			t.Fatal(err)
+		}
+		var l logs
+		s := New(Options{Argv: []string{launcher}, Env: []string{helperEnv + "=ready", root()}, Log: slog.New(slog.NewJSONHandler(&l, nil)),
+			Timing: Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: 80 * time.Millisecond}})
+		t.Cleanup(s.Stop)
+		s.Start()
+		readied(t, s)
+		_, pid := s.Current()
+		if err := os.Remove(launcher); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			t.Fatal(err)
+		}
+		wait(t, "starts that fail", 10*time.Second, func() bool { return len(l.entries("could not start the Worker")) >= 4 })
+		var delays []string
+		for _, e := range l.entries("could not start the Worker")[:4] {
+			delays = append(delays, fmt.Sprint(e["restart_in"]))
+		}
+		if want := []string{"40ms", "80ms", "80ms", "80ms"}; !slices.Equal(delays, want) { // after the exit's own 20ms
+			t.Errorf("delays %q, want %q", delays, want)
+		}
+		if err := os.Symlink(bin, launcher); err != nil {
+			t.Fatal(err)
+		}
+		wait(t, "a Worker again", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 2 })
+		select {
+		case err := <-s.Failed():
+			t.Errorf("a later generation failed the supervisor: %v", err)
+		default:
+		}
+	})
+	t.Run("are never ready", func(t *testing.T) {
+		s, l, _, _ := worker(t, "planned", Timing{ReadyWithin: 200 * time.Millisecond, BackoffMin: 10 * time.Millisecond},
+			"AGENTOS_TEST_PLAN=re,never")
+		s.Start()
+		readied(t, s)
+		wait(t, "the second generation", 5*time.Second, func() bool { return len(l.entries("worker started")) == 2 })
+		time.Sleep(600 * time.Millisecond)
+		if _, pid := s.Current(); pid == 0 || len(l.entries("worker not ready")) != 0 {
+			t.Errorf("the second generation was stopped: %v", l.entries(""))
+		}
+		select {
+		case err := <-s.Failed():
+			t.Errorf("a later generation failed the supervisor: %v", err)
+		default:
+		}
+	})
+}
+
+// A generation whose output a process outside its group keeps open (one that started a session of
+// its own) does not hold the supervisor up: after the drain, the output is closed, the next
+// generation starts, and Stop returns.
+func TestTheDrainEnds(t *testing.T) {
+	s, l, _, file := worker(t, "planned", Timing{Drain: 300 * time.Millisecond, BackoffMin: 10 * time.Millisecond},
+		"AGENTOS_TEST_PLAN=escapes,ready")
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(file + ".escaped"); err == nil {
+			if pid, _ := strconv.Atoi(string(b)); pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	s.Start()
+	readied(t, s)
+	wait(t, "the second generation", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 2 })
+	if len(l.entries("the Worker's output is still open after its process group ended")) != 1 {
+		t.Errorf("logs %v", l.entries(""))
+	}
+	start := time.Now()
+	s.Stop()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("Stop took %s", took)
+	}
+}
+
+// No generation starts once Stop has been called, however close the next start was: Stop closes its
+// channel under the lock that launch takes to start one.
+func TestNoGenerationAfterStop(t *testing.T) {
+	for i := range 50 {
+		s, l, _, _ := worker(t, "planned", Timing{BackoffMin: time.Nanosecond, BackoffMax: time.Nanosecond}, "AGENTOS_TEST_PLAN=re")
+		s.Start()
+		readied(t, s)
+		wait(t, "a few generations", 10*time.Second, func() bool { return len(l.entries("worker started")) >= 3 })
+		s.Stop()
+		s.mu.Lock()
+		starts, atStop := s.starts, s.atStop
+		s.mu.Unlock()
+		if starts != atStop {
+			t.Fatalf("run %d: %d generations started, %d of them before Stop", i, starts, atStop)
+		}
+	}
+}
+
+// Each generation has its own pid file, state directory and lifeline, whichever it is.
+func TestEachGenerationHasItsOwn(t *testing.T) {
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	file, pidFile := filepath.Join(dir, "report"), filepath.Join(dir, "worker.pid")
+	var l logs
+	s := New(Options{Argv: []string{bin}, Env: []string{helperEnv + "=planned", "AGENTOS_TEST_FILE=" + file, root(),
+		"AGENTOS_TEST_PLAN=report-re,report"}, StateDirs: true, Lifeline: true, PIDFile: pidFile,
+		Log: slog.New(slog.NewJSONHandler(&l, nil)), Timing: Timing{BackoffMin: 10 * time.Millisecond}})
+	t.Cleanup(s.Stop)
+	s.Start()
+	readied(t, s)
+	wait(t, "the second generation", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 2 })
+	b, err := os.ReadFile(file + ".gen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gens []struct {
+		PID      int
+		FD0, FD3 string
+		State    string
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
+		var g struct {
+			PID      int
+			FD0, FD3 string
+			State    string
+		}
+		if err := json.Unmarshal([]byte(line), &g); err != nil {
+			t.Fatalf("%q: %v", line, err)
+		}
+		gens = append(gens, g)
+	}
+	if len(gens) != 2 {
+		t.Fatalf("reports %+v", gens)
+	}
+	second := gens[1]
+	if second.FD0 != "pipe" || second.FD3 != "pipe" || second.State == "" || second.State == gens[0].State {
+		t.Errorf("the second generation %+v, the first %+v", second, gens[0])
+	}
+	if _, err := os.Lstat(gens[0].State); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the first generation's state directory %s stays: %v", gens[0].State, err)
+	}
+	var rec pidRecord
+	if b, err := os.ReadFile(pidFile); err != nil || json.Unmarshal(b, &rec) != nil {
+		t.Fatalf("pid file %q: %v", b, err)
+	}
+	if start, err := startTime(second.PID); err != nil || rec.PID != second.PID || rec.Generation != 2 || rec.Start != start {
+		t.Errorf("pid file %+v, the second generation %d started %s (%v)", rec, second.PID, start, err)
+	}
+}
+
+// How long a generation was up, for the delays to start over, counts from its start, not from when it
+// said it was ready: a launcher's own start (srt's, bwrap's) is part of the Worker's.
+func TestTheDelaysStartOverCountedFromTheStart(t *testing.T) {
+	s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: time.Second,
+		ResetAfter: 400 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,late-long,re,ready")
+	s.Start()
+	readied(t, s)
+	wait(t, "the fourth generation", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 4 })
+	var restarts []string
+	for _, e := range l.entries("worker exited") {
+		restarts = append(restarts, fmt.Sprint(e["restart_in"]))
+	}
+	// up 550 ms from its start, 250 ms from its readiness: the delays start over
+	if want := []string{"20ms", "20ms", "40ms"}; !slices.Equal(restarts, want) {
+		t.Errorf("restarts %q, want %q", restarts, want)
+	}
+}
+
 // One record of an exit agentd did not cause, at most one in each window: the first at once, the
 // rest held, and when the window is up one record describes the latest and counts the others. Every
 // exit is either described or counted; the stop's own is neither.
@@ -580,14 +876,16 @@ func TestWhatTheWorkerGets(t *testing.T) {
 	var got struct {
 		PID, SID, PGID int
 		TTY, CWD, FD3  string
+		FD0            string
 		Env            []string
 	}
 	b, err := os.ReadFile(file)
 	if err != nil || json.Unmarshal(b, &got) != nil {
 		t.Fatalf("%q: %v", b, err)
 	}
-	if got.SID != got.PID || got.PGID != got.PID || got.TTY != "none" || got.FD3 != "pipe" {
-		t.Errorf("session %d, group %d of pid %d, %s controlling terminal, fd 3 %s", got.SID, got.PGID, got.PID, got.TTY, got.FD3)
+	if got.SID != got.PID || got.PGID != got.PID || got.TTY != "none" || got.FD3 != "pipe" || got.FD0 != "pipe" {
+		t.Errorf("session %d, group %d of pid %d, %s controlling terminal, fd 3 %s, stdin %s", got.SID, got.PGID, got.PID,
+			got.TTY, got.FD3, got.FD0)
 	}
 	if real, _ := filepath.EvalSymlinks(dir); got.CWD != real && got.CWD != dir {
 		t.Errorf("cwd %s", got.CWD)
@@ -636,7 +934,7 @@ func agentd(t *testing.T, child string, lifeline bool) (cmd *exec.Cmd, report, p
 	report, pidFile = filepath.Join(dir, "report"), filepath.Join(dir, "worker.pid")
 	cmd = exec.Command(bin)
 	cmd.Env = []string{helperEnv + "=supervise", "AGENTOS_TEST_CHILD=" + child, "AGENTOS_TEST_FILE=" + report,
-		"AGENTOS_TEST_PIDFILE=" + pidFile, "AGENTOS_TEST_LIFELINE=" + map[bool]string{true: "1", false: "0"}[lifeline]}
+		"AGENTOS_TEST_PIDFILE=" + pidFile, "AGENTOS_TEST_LIFELINE=" + map[bool]string{true: "1", false: "0"}[lifeline], root()}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
