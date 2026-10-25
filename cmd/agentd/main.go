@@ -478,6 +478,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		sup.Stop()
 		controlSrv.GracefulStop()
 		runtimeSrv.Stop()
+		log.Info("the Runtime entry is closed")
 		return nil
 	}
 	if sup != nil {

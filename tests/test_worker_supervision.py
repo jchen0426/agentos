@@ -165,6 +165,9 @@ def test_agentd_stops_its_worker_first(stack: Stack, worker_state: str) -> None:
     after = entries[[e.get("msg") for e in entries].index("shutting down"):]
     assert not any(e.get("msg") == "worker started" for e in after), after
     [stopped] = [e for e in after if e.get("msg") == "worker stopped"]
+    # Before the Runtime entry closes: a supervisor still running then would start a Worker that cannot reach it.
+    msgs = [e.get("msg") for e in after]
+    assert msgs.index("worker stopped") < msgs.index("the Runtime entry is closed"), msgs
     if SANDBOX != "bwrap":  # bwrap dies of SIGTERM at once, and the sandbox with it
         if worker_state == "responsive":  # it shut down by itself: the Runtime entry still served
             assert stopped["status"] == "exit status 0" and took < 5, (stopped, took)
