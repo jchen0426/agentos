@@ -282,7 +282,11 @@ func TestAReportWaitsForTemporalBeforeItIsRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := tools.Request{WorkflowID: testWorkflowID, EffectID: sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon), Args: args}
+	id, err := effectID(testWorkflowID, cc, args, canon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := tools.Request{WorkflowID: testWorkflowID, EffectID: id, Args: args}
 	ctx := context.Background()
 	h.err = serviceerror.NewUnavailable("connection refused")
 	res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{})

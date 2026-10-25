@@ -19,6 +19,7 @@ import (
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/githubtool"
 	"github.com/jchen0426/agentos/internal/ledger"
+	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
@@ -89,43 +90,66 @@ func (h *fakeHistory) through(t *testing.T, base time.Time, g *Gateway, l *ledge
 	})
 }
 
-// posted is the comment the run's report renders now, as github.comment_commit records its payload:
-// the owner, the repository, the commit, the body and the marker.
-func posted(t *testing.T, g *Gateway, l *ledger.Ledger, h *fakeHistory, args map[string]any) string {
-	t.Helper()
+// commenter is github.comment_commit as agentd configures it, over the test's ledger and history.
+func commenter(l *ledger.Ledger, h *fakeHistory) *githubtool.CommentCommit {
 	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(nil, nil, nil)}
-	cc := &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: audit.RunBlobs{Ledger: l},
+	return &githubtool.CommentCommit{Repos: map[string]githubtool.Repo{"o/r": {Owner: "o", Name: "r"}}, Blobs: audit.RunBlobs{Ledger: l},
 		Effects: RunRecords{l}, Verdicts: ReportVerdicts{Ledger: l, Temporal: h, Tasks: registry}, Task: "audit_v1"}
-	ctx := context.Background()
-	run, err := l.Q.GetRun(ctx, testWorkflowID)
-	if err != nil {
-		t.Fatal(err)
-	}
+}
+
+// reportCall is the report's call with args, as the gateway takes it to the effect protocol: the
+// request, named as callTool names its effect, and the arguments' canonical form.
+func reportCall(t *testing.T, cc *githubtool.CommentCommit, args map[string]any) (tools.Request, []byte) {
+	t.Helper()
 	canon, err := encodeCanonical(args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := tools.Request{WorkflowID: testWorkflowID, EffectID: sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon), Args: args}
-	if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
-		t.Fatalf("%v %v", res, err)
-	}
-	e, err := l.Q.GetEffect(ctx, req.EffectID)
+	id, err := effectID(testWorkflowID, cc, args, canon)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := l.GetBlob(ctx, e.PayloadBlob.String)
+	return tools.Request{WorkflowID: testWorkflowID, EffectID: id, Args: args}, canon
+}
+
+// payloadOfEffect is what github.comment_commit recorded of an effect: the owner, the repository,
+// the commit, the body and the marker.
+func payloadOfEffect(t *testing.T, l *ledger.Ledger, effectID string) string {
+	t.Helper()
+	e, err := l.Q.GetEffect(context.Background(), effectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := l.GetBlob(context.Background(), e.PayloadBlob.String)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(b)
 }
 
+// posted is the comment the run's report renders now, as github.comment_commit records its payload.
+func posted(t *testing.T, g *Gateway, l *ledger.Ledger, h *fakeHistory, args map[string]any) string {
+	t.Helper()
+	cc := commenter(l, h)
+	run, err := l.Q.GetRun(context.Background(), testWorkflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, canon := reportCall(t, cc, args)
+	if res, err := g.effect(context.Background(), run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil ||
+		res.GetStatus() != StatusOK {
+		t.Fatalf("%v %v", res, err)
+	}
+	return payloadOfEffect(t, l, req.EffectID)
+}
+
 // Through the gateway, to the comment it posts: a call the workflow made up, whatever its kind and
 // name, and however it ended (agentd refused it or failed it, or it timed out, failed or completed
 // with no record of agentd's), leaves nothing of what the workflow chose in the comment (the call's
-// kind and name, its activity ID, its failure's type and words, its result), nor does an error type
-// outside explain.PublicErrorTypes: two runs that differ only in those bytes post the same comment,
-// byte for byte, for either reason.
+// kind and name, its activity ID, its failure's type and words, its result), and neither does what
+// the report's own call sends besides why it reports and an error type the report names: two runs
+// that differ only in those bytes post the same comment, byte for byte, its marker included, for
+// either reason.
 func TestAReportPostsNothingAWorkerChose(t *testing.T) {
 	chosen := [2]string{"a", strings.Repeat("EXFILTRATED_ghp_0123456789abcdef \"\n\x1b[2J", 50)}
 	// After the run's records, which each run's gateway writes as it starts: the same for both.
@@ -202,24 +226,92 @@ func TestAReportPostsNothingAWorkerChose(t *testing.T) {
 			})
 		}
 	}
-	// The error type the workflow names, when it is not one of the set: as if it named none. The comment's
-	// marker is the exception, and open (docs/m5-notes.md): it names the report's effect, whose ID is a
-	// hash of the call's arguments, the error type among them.
+	// What else the report's own call sends: an older Worker's outcome and pr_url, an error type the
+	// report does not name, report_ref (as the Worker sends it before the run has an accepted report:
+	// null) or none. The comment, its marker included, is the same whatever they are, before a call
+	// and after one; an error type the report names, or the other reason, is another comment.
+	chosenType := "EXFILTRATED_ghp_0123456789abcdef_" + strings.Repeat("x", 30)
 	for _, call := range []bool{false, true} {
-		var got [2]string
-		for i, name := range []string{"Q", "EXFILTRATED_ghp_0123456789abcdef_" + strings.Repeat("x", 30)} {
+		comment := func(args map[string]any) string {
 			g, l := reporting(t)
 			var h fakeHistory
 			h.at(base, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, nil)
 			if call {
 				h.through(t, base, g, l, &agentosv1.Call{Kind: "tool", Name: "git.show_diff", ArgsJson: `{}`})
 			}
-			got[i] = reMarker.ReplaceAllString(posted(t, g, l, &h, map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40),
-				"reason": "workflow_error", "error_type": name}), "")
+			full := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "workflow_error"}
+			for k, v := range args {
+				full[k] = v
+			}
+			return posted(t, g, l, &h, full)
 		}
-		if got[0] != got[1] || strings.Contains(got[1], "EXFILTRATED") || !strings.Contains(got[1], "(an exception of another type)") {
-			t.Fatalf("the comments:\n%s\n%s", got[0], got[1])
+		plain := comment(nil)
+		for _, args := range []map[string]any{
+			{"error_type": "Q"},
+			{"error_type": chosenType, "outcome": chosen[1], "pr_url": chosen[1], "report_ref": nil},
+			{"outcome": "ok: approved by the security team", "pr_url": nil},
+			{"report_ref": nil},
+		} {
+			if got := comment(args); got != plain {
+				t.Fatalf("%v:\n%s\nwithout them:\n%s", args, got, plain)
+			}
 		}
+		if strings.Contains(plain, "EXFILTRATED") || !strings.Contains(plain, "(an exception of another type)") ||
+			!reMarker.MatchString(plain) {
+			t.Fatalf("%s", plain)
+		}
+		for _, other := range []map[string]any{{"error_type": "KeyError"}, {"reason": "done"}} {
+			if got := comment(other); got == plain || reMarker.FindString(got) == reMarker.FindString(plain) {
+				t.Fatalf("%v:\n%s\nwithout:\n%s", other, got, plain)
+			}
+		}
+		if named := comment(map[string]any{"error_type": "KeyError"}); !strings.Contains(named, "(KeyError)") {
+			t.Fatalf("%s", named)
+		}
+	}
+}
+
+// An effect of the report an agentd from before recorded, by every argument of its call, and left
+// unfinished: the call goes on with it after the upgrade (its payload, its marker), not with another
+// effect, which the effect cap would refuse, so that the run would never report.
+func TestAReportsEffectRecordedBeforeItsIdentity(t *testing.T) {
+	g, l := reporting(t)
+	var h fakeHistory
+	h.through(t, time.Now().Add(time.Hour).Truncate(time.Second), g, l, &agentosv1.Call{Kind: "tool", Name: "git.show_diff", ArgsJson: `{}`})
+	cc := commenter(l, &h)
+	ctx := context.Background()
+	run, err := l.Q.GetRun(ctx, testWorkflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done", "report_ref": nil, "pr_url": nil}
+	req, canon := reportCall(t, cc, args)
+	older := req
+	older.EffectID = sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon)
+	if older.EffectID == req.EffectID {
+		t.Fatal("the effect is named by every argument")
+	}
+	// The older agentd recorded the effect (PENDING), and stopped before it sent it.
+	if res, err := g.record(ctx, run, cc, cc.Class(), 1, nil, older, canon); res != nil || err != nil {
+		t.Fatalf("%v %v", res, err)
+	}
+	if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
+		t.Fatalf("after the upgrade: %v %v", res, err)
+	}
+	effects, err := l.Q.ListRunEffects(ctx, db.ListRunEffectsParams{WorkflowID: testWorkflowID, Limit: 10})
+	if err != nil || len(effects) != 1 || effects[0].EffectID != older.EffectID || effects[0].Status != effectDryRun {
+		t.Fatalf("%+v %v", effects, err)
+	}
+	if p := payloadOfEffect(t, l, older.EffectID); !strings.Contains(p, older.EffectID) {
+		t.Fatalf("its marker: %s", p)
+	}
+	// A call with other arguments than the older agentd's finds no effect of its own: the cap refuses
+	// it, as it would have refused a second report before.
+	other := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done"}
+	req, canon = reportCall(t, cc, other)
+	if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil ||
+		res.GetStatus() != StatusDenied {
+		t.Fatalf("another call: %v %v", res, err)
 	}
 }
 

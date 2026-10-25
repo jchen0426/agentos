@@ -116,6 +116,10 @@ func (r ReportVerdicts) ReportVerdict(ctx context.Context, workflowID, reason, e
 }
 
 // verdictOf is the report's verdict from the outcome: the step only when the task names it.
+// NamesErrorType reports whether the report names the error type the workflow gives: one of
+// explain.PublicErrorTypes.
+func (ReportVerdicts) NamesErrorType(name string) bool { return explain.PublicErrorTypes[name] }
+
 func verdictOf(o explain.Outcome) githubtool.Verdict {
 	v := githubtool.Verdict{Verdict: o.Verdict, Kind: o.Kind, Cause: o.Cause, Claim: o.Claim, Cut: o.Cut}
 	if o.Named {

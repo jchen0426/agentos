@@ -103,7 +103,9 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 	}
 	w := t.(tools.Writer)
 	// The same payload in the same run is the same effect, on every attempt.
-	req.EffectID = sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon)
+	if req.EffectID, err = effectID(run.WorkflowID, w, args, canon); err != nil {
+		return nil, err
+	}
 	v, err, _ := g.effects.Do(req.EffectID, func() (any, error) {
 		return g.track(func() (any, error) {
 			exec, cancel := detach(ctx, info)
@@ -115,6 +117,18 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 		return nil, err
 	}
 	return v.(*agentosv1.Result), nil
+}
+
+// effectID names a write's effect: the run, the tool, and the call's arguments in their canonical
+// form (canon), or only those that make what it writes (tools.Identifier).
+func effectID(workflowID string, t tools.Writer, args map[string]any, canon []byte) (string, error) {
+	if id, ok := t.(tools.Identifier); ok {
+		var err error
+		if canon, err = encodeCanonical(id.Identity(args)); err != nil {
+			return "", err
+		}
+	}
+	return sha256Hex([]byte(workflowID), []byte(t.Name()), canon), nil
 }
 
 // toolError turns a tool's error into the call's outcome: a denial is a result, a refusal
@@ -138,6 +152,19 @@ func toolError(tool string, err error) (*agentosv1.Result, error) {
 func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class string, maxPerRun int,
 	rule *approvalRule, req tools.Request, canon []byte, fx faults.Effect) (*agentosv1.Result, error) {
 	e, err := g.Ledger.Q.GetEffect(ctx, req.EffectID)
+	if _, named := t.(tools.Identifier); named && errors.Is(err, sql.ErrNoRows) {
+		// An agentd from before the tool named its effect by some arguments only named it by all of
+		// them. A call whose effect it recorded, and left unfinished, goes on with that effect (its
+		// payload, its marker): not with a second one, which the effect cap would refuse, or would
+		// send.
+		if legacy := sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon); legacy != req.EffectID {
+			if old, oerr := g.Ledger.Q.GetEffect(ctx, legacy); oerr == nil {
+				e, err, req.EffectID = old, nil, legacy
+			} else if !errors.Is(oerr, sql.ErrNoRows) {
+				return nil, oerr
+			}
+		}
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		// Rendering the payload may call the git tool server (github.open_draft_pr reads the files its
 		// patch changes): a fault's hold in it goes with the context.

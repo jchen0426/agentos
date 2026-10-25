@@ -1540,3 +1540,25 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，不加沙箱 | 274 | 28 | 149（132 个测试） | 127 | 19 | 0 | 3 |
   | macOS，srt | 297 | 5 | 155（138 个测试） | 133 | 19 | 0 | 3 |
   | Linux VM，bwrap | 286 | 16 | 154（137 个测试） | 132 | 19 | 0 | 3 |
+
+### 报告剩下的两条通道（785bbb9 之后，这个 PR）
+
+两个提交，一部分一个：先是评论的标记，再是模型任务的输入。
+
+#### 评论的标记（你选的修法 A）
+
+- **问题**：评论的最后一行是标记 `<!-- agent-effect:<effect ID> -->`。effect ID 原来是 sha256(工作流 ID、工具名、规范化的全部参数)，而参数里有几样是 Worker 随意选的：模式之内的 error_type、旧 Worker 的 outcome、pr_url。所以标记跟着 Worker 选的字节变。
+- **改法**：
+  - **接缝在工具上**：新加 `tools.Identifier`，写工具可以说它的 effect 只由哪些参数命名（`Identity(args)`）。网关的 `effectID` 对这样的工具只用这些参数算 effect ID，别的工具照旧用全部参数。标记和幂等键都从 effect ID 来，跟着变。网关里没有为评论写特例。
+  - **评论的身份**（`CommentCommit.Identity`）：repo、commit、reason，加上报告会写出名字的 error_type（`Verdicts.NamesErrorType`；网关的 `ReportVerdicts` 用的是 `explain.PublicErrorTypes`）。outcome、pr_url、report_ref 都不算。没有 reason 的旧 Worker，身份里就只有 repo 和 commit。
+  - **report_ref 可以去掉**：我核对了 Prepare。评论里的报告永远是运行最新一个被接受的答复；工作流给的 report_ref 只能是空、null 或者正好是它，别的一律拒绝（DeniedError，effect 不记）。所以它改变不了评论里的任何东西。
+- **升级**：
+  - **会出什么事**：升级前记下、还没做完的报告 effect，用的是旧 ID。升级后同一个调用重试，算出的是新 ID，找不到 effect，就去记一个新的；effect 上限（max_per_run 1）把旧的算进去，新的被拒，报告就发不出去，运行以 FAILED 结束。
+  - **处理**：对实现了 `Identifier` 的工具，按新 ID 找不到时，再按旧的算法（全部参数）找一次。找到了，就接着用旧的 effect：它的 payload、它的标记（还是旧 ID，和 Find 对得上）。不会再记第二个，也不会再发第二条评论。
+  - 只有参数和升级前那次完全一样（Temporal 重试同一个调用）才找得到旧的。参数不同的调用，升级前就会被上限拒绝，现在也一样。升级之后新记的 effect 都按新 ID，没有这个问题。
+- **T5、T6 和 harness**：它们都从账本读 effect ID（`stack.effect(...)['effect_id']`、`self.effects(run)`），自己不算，不用改。githubsim 认标记只看 `agent-effect:` 后面的十六进制，格式没变。
+- **测试**：
+  - `TestTheReportsEffectIsWhatItShows`（githubtool）：哪些参数进身份，哪些不进。
+  - `TestAReportPostsNothingAWorkerChose`（gateway）：报告调用自己的那部分改成连标记一起比整个 payload。旧 Worker 的 outcome 和 pr_url、报告不写名字的 error_type、带不带 report_ref（null），评论一字不差；报告会写名字的 error_type，就是另一条评论、另一个标记。调用之前、之后各比一次。上一轮“去掉标记再比”的做法拿掉了。
+  - `TestAReportsEffectRecordedBeforeItsIdentity`（gateway）：旧 agentd 按全部参数记下 effect（PENDING）就停了；升级后的调用接着用它，账本里只有这一个，标记是旧 ID 的；参数不同的调用照旧被上限拒绝。
+- **改坏**：10 处都有测试失败：身份用全部参数；不含 reason；含任何 error_type；不含 error_type；含 outcome；含 report_ref；网关不管身份；不找旧 agentd 的 effect；找到了不用；报告写出任何 error_type。前 6 处只跑网关的测试也会失败；第一遍“不含 reason”只有 githubtool 的单元测试杀得掉，网关测试补了“另一个 reason 是另一条评论”。

@@ -394,12 +394,13 @@ ends (the verdict, its kind, the step it names, a few counts such as attempts, a
 which of Temporal's timeouts ended a call); a budget's figures, when a call runs out of budget,
 which follow the size of a model task's request (about 17 bits a report while its plain arguments,
 below, are open); when it reports (the comment's time, and an approval's request time); and that it
-reports once per run (the effect's cap, unless the policy raises the tool's `max_per_run`). Two
-ways out are still open: a model task's plain arguments (the ones that are not a
-blob) reach the model as they are, and the model's answer is the report; and the comment's hidden
-marker names the report's effect by a hash of the report call's arguments, which the Worker can
-choose until the hash says what it wants (docs/m5-notes.md). The report shows no internal error's
-text: where agentd could not read something, or a tool's server failed, it says so and that
+reports once per run (the effect's cap, unless the policy raises the tool's `max_per_run`). The
+comment's hidden marker names the report's effect, and the effect is named only by what the comment
+shows: the repository, the commit, the reason and an error type the report names, not what else the
+report's call sends (an older Worker's outcome, `pr_url`, `report_ref`). One way out is still open:
+a model task's plain arguments (the ones that are not a blob) reach the model as they are, and the
+model's answer is the report (docs/m5-notes.md). The report shows no internal error's text: where
+agentd could not read something, or a tool's server failed, it says so and that
 agentd's log has the details; a model's or a tool's own words are shown fenced, when agentd's records
 hold them. When the outcome rests on everything it needs but other evidence was past agentd's
 bounds, the report says which, and that it does not change the outcome.
