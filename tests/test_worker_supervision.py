@@ -1,10 +1,11 @@
 """agentd starts and supervises the Worker (M5 C2a): through its sandbox launcher once the Runtime
 entry serves; the first must say it is ready before agentd does; every exit is followed by a
 restart, after a delay that doubles to 60 s and starts over after a minute up; each exit agentd did
-not cause has an audit record, at most one a minute; on SIGTERM agentd stops it first. A Worker a
-killed agentd left is gone before the next agentd listens (on macOS through the launcher's
-lifeline, else through worker.pid), and never one another agentd still runs. Neither the Worker
-nor the git tool server has a controlling terminal, whatever agentd's.
+not cause has an audit record, at most one a minute; on SIGTERM agentd stops it first, through its
+stop channel (stdin), so that the Worker reports what it holds. A Worker a killed agentd left is
+gone before the next agentd listens (it stops by itself when its stop channel ends; on macOS the
+launcher's lifeline kills it, on Linux bwrap; else worker.pid), and never one another agentd still
+runs. Neither the Worker nor the git tool server has a controlling terminal, whatever agentd's.
 
 The tests of agentd's own Worker run in every environment (AGENTOS_SANDBOX none, srt, bwrap); those
 of the macOS launcher's protocol only under srt."""
@@ -23,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, TEST_MODELS, WORKER_LAUNCHER, Stack, command_of, descendants,
-                           free_port, started_at, wait_for)
+                           event_types, free_port, started_at, wait_for)
 
 NO_TTY = {"??", "?"}  # what ps says of a process with no controlling terminal: macOS, Linux
 
@@ -148,6 +149,8 @@ def test_agentd_stops_when_its_first_worker_is_not_ready(stack: Stack, fault: st
 
 @pytest.mark.parametrize("worker_state", ["responsive", "frozen"])
 def test_agentd_stops_its_worker_first(stack: Stack, worker_state: str) -> None:
+    """agentd asks its Worker to stop (its stop channel ends), first: the Worker stops by itself, on
+    every platform. One that cannot (frozen) gets SIGTERM after 5 s, then SIGKILL."""
     stack.start_agentd(worker=True)
     w = stack.worker()
     pid = w.wait_ready(1)
@@ -156,7 +159,7 @@ def test_agentd_stops_its_worker_first(stack: Stack, worker_state: str) -> None:
     agentd = stack.agentd
     assert agentd is not None
     if worker_state == "frozen":
-        os.kill(pid, signal.SIGSTOP)  # it cannot act on SIGTERM
+        os.kill(pid, signal.SIGSTOP)  # it cannot act on its stop channel, nor on SIGTERM
     start = time.monotonic()
     agentd.popen.send_signal(signal.SIGTERM)
     assert agentd.popen.wait(timeout=60) == 0
@@ -168,11 +171,11 @@ def test_agentd_stops_its_worker_first(stack: Stack, worker_state: str) -> None:
     # Before the Runtime entry closes: a supervisor still running then would start a Worker that cannot reach it.
     msgs = [e.get("msg") for e in after]
     assert msgs.index("worker stopped") < msgs.index("the Runtime entry is closed"), msgs
-    if SANDBOX != "bwrap":  # bwrap dies of SIGTERM at once, and the sandbox with it
-        if worker_state == "responsive":  # it shut down by itself: the Runtime entry still served
-            assert stopped["status"] == "exit status 0" and took < 5, (stopped, took)
-        else:
-            assert stopped["status"] == "signal: killed" and 5 <= took < 20, (stopped, took)
+    if worker_state == "responsive":  # it shut down by itself, the Runtime entry still serving
+        assert stopped["status"] == "exit status 0" and took < 5, (stopped, took)
+        assert not any(e.get("msg") == "the Worker did not stop when asked: SIGTERM" for e in after), after
+    else:  # SIGTERM after the grace (bwrap dies of it at once); srt and the Worker itself need SIGKILL
+        assert stopped["status"].startswith("signal: ") and 5 <= took < 20, (stopped, took)
     assert started_at(pid) == "" and started_at(launch["pid"]) == "", (pid, launch)
     assert stack.worker_processes() == []
     assert not (stack.data_dir / "worker.pid").exists()
@@ -182,6 +185,9 @@ def test_agentd_stops_its_worker_first(stack: Stack, worker_state: str) -> None:
 
 
 def test_kill_9_of_agentd_leaves_no_second_worker(stack: Stack) -> None:
+    """agentd killed -9: its Worker ends with it, on every platform. Its stop channel ends with agentd,
+    and an honest Worker stops by itself; on macOS the launcher's lifeline kills it, on Linux bwrap's
+    --die-with-parent."""
     stack.start_agentd(worker=True)
     w = stack.worker()
     pid = w.wait_ready(1)
@@ -189,45 +195,68 @@ def test_kill_9_of_agentd_leaves_no_second_worker(stack: Stack) -> None:
     [launch] = w.log("worker started")
     old = stack.agentd.popen.pid
     stack.kill_agentd()
-    if SANDBOX in ("srt", "bwrap"):
-        # The lifeline (macOS) or bwrap's --die-with-parent (Linux) ends it with agentd.
-        wait_for(lambda: started_at(pid) == "" and started_at(launch["pid"]) == "", "the Worker to end with agentd",
-                 timeout=10)
-    else:
-        time.sleep(3)
-        assert started_at(pid) == born, "an unsandboxed Worker has no lifeline: it should outlive agentd until the sweep"
-    if SANDBOX == "srt":
-        assert state_dirs(old), "agentd was killed: its Worker's state directory is left for the next one"
+    wait_for(lambda: started_at(pid) == "" and started_at(launch["pid"]) == "", "the Worker to end with agentd", timeout=10)
     stack.restart_agentd()
     assert started_at(pid) != born
     now = stack.worker().pid()
     assert stack.worker_processes() == [now]
-    swept = stack.worker().log("stopped the Worker the last agentd on this data directory left running")
-    assert len(swept) == (1 if SANDBOX == "none" else 0), swept
     assert state_dirs(old) == []
     succeeds(stack)
 
 
-@pytest.mark.skipif(SANDBOX != "srt", reason="the macOS launcher's lifeline")
-def test_the_next_agentd_stops_a_worker_its_lifeline_missed(stack: Stack) -> None:
+@pytest.mark.parametrize("next_agentd", ["with its Worker", "--no-worker"])
+def test_the_next_agentd_stops_a_worker_the_last_left_running(stack: Stack, next_agentd: str) -> None:
+    """A Worker that cannot stop by itself (frozen here; a subverted one would not), and on macOS has
+    lost its lifeline too, outlives a killed agentd; the next agentd on the data directory stops it
+    before it listens, whether it runs a Worker of its own or not (worker.pid). On Linux bwrap's
+    --die-with-parent has ended it already."""
     stack.start_agentd(worker=True)
     w = stack.worker()
     pid = w.wait_ready(1)
     born = started_at(pid)
     [launch] = w.log("worker started")
-    # The lifeline's watcher is a subshell of the launcher (now srt), and its cat.
-    watcher = [p for p in descendants(launch["pid"]) if "run-worker.sh" in command_of(p)]
-    assert watcher, [command_of(p) for p in descendants(launch["pid"])]
-    for p in [*watcher, *(c for p in watcher for c in descendants(p))]:
-        os.kill(p, signal.SIGKILL)
+    if SANDBOX == "srt":  # the lifeline's watcher is a subshell of the launcher (now srt), with its cat
+        watcher = [p for p in descendants(launch["pid"]) if "run-worker.sh" in command_of(p)]
+        assert watcher, [command_of(p) for p in descendants(launch["pid"])]
+        for p in [*watcher, *(c for p in watcher for c in descendants(p))]:
+            os.kill(p, signal.SIGKILL)
+    os.kill(pid, signal.SIGSTOP)
     stack.kill_agentd()
-    time.sleep(5)
-    assert started_at(pid) == born, "the Worker ended without its lifeline: the test shows nothing"
-    stack.restart_agentd()
+    time.sleep(3)
+    if SANDBOX == "bwrap":
+        assert started_at(pid) == "", "bwrap's --die-with-parent did not end the sandbox"
+    else:
+        assert started_at(pid) == born, "the Worker ended with agentd: the test shows nothing"
+    stack.start_agentd(worker=next_agentd == "with its Worker")
     assert started_at(pid) == "", "the next agentd left the last one's Worker running"
-    assert len(stack.worker().log("stopped the Worker the last agentd on this data directory left running")) == 1
-    assert stack.worker_processes() == [stack.worker().pid()]
-    succeeds(stack)
+    swept = [e for e in stack.agentd_log() if e.get("msg") == "stopped the Worker the last agentd on this data directory left running"]
+    assert len(swept) == (0 if SANDBOX == "bwrap" else 1), swept
+    if next_agentd == "with its Worker":
+        assert stack.worker_processes() == [stack.worker().pid()]
+        succeeds(stack)
+    else:
+        assert stack.worker_processes() == []
+
+
+def test_a_workflow_task_in_flight_is_reported_across_agentds_stop(stack: Stack) -> None:
+    """agentd stops its Worker through the stop channel: the Worker finishes the workflow task it holds
+    and reports it while the Runtime entry still serves, so the task does not time out. A signal through
+    the launcher would cut it off: srt drops the connections it proxies before it passes SIGTERM on, and
+    bwrap dies of SIGTERM, the sandbox with it."""
+    stack.start_agentd(worker=True, workflows="tests.rogue_workflows:SlowTask")
+    run = stack.start_run()
+    events = wait_for(lambda: ev if "WORKFLOW_TASK_STARTED" in (ev := event_types(stack.history(run))) else None,
+                      "the Worker to take the run's workflow task", interval=0.05)
+    assert "WORKFLOW_TASK_COMPLETED" not in events, events  # in flight: it holds it for 1.5 s
+    agentd = stack.agentd
+    assert agentd is not None
+    agentd.popen.send_signal(signal.SIGTERM)
+    assert agentd.popen.wait(timeout=60) == 0
+    events = event_types(stack.history(run))
+    assert "WORKFLOW_TASK_TIMED_OUT" not in events and "WORKFLOW_EXECUTION_COMPLETED" in events, events
+    [stopped] = [e for e in stack.agentd_log() if e.get("msg") == "worker stopped"]
+    assert stopped["status"] == "exit status 0", stopped
+    stack.restart_agentd()  # its log verifies
 
 
 def test_t16_a_second_agentd_leaves_the_first_ones_worker_alone(stack: Stack) -> None:

@@ -446,17 +446,24 @@ Worker that was up a minute. It never gives up, so that the Control socket keeps
 cancel the run that makes it crash. It has no liveness probe: a Worker that hangs, or that someone
 stopped (`kill -STOP`, as T1 does), is left as it is. The first Worker must say it is ready within
 60 s, before agentd says it is; otherwise agentd stops, and its error quotes the Worker's last lines.
-On SIGTERM or Ctrl-C agentd stops the Worker first: no more restarts, SIGTERM, and after 5 s SIGKILL
-for its whole process group. agentd's log has each start (its generation, pid, argv and environment),
-each readiness and each exit (its status, how long it ran, the next delay, its last lines), and the
-Worker's own output, escaped, at most 2 KiB a line and 20 lines a second, with a count of the rest.
-The Worker's environment is agentd's own making, from scratch (`PATH`, `HOME`, `LANG`, and the
-`AGENTOS_SANDBOX_*` variables below), so the log of it holds no secret: a Worker never gets one. Each
-exit agentd did not cause is also an audit record (`worker.exited`: its generation, pid, exit code or
-signal, how long it ran, whether it was ready, the next delay), at most one a minute: an exit within a
-minute of the last record is held, and the next record describes the latest and counts the others
-(`unrecorded`). `audit verify` and `runs explain` read past these records; `agentd.started` names the
-Worker's launcher, code directory, workflows and limits (none yet).
+On SIGTERM or Ctrl-C agentd stops the Worker first, before it closes the Runtime entry: no more
+restarts, and the Worker is asked to stop through its stdin, a pipe whose write end only agentd holds
+(`--stop-on-stdin-eof`). It finishes the workflow tasks it holds and reports them, and exits, on every
+platform. One that does not within 5 s gets SIGTERM, then SIGKILL for its whole process group. A signal
+could not ask it: srt drops the connections it proxies, the Worker's included, before it passes
+SIGTERM on, and bwrap dies of SIGTERM, the sandbox with it. The pipe also ends when agentd dies, however
+it ends: an honest Worker then stops by itself. The delays start over after a Worker that was up a
+minute counted from its start, not from its readiness. agentd's log has each start (its generation,
+pid, argv and environment), each readiness and each exit (its status, how long it ran, the next delay,
+its last lines), and the Worker's own output, escaped, at most 2 KiB a line and 20 lines a second, with
+a count of the rest. The Worker's environment is agentd's own making, from scratch (agentd's own `PATH`
+and `HOME`, `LANG`, and the `AGENTOS_SANDBOX_*` variables below), so the log of it holds no secret: a
+Worker never gets one. Each exit agentd did not cause is also an audit record (`worker.exited`: its
+generation, pid, exit code or signal, how long it ran, whether it was ready, the next delay): an exit
+within a minute of the last record is held, and the next record, when the minute is up or agentd
+stops, describes the latest and counts the others (`unrecorded`). A `dropped` in one counts earlier
+`worker.exited` records the audit log lost. `audit verify` and `runs explain` read past these records;
+`agentd.started` names the Worker's launcher, code directory, workflows and limits (none yet).
 
 ```yaml
 worker:
@@ -478,10 +485,11 @@ the home directory and the shared temporary directories (`/tmp`, `/var/tmp`, `/v
 agentd's data and the mirrors under the home directory, or list them in `deny_read`. The Worker runs at
 most 100 workflow tasks at once, and so at most 100 threads of them.
 
-Linux ends the sandbox with agentd (bwrap's `--die-with-parent`). macOS has no such thing: agentd
-gives the macOS launcher a lifeline, a pipe whose end only agentd holds, and the launcher kills the
-Worker when agentd is gone, however it ended; a Worker that outlived a killed agentd would reach the
-next one on the same port. agentd also records the running Worker's launcher, with when it started,
+A Worker whose agentd was killed stops by itself (its stdin ends). If it does not: Linux ends the
+sandbox with agentd (bwrap's `--die-with-parent`); macOS has no such thing, so agentd gives the macOS
+launcher a lifeline, a pipe whose end only agentd holds, and the launcher kills the Worker when agentd
+is gone, however it ended; a Worker that outlived a killed agentd would reach the next one on the same
+port. agentd also records the running Worker's launcher, with when it started,
 in `worker.pid` in its data directory, and the next agentd on that data directory stops it once it
 holds the directory's lock, before it listens. These clean up after an honest Worker, not a
 subverted one: on macOS a subverted Worker can fork a child that leaves its process group (`setsid`, a

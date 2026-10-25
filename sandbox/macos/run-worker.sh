@@ -39,6 +39,9 @@
 #     not contain a subverted one, which can fork a child that leaves the group (setsid, or a double
 #     fork): still sandboxed, it could reach the next agentd's port. Not fixed here: C3b's ulimit -u
 #     (no fork), or a per-generation credential at the Runtime entry, would close it
+#   - stdin: agentd's stop channel, a pipe the Worker reads (--stop-on-stdin-eof) and stops at its end.
+#     This script and srt hand it on as it is (srt's own SIGTERM handling would drop the Worker's
+#     connections before it passed the signal on)
 #   - controlling terminal: none. srt lets what it runs ioctl /dev/tty, so a Worker in a session
 #     with a terminal could type into it (TIOCSTI). This script refuses to run with one: agentd
 #     starts it in a session of its own; by hand, see the README

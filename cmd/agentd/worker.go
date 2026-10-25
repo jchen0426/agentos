@@ -33,13 +33,15 @@ func checkWorker(goos string, cfg *config.Config, insecureDev bool) error {
 // through its launcher, which takes the Runtime entry (macOS a port, Linux the socket), the Python
 // environment and the code directory, then the Worker's command; or, with no launcher
 // (--insecure-dev), the Worker's command alone. The environment is agentd's own making, from
-// scratch: what the launchers need (PATH for node, bwrap and socat; HOME, which the macOS launcher
-// denies), and what agentd keeps from the Worker. None of agentd's own environment, and no secret:
-// a Worker never gets one.
+// scratch: what the launchers need (agentd's own PATH, for node, bwrap and socat, and HOME, which the
+// macOS launcher denies), and what agentd keeps from the Worker. Nothing else of agentd's own
+// environment, and no secret: a Worker never gets one.
 func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor.Options, error) {
 	w := cfg.Worker
 	python := filepath.Join(w.Python, "bin", "python")
-	args := []string{"--namespace", cfg.Temporal.Namespace, "--task-queue", cfg.TaskQueues.Workflows, "--workflows", w.Workflows}
+	// The Worker stops, gracefully, when its stdin ends: the supervisor's stop channel.
+	args := []string{"--namespace", cfg.Temporal.Namespace, "--task-queue", cfg.TaskQueues.Workflows, "--workflows", w.Workflows,
+		"--stop-on-stdin-eof"}
 	deny, err := json.Marshal(slices.Concat(toolDenyRead(cfg), w.DenyRead))
 	if err != nil {
 		return supervisor.Options{}, err

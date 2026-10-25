@@ -1,7 +1,9 @@
 """Workflows that misbehave, for the tests of agentd's own enforcement (tests/test_cancel.py,
-tests/test_write_limits.py, tests/test_t5_payload_binding.py, tests/test_t9_isolation.py)."""
+tests/test_write_limits.py, tests/test_t5_payload_binding.py, tests/test_t9_isolation.py,
+tests/test_worker_supervision.py)."""
 
 import asyncio
+import time
 from datetime import timedelta
 
 from temporalio import workflow
@@ -169,6 +171,22 @@ class StepsOutOfLine(SecurityAudit):
         else:
             raise ValueError(f"no such step out of line: {a.base_branch}")
         return {}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+
+@workflow.defn(name="security-audit")
+class SlowTask(SecurityAudit):
+    """Holds its one workflow task for 1.5 s, under the SDK's 2 s limit for a workflow task that does
+    not yield, and then ends: a workflow task in flight while agentd stops (tests/test_worker_supervision.py)."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        with workflow.unsafe.sandbox_unrestricted():
+            time.sleep(1.5)
+        return {"slow": True}
 
     @workflow.signal
     def doorbell(self) -> None:

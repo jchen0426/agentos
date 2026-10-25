@@ -33,8 +33,10 @@
 # a cgroup (docs/m1-notes.md).
 #
 # agentd starts this itself (agentd.yaml's worker section), in a session of its own, and starts it
-# again whenever it exits. bwrap's --die-with-parent ends the sandbox when agentd dies, however it
-# ends; --new-session keeps the Worker off any terminal. AGENTOS_SANDBOX_DENY_READ means nothing here:
+# again whenever it exits. Its stdin is agentd's stop channel, which bwrap hands the Worker as it is:
+# the Worker stops at its end (bwrap would die of SIGTERM, the sandbox with it). bwrap's
+# --die-with-parent ends the sandbox when agentd dies, however it ends; --new-session keeps the Worker
+# off any terminal. AGENTOS_SANDBOX_DENY_READ means nothing here:
 # the sandbox mounts only what it is given.
 #
 # Usage: run-worker.sh <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...]

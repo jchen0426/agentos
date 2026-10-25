@@ -30,7 +30,7 @@ var port = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7244}
 // configuration's namespace, task queue and workflows.
 func TestWorkerLaunch(t *testing.T) {
 	worker := []string{"/opt/venv/bin/python", "-m", "agentos_worker"}
-	args := []string{"--namespace", "ns", "--task-queue", "wq", "--workflows", "agentos_worker.workflows:WORKFLOWS"}
+	args := []string{"--namespace", "ns", "--task-queue", "wq", "--workflows", "agentos_worker.workflows:WORKFLOWS", "--stop-on-stdin-eof"}
 	cfg := workerConfig()
 	o, err := workerLaunch("darwin", cfg, port)
 	if want := slices.Concat([]string{"/opt/agentos/run-worker.sh", "7244", "/opt/venv", "/opt/code", "--"}, worker,

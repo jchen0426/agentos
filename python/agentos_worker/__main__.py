@@ -58,6 +58,26 @@ def wait_on_output() -> None:
                                   errors=sys.stderr.errors, line_buffering=True)
 
 
+def watch_stop_channel(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
+    """Stop, gracefully, once stdin ends: agentd's stop channel is a pipe whose write end only it
+    holds. It closes it to have the Worker stop (a signal through the launcher would cut the Worker
+    off first: srt drops the connections it proxies before it passes SIGTERM on, and bwrap dies of
+    it), and it closes by itself when agentd dies, however it ends. What arrives on it is ignored."""
+
+    def readable() -> None:
+        try:
+            data = os.read(0, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            loop.remove_reader(0)
+            stop.set()
+
+    loop.add_reader(0, readable)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="agentos-worker", description=__doc__.splitlines()[0])
     p.add_argument("--endpoint", default="127.0.0.1:7233", help="Runtime entry, host:port")
@@ -70,6 +90,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--http-connect-proxy", default=None, metavar="HOST:PORT",
         help='HTTP CONNECT proxy to reach the endpoint through; "env" reads HTTPS_PROXY/HTTP_PROXY',
+    )
+    p.add_argument(
+        "--stop-on-stdin-eof", action="store_true",
+        help="stop as on SIGTERM when stdin ends: agentd's stop channel, which also ends when agentd does",
     )
     return p.parse_args()
 
@@ -110,6 +134,8 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
+    if args.stop_on_stdin_eof:
+        watch_stop_channel(loop, stop)
     async with worker:
         logging.info("worker ready: endpoint=%s task_queue=%s", args.endpoint, args.task_queue)
         await stop.wait()
