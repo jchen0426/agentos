@@ -260,7 +260,9 @@ def test_the_workers_output_is_logged_escaped_and_bounded(stack: Stack) -> None:
     assert cut["bytes"] == len("chatty: ") + 10_000 and cut["line"].endswith("…"), cut
     chatty = [e for e in lines if e["line"].startswith("chatty: line ")]
     assert chatty and len(chatty) <= 20 + 20 * (at(chatty[-1]) - at(chatty[0])) + 1, len(chatty)
-    assert sum(e["lines"] for e in w.log("worker output not logged")) > 0
+    # The count of what was left out is logged within a second of the first line left out.
+    wait_for(lambda: sum(e["lines"] for e in w.log("worker output not logged")) > 0, "the count of the lines not logged",
+             timeout=10)
 
 
 @pytest.mark.audit_verify(skip="agentd refuses to start by design")
