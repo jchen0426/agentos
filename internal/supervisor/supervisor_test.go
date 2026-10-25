@@ -489,8 +489,20 @@ func TestStop(t *testing.T) {
 			return child > 0
 		})
 		start := time.Now()
-		s.Stop()
-		if took := time.Since(start); took < 400*time.Millisecond || took > 5*time.Second {
+		stopped := make(chan struct{})
+		go func() {
+			s.Stop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second): // the graces are 400 ms in all
+			// Killed here, the Worker's group lets Stop return, and the test's cleanup after it.
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			<-stopped
+			t.Fatal("Stop did not return within 5 s: the Worker deaf to its stop channel and SIGTERM was not killed")
+		}
+		if took := time.Since(start); took < 400*time.Millisecond {
 			t.Errorf("Stop took %s", took)
 		}
 		if !gone(pid) {

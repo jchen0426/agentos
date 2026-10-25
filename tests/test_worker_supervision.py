@@ -25,6 +25,7 @@ import pytest
 
 from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, TEST_MODELS, WORKER_LAUNCHER, Stack, command_of, descendants,
                            event_types, free_port, started_at, wait_for)
+from tests.rogue_workflows import SLOW_HELD, SLOW_HOLDING
 
 NO_TTY = {"??", "?"}  # what ps says of a process with no controlling terminal: macOS, Linux
 
@@ -242,19 +243,23 @@ def test_a_workflow_task_in_flight_is_reported_across_agentds_stop(stack: Stack)
     """agentd stops its Worker through the stop channel: the Worker finishes the workflow task it holds
     and reports it while the Runtime entry still serves, so the task does not time out. A signal through
     the launcher would cut it off: srt drops the connections it proxies before it passes SIGTERM on, and
-    bwrap dies of SIGTERM, the sandbox with it."""
+    bwrap dies of SIGTERM, the sandbox with it. agentd gets SIGTERM once the task logs that its hold (of
+    1 s) has begun, and the hold is over only after agentd has begun to stop."""
     stack.start_agentd(worker=True, workflows="tests.rogue_workflows:SlowTask")
+    w = stack.worker()
     run = stack.start_run()
-    events = wait_for(lambda: ev if "WORKFLOW_TASK_STARTED" in (ev := event_types(stack.history(run))) else None,
-                      "the Worker to take the run's workflow task", interval=0.05)
-    assert "WORKFLOW_TASK_COMPLETED" not in events, events  # in flight: it holds it for 1.5 s
+    wait_for(lambda: any(SLOW_HOLDING in e["line"] for e in w.log("worker output")), "the run's workflow task to begin its hold",
+             interval=0.05)
     agentd = stack.agentd
     assert agentd is not None
     agentd.popen.send_signal(signal.SIGTERM)
     assert agentd.popen.wait(timeout=60) == 0
     events = event_types(stack.history(run))
     assert "WORKFLOW_TASK_TIMED_OUT" not in events and "WORKFLOW_EXECUTION_COMPLETED" in events, events
-    [stopped] = [e for e in stack.agentd_log() if e.get("msg") == "worker stopped"]
+    entries = stack.agentd_log()
+    msgs = ["held" if e.get("msg") == "worker output" and SLOW_HELD in e["line"] else e.get("msg") for e in entries]
+    assert "held" in msgs and msgs.index("shutting down") < msgs.index("held"), msgs  # in flight across the stop
+    [stopped] = [e for e in entries if e.get("msg") == "worker stopped"]
     assert stopped["status"] == "exit status 0", stopped
     stack.restart_agentd()  # its log verifies
 

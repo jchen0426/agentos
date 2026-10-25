@@ -177,15 +177,23 @@ class StepsOutOfLine(SecurityAudit):
         super().doorbell()
 
 
+# What SlowTask logs as its hold begins, and once it is over.
+SLOW_HOLDING, SLOW_HELD = "slow task: holding its workflow task", "slow task: done holding"
+
+
 @workflow.defn(name="security-audit")
 class SlowTask(SecurityAudit):
-    """Holds its one workflow task for 1.5 s, under the SDK's 2 s limit for a workflow task that does
-    not yield, and then ends: a workflow task in flight while agentd stops (tests/test_worker_supervision.py)."""
+    """Holds its one workflow task for 1 s, half the SDK's 2 s limit for a workflow task that does not
+    yield, and then ends; it logs as the hold begins and once it is over. A workflow task in flight
+    while agentd stops (tests/test_worker_supervision.py): the test stops agentd once the hold has
+    begun."""
 
     @workflow.run
     async def run(self, a: AuditInput) -> dict:
+        workflow.logger.info(SLOW_HOLDING)
         with workflow.unsafe.sandbox_unrestricted():
-            time.sleep(1.5)
+            time.sleep(1.0)
+        workflow.logger.info(SLOW_HELD)
         return {"slow": True}
 
     @workflow.signal

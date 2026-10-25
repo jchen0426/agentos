@@ -1808,7 +1808,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - 没有这个参数什么都不变：harness 自己起的 Worker、`--no-worker` 时手动起的 Worker 的 stdin 照旧，不会一起来就停。
   - 查过：macOS 启动脚本只重新打开关着的 fd 0，管道原样保留；srt 对 fd 0 用 inherit；bwrap 也原样传下去。两个启动脚本的头部注释写了这一点。
   - 附带的好处（不代替生命线）：agentd 死了，管道写端随之关掉，诚实的 Worker 在每个平台上都会自己停，不加沙箱的也一样。
-  - 黑盒测试：Worker 手里有一个工作流任务时（`tests.rogue_workflows:SlowTask` 在工作流任务里停 1.5 秒，在 SDK 2 秒的死锁上限之内），给 agentd 发 SIGTERM：历史里没有 WorkflowTaskTimedOut，执行已经完成，Worker 以 0 退出。三种环境都跑。黑盒改坏（B5：先 SIGTERM，管道 5 秒后才关，就是第一轮的做法）在 srt 下这个测试失败：历史停在 WorkflowTaskStarted，完成没报上去；none 下照样通过，没有启动脚本时 SIGTERM 直接到 Worker，本来就是优雅的。
+  - 黑盒测试：Worker 手里有一个工作流任务时（`tests.rogue_workflows:SlowTask` 在工作流任务里停 1 秒，是 SDK 2 秒死锁上限的一半，停之前、停完各打一行日志），等“开始停”那一行出现在 agentd 的日志里，再给 agentd 发 SIGTERM：历史里没有 WorkflowTaskTimedOut，执行已经完成，“停完”那一行在 agentd 的 "shutting down" 之后（任务确实跨过了停止，SIGTERM 来晚了测试会失败，不会空过），Worker 以 0 退出。三种环境都跑。原来停 1.5 秒、看到历史里的 WorkflowTaskStarted 就发 SIGTERM：离死锁上限太近（CI 的 macOS 只有 3 个核，Linux 的任务也重），SIGTERM 来晚了测试也照样通过。黑盒改坏（B5：先 SIGTERM，管道 5 秒后才关，就是第一轮的做法）在 srt 下这个测试失败：历史停在 WorkflowTaskStarted，完成没报上去；none 下照样通过，没有启动脚本时 SIGTERM 直接到 Worker，本来就是优雅的。
   - 跟着改的测试：SIGTERM 时响应的 Worker 在三种环境下都以 0 退出（bwrap 也是）；被 SIGSTOP 的过了 5 秒先吃 SIGTERM。kill -9 agentd 后三种环境下 Worker 都在 10 秒内没了。原来只在 srt 下跑的“生命线漏掉的 Worker”改成三种环境都跑：把 Worker SIGSTOP（这样它不能自己停），srt 下再杀掉看门进程，kill -9 agentd，下一个 agentd（带自己的 Worker，或者 `--no-worker`）在监听之前把它清扫掉；bwrap 下 `--die-with-parent` 已经结束了沙箱。这也补上了“`--no-worker` 时也清扫”的测试。
 - **B4. 第一代之后“从不放弃”没有测试钉住（ADV-2）**：S06（`if !wasReady` 代替 `first && !wasReady`）、S22（启动失败后 `return`）、S19（每一代都有就绪期限）都活了下来。加了 `TestLaterGenerations`：
   - 第 2、3 代在就绪前就退出（plan `re, early, early, ready`）：照样重启，Failed 上什么都没有；
@@ -1834,7 +1834,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 - **改坏检查**：Go 60 处（第一轮的 46 处在新代码上重跑，S6 的匹配文本跟着新的 terminate 改了；新加 14 处），59 处抓到，1 处是等价的（S8，见 C6）。
   - 新加的：停止通道一直不关（N1）；过了期限不发 SIGTERM（N2）；stdin 不接管道（N3）；两代之间 `Current()` 还报旧 pid（N4）；ADV-2 的 S06、S19（每一代都有就绪期限）、S22；ADV-3 的 S30；ADV-5 的检查（第一次没抓到，见 C6）；pause 不理 Stop（S8b）；C.1 不数 Temporal 的私钥（A8）；不给 `--stop-on-stdin-eof`（A9）；关闭顺序颠倒（A10）；家目录里的 Python 照收（C9）。
-  - S6（SIGTERM 之后不 SIGKILL）是靠 go test 的 90 秒超时抓到的：对两者都不理的 Worker，Stop 永远不返回。
+  - S6（SIGTERM 之后不 SIGKILL）原来靠 go test 的 90 秒超时才抓到：对两者都不理的 Worker，Stop 永远不返回。现在 “deaf to both” 有自己的 5 秒期限（两段宽限一共 400 毫秒），到期时测试自己杀掉进程组，让 Stop 和测试的清理都能返回，然后失败：S6 在 5.02 秒失败。
   - 黑盒：B5（见 B3）srt 下失败、none 下通过，和预期一致；B2（关闭顺序，现在在 `stopInOrder` 里）按新代码重写，none 下抓到。
 - **跑过的**（macOS，`--verify-after-each`，两种环境同时跑；完整的三种套件和 Linux VM 由你跑）：none 下 `test_worker_supervision.py`；srt 下它、`test_sandbox.py` 和 T16（srt 在伪终端上跑，和第一轮一样）。
 
@@ -1843,7 +1843,9 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，不加沙箱 | 18 | 3 | 18 | 13 | 0 | 5 |
   | macOS，srt | 42 | 3 | 24 | 18 | 0 | 6 |
 
-  跑完没有留下 Worker、agentd 或状态目录。`gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；supervisor、cmd/agentd、config 在 `-race` 下也过；`make build`、`make build-linux` 都通过，`bin/` 和 `bin/linux-arm64/` 是最后的代码（d314cb0，之后只改了这份笔记）。bwrap 下的路径（停止通道经 bwrap 传下去、在途任务的测试、kill -9 后 10 秒内没了）我没跑。
+  跑完没有留下 Worker、agentd 或状态目录。`gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；supervisor、cmd/agentd、config 在 `-race` 下也过；`make build`、`make build-linux` 都通过，`bin/` 和 `bin/linux-arm64/` 是最后的代码（d314cb0，之后只改了测试和这份笔记）。bwrap 下的路径（停止通道经 bwrap 传下去、在途任务的测试、kill -9 后 10 秒内没了）我没跑。
+
+  最后一个提交（SlowTask 停 1 秒、按它的日志发 SIGTERM；“deaf to both” 的期限）之后：上面的 Go 检查和两个 build 重跑都过；在途任务的测试 none、srt 下各跑 3 次都过；把 SIGTERM 推迟到停完之后（测试里多睡 1.5 秒），它在顺序那一条断言上失败；B5 重跑，srt 下失败、none 下通过，和原来一样。
 
 #### 剩余风险（对抗审查列的，第二轮加上）
 
