@@ -183,9 +183,16 @@ func TestNoUnsandboxedWorkerNextToASecret(t *testing.T) {
 	if err := checkUnsandboxedSecrets(cfg, mods, true); err == nil || strings.Contains(err.Error(), "github") {
 		t.Errorf("unsandboxed, next to a key: %v", err)
 	}
-	if err := checkUnsandboxedSecrets(cfg, &models.Config{Providers: map[string]models.Provider{"fake": {Adapter: "fake"}}}, true); err != nil {
+	noKeys := &models.Config{Providers: map[string]models.Provider{"fake": {Adapter: "fake"}}}
+	if err := checkUnsandboxedSecrets(cfg, noKeys, true); err != nil {
 		t.Errorf("unsandboxed, no secret: %v", err)
 	}
+	// The Temporal client key: with it a Worker would reach Temporal as agentd, past the Runtime proxy.
+	cfg.Temporal.TLS = &config.TLS{CertFile: "/etc/agentos/agentd.crt", KeyFile: "/etc/agentos/agentd.key"}
+	if err := checkUnsandboxedSecrets(cfg, noKeys, true); err == nil || !strings.Contains(err.Error(), "agentd.yaml's temporal.tls.key_file names") {
+		t.Errorf("unsandboxed, next to the Temporal client key: %v", err)
+	}
+	cfg.Temporal.TLS = nil
 	if err := checkUnsandboxedSecrets(workerConfig(), mods, true); err != nil {
 		t.Errorf("sandboxed: %v", err)
 	}

@@ -116,8 +116,11 @@ directory). Without a sandbox for the git tool server or for the Worker, agentd 
 `--insecure-dev` runs either unsandboxed when its `sandbox` is unset, for development only, and says
 so at every start. An unsandboxed Worker runs as you, and could read a key from the keychain: agentd
 refuses to start its own without a sandbox while its configuration names a real secret (a `keyring:`
-key in models.yaml, or `github.token`), and says which. `--no-worker` is the old flow, and the way out
-then: agentd starts no Worker, and you run one yourself (below).
+key in models.yaml, `github.token`, or the Temporal client key, with which a Worker could reach
+Temporal as agentd, past the Runtime proxy), and says which. That guards against a mistake; it contains
+nothing: an unsandboxed Worker can read whatever you can, secrets no configuration names too.
+`--no-worker` is the old flow, and the way out then: agentd starts no Worker, and you run one yourself
+(below).
 
 ```bash
 bin/agentd --no-worker --config config/dev/agentd.yaml

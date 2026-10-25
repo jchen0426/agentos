@@ -99,8 +99,9 @@ func workerRecord(cfg *config.Config) map[string]any {
 
 // checkUnsandboxedSecrets refuses to start agentd's Worker without a sandbox (--insecure-dev, no
 // worker.sandbox) while the configuration names a real secret: the Worker would run as the user,
-// and could read it from the keychain itself. The way out is --no-worker, with a Worker started by
-// hand: then it is the user's own doing.
+// and could read it itself, from the keychain or its file. The way out is --no-worker, with a Worker
+// started by hand: then it is the user's own doing. It guards against a mistake; it contains nothing:
+// an unsandboxed Worker can read whatever its user can, secrets the configuration does not name too.
 func checkUnsandboxedSecrets(cfg *config.Config, mods *models.Config, insecureDev bool) error {
 	if len(cfg.Worker.Sandbox) > 0 || !insecureDev {
 		return nil
@@ -110,13 +111,14 @@ func checkUnsandboxedSecrets(cfg *config.Config, mods *models.Config, insecureDe
 		return nil
 	}
 	return fmt.Errorf("%s names a real secret, and agentd's Worker would run without a sandbox (--insecure-dev, no "+
-		"worker.sandbox), as you, able to read it from the keychain: give the Worker its sandbox (worker.sandbox), or start "+
+		"worker.sandbox), as you, able to read it: give the Worker its sandbox (worker.sandbox), or start "+
 		"agentd with --no-worker and a Worker of your own", strings.Join(named, ", "))
 }
 
-// secretsIn is every setting of the configuration that names a real secret, a keyring reference:
-// each model provider's key, whether a task reaches the provider or not (the keychain holds it all
-// the same), and the GitHub token.
+// secretsIn is every setting of the configuration that names a real secret: each model provider's
+// key, whether a task reaches the provider or not (the keychain holds it all the same), the GitHub
+// token, and the Temporal client key, with which a Worker could reach Temporal as agentd, past the
+// Runtime proxy.
 func secretsIn(cfg *config.Config, mods *models.Config) []string {
 	var named []string
 	for _, name := range slices.Sorted(maps.Keys(mods.Providers)) {
@@ -126,6 +128,9 @@ func secretsIn(cfg *config.Config, mods *models.Config) []string {
 	}
 	if g := cfg.GitHub; g != nil && g.Token != "" {
 		named = append(named, "agentd.yaml's github.token")
+	}
+	if t := cfg.Temporal.TLS; t != nil && t.KeyFile != "" {
+		named = append(named, "agentd.yaml's temporal.tls.key_file")
 	}
 	return named
 }
