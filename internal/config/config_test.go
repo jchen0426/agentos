@@ -524,6 +524,25 @@ func TestCheckWorker(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "outer"), filepath.Join(dir, "around")); err != nil {
 		t.Fatal(err)
 	}
+	// A home directory with a Python in it, as uv keeps its own; a venv elsewhere whose python leads
+	// there; and a code directory at home with a venv inside it.
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	for _, d := range []string{"home/.local/python/bin", "homevenv/bin", "home/code/venv/bin"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"home/.local/python/bin/python3.12", "home/code/venv/bin/python3.12"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "home/.local/python/bin/python3.12"), filepath.Join(dir, "homevenv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("python3.12", filepath.Join(dir, "home/code/venv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
 	load := func(body string) *Config {
 		t.Helper()
 		path := filepath.Join(dir, "agentd.yaml")
@@ -573,6 +592,12 @@ func TestCheckWorker(t *testing.T) {
 		"Linux socket around data": {"data_dir: outer/data\nruntime_listen: unix://outer/runtime.sock\nworker: {" + sandbox + "python: venv, code: code}\n", "linux", true,
 			"holds the data directory"},
 		"another platform": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: venv, code: code}\n", "freebsd", true, "no Worker launcher for freebsd"},
+		// A Python in the home directory, which the macOS sandbox cannot read (uv's): refused there only.
+		"macOS, a Python at home": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: homevenv, code: code}\n", "darwin", true,
+			"in the home directory, which the macOS sandbox cannot read"},
+		"macOS, a Python at home, unsandboxed":  {"data_dir: data\n" + tcp + "worker: {python: homevenv, code: code}\n", "darwin", false, ""},
+		"Linux, a Python at home":               {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: homevenv, code: code}\n", "linux", true, ""},
+		"macOS, a Python in the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: home/code/venv, code: home/code}\n", "darwin", true, ""},
 	} {
 		err := load(c.body).CheckWorker(c.goos, c.sandboxed)
 		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {

@@ -375,6 +375,42 @@ func (c *Config) private() []named {
 	return paths
 }
 
+// outsideHome refuses, for the macOS sandbox, a Python environment whose bin/python leads into the
+// home directory outside the Python environment and the code directory: the sandbox cannot read it,
+// and the Worker would fail only once its launcher ran. uv's own Pythons live there.
+func outsideHome(w Worker) error {
+	python := filepath.Join(w.Python, "bin", "python")
+	real, err := filepath.EvalSymlinks(python)
+	if err != nil {
+		return fmt.Errorf("worker.python: %s: %w", python, err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil // the launcher denies $HOME: nothing to compare with here
+	}
+	readable := func(p string) bool {
+		for _, d := range []string{w.Python, w.Code} {
+			if within(p, d) {
+				return true
+			}
+			if r, err := filepath.EvalSymlinks(d); err == nil && within(p, r) {
+				return true
+			}
+		}
+		return false
+	}
+	realHome := home
+	if r, err := filepath.EvalSymlinks(home); err == nil {
+		realHome = r
+	}
+	if (within(real, home) || within(real, realHome)) && !readable(real) {
+		return fmt.Errorf("worker.python: %s leads to %s, in the home directory, which the macOS sandbox cannot read: "+
+			"give the Worker a Python environment made from a Python outside it (python.org's or Homebrew's; "+
+			"uv's own Pythons are in the home directory)", python, real)
+	}
+	return nil
+}
+
 // workflowsSpec is module:attribute, as the Worker's --workflows takes it.
 var workflowsSpec = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -413,6 +449,11 @@ func (c *Config) CheckWorker(goos string, sandboxed bool) error {
 	if fi, err := os.Stat(filepath.Join(w.Python, "bin", "python")); err != nil || fi.IsDir() {
 		return fmt.Errorf("worker.python: %s/bin/python does not run the Worker: %v", w.Python, err)
 	}
+	if sandboxed && goos == "darwin" {
+		if err := outsideHome(w); err != nil {
+			return err
+		}
+	}
 	if fi, err := os.Stat(w.Code); err != nil || !fi.IsDir() {
 		return fmt.Errorf("worker.code: %s is not a directory: %v", w.Code, err)
 	}
@@ -434,7 +475,7 @@ func (c *Config) CheckWorker(goos string, sandboxed bool) error {
 			"give it tcp://127.0.0.1:<port>", c.RuntimeListen)
 	case goos == "linux" && !unixListen:
 		return fmt.Errorf("runtime_listen %s: the Linux sandbox has no network, and its launcher forwards to a socket: "+
-			"give it unix:///<path>", c.RuntimeListen)
+			"give it unix:///<path> (or start agentd with --no-worker and run a Worker yourself)", c.RuntimeListen)
 	case goos == "linux":
 		// The launcher mounts the socket's directory into the sandbox, all of it.
 		dir := locate(filepath.Dir(socket))

@@ -483,7 +483,8 @@ key, or a mirror, and the launchers refuse either if it holds dev data (agentd's
 directory, Temporal's database), a FIFO, or on Linux a Unix socket (a read-only mount does not stop
 `connect()`). agentd also refuses a Runtime entry the launcher cannot hand the Worker: on macOS
 `tcp://127.0.0.1:<port>`, the one destination its sandbox lets through; on Linux `unix://<path>`, in a
-directory of its own, which the sandbox mounts. On macOS the sandbox can also read everything outside
+directory of its own, which the sandbox mounts. On macOS it refuses a Python environment whose
+`bin/python` leads into the home directory (uv's own Pythons are there), which the sandbox cannot read. On macOS the sandbox can also read everything outside
 the home directory and the shared temporary directories (`/tmp`, `/var/tmp`, `/var/folders`): keep
 agentd's data and the mirrors under the home directory, or list them in `deny_read`. The Worker runs at
 most 100 workflow tasks at once, and so at most 100 threads of them.
