@@ -390,10 +390,12 @@ a model's words), and nothing of what Temporal has of a call agentd has no recor
 fail or complete a call itself, on a task queue of its own. `runs explain`, which is local, names
 them all. What a subverted Worker still steers in the report: why it reports and the error's type
 (two reasons, 51 names or none); which of the task's steps it calls, in what order, and how each
-ends (the verdict, its kind, the step it names, a few counts such as attempts and a budget's
-figures, a few bits such as which of Temporal's timeouts ended a call); when it reports (the
-comment's time, and an approval's request time); and that it reports once per run (the effect's
-cap). Two ways out are still open: a model task's plain arguments (the ones that are not a
+ends (the verdict, its kind, the step it names, a few counts such as attempts, a few bits such as
+which of Temporal's timeouts ended a call); a budget's figures, when a call runs out of budget,
+which follow the size of a model task's request (about 17 bits a report while its plain arguments,
+below, are open); when it reports (the comment's time, and an approval's request time); and that it
+reports once per run (the effect's cap, unless the policy raises the tool's `max_per_run`). Two
+ways out are still open: a model task's plain arguments (the ones that are not a
 blob) reach the model as they are, and the model's answer is the report; and the comment's hidden
 marker names the report's effect by a hash of the report call's arguments, which the Worker can
 choose until the hash says what it wants (docs/m5-notes.md). The report shows no internal error's
