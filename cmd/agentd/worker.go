@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/jchen0426/agentos/internal/config"
+	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/supervisor"
 )
 
@@ -91,4 +93,37 @@ func workerRecord(cfg *config.Config) map[string]any {
 	}
 	return map[string]any{"sandbox": sandbox, "python": w.Python, "code": w.Code, "workflows": w.Workflows,
 		"limits": map[string]any{}}
+}
+
+// checkUnsandboxedSecrets refuses to start agentd's Worker without a sandbox (--insecure-dev, no
+// worker.sandbox) while the configuration names a real secret: the Worker would run as the user,
+// and could read it from the keychain itself. The way out is --no-worker, with a Worker started by
+// hand: then it is the user's own doing.
+func checkUnsandboxedSecrets(cfg *config.Config, mods *models.Config, insecureDev bool) error {
+	if len(cfg.Worker.Sandbox) > 0 || !insecureDev {
+		return nil
+	}
+	named := secretsIn(cfg, mods)
+	if len(named) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s names a real secret, and agentd's Worker would run without a sandbox (--insecure-dev, no "+
+		"worker.sandbox), as you, able to read it from the keychain: give the Worker its sandbox (worker.sandbox), or start "+
+		"agentd with --no-worker and a Worker of your own", strings.Join(named, ", "))
+}
+
+// secretsIn is every setting of the configuration that names a real secret, a keyring reference:
+// each model provider's key, whether a task reaches the provider or not (the keychain holds it all
+// the same), and the GitHub token.
+func secretsIn(cfg *config.Config, mods *models.Config) []string {
+	var named []string
+	for _, name := range slices.Sorted(maps.Keys(mods.Providers)) {
+		if mods.Providers[name].Key != "" {
+			named = append(named, fmt.Sprintf("models.yaml's providers.%s.key", name))
+		}
+	}
+	if g := cfg.GitHub; g != nil && g.Token != "" {
+		named = append(named, "agentd.yaml's github.token")
+	}
+	return named
 }

@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, WORKER_LAUNCHER, Stack, command_of, descendants, free_port,
-                           started_at, wait_for)
+from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, TEST_MODELS, WORKER_LAUNCHER, Stack, command_of, descendants,
+                           free_port, started_at, wait_for)
 
 NO_TTY = {"??", "?"}  # what ps says of a process with no controlling terminal: macOS, Linux
 
@@ -286,6 +286,29 @@ def test_agentd_refuses_a_worker_it_cannot_run(stack: Stack, what: str) -> None:
     assert stack.agentd is not None and stack.agentd.popen.wait(timeout=30) != 0
     assert want in stack.agentd.text(), stack.agentd.text()
     assert not (stack.data_dir / "ledger.db").exists()  # refused before agentd changed anything
+
+
+def test_no_unsandboxed_worker_next_to_a_real_secret(stack: Stack) -> None:
+    """An unsandboxed Worker runs as the user, and could read a key from the keychain: agentd starts
+    none while its configuration names a real secret (the user's decision). A provider's key counts
+    whether a task reaches it or not, and agentd reads none it does not use: this one is not there."""
+    models = TEST_MODELS.replace("providers:\n", 'providers:\n  spare: {adapter: anthropic, key: "keyring:agentos-test-not-there"}\n', 1)
+    assert models != TEST_MODELS
+    if SANDBOX != "none":  # a sandbox keeps the keychain from the Worker
+        stack.start_agentd(worker=True, models=models)
+        succeeds(stack)
+        return
+    with pytest.raises(AssertionError):
+        stack.start_agentd(worker=True, models=models)
+    assert stack.agentd is not None and stack.agentd.popen.wait(timeout=30) == 1
+    [stopped] = [e for e in stack.agentd_log() if e.get("msg") == "agentd stopped"]
+    assert "models.yaml's providers.spare.key names a real secret" in stopped["error"], stopped
+    assert "--no-worker" in stopped["error"], stopped
+    assert stack.worker_processes() == []
+    # The way out: agentd with --no-worker, and a Worker started by hand.
+    stack.start_agentd(models=models)
+    stack.start_worker()
+    succeeds(stack)
 
 
 def test_with_no_worker_agentd_starts_none(stack: Stack) -> None:

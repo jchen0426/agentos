@@ -140,6 +140,12 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	if err != nil {
 		return err
 	}
+	// The user's decision (M5 C2a): no Worker of agentd's own runs unsandboxed next to a real secret.
+	if !noWorker {
+		if err := checkUnsandboxedSecrets(cfg, mods, insecureDev); err != nil {
+			return err
+		}
+	}
 	prices, err := pricing.Load(cfg.PricesFile)
 	if err != nil {
 		return err

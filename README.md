@@ -114,8 +114,10 @@ agentd starts the Worker itself, once its Runtime entry serves, in the sandbox i
 (`.venv/bin/python` must lead there: python.org's or Homebrew's, not one uv downloaded into the home
 directory). Without a sandbox for the git tool server or for the Worker, agentd refuses to start;
 `--insecure-dev` runs either unsandboxed when its `sandbox` is unset, for development only, and says
-so at every start. `--no-worker` is the old flow: agentd starts no Worker, and you run one yourself
-(below).
+so at every start. An unsandboxed Worker runs as you, and could read a key from the keychain: agentd
+refuses to start its own without a sandbox while its configuration names a real secret (a `keyring:`
+key in models.yaml, or `github.token`), and says which. `--no-worker` is the old flow, and the way out
+then: agentd starts no Worker, and you run one yourself (below).
 
 ```bash
 bin/agentd --no-worker --config config/dev/agentd.yaml

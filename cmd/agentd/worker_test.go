@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/jchen0426/agentos/internal/config"
+	"github.com/jchen0426/agentos/internal/models"
 )
 
 func workerConfig() *config.Config {
@@ -161,5 +162,34 @@ func TestWorkerRecord(t *testing.T) {
 	cfg.Worker.Sandbox = nil
 	if r := workerRecord(cfg); r["sandbox"] != "" {
 		t.Errorf("unsandboxed: %v", r)
+	}
+}
+
+// agentd starts no Worker of its own without a sandbox while its configuration names a real secret
+// (the user's decision): the Worker would run as the user, and could read it from the keychain. Each
+// such setting is named, and the way out. A sandboxed Worker, or none (--no-worker), is no matter.
+func TestNoUnsandboxedWorkerNextToASecret(t *testing.T) {
+	mods := &models.Config{Providers: map[string]models.Provider{"fake": {Adapter: "fake"},
+		"spare": {Adapter: "anthropic", Key: "keyring:agentos-test"}, "local": {Adapter: "openai_compat", BaseURL: "http://127.0.0.1:1/v1"}}}
+	cfg := workerConfig()
+	cfg.Worker.Sandbox = nil
+	cfg.GitHub = &config.GitHub{Token: "keyring:agentos-github-token"}
+	err := checkUnsandboxedSecrets(cfg, mods, true)
+	if err == nil || !strings.Contains(err.Error(), "models.yaml's providers.spare.key, agentd.yaml's github.token names a real secret") ||
+		!strings.Contains(err.Error(), "--no-worker") || strings.Contains(err.Error(), "providers.local") {
+		t.Errorf("unsandboxed, next to two secrets: %v", err)
+	}
+	cfg.GitHub = &config.GitHub{APIURL: "http://127.0.0.1:1/"} // a simulator: no token
+	if err := checkUnsandboxedSecrets(cfg, mods, true); err == nil || strings.Contains(err.Error(), "github") {
+		t.Errorf("unsandboxed, next to a key: %v", err)
+	}
+	if err := checkUnsandboxedSecrets(cfg, &models.Config{Providers: map[string]models.Provider{"fake": {Adapter: "fake"}}}, true); err != nil {
+		t.Errorf("unsandboxed, no secret: %v", err)
+	}
+	if err := checkUnsandboxedSecrets(workerConfig(), mods, true); err != nil {
+		t.Errorf("sandboxed: %v", err)
+	}
+	if err := checkUnsandboxedSecrets(cfg, mods, false); err != nil { // checkWorker refuses that already
+		t.Errorf("no --insecure-dev: %v", err)
 	}
 }

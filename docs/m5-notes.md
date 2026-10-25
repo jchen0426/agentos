@@ -1743,6 +1743,9 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 ### 用户定的
 
+- **C.1：不加沙箱的 Worker 和真密钥**。用户原话：“拒绝：--insecure-dev 且没有 worker.sandbox 时，配置里有真密钥就拒绝拉起 Worker，要跑就用 --no-worker 自己起。”
+  - 做法：`--insecure-dev`、没有 `worker.sandbox`、又没有 `--no-worker` 时，配置里只要有 `keyring:` 引用（任一个模型 provider 的 key，不管有没有任务用到它，因为钥匙串里反正有；或者 `github.token`），agentd 就拒绝启动，错误里点名是哪个设置，并说出路：给 Worker 沙箱，或者 `--no-worker` 再自己起一个 Worker。README 也这么写。单独一个提交，放在最后。测试：none 下配置里有 `keyring:` 引用的栈被拒绝，同一份配置加 `--no-worker`、再手动起 Worker，能跑完一次运行；srt、bwrap 下同一份配置照常起沙箱里的 Worker。
+  - 查过：默认的假模型、模拟的 GitHub 都不带 `keyring:` 引用，没有一个测试栈会碰到它。`AGENTOS_MODEL=claude` 或 `openai` 加 `AGENTOS_SANDBOX=none` 时，`worker=True` 的栈都会被拒绝：这和 README 一直以来的要求一致（agentd 拿着真密钥时 Worker 要在沙箱里）。C2b 迁移 T1 时要记得：真模型的 T1 只在 srt 下跑。
 - **测试用真的常数**（不加只给测试用的开关）：两个慢的用例，一个等 60 秒的就绪超时，一个等 60 秒的间隔重置。
 - **dev 配置加 `worker` 一节**，README 写明现在要 `npm ci` 和家目录外的 Python，`--no-worker` 是原来的流程。
 - **C.4（TIOCSTI）在这个 PR 里修**：启动脚本、直接调启动脚本的测试、README 的手动运行办法、git 工具服务器（上面第 13 条和“做了什么”）。
@@ -1765,7 +1768,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - （srt）启动脚本的协议：用 agentd 给的状态目录，并把它留给 agentd 删；生命线的写端一关，srt 和 Worker 都被杀。
   - （srt）启动脚本在终端上拒绝运行；照 README 的 perl 办法能跑。
 - **Go 测试**：supervisor（间隔和重置、第一个 Worker 的三种结局、停的各种情形、输出的截断和限速、记录的频率和压着的记录、会话和环境、生命线在 agentd 被杀时读到 EOF、清扫各种情形、启动时间和僵尸进程）；statedir；gitmcp 的会话；agentd 的命令、环境白名单、拒绝；config 的 worker 一节和 CheckWorker；verify 跳过 worker.exited；runs explain 的 Starts 不含它。
-- **改坏检查**：Go 43 处，黑盒 4 处，最后全部抓到。
+- **改坏检查**：Go 46 处（其中 3 处是 C.1 的拒绝），黑盒 4 处，最后全部抓到。
   - 第一轮 Go 有 7 处“活下来”，其中 5 处是改法本身编译不过（变量没用上），重写后都被抓到；真正漏掉的两处（停下时不写压着的记录、一分钟到了不写）补了测试 `TestRecordsOfHeldExits`；另外为“正常退出也杀整个进程组”补了一个用例。
   - 黑盒：清扫挪到锁之前（B1，T16 用例抓到）；看门进程不读（B3）；启动脚本不查终端（B4）；关闭顺序（B2）原来抓不到，加了日志后抓到。去掉 Worker 输出的修法，srt 下的输出用例失败。
 
