@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -198,5 +199,26 @@ func TestNoUnsandboxedWorkerNextToASecret(t *testing.T) {
 	}
 	if err := checkUnsandboxedSecrets(cfg, mods, false); err != nil { // checkWorker refuses that already
 		t.Errorf("no --insecure-dev: %v", err)
+	}
+}
+
+// stopping records the order in which agentd stops what it serves.
+type stopping struct {
+	name  string
+	order *[]string
+}
+
+func (s stopping) Stop()         { *s.order = append(*s.order, s.name) }
+func (s stopping) GracefulStop() { *s.order = append(*s.order, s.name) }
+
+// On SIGTERM agentd stops its Worker first, then the Control server, then the Runtime entry: the
+// Worker reports what it holds through the Runtime entry, and a supervisor still running once it is
+// closed would start a Worker that cannot reach it. (On an error, run's deferred Stop of the
+// supervisor is its latest defer, and runs before the servers': no test here.)
+func TestTheWorkerStopsFirst(t *testing.T) {
+	var order []string
+	stopInOrder(slog.New(slog.DiscardHandler), stopping{"worker", &order}, stopping{"control", &order}, stopping{"runtime", &order})
+	if want := []string{"worker", "control", "runtime"}; !slices.Equal(order, want) {
+		t.Fatalf("stopped %q, want %q", order, want)
 	}
 }

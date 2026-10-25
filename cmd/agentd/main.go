@@ -486,15 +486,9 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	errs := make(chan error, 2)
 	go func() { errs <- runtimeSrv.Serve(runtimeLn) }()
 	go func() { errs <- controlSrv.Serve(controlLn) }()
-	// The Worker stops first: this branch closes the Runtime entry before any deferred cleanup runs,
-	// and a supervisor still running would start a Worker that cannot reach it. On an error, the
-	// deferred Stop below is the latest defer, and runs before the servers' own.
+	// On an error, the deferred Stop below is the latest defer, and runs before the servers' own.
 	shutdown := func() error {
-		log.Info("shutting down")
-		sup.Stop()
-		controlSrv.GracefulStop()
-		runtimeSrv.Stop()
-		log.Info("the Runtime entry is closed")
+		stopInOrder(log, sup, controlSrv, runtimeSrv)
 		return nil
 	}
 	if sup != nil {
@@ -526,6 +520,19 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	case err := <-errs:
 		return err
 	}
+}
+
+// stopInOrder stops what agentd serves, on SIGTERM: the Worker first, then the Control server
+// (gracefully), then the Runtime entry. This runs before any deferred cleanup, and a supervisor still
+// running once the Runtime entry is closed would start a Worker that cannot reach it; a Worker asked
+// to stop reports what it holds through the Runtime entry, which must still serve. worker may be a nil
+// *supervisor.Supervisor (--no-worker).
+func stopInOrder(log *slog.Logger, worker interface{ Stop() }, control interface{ GracefulStop() }, runtime interface{ Stop() }) {
+	log.Info("shutting down")
+	worker.Stop()
+	control.GracefulStop()
+	runtime.Stop()
+	log.Info("the Runtime entry is closed")
 }
 
 // agentdIdentity is who this agentd is in the heads it pushes (audit.Identity): from its
