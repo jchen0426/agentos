@@ -18,11 +18,13 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sys/unix"
 
 	"github.com/jchen0426/agentos/internal/gitenv"
 	"github.com/jchen0426/agentos/internal/gitmcp/gitmcptest"
@@ -1023,12 +1025,61 @@ func TestWithOwnSlots(t *testing.T) {
 // says, the way a subverted server could: see fakeServer.
 const fakeServerEnv = "AGENTOS_TEST_FAKE_SERVER"
 
+// sessionReport makes this test binary a launcher that writes where it runs to the file after it:
+// its pid, session, process group, and whether it has a controlling terminal.
+const sessionReport = "--report-session"
+
 func TestMain(m *testing.M) {
 	if answer := os.Getenv(fakeServerEnv); answer != "" {
 		fakeServer(answer)
 		return
 	}
+	if len(os.Args) > 2 && os.Args[1] == sessionReport {
+		sid, err := unix.Getsid(0)
+		if err != nil {
+			sid = -1
+		}
+		tty := "none"
+		if f, err := os.Open("/dev/tty"); err == nil {
+			tty, _ = "one", f.Close()
+		}
+		_ = os.WriteFile(os.Args[2], []byte(fmt.Sprintf("%d %d %d %s", os.Getpid(), sid, syscall.Getpgrp(), tty)), 0o600)
+		return
+	}
 	os.Exit(m.Run())
+}
+
+// The server, its launcher and all they start run in a session of their own, which has no
+// controlling terminal: sandbox-runtime lets what it runs ioctl /dev/tty, so a subverted server on
+// the terminal agentd runs on could type into it (TIOCSTI). The launcher leads the session's
+// process group, which a timeout kills whole. (Whether this test runs on a terminal or not, a
+// launcher in agentd's own session would not be its leader.)
+func TestTheServerRunsInASessionOfItsOwn(t *testing.T) {
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "session")
+	c, err := NewClient(Options{Server: bin, Sandbox: []string{bin, sessionReport, marker}, Timeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The launcher reports and exits: the call fails, as one whose server never starts.
+	if err := c.Call(context.Background(), t.TempDir(), "show_diff", ShowDiffIn{Commit: strings.Repeat("a", 40)}, &ShowDiffOut{}); err == nil {
+		t.Fatal("a call to no server succeeded")
+	}
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid, sid, pgid int
+	var tty string
+	if _, err := fmt.Sscan(string(b), &pid, &sid, &pgid, &tty); err != nil {
+		t.Fatalf("%q: %v", b, err)
+	}
+	if sid != pid || pgid != pid || tty != "none" {
+		t.Errorf("the launcher (pid %d) runs in session %d, process group %d, with %s controlling terminal", pid, sid, pgid, tty)
+	}
 }
 
 // fakeServer serves every tool on stdio with one answer: "many values" (an answer of
