@@ -449,6 +449,57 @@ func TestAbandoningAnUnsentEffectIsConditional(t *testing.T) {
 	}
 }
 
+// foundComment is github.comment_commit whose lookup finds the comment an older agentd posted: the
+// test has no GitHub to look in.
+type foundComment struct{ *githubtool.CommentCommit }
+
+func (foundComment) Find(context.Context, json.RawMessage) (map[string]any, bool, error) {
+	return map[string]any{"url": "https://github.com/o/r/commit/a#commitcomment-1", "id": json.Number("1")}, true, nil
+}
+
+// Where it is used: the legacy effect, unsent when effect read it, is claimed between that read and
+// the abandon, as an older agentd still finishing during an upgrade would claim it. The abandon does
+// not take, and the call goes on with the legacy effect as it is now (claimed: looked up, and found),
+// recording no second effect.
+func TestALegacyEffectClaimedMeanwhileIsCarriedOn(t *testing.T) {
+	ctx := context.Background()
+	g, l := reporting(t)
+	var h fakeHistory
+	h.through(t, time.Now().Add(time.Hour).Truncate(time.Second), g, l, &agentosv1.Call{Kind: "tool", Name: "git.show_diff", ArgsJson: `{}`})
+	cc := foundComment{commenter(l, &h)}
+	run, err := l.Q.GetRun(ctx, testWorkflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done", "report_ref": nil}
+	req, canon := reportCall(t, cc.CommentCommit, args)
+	older := req
+	older.EffectID = sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon)
+	if res, err := g.record(ctx, run, cc, cc.Class(), 1, nil, older, canon); res != nil || err != nil {
+		t.Fatalf("%v %v", res, err)
+	}
+	claimed := false
+	beforeTakeOver = func(e db.Effect) {
+		if e.EffectID != older.EffectID {
+			return
+		}
+		claimed = true
+		if _, err := l.DB.ExecContext(ctx, "UPDATE effects SET claimed_by = 'older-agentd', claimed_at = ?, maybe_sent = 1, "+
+			"version = version + 1 WHERE effect_id = ?", ledger.Now(), e.EffectID); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { beforeTakeOver = nil })
+	res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{})
+	if err != nil || res.GetStatus() != StatusOK || !claimed {
+		t.Fatalf("%v %v, claimed %v", res, err, claimed)
+	}
+	effects, err := l.Q.ListRunEffects(ctx, db.ListRunEffectsParams{WorkflowID: testWorkflowID, Limit: 10})
+	if err != nil || len(effects) != 1 || effects[0].EffectID != older.EffectID || effects[0].Status != effectSucceeded {
+		t.Fatalf("%+v %v", effects, err)
+	}
+}
+
 // Two runs auditing one commit, whose reports send the same arguments, are two effects: the effect's
 // identity is the comment's repository, commit and reason, and the run's workflow ID names it too. A
 // second run that shared the first's ID would find the first run's comment, and never post its own.

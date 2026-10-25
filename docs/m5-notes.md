@@ -1629,11 +1629,24 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - **跑过的**：`gofmt -l`、`go vet ./...` 没输出，`go test ./...` 25 个包全过。`make build` 之后，黑盒不加沙箱，带 `--verify-after-each`，跑了 test_write_limits.py、T5、T6、T7、T12、T13：44 passed。44 个栈：41 个 verify 以 0 退出，1 个和标注一致（T5 审批之后改 payload 那个，照设计以 1 退出），0 个失败，2 个照设计没验（agentd 不启动）。
 - **L2/R3-4 复查**：grep 过 README、notes、配置注释：没有剩下“它的 diff，由 commit 定下”或者把 `_ref` 说成只能是 diff 的话。剩下的“the run's diff”说的都是 Worker、T7、T13 的工作流实际发的是什么。T7 的 docstring 改得更清楚了（“那时 diff 是运行唯一的 blob”）。
 
+#### 第四轮：对抗审查（19f6374）之后（19f6374 之上）
+
+安全审查没有中危及以上，N2 和 L4 已经了结。对抗审查有两个中危。
+
+- **R4-1（中）：一个暂停的调用可能有两条 budget_exhausted 记录**：被接受的那次尝试的，和一次过期的尝试的（心跳超时后还在跑，走的也是“拒答、然后没有余额”这条路），后者在重发被数过之后才写。`callsEnded` 原来留最后一条，链接就断了，重发丢掉自己的过去。审查的复现：被接受的记录在 +10ms，重发在 +1s 被数，过期的 budget_exhausted 在 +3s，结果 `declined=[false false]`。改法：每个调用留最早的那条 budget_exhausted（行按 seq 来，第一条就是最早的）。审查里活下来的 `pb_first_budget` 就是这个改法。`TestResumeTakesItsOwnPastByItsBudgetRecord` 加了 (d) 这一种。agentd 同时接下的调用照旧从头来（`TestResumeTakesNoOtherCallsPast` 和 (c) 照旧过）。
+- **R4-2（中）：有条件的作废在用它的地方没有钉住**。`TestAbandoningAnUnsentEffectIsConditional` 直接调 `abandonUnsent`；`effect()` 里不管 `keep`、或者改回无条件 `g.unsent` 的改坏，整个网关测试都过。加了 `TestALegacyEffectClaimedMeanwhileIsCarriedOn`：legacy effect 在 `effect()` 读它和作废它之间被别人认领（像升级时还没做完的旧 agentd 那样），断言调用接着用这个 legacy effect、不记第二个。为了在那一刻改它，加了一个只给测试用的钩子 `beforeTakeOver`（生产里是 nil）。测试里没有 GitHub，认领过的 effect 走查找，用一个 Find 总是找到的包装（`foundComment`）。
+- **低**：
+  - 同一调度时间的调用原来按 `created_at` 的文本排：RFC 3339 去掉末尾的零，“…00Z”排在“…00.02Z”后面。改成和调度时间一样，解析了再比。加了 `TestResumeOrdersByParsedCreatedTime`：同一调度时间、created_at 一个是整秒一个是 .02 秒，重发要排在它重发的那个调用后面。
+  - `pausedBefore` 里那段注释原来还写“上一个调用的最后一条记录”，改成“最早的那条 budget_exhausted 记录”。
+  - 上面剩余风险里的 L4 那条加了：这种情形下第二个调用的重发可能丢掉自己的过去。
+- **改坏**（审查在 `scratchpad/review-adv/r4/mut/` 下的改坏只读了，按现在的代码重写，没跑它的脚本）：`pb_first_budget` 现在就是代码本身；它的反面（留最后一条 budget_exhausted，就是修之前的代码）被 (d) 杀掉。`ta_ignore_keep`、`ta_old_unconditional` 被 `TestALegacyEffectClaimedMeanwhileIsCarriedOn` 杀掉。另外三处也被杀掉：结束取任何状态的第一条记录、取任何状态的最后一条记录（都被 `TestResumeTakesItsOwnPastByItsBudgetRecord` 杀掉），同一调度时间按 created_at 的文本排（被 `TestResumeOrdersByParsedCreatedTime` 杀掉）。前几轮的改坏里有 11 处对着的代码后来重写了（P1–P3、K1、K2、K5、K6 和它们只跑网关的版本、S2），它们各自那一轮都杀掉过；现在代码上对应的情形由这一轮和第三轮的改坏覆盖。
+- **跑过的**：`gofmt -l`、`go vet ./...` 没输出，`go test ./...` 25 个包全过。动手之前和 `make build` 之前都查过：Mac 上和 VM 里都没有这个工作区的 pytest（VM 里的 agentd、githubsim 是另一个工作区 runtime-proxy-limits 的，没碰）。黑盒不加沙箱，带 `--verify-after-each`，跑了 test_write_limits.py、T5、T6、T7、T12、T13：44 passed。44 个栈：41 个 verify 以 0 退出，1 个和标注一致（T5 审批之后改 payload 那个，照设计以 1 退出），0 个失败，2 个照设计没验（agentd 不启动）。
+
 #### 剩余风险（这个 PR 之后）
 
 - 被攻破的 Worker 在报告里还能决定的：reason 和 51 个名字之一（或不给）；调用任务的哪些步骤、顺序、各自怎么结束（判定、kind、点名的步、几个计数、几个位）；什么时候报告；一个运行一个报告（除非策略放宽 max_per_run）。
 - 预算数字：请求大小跟着调用指运行的哪个 blob、前面调了几次走，几个位。
 - 草稿 PR 的分支名带 patch_ref 所指 blob 的哈希的 8 个十六进制字符；Worker 选哪个 blob，几个位，在人批准之后。
-- `pausedBefore` 按 agentd 处理调用的先后连：工作流同时发的两个参数一样的调用，第二个直到第一个以 budget_exhausted 结束之后才被数到，会共享过去（供应商自己对同一个任务、同一组输入 blob 的更早的答复；路由仍在任务的跳点里，每跳过策略）。参数一样的调用一个接一个发，也分不出来。
+- `pausedBefore` 按 agentd 处理调用的先后连：工作流同时发的两个参数一样的调用，第二个直到第一个以 budget_exhausted 结束之后才被数到，会共享过去（供应商自己对同一个任务、同一组输入 blob 的更早的答复；路由仍在任务的跳点里，每跳过策略）。同样这种情形，第二个调用自己的重发反而可能丢掉它自己的过去：往回找的时候停在第一个调用还在跑的那个重发上（它还没有结果，不是 budget_exhausted），连不过去，就从头来、再付一次钱。参数一样的调用一个接一个发，也分不出来。
 - 改 `PublicErrorTypes` 会给跨过集合边界的、没做完的报告 effect 换 ID：换 agentd 之前先让在途的报告做完。
 - 升级要先把在途的报告 effect 放干：#54 之后、这个 PR 之前记下而没做完、可能已发出去的报告 effect，升级后沿用旧标记（不会发第二条），但它的 payload 是旧 agentd 渲染的。没发出去的会重新渲染，没有这个问题。

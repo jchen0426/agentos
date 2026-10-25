@@ -119,6 +119,11 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 	return v.(*agentosv1.Result), nil
 }
 
+// beforeTakeOver, set by tests only, runs between effect's read of an unsent legacy effect and
+// takeOverLegacy's abandon of it: where an older agentd still finishing during an upgrade can claim
+// it, or a cancel settle it.
+var beforeTakeOver func(db.Effect)
+
 // takeOverLegacy settles what becomes of old, a legacy effect nothing of went out when it was read:
 // abandoned, so that the call records a fresh effect (keep false); or, when it changed meanwhile and
 // so was not abandoned, read again for the call to go on with as it is now (keep true).
@@ -196,6 +201,9 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 				// code. Its marker is the identity ID, and nothing with the old marker is out to clash.
 				// Only if it is still so when it is abandoned: an attempt that claimed it meanwhile, or a
 				// cancel that settled it, wins, and the call goes on with that effect as it is now.
+				if beforeTakeOver != nil {
+					beforeTakeOver(old)
+				}
 				cur, keep, terr := g.takeOverLegacy(ctx, old)
 				if terr != nil {
 					return nil, terr

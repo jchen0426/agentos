@@ -1113,13 +1113,15 @@ func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.R
 	if err != nil {
 		return nil, err
 	}
-	// The scheduled times are RFC 3339 with trailing zeros cut, which does not sort as text.
+	// The scheduled and created times are RFC 3339 with trailing zeros cut, which does not sort as
+	// text ("…00Z" after "…00.02Z"): both are compared parsed.
 	at := func(c db.Call) time.Time { t, _ := time.Parse(time.RFC3339Nano, c.ScheduledAt); return t }
+	created := func(c db.Call) time.Time { t, _ := time.Parse(time.RFC3339Nano, c.CreatedAt); return t }
 	slices.SortStableFunc(calls, func(a, b db.Call) int {
 		if c := at(a).Compare(at(b)); c != 0 {
 			return c
 		}
-		return strings.Compare(a.CreatedAt, b.CreatedAt)
+		return created(a).Compare(created(b))
 	})
 	self := slices.IndexFunc(calls, func(c db.Call) bool {
 		return c.ActivityID == info.ActivityID && c.ScheduledAt == info.ScheduledTime.UTC().Format(time.RFC3339Nano)
@@ -1136,10 +1138,9 @@ func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.R
 		return nil, err
 	}
 	// Whether one call ended before the next began is read from agentd's own clock at both ends:
-	// the previous call's last record (ended, agentd's At) against when agentd first counted the
-	// next (calls.created_at). The scheduled time is Temporal's, on another host, and the drift
-	// between the two clocks could make a short overlap look sequential.
-	created := func(c db.Call) time.Time { t, _ := time.Parse(time.RFC3339Nano, c.CreatedAt); return t }
+	// the previous call's earliest budget_exhausted record (ended, agentd's At) against when agentd
+	// first counted the next (calls.created_at). The scheduled time is Temporal's, on another host,
+	// and the drift between the two clocks could make a short overlap look sequential.
 	var paused []string
 	for i := first; i < self; i++ {
 		end, ok := ended[callKey{audit.Text(calls[i].ActivityID), calls[i].ScheduledAt}]
@@ -1160,9 +1161,11 @@ type callKey struct{ activityID, scheduledAt string }
 const maxCallRecords = 100_000
 
 // callsEnded is when each of the run's logical calls that returned budget_exhausted ended: the time
-// of the call record that carried that outcome. Not its latest record: an earlier attempt of the same
-// call, still running in agentd after Temporal gave up on it (a heartbeat timeout), can write its
-// record after the call's resend was counted, and that late record is no end of the call.
+// of its earliest call record that carried that outcome. Not its latest record, nor its latest
+// budget_exhausted one: an earlier attempt of the same call, still running in agentd after Temporal
+// gave up on it (a heartbeat timeout), can write its record after the call's resend was counted,
+// a budget_exhausted one too (it takes the same declined-then-no-room path), and that late record is
+// no end of the call.
 func (g *Gateway) callsEnded(ctx context.Context, run db.Run) (map[callKey]time.Time, error) {
 	rows, err := g.Ledger.Q.ListRunOwnCallRecords(ctx, db.ListRunOwnCallRecordsParams{WorkflowID: run.WorkflowID,
 		TemporalRunID: run.RunID.String, Max: maxCallRecords})
@@ -1180,8 +1183,12 @@ func (g *Gateway) callsEnded(ctx context.Context, run db.Run) (map[callKey]time.
 			p.Status != StatusBudgetExhausted {
 			continue
 		}
+		key := callKey{p.ActivityID, p.ScheduledAt}
+		if _, seen := out[key]; seen {
+			continue // the rows come by seq: the first is the earliest
+		}
 		if at, err := time.Parse(time.RFC3339Nano, r.At); err == nil {
-			out[callKey{p.ActivityID, p.ScheduledAt}] = at
+			out[key] = at
 		}
 	}
 	return out, nil

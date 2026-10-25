@@ -300,6 +300,9 @@ func TestResumeReadsOneClock(t *testing.T) {
 //     keeps its past.
 //   - (c) An earlier attempt wrote its record early, but the budget_exhausted came after the next
 //     call was counted: they overlap, and the next starts afresh.
+//   - (d) A stale attempt took the same declined-then-no-room path and wrote a budget_exhausted of
+//     its own after the resend was counted: the end is the earliest budget_exhausted, and the
+//     resend keeps its past.
 func TestResumeTakesItsOwnPastByItsBudgetRecord(t *testing.T) {
 	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -359,6 +362,46 @@ func TestResumeTakesItsOwnPastByItsBudgetRecord(t *testing.T) {
 	f.ended("1:audit_v1", sched, t0.Add(2*time.Second), StatusBudgetExhausted)
 	if declined, refusal, _ := f.resume(info, opus, sol); slices.Contains(declined, true) || refusal != nil {
 		t.Errorf("(c) an overlapping call took another's past: declined %v, refusal %+v", declined, refusal)
+	}
+
+	// (d) The accepted budget_exhausted at t0+10ms, the resend counted at t0+1s, a stale attempt's
+	// budget_exhausted at t0+3s.
+	f = newResumeFixture(t)
+	sched = paused(f)
+	f.ended("1:audit_v1", sched, t0.Add(10*time.Millisecond), StatusBudgetExhausted)
+	info = resend(f, t0.Add(time.Second))
+	f.ended("1:audit_v1", sched, t0.Add(3*time.Second), StatusBudgetExhausted)
+	if !keeps(f, info) {
+		t.Error("(d) a stale attempt's late budget_exhausted took the resend's past")
+	}
+}
+
+// Calls Temporal scheduled at the same time are taken in the order agentd counted them, by the
+// parsed time: RFC 3339 cuts trailing zeros, so as text "…00Z" sorts after "…00.02Z", and the
+// resend would come before the call it resends.
+func TestResumeOrdersByParsedCreatedTime(t *testing.T) {
+	f := newResumeFixture(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC) // "…T10:00:00Z"
+	sched := t0.Format(time.RFC3339Nano)
+	for _, c := range []struct{ id, created string }{
+		{"1:audit_v1", t0.Format(time.RFC3339Nano)},
+		{"2:audit_v1", t0.Add(20 * time.Millisecond).Format(time.RFC3339Nano)}, // "…T10:00:00.02Z"
+	} {
+		if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: c.id, ScheduledAt: sched,
+			Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: c.created}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.g.Ledger.Q.SetCallOutcome(ctx, db.SetCallOutcomeParams{Outcome: sql.NullString{String: StatusBudgetExhausted, Valid: true},
+		WorkflowID: "wf", ActivityID: "1:audit_v1", ScheduledAt: sched}); err != nil {
+		t.Fatal(err)
+	}
+	refused := f.request("1:audit_v1", 1, 1, opus, StatusRefused)
+	f.ended("1:audit_v1", sched, t0.Add(10*time.Millisecond), StatusBudgetExhausted)
+	declined, refusal, _ := f.resume(activity.Info{ActivityID: "2:audit_v1", ScheduledTime: t0, Attempt: 1}, opus, sol)
+	if !slices.Equal(declined, []bool{true, false}) || refusal == nil || refusal.Model != refused.Model {
+		t.Errorf("declined %v, refusal %+v", declined, refusal)
 	}
 }
 
