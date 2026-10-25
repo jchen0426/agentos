@@ -8,9 +8,12 @@ it is agentd's loopback port, reached through sandbox-runtime's HTTP CONNECT pro
 import argparse
 import asyncio
 import importlib
+import io
 import logging
 import os
+import select
 import signal
+import sys
 from urllib.parse import unquote, urlsplit
 
 from temporalio.client import Client
@@ -21,6 +24,38 @@ from temporalio.worker import Worker
 # 500 threads (its slots are 100), on top of one thread a CPU for the SDK's core. The sandbox's
 # task limit (M5 C3) counts threads.
 MAX_WORKFLOW_TASKS = 100
+
+
+class _Waiting(io.RawIOBase):
+    """A file descriptor written as if it were in blocking mode, whether it is or not."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def write(self, b) -> int:  # noqa: ANN001 - a bytes-like object
+        while True:
+            try:
+                return os.write(self._fd, b)
+            except BlockingIOError:
+                select.select([], [self._fd], [])
+
+
+def wait_on_output() -> None:
+    """Make the Worker's stdout and stderr wait while agentd has not read what came before, as a
+    pipe in blocking mode does. Under sandbox-runtime they need not be in blocking mode: srt hands
+    the Worker its own stdout and stderr, and node puts them into non-blocking mode once srt
+    proxies a connection. A write to a full pipe would then fail (EAGAIN): a workflow's print(),
+    or the Worker as it imports workflows that write a lot."""
+    sys.stdout = io.TextIOWrapper(io.BufferedWriter(_Waiting(1)), encoding=sys.stdout.encoding,
+                                  errors=sys.stdout.errors)
+    sys.stderr = io.TextIOWrapper(io.BufferedWriter(_Waiting(2)), encoding=sys.stderr.encoding,
+                                  errors=sys.stderr.errors, line_buffering=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +97,7 @@ def proxy_from(arg: str | None) -> HttpConnectProxyConfig | None:
 
 async def main() -> None:
     args = parse_args()
+    wait_on_output()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     client = await Client.connect(
         args.endpoint, namespace=args.namespace, http_connect_proxy_config=proxy_from(args.http_connect_proxy),
