@@ -1133,7 +1133,9 @@ func (g *Gateway) guard(ctx context.Context, run db.Run, info activity.Info, c *
 		case c.GetKind() == "model" && over(n.ModelCalls, g.Limits.ModelCalls):
 			reason = fmt.Sprintf("loop guard: more than %d model calls in one run", g.Limits.ModelCalls)
 		case c.GetKind() == "tool" && over(n.SameCalls, g.Limits.SameToolCalls):
-			reason = fmt.Sprintf("loop guard: %s called more than %d times with the same arguments", c.GetName(), g.Limits.SameToolCalls)
+			// The reason names no call: the workflow chose the call's name, and a run's report quotes the
+			// reason (internal/explain).
+			reason = fmt.Sprintf("loop guard: more than %d calls of one tool with the same arguments", g.Limits.SameToolCalls)
 		}
 		if reason == "" {
 			return nil

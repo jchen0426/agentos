@@ -376,7 +376,8 @@ func TestTheReportAgreesWithExplain(t *testing.T) {
 		t.Fatalf("report %+v; explain %s %s %s", o, e.GetVerdict(), e.GetKind(), e.GetStep())
 	}
 	// An error type the workflow cannot name, or a reason it does not give, says nothing it chose.
-	if o := w.report(ReasonWorkflowError, "x y"); strings.Contains(o.Claim, "x y") || !strings.Contains(o.Claim, "did not name") {
+	if o := w.report(ReasonWorkflowError, "x y"); strings.Contains(o.Claim, "x y") ||
+		!strings.Contains(o.Claim, "(an exception of another type)") {
 		t.Fatalf("%+v", o)
 	}
 	if o, d := w.report("", ""), w.report(ReasonDone, ""); !reflect.DeepEqual(o, d) {
@@ -444,17 +445,6 @@ func TestUnreachable(t *testing.T) {
 	}
 	if Unreachable(nil) {
 		t.Error("nil")
-	}
-}
-
-// A step whose name is the workflow's, not the task's, is not named in the report's words.
-func TestTheReportNamesOnlyTheTasksSteps(t *testing.T) {
-	w := newWorld(t)
-	w.returns("@mallory see www.evil.example", statusDenied, map[string]any{"reason": "no such tool",
-		"refused_by": audit.RefusedByAgentd}, nil)
-	o := w.report(ReasonDone, "")
-	if o.Named || o.Kind != KindDenied || o.Step != `"tool @mallory see www.evil.example"` || !strings.Contains(o.Cause, "@mallory") {
-		t.Fatalf("%+v", o)
 	}
 }
 

@@ -252,8 +252,9 @@ func TestAForgedAnchorPastTheCut(t *testing.T) {
 
 // A report shows no internal error's text: an error of agentd's own, its model adapter's or the git
 // tool server's says only that agentd's log has it, and so does a timeout beyond Temporal's word for
-// it; a tool's own words, refusing the call for good, stay, fenced. runs explain, for the operator,
-// says it all.
+// it; a tool's own words, refusing the call for good, stay, fenced, when agentd's record holds them. A
+// failure in Temporal that agentd has no record of says nothing of its own: whoever failed the call
+// chose its type and its words. runs explain, for the operator, says it all.
 func TestTheReportShowsNoInternalError(t *testing.T) {
 	internal := "Post \"https://api.anthropic.com/v1/messages\": dial tcp 10.1.2.3:443: connect: connection refused"
 	for _, tc := range []struct {
@@ -295,7 +296,7 @@ func TestTheReportShowsNoInternalError(t *testing.T) {
 			w.start("agentd.started", audit.Agentd, nil)
 			w.l.Starts[len(w.l.Starts)-1].At = failedAt.Add(-500 * time.Millisecond).Format(time.RFC3339Nano)
 			return c
-		}, []string{"fetch_diff failed: ", "bad object deadbeef"}, ""},
+		}, []string{"fetch_diff failed; agentd has no record of its error"}, "bad object deadbeef"},
 		{"a failure with no record of agentd's", func(w *world) *call {
 			c := w.schedule("audit_v1")
 			c.end(5, appFailure("x", "PanicError", false), func(e *historypb.HistoryEvent, started int64) {
@@ -304,7 +305,7 @@ func TestTheReportShowsNoInternalError(t *testing.T) {
 					ScheduledEventId: c.scheduled, StartedEventId: started, Failure: appFailure(internal, "PanicError", false)}}
 			})
 			return c
-		}, []string{`analyze failed after 5 attempts, by a failure with no record of agentd's; it says "PanicError"`}, "10.1.2.3"},
+		}, []string{"analyze failed after 5 attempts, by a failure with no record of agentd's"}, "PanicError"},
 		{"a timeout", func(w *world) *call {
 			c := w.schedule("git.show_diff")
 			c.end(1, nil, func(e *historypb.HistoryEvent, started int64) {
@@ -322,6 +323,9 @@ func TestTheReportShowsNoInternalError(t *testing.T) {
 			o := w.report(ReasonDone, "")
 			r.completes(1, statusOK, nil, nil, nil)
 			w.completed("failed")
+			if strings.Contains(o.Cause, "10.1.2.3") {
+				t.Errorf("report cause %q", o.Cause)
+			}
 			for _, says := range tc.report {
 				if !strings.Contains(o.Cause, says) {
 					t.Errorf("report cause %q, without %q", o.Cause, says)
@@ -660,8 +664,8 @@ func TestWhereAnErrorCameFrom(t *testing.T) {
 }
 
 // A step is the task's by its call's kind and name (D12), never by its activity ID, which the
-// workflow chooses: any other call shows as its kind and name, quoted, and the report does not name
-// it outside its fence.
+// workflow chooses: runs explain shows any other call as its kind and name, quoted; the report as a
+// call the task does not name, and nothing agentd's words of it quote.
 func TestStepsAreTheTasksByKindAndName(t *testing.T) {
 	for _, tc := range []struct{ id, kind, name, step string }{
 		{"analyze", "tool", "", `"tool"`},
@@ -680,7 +684,7 @@ func TestStepsAreTheTasksByKindAndName(t *testing.T) {
 					ActivityId: c.id, Input: input}}
 			})
 			c.completes(1, statusDenied, map[string]any{"reason": "no such tool", "refused_by": audit.RefusedByAgentd}, nil, nil)
-			if o := w.report(ReasonDone, ""); o.Step != tc.step || o.Named {
+			if o := w.report(ReasonDone, ""); o.Step != unnamedStep || o.Named || o.Cause != "agentd refused "+unnamedStep {
 				t.Fatalf("report %+v", o)
 			}
 			w.ok("github.comment_commit")

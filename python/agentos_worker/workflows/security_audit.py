@@ -25,7 +25,8 @@ WAIT_STATES = {  # gateway status -> AgentState while waiting
     "budget_exhausted": "PAUSED_BUDGET",
 }
 # The run's result keeps this much of its outcome: an error's text can be any length. (The report
-# says what agentd's records say of the run, not this: the workflow tells it only why it reports.)
+# says what agentd's records say of the run, not this: the workflow's own words in it are only why it
+# reports.)
 MAX_OUTCOME = 4000
 # What github.comment_commit takes as an exception's type: an identifier.
 ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
@@ -112,7 +113,7 @@ class SecurityAudit:
             report_ref, pr_url = self.report_ref, None
         outcome = outcome[:MAX_OUTCOME]
         # Every other end path posts a report (section 3). agentd writes its outcome from its own
-        # records; the workflow says only why it reports.
+        # records; the workflow's own words in it are only why it reports.
         why = {"reason": "done"}
         if raised is not None:
             why = {"reason": "workflow_error"}

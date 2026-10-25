@@ -225,12 +225,19 @@ type call struct {
 
 // schedule has the workflow schedule a call of name, of kind model for audit_v1, tool otherwise.
 func (w *world) schedule(name string) *call {
-	w.calls++
-	c := &call{w: w, id: fmt.Sprintf("%d:%s", w.calls, name), kind: "tool", name: name}
+	kind := "tool"
 	if name == "audit_v1" {
-		c.kind = "model"
+		kind = "model"
 	}
-	input, err := converter.GetDefaultDataConverter().ToPayloads(&agentosv1.Call{Kind: c.kind, Name: name, ArgsJson: "{}"})
+	return w.scheduleAs(fmt.Sprintf("%d:%s", w.calls+1, name), kind, name)
+}
+
+// scheduleAs has the workflow schedule a call of kind and name under activity ID id, all three its
+// own choice: the history's input is what it wrote.
+func (w *world) scheduleAs(id, kind, name string) *call {
+	w.calls++
+	c := &call{w: w, id: id, kind: kind, name: name}
+	input, err := converter.GetDefaultDataConverter().ToPayloads(&agentosv1.Call{Kind: kind, Name: name, ArgsJson: "{}"})
 	if err != nil {
 		w.t.Fatal(err)
 	}
@@ -241,10 +248,11 @@ func (w *world) schedule(name string) *call {
 	return c
 }
 
-// record is agentd's call record of an attempt of the call, ending with status, and its extra fields.
+// record is agentd's call record of an attempt of the call, ending with status, and its extra fields:
+// its activity ID, kind and name bounded, as agentd's gateway records them.
 func (c *call) record(attempt int32, status string, extra map[string]any) int64 {
-	p := map[string]any{"activity_id": c.id, "attempt": attempt, "kind": c.kind, "name": c.name, "status": status,
-		"policy": map[string]any{"decision": "allow"}}
+	p := map[string]any{"activity_id": audit.Text(c.id), "attempt": attempt, "kind": audit.Text(c.kind), "name": audit.Text(c.name),
+		"status": status, "policy": map[string]any{"decision": "allow"}}
 	for k, v := range extra {
 		p[k] = v
 	}

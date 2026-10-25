@@ -126,7 +126,7 @@ func TestLoopGuard(t *testing.T) {
 		BudgetLimitMicros: 1, CreatedAt: ledger.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	g := &Gateway{Ledger: l, Limits: LoopLimits{ModelCalls: 2, GatewayCalls: 6, SameToolCalls: 2}}
+	g := &Gateway{Ledger: l, Limits: LoopLimits{ModelCalls: 2, GatewayCalls: 7, SameToolCalls: 2}}
 	scheduled := map[string]time.Time{} // the server's first-scheduled time, per activity ID
 	call := func(activityID, kind, name, args string) string {
 		t.Helper()
@@ -140,23 +140,25 @@ func TestLoopGuard(t *testing.T) {
 		}
 		return reason
 	}
+	// Its reasons name no call: the workflow chose the name, and the run's report quotes the reason.
 	steps := []struct {
 		activityID, kind, name, args string
-		refused                      bool
+		refused                      string // the reason, when it is refused
 	}{
-		{"1:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false},
-		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false},
-		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, false}, // a retry counts once
-		{"3:git.show_diff", "tool", "git.show_diff", `{"a":1}`, true},  // a third time, same arguments
-		{"4:git.show_diff", "tool", "git.show_diff", `{"a":2}`, false}, // other arguments
-		{"5:audit_v1", "model", "audit_v1", `{"d":1}`, false},
-		{"6:audit_v1", "model", "audit_v1", `{"d":1}`, false},        // sent again after a pause: not a loop
-		{"7:audit_v1", "model", "audit_v1", `{"d":2}`, true},         // a third model call
-		{"8:git.apply_check", "tool", "git.apply_check", `{}`, true}, // the seventh call of the run
+		{"1:git.show_diff", "tool", "git.show_diff", `{"a":1}`, ""},
+		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, ""},
+		{"2:git.show_diff", "tool", "git.show_diff", `{"a":1}`, ""}, // a retry counts once
+		{"3:git.show_diff", "tool", "git.show_diff", `{"a":1}`, // a third time, same arguments
+			"loop guard: more than 2 calls of one tool with the same arguments"},
+		{"4:git.show_diff", "tool", "git.show_diff", `{"a":2}`, ""}, // other arguments
+		{"5:audit_v1", "model", "audit_v1", `{"d":1}`, ""},
+		{"6:audit_v1", "model", "audit_v1", `{"d":1}`, ""},                                                 // sent again after a pause: not a loop
+		{"7:audit_v1", "model", "audit_v1", `{"d":2}`, "loop guard: more than 2 model calls in one run"},   // a third model call
+		{"8:git.apply_check", "tool", "git.apply_check", `{}`, "loop guard: more than 7 calls in one run"}, // the eighth call of the run
 	}
 	for _, s := range steps {
-		if reason := call(s.activityID, s.kind, s.name, s.args); (reason != "") != s.refused {
-			t.Errorf("%s %s: refused=%q, want refused=%v", s.activityID, s.args, reason, s.refused)
+		if reason := call(s.activityID, s.kind, s.name, s.args); reason != s.refused {
+			t.Errorf("%s %s: refused %q, want %q", s.activityID, s.args, reason, s.refused)
 		}
 	}
 

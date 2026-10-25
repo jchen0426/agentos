@@ -10,8 +10,9 @@
 // checkAnchors); one that does not was put there by someone else in Temporal's namespace, and the
 // call is judged by agentd's record of it. The Worker writes its result's outcome, its failure
 // messages, the activity IDs it schedules and the names of the calls it makes: they are shown as its
-// claim, quoted, and never judged on. Every text from the Worker, a tool, a model or the outside
-// world leaves bounded, as one line of printable text without runs of spaces (internal/safetext).
+// claim, quoted, and never judged on; a report, which is public, shows none of them (Report). Every
+// text from the Worker, a tool, a model or the outside world leaves bounded, as one line of printable
+// text without runs of spaces (internal/safetext).
 //
 // A crash leaves no record of its own: each is inferred from what it leaves, and the explanation
 // says so.

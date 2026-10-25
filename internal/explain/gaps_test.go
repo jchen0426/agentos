@@ -232,16 +232,16 @@ func TestAnExplanationIsBounded(t *testing.T) {
 	}
 }
 
-// The report takes from the workflow an error type that is an identifier of at most 64 characters,
-// and says nothing longer than its bounds, on one line.
+// The report names no error type the workflow made up, however well formed (64 characters, as the
+// report call's arguments allow), and says nothing longer than its bounds, on one line.
 func TestTheReportsBounds(t *testing.T) {
 	w := newWorld(t)
 	w.ok("git.show_diff")
-	if o := w.report(ReasonWorkflowError, strings.Repeat("E", 64)); !strings.Contains(o.Claim, "("+strings.Repeat("E", 64)+")") {
-		t.Fatalf("%+v", o)
-	}
-	if o := w.report(ReasonWorkflowError, strings.Repeat("E", 65)); !strings.Contains(o.Claim, "did not name") {
-		t.Fatalf("%+v", o)
+	for _, name := range []string{strings.Repeat("E", 64), strings.Repeat("E", 65)} {
+		if o := w.report(ReasonWorkflowError, name); strings.Contains(o.Claim, "EEEE") ||
+			!strings.Contains(o.Claim, "(an exception of another type)") {
+			t.Fatalf("%+v", o)
+		}
 	}
 	c := w.schedule("audit_v1")
 	c.failsForGood(1, strings.Repeat("boom\n", 400), "", nil)
@@ -334,7 +334,7 @@ func TestAWriteOnlyDryRun(t *testing.T) {
 // A step the task requires is met by a call of its kind and name, the latest accepted one for a
 // condition; the report is the task's call by its kind and name; a wait is gone on from by a call of
 // its kind and name; and a workflow's error is told at the step it names, by name only when the task
-// names it.
+// names it, else as a call the task does not name.
 func TestTheTasksCallsByKindAndName(t *testing.T) {
 	w := newWorld(t)
 	w.ok("git.show_diff")
@@ -399,7 +399,8 @@ func TestTheTasksCallsByKindAndName(t *testing.T) {
 	w.ok("git.show_diff")
 	w.returns("test.unsafe_write", statusOK, nil, nil)
 	w.schedule("github.comment_commit")
-	if o := w.report(ReasonWorkflowError, "KeyError"); o.Named || o.Step != `"tool test.unsafe_write"` {
+	if o := w.report(ReasonWorkflowError, "KeyError"); o.Named || o.Step != unnamedStep || strings.Contains(o.Cause, "unsafe") ||
+		o.Cause != "by the workflow's own account, its code failed after a call the task does not name returned ok" {
 		t.Fatalf("%+v", o)
 	}
 }
