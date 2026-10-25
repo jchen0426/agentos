@@ -16,6 +16,7 @@ tasks:
   audit_v1:
     model: fake/audit-fixture
     max_tokens: 4096
+    inputs: [diff_ref]
     output_schema: {AUDIT_SCHEMA}
     blobs: [patch]
     cross_provider_fallback: [other/audit-fixture]

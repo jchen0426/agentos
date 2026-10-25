@@ -139,7 +139,7 @@ if MODEL == "fake":
 providers:
   fake: {{adapter: fake}}
 tasks:
-  audit_v1: {{model: fake/audit-fixture, max_tokens: 4096, output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
+  audit_v1: {{model: fake/audit-fixture, max_tokens: 4096, inputs: [diff_ref], output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
 """
 elif MODEL == "claude":
     # As config/models.yaml, but max_tokens 8000: a request that runs to the limit on the model
@@ -151,6 +151,7 @@ tasks:
   audit_v1:
     model: anthropic/claude-opus-5-5
     max_tokens: 8000
+    inputs: [diff_ref]
     effort: high
     prompt: {REPO / "config/prompts/audit_v1/claude.md"}
     output_schema: {AUDIT_SCHEMA}
@@ -173,6 +174,7 @@ tasks:
   audit_v1:
     model: openai/gpt-6.1-sol
     max_tokens: 8000
+    inputs: [diff_ref]
     effort: high
     prompt: {REPO / "config/prompts/audit_v1/claude.md"}
     output_schema: {AUDIT_SCHEMA}
@@ -193,6 +195,7 @@ tasks:
   audit_v1:
     model: local/gpt-oss:20b
     max_tokens: 8000
+    inputs: [diff_ref]
     effort: medium
     prompt: {REPO / "config/prompts/audit_v1/claude.md"}
     output_schema: {AUDIT_SCHEMA}

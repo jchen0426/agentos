@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/budget"
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/ledger"
@@ -77,6 +78,7 @@ tasks:
   audit_v1:
     model: fake/audit-fixture
     max_tokens: 4096
+    inputs: [diff_ref]
     output_schema: %s
     blobs: [patch]
     cross_provider_fallback: [other/audit-fixture]
@@ -110,6 +112,22 @@ models:
 		Policy: &policy.Policy{Models: map[string]policy.Model{"audit_v1": {AllowedProviders: []string{"fake", "other"}}}},
 		Limits: LoopLimits{Attempts: 10}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	return g, db.Run{WorkflowID: "wf"}, route
+}
+
+// diffCall is the security audit's model call as the Worker makes it: audit_v1, its one input the
+// run's own diff.
+func diffCall(t *testing.T, g *Gateway, run db.Run) (*agentosv1.Call, map[string]any, []byte) {
+	t.Helper()
+	ref, err := audit.PutRunBlob(context.Background(), g.Ledger, run.WorkflowID, []byte("diff --git a/app.py b/app.py\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"diff_ref": ref}
+	canon, err := encodeCanonical(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &agentosv1.Call{Kind: "model", Name: "audit_v1", ArgsJson: string(canon)}, args, canon
 }
 
 // An answer that broke the schema leaves too little of the attempt for the second one: the
@@ -244,9 +262,7 @@ func TestNoModelRequestBeforeItsRecord(t *testing.T) {
 	g, run, _ := fallbackGateway(t)
 	fake := &counted{Adapter: models.Fake{}}
 	g.Adapters = map[string]models.Adapter{"fake": fake, "other": fake}
-	call := &agentosv1.Call{Kind: "model", Name: "audit_v1", ArgsJson: `{"diff":"x"}`}
-	args := map[string]any{"diff": "x"}
-	canon, _ := encodeCanonical(args)
+	call, args, canon := diffCall(t, g, run)
 	info := activity.Info{ActivityID: "1:audit_v1", Attempt: 1, RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
 		ScheduledTime: time.Unix(1000, 0)}
 	info.WorkflowExecution.ID = run.WorkflowID

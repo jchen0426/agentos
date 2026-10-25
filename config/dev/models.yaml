@@ -4,5 +4,6 @@ tasks:
   audit_v1:
     model: fake/audit-fixture
     max_tokens: 4096
+    inputs: [diff_ref]  # each a blob of the run's own; a _ref names any of the run's blobs, the workflow's choice
     output_schema: ../schemas/audit_report.json
     blobs: [patch]

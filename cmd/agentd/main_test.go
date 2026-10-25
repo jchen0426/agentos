@@ -165,7 +165,7 @@ func TestModelAdapterKeys(t *testing.T) {
 		}
 		return m
 	}
-	task := "tasks: {audit_v1: {model: local/m, max_tokens: 10}}\n"
+	task := "tasks: {audit_v1: {model: local/m, max_tokens: 10, inputs: [diff_ref]}}\n"
 	for name, c := range map[string]struct {
 		provider, wantErr string
 	}{
@@ -194,7 +194,7 @@ func TestCutKeyWarning(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "models.yaml")
 	body := `providers:
   openai: {adapter: openai_compat, api: responses, base_url: "https://api.openai.com/v1", key: "keyring:agentos-test-cut"}
-tasks: {audit_v1: {model: openai/m, max_tokens: 10}}
+tasks: {audit_v1: {model: openai/m, max_tokens: 10, inputs: [diff_ref]}}
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)

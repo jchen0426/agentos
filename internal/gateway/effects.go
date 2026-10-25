@@ -103,7 +103,9 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 	}
 	w := t.(tools.Writer)
 	// The same payload in the same run is the same effect, on every attempt.
-	req.EffectID = sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon)
+	if req.EffectID, err = effectID(run.WorkflowID, w, args, canon); err != nil {
+		return nil, err
+	}
 	v, err, _ := g.effects.Do(req.EffectID, func() (any, error) {
 		return g.track(func() (any, error) {
 			exec, cancel := detach(ctx, info)
@@ -115,6 +117,52 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 		return nil, err
 	}
 	return v.(*agentosv1.Result), nil
+}
+
+// beforeTakeOver, set by tests only, runs between effect's read of an unsent legacy effect and
+// takeOverLegacy's abandon of it: where an older agentd still finishing during an upgrade can claim
+// it, or a cancel settle it.
+var beforeTakeOver func(db.Effect)
+
+// takeOverLegacy settles what becomes of old, a legacy effect nothing of went out when it was read:
+// abandoned, so that the call records a fresh effect (keep false); or, when it changed meanwhile and
+// so was not abandoned, read again for the call to go on with as it is now (keep true).
+func (g *Gateway) takeOverLegacy(ctx context.Context, old db.Effect) (db.Effect, bool, error) {
+	abandoned, err := g.abandonUnsent(ctx, old, "re-rendered after an upgrade changed the effect's identity")
+	if err != nil || abandoned {
+		return db.Effect{}, false, err
+	}
+	cur, err := g.Ledger.Q.GetEffect(ctx, old.EffectID)
+	return cur, err == nil, err
+}
+
+// abandonUnsent abandons e, an effect nothing of went out, if it still is so at its version (PENDING,
+// unclaimed, maybe_sent 0), and reports whether it did. It settles nothing when e changed meanwhile.
+func (g *Gateway) abandonUnsent(ctx context.Context, e db.Effect, reason string) (bool, error) {
+	why := valid(reason)
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		if n, err := q.AbandonUnclaimedEffect(ctx, db.AbandonUnclaimedEffectParams{
+			Reason: why, UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version}); err != nil || n == 0 {
+			return cmp.Or(err, errChanged)
+		}
+		return noteSettled(ctx, q, e.WorkflowID, e.EffectID, effectAbandoned, why, sql.NullString{})
+	})
+	if errors.Is(err, errChanged) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// effectID names a write's effect: the run, the tool, and the call's arguments in their canonical
+// form (canon), or only those that make what it writes (tools.Identifier).
+func effectID(workflowID string, t tools.Writer, args map[string]any, canon []byte) (string, error) {
+	if id, ok := t.(tools.Identifier); ok {
+		var err error
+		if canon, err = encodeCanonical(id.Identity(args)); err != nil {
+			return "", err
+		}
+	}
+	return sha256Hex([]byte(workflowID), []byte(t.Name()), canon), nil
 }
 
 // toolError turns a tool's error into the call's outcome: a denial is a result, a refusal
@@ -138,6 +186,38 @@ func toolError(tool string, err error) (*agentosv1.Result, error) {
 func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class string, maxPerRun int,
 	rule *approvalRule, req tools.Request, canon []byte, fx faults.Effect) (*agentosv1.Result, error) {
 	e, err := g.Ledger.Q.GetEffect(ctx, req.EffectID)
+	if _, named := t.(tools.Identifier); named && errors.Is(err, sql.ErrNoRows) {
+		// An agentd from before the tool named its effect by every argument now named it by some only.
+		// A call whose effect that agentd recorded, and left unfinished, is found by the old ID.
+		if legacy := sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon); legacy != req.EffectID {
+			switch old, oerr := g.Ledger.Q.GetEffect(ctx, legacy); {
+			case errors.Is(oerr, sql.ErrNoRows):
+			case oerr != nil:
+				return nil, oerr
+			case old.Status == effectPending && !old.ClaimedBy.Valid && old.MaybeSent == 0:
+				// Nothing of it went out, and its payload was rendered by that older agentd, which could
+				// put in it what current code keeps out of a report. Abandon it (ABANDONED does not count
+				// toward the cap) and record a fresh effect under the identity ID, rendered by current
+				// code. Its marker is the identity ID, and nothing with the old marker is out to clash.
+				// Only if it is still so when it is abandoned: an attempt that claimed it meanwhile, or a
+				// cancel that settled it, wins, and the call goes on with that effect as it is now.
+				if beforeTakeOver != nil {
+					beforeTakeOver(old)
+				}
+				cur, keep, terr := g.takeOverLegacy(ctx, old)
+				if terr != nil {
+					return nil, terr
+				}
+				if keep {
+					e, err, req.EffectID = cur, nil, legacy
+				}
+			default:
+				// It may have gone out (claimed, or an attempt may have sent it): a comment of it carries
+				// the old marker, so the call goes on with that effect rather than post a second one.
+				e, err, req.EffectID = old, nil, legacy
+			}
+		}
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		// Rendering the payload may call the git tool server (github.open_draft_pr reads the files its
 		// patch changes): a fault's hold in it goes with the context.

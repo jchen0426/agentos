@@ -47,9 +47,11 @@ type Effects interface {
 
 // Verdicts says how a run went, for its report: agentd's verdict on the run's calls before the
 // report, from the run's history and agentd's own records (internal/explain's Report). reason is why
-// the workflow says it reports: done, or workflow_error with its exception's type (errorType).
+// the workflow says it reports: done, or workflow_error with its exception's type (errorType), which
+// the report names only when NamesErrorType says so.
 type Verdicts interface {
 	ReportVerdict(ctx context.Context, workflowID, reason, errorType string) (Verdict, error)
+	NamesErrorType(errorType string) bool
 }
 
 // Verdict is what the report says of how the run went.
@@ -111,6 +113,24 @@ func (*CommentCommit) Args() *tools.Schema     { return commentArgs }
 func (*CommentCommit) Result() *tools.Schema   { return commentResult }
 func (t *CommentCommit) Live() bool            { return t.Client.live() }
 func (t *CommentCommit) Settle() time.Duration { return t.Client.settle() }
+
+// Identity is what of the report's call the comment shows, and so all that names its effect and
+// the marker the comment ends with: the repository, the commit, why the workflow reports, and the
+// error type when the report names it. The rest the workflow sends changes nothing the comment
+// shows: an older Worker's outcome and its pr_url are taken and not shown, and report_ref is
+// refused unless it is the run's latest accepted answer of the model task, which the comment shows
+// whatever the workflow sends. A missing reason reports as done (Prepare reads it so), and is the
+// same effect.
+func (t *CommentCommit) Identity(args map[string]any) map[string]any {
+	id := map[string]any{"repo": args["repo"], "commit": args["commit"], "reason": "done"}
+	if r := tools.String(args, "reason"); r != "" {
+		id["reason"] = r
+	}
+	if name := tools.String(args, "error_type"); name != "" && t.Verdicts.NamesErrorType(name) {
+		id["error_type"] = name
+	}
+	return id
+}
 
 type commentPayload struct {
 	Owner  string `json:"owner"`

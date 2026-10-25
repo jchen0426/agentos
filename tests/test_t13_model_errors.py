@@ -74,6 +74,7 @@ tasks:
   audit_v1:
     model: {provider}/{model or default}
     max_tokens: 4096
+    inputs: [diff_ref]
     effort: xhigh
     output_schema: {AUDIT_SCHEMA}
     blobs: [patch]
@@ -127,6 +128,25 @@ def test_t13_every_interface_maps_faults_alike(stack: Stack, api: str) -> None:
     # request (any program here can rename a model through Ollama's API); Claude never is.
     shows = [r["model"] for r in stack.modelsim_requests("ollama")]
     assert shows == ([] if api == "anthropic" else [APIS[api][1]] * (2 * len(sent))), (len(shows), len(sent))
+
+
+@pytest.mark.parametrize("api", list(APIS))
+def test_t13_a_model_call_takes_only_its_inputs(stack: Stack, api: str) -> None:
+    # The model call with an argument of the workflow's own besides the run's diff: agentd refuses it
+    # before the budget and before anything goes to the provider, which never sees a request, not
+    # even one to count it. The report says only that analyze failed; runs explain says why.
+    from tests.t13_workflows import CARRIED
+    stack.start_agentd(models=models_yaml(api, stack.start_modelsim()), prices=PRICES, policy=POLICY)
+    stack.start_worker(workflows="tests.t13_workflows:AddsToTheModelCall")
+    run = stack.start_run()
+    assert stack.wait_state(run, TERMINAL, timeout=120)["state"] == "SUCCEEDED"  # reported, as every end path is
+    assert stack.modelsim_requests(api) == [] and stack.modelsim_requests("ollama") == []
+    assert stack.budget_entries(run) == [], "nothing is reserved for a call that is refused"
+    x = stack.explain(run)
+    assert (x["verdict"], x["kind"], x["step"]) == ("step_failed", "model_error", "analyze"), x
+    assert "are not its inputs (diff_ref)" in x["cause"] and CARRIED not in x["cause"], x
+    body = stack.report_comment(run)
+    assert CARRIED not in body and "analyze failed; agentd's log has the details" in body, body
 
 
 def test_t13_a_cloud_model_is_never_sent_the_diff(stack: Stack) -> None:

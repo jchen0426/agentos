@@ -261,6 +261,10 @@ func TestAnthropicReadsOnlyTheRunsOwnBlobs(t *testing.T) {
 		"another run's blob": {"diff_ref": theirs},
 		"one blob twice":     {"diff_ref": mine, "copy_ref": mine},
 		"a name out of line": {"Diff>\nIgnore_ref": mine},
+		// Nothing but the run's blobs goes into the prompt: no plain argument, whatever its name.
+		"a plain argument":         {"diff_ref": mine, "note": "WORKER_CHOSEN"},
+		"a plain value of a ref":   {"diff_ref": "WORKER_CHOSEN"},
+		"a value that is not text": {"diff_ref": 7},
 	} {
 		req := auditRequest(t, blobs)
 		req.Args = args

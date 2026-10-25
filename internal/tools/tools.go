@@ -84,6 +84,16 @@ type Editable interface {
 	EditArg() string
 }
 
+// Identifier is a write whose effect is named by some of its arguments only: those that make what
+// it writes, as Identity returns them from the call's arguments. Calls that differ in the others
+// are the same effect, and what the write leaves to be found by (a comment's marker, which names
+// its effect) is the same for them: the others are the workflow's to send as it likes, and a write
+// that shows nothing of them would carry them out all the same, in its effect's ID.
+type Identifier interface {
+	Writer
+	Identity(args map[string]any) map[string]any
+}
+
 // Proceed is asked before each visible request of a write. It fails with ErrStopped when the
 // request must not go out (the run was cancelled meanwhile, or the write's approval ran out while
 // the tool prepared the request), and with another error that wraps

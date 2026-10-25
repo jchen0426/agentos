@@ -73,9 +73,7 @@ func TestTheRecordsCoverAModelCall(t *testing.T) {
 	model := func(t *testing.T) *Gateway {
 		g, run, _ := fallbackGateway(t)
 		g.Adapters = map[string]models.Adapter{"fake": models.Fake{}, "other": models.Fake{}}
-		call := &agentosv1.Call{Kind: "model", Name: "audit_v1", ArgsJson: `{"diff":"x"}`}
-		args := map[string]any{"diff": "x"}
-		canon, _ := encodeCanonical(args)
+		call, args, canon := diffCall(t, g, run)
 		info := activity.Info{ActivityID: "1:audit_v1", Attempt: 1, RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
 			ScheduledTime: time.Unix(1000, 0)}
 		info.WorkflowExecution.ID = run.WorkflowID

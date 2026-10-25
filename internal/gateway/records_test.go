@@ -282,7 +282,11 @@ func TestAReportWaitsForTemporalBeforeItIsRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := tools.Request{WorkflowID: testWorkflowID, EffectID: sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon), Args: args}
+	id, err := effectID(testWorkflowID, cc, args, canon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := tools.Request{WorkflowID: testWorkflowID, EffectID: id, Args: args}
 	ctx := context.Background()
 	h.err = serviceerror.NewUnavailable("connection refused")
 	res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{})
@@ -363,7 +367,7 @@ func TestCheckRequired(t *testing.T) {
 		{Call: tasks.Call{Kind: "tool", Name: "git.apply_check"}, When: &tasks.Holds{Call: tasks.Call{Kind: "model", Name: "audit_v1"},
 			Field: "patch_ref"}}}
 	reg := tasks.Registry{"security-audit": audit}
-	const with = "  audit_v1: {model: fake/audit-fixture, max_tokens: 4096, output_schema: %s, blobs: [patch]}\n"
+	const with = "  audit_v1: {model: fake/audit-fixture, max_tokens: 4096, inputs: [diff_ref], output_schema: %s, blobs: [patch]}\n"
 	if err := CheckRequired(reg, load(with), toolset); err != nil {
 		t.Fatal(err)
 	}
@@ -371,10 +375,10 @@ func TestCheckRequired(t *testing.T) {
 		task string
 		says string
 	}{
-		"the patch not a blob": {"  audit_v1: {model: fake/audit-fixture, max_tokens: 4096, output_schema: %s}\n",
+		"the patch not a blob": {"  audit_v1: {model: fake/audit-fixture, max_tokens: 4096, inputs: [diff_ref], output_schema: %s}\n",
 			"task security-audit requires validate_patch (tool git.apply_check) once analyze (model audit_v1)'s result holds " +
 				"patch_ref, which model task audit_v1 does not produce: its output's patch is not one of its blobs"},
-		"no such model task": {"  other_v1: {model: fake/audit-fixture, max_tokens: 4096, output_schema: %s}\n",
+		"no such model task": {"  other_v1: {model: fake/audit-fixture, max_tokens: 4096, inputs: [diff_ref], output_schema: %s}\n",
 			"task security-audit requires analyze (model audit_v1): models.yaml has no model task audit_v1"},
 	} {
 		if err := CheckRequired(reg, load(tc.task), toolset); err == nil || !strings.Contains(err.Error(), tc.says) {
@@ -568,8 +572,8 @@ func TestEveryRefusalSaysWhoRefused(t *testing.T) {
 	t.Run("the policy's denial of a model's provider", func(t *testing.T) {
 		g, run, _ := fallbackGateway(t)
 		g.Policy = &policy.Policy{Models: map[string]policy.Model{"audit_v1": {AllowedProviders: []string{"other"}}}}
-		res, err := g.dispatch(ctx, activity.Info{ActivityID: "2:audit_v1", Attempt: 1}, run,
-			&agentosv1.Call{Kind: "model", Name: "audit_v1"}, map[string]any{"diff": "x"}, []byte(`{"diff":"x"}`), faults.Effect{},
+		call, args, canon := diffCall(t, g, run)
+		res, err := g.dispatch(ctx, activity.Info{ActivityID: "2:audit_v1", Attempt: 1}, run, call, args, canon, faults.Effect{},
 			&callRecord{})
 		if err != nil || res.GetStatus() != StatusDenied || refusedBy(t, res) != audit.RefusedByPolicy {
 			t.Fatalf("%v %v", res, err)

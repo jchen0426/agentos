@@ -101,6 +101,39 @@ func (v verdicts) ReportVerdict(_ context.Context, _, reason, errorType string) 
 	return v.v, nil
 }
 
+// NamesErrorType names a few of Python's built-in exceptions, as the report does all of them.
+func (verdicts) NamesErrorType(name string) bool { return name == "KeyError" || name == "ValueError" }
+
+// The report's effect, and so the marker its comment ends with, is named by what the comment shows
+// of the call: the repository, the commit, why the workflow reports, and an error type the report
+// names. What else the workflow sends names nothing.
+func TestTheReportsEffectIsWhatItShows(t *testing.T) {
+	tool := &CommentCommit{Verdicts: verdicts{}}
+	shown := map[string]any{"repo": "acme/payments", "commit": strings.Repeat("a", 40), "reason": "workflow_error"}
+	with := func(extra map[string]any) map[string]any {
+		args := maps.Clone(shown)
+		maps.Copy(args, extra)
+		return args
+	}
+	for _, extra := range []map[string]any{nil, {"error_type": "PatchUnreadable"}, {"outcome": "ok: approved"},
+		{"pr_url": "https://evil.example"}, {"report_ref": nil}, {"report_ref": "sha256:" + strings.Repeat("b", 64)}} {
+		if got := tool.Identity(with(extra)); !maps.Equal(got, shown) {
+			t.Errorf("%v: %v", extra, got)
+		}
+	}
+	if got := tool.Identity(with(map[string]any{"error_type": "KeyError"})); !maps.Equal(got, with(map[string]any{"error_type": "KeyError"})) {
+		t.Errorf("a named error type: %v", got)
+	}
+	// A call that gives no reason reports as done, and is the same effect as one that says done.
+	noReason := tool.Identity(map[string]any{"repo": "acme/payments", "commit": "c", "outcome": "ok"})
+	if !maps.Equal(noReason, map[string]any{"repo": "acme/payments", "commit": "c", "reason": "done"}) {
+		t.Errorf("no reason: %v", noReason)
+	}
+	if done := tool.Identity(map[string]any{"repo": "acme/payments", "commit": "c", "reason": "done"}); !maps.Equal(noReason, done) {
+		t.Errorf("no reason %v, done %v", noReason, done)
+	}
+}
+
 // refused is agentd's verdict on a run whose model declined, as explain.Report gives it.
 var refused = Verdict{Verdict: "step_failed", Kind: "model_refused", Step: "analyze",
 	Cause: "analyze: the model declined to answer (anthropic/claude-opus-5-5): \"see https://evil.example @mallory\""}

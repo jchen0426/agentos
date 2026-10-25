@@ -156,9 +156,7 @@ func TestAFaultedStatusIsAnsweredAfterTheCallStarted(t *testing.T) {
 	})
 	t.Run("a model", func(t *testing.T) {
 		g, run, _ := fallbackGateway(t)
-		call := &agentosv1.Call{Kind: "model", Name: "audit_v1", ArgsJson: `{"diff":"x"}`}
-		args := map[string]any{"diff": "x"}
-		canon, _ := encodeCanonical(args)
+		call, args, canon := diffCall(t, g, run)
 		info := activity.Info{ActivityID: "1:audit_v1", Attempt: 1, RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 5},
 			ScheduledTime: time.Unix(1000, 0)}
 		info.WorkflowExecution.ID = run.WorkflowID

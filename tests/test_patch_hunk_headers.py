@@ -15,7 +15,7 @@ MODELS = """
 providers:
   anthropic: {{adapter: anthropic, base_url: "{url}"}}
 tasks:
-  audit_v1: {{model: anthropic/claude-opus-5-5, max_tokens: 4096, output_schema: {schema}, blobs: [patch]}}
+  audit_v1: {{model: anthropic/claude-opus-5-5, max_tokens: 4096, inputs: [diff_ref], output_schema: {schema}, blobs: [patch]}}
 """
 PRICES = """
 price_table_version: hunk-headers

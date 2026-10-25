@@ -29,6 +29,7 @@ tasks:
   audit_v1:
     model: anthropic/claude-opus-5-5
     max_tokens: 16000
+    inputs: [diff_ref]
     effort: high
     fallback: [anthropic/claude-opus-4-8]
     cross_provider_fallback: [openai/gpt-6.1-sol, local/gpt-oss:20b]
@@ -65,8 +66,12 @@ tasks:
 }
 
 func TestModelsRefusesBadRoutes(t *testing.T) {
+	// Each with its inputs, but for those about them: what else is wrong refuses it.
 	task := func(lines string) string {
-		return providers + "tasks:\n  audit_v1:\n    max_tokens: 1000\n" + lines
+		return providers + "tasks:\n  audit_v1:\n    max_tokens: 1000\n    inputs: [diff_ref]\n" + lines
+	}
+	bare := func(lines string) string {
+		return providers + "tasks:\n  audit_v1:\n    max_tokens: 1000\n    model: anthropic/claude-opus-5-5\n" + lines
 	}
 	for name, body := range map[string]string{
 		// A fallback within the request exists only on Claude, and only on the same provider.
@@ -81,17 +86,30 @@ func TestModelsRefusesBadRoutes(t *testing.T) {
 		"ollama cloud suffix": task("    model: local/deepseek-v4:cloud\n"),
 		"ollama cloud upper":  task("    model: local/GPT-OSS:120B-CLOUD\n"),
 		"cloud on responses": "providers:\n  ollama: {adapter: openai_compat, api: responses, base_url: http://127.0.0.1:11434/v1}\n" +
-			"tasks: {audit_v1: {model: ollama/gpt-oss:120b-cloud, max_tokens: 10}}\n",
+			"tasks: {audit_v1: {model: ollama/gpt-oss:120b-cloud, max_tokens: 10, inputs: [diff_ref]}}\n",
 		"unknown task effort": task("    model: anthropic/claude-opus-5-5\n    effort: extreme\n"),
 		"chat without context_tokens": "providers:\n  local: {adapter: openai_compat, api: chat, base_url: http://127.0.0.1:11434/v1}\n" +
-			"tasks: {audit_v1: {model: local/m, max_tokens: 10}}\n",
+			"tasks: {audit_v1: {model: local/m, max_tokens: 10, inputs: [diff_ref]}}\n",
 		"no api":         "providers:\n  openai: {adapter: openai_compat, base_url: https://api.openai.com/v1}\ntasks: {}\n",
 		"no base_url":    "providers:\n  openai: {adapter: openai_compat, api: responses}\ntasks: {}\n",
 		"unknown effort": "providers:\n  openai: {adapter: openai_compat, api: responses, base_url: x, efforts: [extreme]}\ntasks: {}\n",
 		"api on claude":  "providers:\n  anthropic: {adapter: anthropic, api: responses}\ntasks: {}\n",
+		// A task takes blobs of the run's own, each named <name>_ref, and says which: nothing else of
+		// a call reaches the model.
+		"no inputs":          bare(""),
+		"empty inputs":       bare("    inputs: []\n"),
+		"a plain input":      bare("    inputs: [diff_ref, note]\n"),
+		"an input not named": bare("    inputs: [_ref]\n"),
+		"an input in caps":   bare("    inputs: [Diff_ref]\n"),
+		"an input twice":     bare("    inputs: [diff_ref, diff_ref]\n"),
 	} {
 		if _, err := loadModels(t, body); err == nil {
 			t.Errorf("%s: loaded", name)
 		}
+	}
+	if c, err := loadModels(t, bare("    inputs: [diff_ref, patch_ref]\n")); err != nil {
+		t.Errorf("two inputs: %v", err)
+	} else if r, err := c.Route("audit_v1"); err != nil || strings.Join(r.Inputs, ",") != "diff_ref,patch_ref" {
+		t.Errorf("route %+v %v", r, err)
 	}
 }

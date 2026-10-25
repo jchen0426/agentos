@@ -108,6 +108,11 @@ func (p Provider) check() error {
 
 type Task struct {
 	Model string `yaml:"model"` // "<provider>/<model>"
+	// The arguments the task takes, all of them required: each a blob of the calling run's own,
+	// named "<name>_ref", which the prompt holds as a section of its own. Nothing else of the call
+	// reaches the model: the gateway refuses a call with other arguments before anything is sent.
+	// A plain input (text, a number) would need a type that bounds it, which agentd does not have.
+	Inputs []string `yaml:"inputs"`
 	// The most output one request may produce. Fixed here, with the model and its fallbacks,
 	// so that the budget can bound what a request costs before it is sent.
 	MaxTokens    int64    `yaml:"max_tokens"`
@@ -174,6 +179,19 @@ func Load(path string) (*Config, error) {
 func (t *Task) load(dir string) error {
 	if t.Effort != "" && !slices.Contains(efforts, t.Effort) {
 		return fmt.Errorf("effort %q is not one of %v", t.Effort, efforts)
+	}
+	if len(t.Inputs) == 0 {
+		return errors.New("inputs is required: the task's arguments, each a blob of the run's own (<name>_ref)")
+	}
+	for i, in := range t.Inputs {
+		name, isRef := strings.CutSuffix(in, "_ref")
+		switch {
+		case !isRef || !refName.MatchString(name):
+			return fmt.Errorf("input %q is not a blob of the run's own (<name>_ref, the name in lower case): a plain "+
+				"input would need a type that bounds it, which agentd does not have", in)
+		case slices.Contains(t.Inputs[:i], in):
+			return fmt.Errorf("input %q is listed twice", in)
+		}
 	}
 	abs := func(p string) string {
 		if filepath.IsAbs(p) {
@@ -255,6 +273,7 @@ type Route struct {
 	PromptVersion string         // its file and the hash of its text
 	Schema        map[string]any // the output's JSON Schema, sent to providers that constrain output
 	Blobs         []string
+	Inputs        []string // the task's arguments, each a blob of the run's own (Task.Inputs)
 	validator     *jsonschema.Schema
 }
 
@@ -302,7 +321,7 @@ func (c *Config) Route(task string) (Route, error) {
 		}
 		return Route{Task: task, Provider: provider, Adapter: p.Adapter, Model: model, MaxTokens: t.MaxTokens,
 			Candidates: []string{name}, Effort: t.Effort, Prompt: t.prompt, PromptVersion: t.promptVersion,
-			Schema: t.schema, Blobs: t.Blobs, validator: t.validator}, nil
+			Schema: t.schema, Blobs: t.Blobs, Inputs: t.Inputs, validator: t.validator}, nil
 	}
 	r, err := route(t.Model)
 	if err != nil {

@@ -1,9 +1,10 @@
 """T7: 50 model calls in one run compete for its budget (design doc, sections 9 and 11).
 
-The run starts with room for about 13 reservations. The other calls wait in PAUSED_BUDGET
-until `agentctl budget extend` rings the doorbell; then every call finishes. After the
-extension the fake provider answers 429 and 500, loses an answer it billed, never receives
-one request and answers one as the fallback model. At every entry of the ledger, settled
+The 50 calls are alike, argument for argument: each takes the run's diff, its task's one input
+(tests/t7_workflows.py). The run starts with room for about 13 reservations. The other calls wait
+in PAUSED_BUDGET until `agentctl budget extend` rings the doorbell; then every call finishes.
+After the extension the fake provider answers 429 and 500, loses an answer it billed, never
+receives one request and answers one as the fallback model. At every entry of the ledger, settled
 spending plus open reservations stay within the limit, and the provider's own record
 matches the ledger request by request.
 """
@@ -19,7 +20,7 @@ MODELS = f"""
 providers:
   fake: {{adapter: fake}}
 tasks:
-  audit_v1: {{model: {MODEL}, max_tokens: 4096, fallback: [{FALLBACK}], output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
+  audit_v1: {{model: {MODEL}, max_tokens: 4096, inputs: [diff_ref], fallback: [{FALLBACK}], output_schema: {AUDIT_SCHEMA}, blobs: [patch]}}
 """
 # Every request holds its reservation for half a second before it goes out, so the calls
 # really do compete: a fake answer is otherwise settled within a millisecond, and the next
