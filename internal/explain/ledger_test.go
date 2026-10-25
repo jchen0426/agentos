@@ -103,6 +103,52 @@ func TestReadLedger(t *testing.T) {
 	}
 }
 
+// agentd's starts are its agentd.started records, and only those: a Worker's exit (worker.exited,
+// agentd's own record too) is no start, and holds no attempt against agentd.
+func TestReadLedgerStartsAreAgentdsOnly(t *testing.T) {
+	ctx := context.Background()
+	l, err := ledger.Open(ctx, filepath.Join(t.TempDir(), "ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	if err := l.Tx(ctx, func(q *db.Queries) error {
+		return q.InsertRun(ctx, db.InsertRunParams{WorkflowID: "run-1", Task: "security-audit", ParamsJson: "{}",
+			BudgetLimitMicros: 1, CreatedAt: ledger.Now()})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var starts []int64
+	for _, r := range []struct{ workflowID, typ string }{{"run-1", "run.created"}, {"", "worker.exited"}, {"", "agentd.started"},
+		{"", "worker.exited"}, {"run-1", "call"}, {"", "worker.exited"}, {"", "agentd.started"}} {
+		h, err := audit.Record(ctx, l, audit.Event{WorkflowID: r.workflowID, Type: r.typ, Actor: audit.Agentd, Payload: map[string]any{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.typ == "agentd.started" {
+			starts = append(starts, h.Seq)
+		}
+	}
+	var got Ledger
+	if err := l.Read(ctx, func(q *db.Queries) error {
+		run, err := q.GetRun(ctx, "run-1")
+		if err != nil {
+			return err
+		}
+		got, err = ReadLedger(ctx, q, run, Wanted{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var seqs []int64
+	for _, s := range got.Starts {
+		seqs = append(seqs, s.Seq)
+	}
+	if !slices.Equal(seqs, starts) || len(got.Records) != 2 {
+		t.Fatalf("starts %v, want %v; records %d", seqs, starts, len(got.Records))
+	}
+}
+
 // A record ReadLedger cannot read is said, for the result or failure it was for to go unchecked: one a
 // result names, read on its own; and the run's call records past the bound, read in one pass for the
 // attempts that failed, one of which cannot be read: every attempt it was for is unchecked (one whose

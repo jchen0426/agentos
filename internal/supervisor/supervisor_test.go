@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/jchen0426/agentos/internal/audit"
+	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/statedir"
 )
 
@@ -707,5 +708,49 @@ func TestStartTime(t *testing.T) {
 	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
 	if theirs, err := startTime(child.Process.Pid); err != nil || theirs == me {
 		t.Errorf("a child's start %q, %v; mine %q", theirs, err, me)
+	}
+}
+
+// A Worker's exit record is one agentctl audit verify reads past: whatever the exit, its payload
+// decodes into the fields audit.Projection reads of every record (its keys are none of them), and
+// holds no number that is not an integer. The rest of verify skips the type (internal/control's
+// TestVerifyAuditOfTheWorkersExits), and runs explain's starts are agentd.started only.
+func TestTheExitRecord(t *testing.T) {
+	at := time.Date(2026, 10, 25, 12, 0, 0, 123456789, time.FixedZone("x", 3600))
+	for name, e := range map[string]exit{
+		"an exit code":            {generation: 3, pid: 42, code: 1, ran: 1500 * time.Millisecond, ready: true, at: at, restartIn: 2 * time.Second},
+		"a signal":                {generation: 4, pid: 43, signal: "killed", ran: time.Minute, ready: true, at: at, restartIn: time.Second},
+		"never started":           {generation: 5, startError: "fork/exec /x: no such file or directory", at: at, restartIn: 4 * time.Second},
+		"the first, agentd stops": {generation: 1, pid: 44, code: 2, at: at},
+	} {
+		ev := e.Event(7)
+		if ev.Type != ExitedType || ev.Actor != audit.Agentd || ev.WorkflowID != "" {
+			t.Errorf("%s: %+v", name, ev)
+		}
+		b, err := json.Marshal(ev.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p audit.Projection
+		if err := p.Apply(db.AuditLog{Seq: 1, Type: ev.Type, Actor: ev.Actor, Payload: string(b)}); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
+		var fields map[string]any
+		if err := dec.Decode(&fields); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range fields {
+			if n, ok := v.(json.Number); ok {
+				if _, err := n.Int64(); err != nil {
+					t.Errorf("%s: %s is %s", name, k, n)
+				}
+			}
+		}
+		if fields["unrecorded"] != json.Number("7") || fields["exited_at"] != "2026-10-25T11:00:00.123456789Z" ||
+			(e.restartIn == 0) != (fields["restart_in_ms"] == nil) {
+			t.Errorf("%s: %s", name, b)
+		}
 	}
 }

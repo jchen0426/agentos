@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -53,6 +54,8 @@ import (
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
 	"github.com/jchen0426/agentos/internal/safetext"
 	"github.com/jchen0426/agentos/internal/secrets"
+	"github.com/jchen0426/agentos/internal/statedir"
+	"github.com/jchen0426/agentos/internal/supervisor"
 	"github.com/jchen0426/agentos/internal/tasks"
 	"github.com/jchen0426/agentos/internal/tools"
 )
@@ -71,7 +74,9 @@ func main() {
 	configPath := flag.String("config", "agentd.yaml", "path to agentd.yaml")
 	faultScript := flag.String("fault-script", "", "TESTS ONLY: fault injection script for the tools, the fake model and run starts")
 	testTools := flag.Bool("test-tools", false, "TESTS ONLY: also offer test.unsafe_write, a write to a local log")
-	insecureDev := flag.Bool("insecure-dev", false, "DEVELOPMENT ONLY: run the git tool server without a sandbox when git_tools.sandbox is unset")
+	insecureDev := flag.Bool("insecure-dev", false, "DEVELOPMENT ONLY: run the git tool server without a sandbox when git_tools.sandbox is unset, "+
+		"and the Worker when worker.sandbox is")
+	noWorker := flag.Bool("no-worker", false, "start no Worker: run one yourself (maintenance, a staged migration, the evaluation)")
 	logLevel := flag.String("log-level", "info", "debug, info, warn or error")
 	flag.Parse()
 
@@ -82,13 +87,13 @@ func main() {
 	}
 	// The log carries values the Worker chose (activity IDs, call names): no raw controls.
 	log := slog.New(slog.NewJSONHandler(safetext.JSONWriter(os.Stderr), &slog.HandlerOptions{Level: level}))
-	if err := run(*configPath, *faultScript, *testTools, *insecureDev, log); err != nil {
+	if err := run(*configPath, *faultScript, *testTools, *insecureDev, *noWorker, log); err != nil {
 		log.Error("agentd stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.Logger) error {
+func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -105,6 +110,12 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	if err != nil {
 		return err
 	}
+	// Before agentd changes anything: a Worker it could not run as the configuration says.
+	if !noWorker {
+		if err := checkWorker(runtime.GOOS, cfg, insecureDev); err != nil {
+			return err
+		}
+	}
 	if err := mkdirPrivate(cfg.DataDir); err != nil {
 		return err
 	}
@@ -113,6 +124,14 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 		return err
 	}
 	defer lock.Close()
+	// Only now, holding the lock, and before anything listens: a Worker the last agentd on this data
+	// directory left running when it was killed goes, whether this agentd runs one or not. Another
+	// agentd on the data directory never got past the lock, and its Worker is left alone.
+	workerLog := log.With("component", "worker")
+	if err := supervisor.Sweep(filepath.Join(cfg.DataDir, "worker.pid"), workerLog); err != nil {
+		return err
+	}
+	statedir.Sweep(supervisor.StateKind)
 	pol, err := policy.Load(cfg.PolicyFile)
 	if err != nil {
 		return err
@@ -192,6 +211,10 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	startedAt := time.Now()
 	start := startRecord(configPath, cfg, pol, mods, prices, incarnation, faultScript, testTools, insecureDev)
 	start["retention_seconds"] = int64(retention / time.Second)
+	start["no_worker"] = noWorker
+	if !noWorker {
+		start["worker"] = workerRecord(cfg)
+	}
 	// The chain its anchor workflows are named by: its first record's. A new ledger's first record is
 	// this one, which cannot name its own sha256.
 	chain := ""
@@ -373,6 +396,19 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	if err != nil {
 		return fmt.Errorf("runtime socket: %w", err)
 	}
+	var sup *supervisor.Supervisor
+	if !noWorker {
+		o, err := workerLaunch(runtime.GOOS, cfg, runtimeLn.Addr())
+		if err != nil {
+			return err
+		}
+		if len(cfg.Worker.Sandbox) == 0 {
+			workerLog.Warn("THE WORKER RUNS WITHOUT A SANDBOX (--insecure-dev): development only")
+		}
+		// Its exits' records go through the refusals' queue: Add never waits for the ledger.
+		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, refusals.Add
+		sup = supervisor.New(o)
+	}
 	runtimeSrv := runtimeproxy.NewServer(backend, runtimeproxy.Rules{
 		Namespace:     cfg.Temporal.Namespace,
 		WorkflowQueue: cfg.TaskQueues.Workflows,
@@ -434,16 +470,42 @@ func run(configPath, faultScript string, testTools, insecureDev bool, log *slog.
 	errs := make(chan error, 2)
 	go func() { errs <- runtimeSrv.Serve(runtimeLn) }()
 	go func() { errs <- controlSrv.Serve(controlLn) }()
-	log.Info("agentd ready",
-		"runtime", cfg.RuntimeListen, "control", cfg.ControlSocket, "temporal", cfg.Temporal.Address,
-		"gateway_queue", cfg.TaskQueues.Gateway, "workflow_queue", cfg.TaskQueues.Workflows)
-
-	select {
-	case <-ctx.Done():
+	// The Worker stops first: this branch closes the Runtime entry before any deferred cleanup runs,
+	// and a supervisor still running would start a Worker that cannot reach it. On an error, the
+	// deferred Stop below is the latest defer, and runs before the servers' own.
+	shutdown := func() error {
 		log.Info("shutting down")
+		sup.Stop()
 		controlSrv.GracefulStop()
 		runtimeSrv.Stop()
 		return nil
+	}
+	if sup != nil {
+		// The Runtime entry serves: the first Worker must say it is ready before agentd does.
+		sup.Start()
+		defer sup.Stop()
+		select {
+		case <-sup.Ready():
+		case err := <-sup.Failed():
+			return err
+		case <-ctx.Done():
+			return shutdown()
+		case err := <-errs:
+			return err
+		}
+	}
+	theWorker := "none (--no-worker)"
+	if sup != nil {
+		_, pid := sup.Current()
+		theWorker = fmt.Sprintf("pid %d", pid)
+	}
+	log.Info("agentd ready",
+		"runtime", cfg.RuntimeListen, "control", cfg.ControlSocket, "temporal", cfg.Temporal.Address,
+		"gateway_queue", cfg.TaskQueues.Gateway, "workflow_queue", cfg.TaskQueues.Workflows, "worker", theWorker)
+
+	select {
+	case <-ctx.Done():
+		return shutdown()
 	case err := <-errs:
 		return err
 	}
