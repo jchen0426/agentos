@@ -289,23 +289,26 @@ def command_of(pid: int) -> str:
 
 class Proc:
     """A child process with its output in a log file. With terminal, a pseudo-terminal is its
-    controlling terminal, as a terminal is a command's that a person starts in a shell."""
+    controlling terminal, as a terminal is a command's that a person starts in a shell; else stdin
+    is the file descriptor given, or this process's own."""
 
     def __init__(self, name: str, args: list[str], log: Path, env: dict[str, str] | None = None,
-                 cwd: Path | None = None, pass_fds: tuple[int, ...] = (), terminal: bool = False) -> None:
+                 cwd: Path | None = None, pass_fds: tuple[int, ...] = (), terminal: bool = False,
+                 stdin: int | None = None) -> None:
         self.name, self.log = name, log
         self._out = open(log, "w")
         self._pty: int | None = None
-        stdin = None
+        tty = None
         if terminal:
-            self._pty, stdin = os.openpty()
+            self._pty, tty = os.openpty()
+            stdin = tty
             args = [sys.executable, "-c", CTTY_EXEC, *args]
         try:
             self.popen = subprocess.Popen([str(a) for a in args], stdin=stdin, stdout=self._out, stderr=subprocess.STDOUT,
                                           env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
         finally:
-            if stdin is not None:
-                os.close(stdin)  # the child has it; the terminal stays while _pty, its other end, is open
+            if tty is not None:
+                os.close(tty)  # the child has it; the terminal stays while _pty, its other end, is open
 
     def text(self) -> str:
         return self.log.read_text(errors="replace")
@@ -761,15 +764,19 @@ class Stack:
         denied = [str(p) for p in [self.tmp, *self.deny_read]]
         return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied)}
 
-    def start_worker(self, workflows: str | None = None) -> Worker:
+    def start_worker(self, workflows: str | None = None, args: tuple[str, ...] = (), stdin: int | None = None,
+                     ready: bool = True) -> Worker:
+        """A Worker run by hand (agentd with --no-worker), with args after its own, and stdin; once it
+        is ready, unless not ready."""
         n = len(self.workers) + 1
-        w = Worker(f"worker{n}", self.worker_command(workflows), self.tmp / f"worker{n}.log",
-                   env=self.sandbox_env(), cwd=REPO)
+        w = Worker(f"worker{n}", [*self.worker_command(workflows), *args], self.tmp / f"worker{n}.log",
+                   env=self.sandbox_env(), cwd=REPO, stdin=stdin)
         self.procs.append(w)
         self._remember()
         self.workers.append(w)
-        wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
-        assert w.alive(), w.text()
+        if ready:
+            wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
+            assert w.alive(), w.text()
         return w
 
     def _remember(self) -> None:

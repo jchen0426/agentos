@@ -239,12 +239,18 @@ def test_the_next_agentd_stops_a_worker_the_last_left_running(stack: Stack, next
         assert stack.worker_processes() == []
 
 
+# The SDK's own line as a Worker begins to shut down (temporalio.worker).
+SDK_SHUTDOWN = "Beginning worker shutdown"
+
+
 def test_a_workflow_task_in_flight_is_reported_across_agentds_stop(stack: Stack) -> None:
-    """agentd stops its Worker through the stop channel: the Worker finishes the workflow task it holds
-    and reports it while the Runtime entry still serves, so the task does not time out. A signal through
-    the launcher would cut it off: srt drops the connections it proxies before it passes SIGTERM on, and
-    bwrap dies of SIGTERM, the sandbox with it. agentd gets SIGTERM once the task logs that its hold (of
-    1 s) has begun, and the hold is over only after agentd has begun to stop."""
+    """agentd stops its Worker through the stop channel, and nothing else, while the Worker holds a
+    workflow task: agentd gets SIGTERM once the task logs that its hold (of 1 s) has begun; the Worker
+    begins to shut down (the SDK says so) before the hold is over, which only the channel can make it
+    do in time, agentd's SIGTERM coming only after 5 s, and agentd never falls back to it. The Worker
+    finishes the task and reports it while the Runtime entry still serves: the task does not time
+    out. A signal through the launcher would cut it off: srt drops the connections it proxies before
+    it passes SIGTERM on, and bwrap dies of SIGTERM, the sandbox with it."""
     stack.start_agentd(worker=True, workflows="tests.rogue_workflows:SlowTask")
     w = stack.worker()
     run = stack.start_run()
@@ -257,11 +263,46 @@ def test_a_workflow_task_in_flight_is_reported_across_agentds_stop(stack: Stack)
     events = event_types(stack.history(run))
     assert "WORKFLOW_TASK_TIMED_OUT" not in events and "WORKFLOW_EXECUTION_COMPLETED" in events, events
     entries = stack.agentd_log()
-    msgs = ["held" if e.get("msg") == "worker output" and SLOW_HELD in e["line"] else e.get("msg") for e in entries]
-    assert "held" in msgs and msgs.index("shutting down") < msgs.index("held"), msgs  # in flight across the stop
+
+    def what(e: dict) -> str | None:  # the Worker's lines that matter here, else agentd's message
+        if e.get("msg") == "worker output":
+            for mark in (SLOW_HELD, SDK_SHUTDOWN):
+                if mark in e["line"]:
+                    return mark
+        return e.get("msg")
+
+    msgs = [what(e) for e in entries]
+    assert SDK_SHUTDOWN in msgs and SLOW_HELD in msgs, msgs
+    assert msgs.index("shutting down") < msgs.index(SDK_SHUTDOWN) < msgs.index(SLOW_HELD), msgs
+    assert "the Worker did not stop when asked: SIGTERM" not in msgs, msgs
     [stopped] = [e for e in entries if e.get("msg") == "worker stopped"]
     assert stopped["status"] == "exit status 0", stopped
     stack.restart_agentd()  # its log verifies
+
+
+def test_a_worker_asked_to_stop_while_it_starts_never_polls(stack: Stack) -> None:
+    """A Worker whose stop channel ended while it started (its agentd stopped meanwhile, or died) stops
+    without polling its task queue: it takes no workflow task only to cut it short. Here it is run by
+    hand, as with --no-worker, on a stop channel that has ended already."""
+    stack.start_agentd()
+    r, w = os.pipe()
+    os.close(w)
+    try:
+        worker = stack.start_worker(args=("--stop-on-stdin-eof",), stdin=r, ready=False)
+    finally:
+        os.close(r)
+    assert worker.popen.wait(timeout=60) == 0, worker.text()
+    assert "worker stopped before it polled" in worker.text() and "worker ready" not in worker.text(), worker.text()
+
+
+def test_a_worker_whose_stdin_cannot_be_watched_runs_on(stack: Stack) -> None:
+    """--stop-on-stdin-eof with stdin on /dev/null, which kqueue and epoll refuse to watch: the Worker
+    says so, once, and serves; only a signal stops it then."""
+    stack.start_agentd()
+    with open(os.devnull) as null:
+        worker = stack.start_worker(args=("--stop-on-stdin-eof",), stdin=null.fileno())
+    assert worker.text().count("not watching stdin") == 1, worker.text()
+    succeeds(stack)
 
 
 def test_t16_a_second_agentd_leaves_the_first_ones_worker_alone(stack: Stack) -> None:

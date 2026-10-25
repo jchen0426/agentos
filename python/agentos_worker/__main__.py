@@ -62,7 +62,12 @@ def watch_stop_channel(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> 
     """Stop, gracefully, once stdin ends: agentd's stop channel is a pipe whose write end only it
     holds. It closes it to have the Worker stop (a signal through the launcher would cut the Worker
     off first: srt drops the connections it proxies before it passes SIGTERM on, and bwrap dies of
-    it), and it closes by itself when agentd dies, however it ends. What arrives on it is ignored."""
+    it), and it closes by itself when agentd dies, however it ends. What arrives on it is ignored.
+
+    An end that came while the Worker started is seen at once, before this returns: the event loop
+    would run the reader only after the task that called this had gone on. A stdin that cannot be
+    watched (/dev/null, which kqueue and epoll refuse, or a file on Linux) is said once, and only a
+    signal stops the Worker then."""
 
     def readable() -> None:
         try:
@@ -75,7 +80,13 @@ def watch_stop_channel(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> 
             loop.remove_reader(0)
             stop.set()
 
-    loop.add_reader(0, readable)
+    try:
+        loop.add_reader(0, readable)
+    except OSError as e:
+        logging.warning("not watching stdin as agentd's stop channel (%s): only a signal stops this Worker", e)
+        return
+    if select.select([0], [], [], 0)[0]:
+        readable()
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,6 +147,9 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop.set)
     if args.stop_on_stdin_eof:
         watch_stop_channel(loop, stop)
+    if stop.is_set():  # asked to stop while it started: no workflow task taken, only to be cut short
+        logging.info("worker stopped before it polled: asked to stop while it started")
+        return
     async with worker:
         logging.info("worker ready: endpoint=%s task_queue=%s", args.endpoint, args.task_queue)
         await stop.wait()
