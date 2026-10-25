@@ -736,6 +736,7 @@ func TestSweepLeavesOtherProcesses(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s: the file stays", name)
 		}
+		time.Sleep(200 * time.Millisecond) // a SIGKILL takes a moment to land
 		if gone(other.Process.Pid) {
 			t.Fatalf("%s: killed another process", name)
 		}
