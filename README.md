@@ -224,6 +224,11 @@ What a run must have done to have ended well reads its model task's output: the 
 (`blobs: [patch]`) and its output schema's fields. agentd checks at start that `config/models.yaml`
 still gives every field those rules read, and refuses to start, naming the field, if one is gone.
 
+A model task's `inputs` are all it takes, each a blob of the run's own (`<name>_ref`; the audit's
+is `diff_ref`), and all are required: a call with any other argument is refused before anything is
+reserved or sent. agentd refuses to start with a task that lists none, or one that is not a blob: a
+plain input would need a type that bounds it, which v0.1 does not have.
+
 ```bash
 printf 'add-generic-password -U -s agentos-openai-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
 ```
@@ -390,20 +395,22 @@ a model's words), and nothing of what Temporal has of a call agentd has no recor
 fail or complete a call itself, on a task queue of its own. `runs explain`, which is local, names
 them all. What a subverted Worker still steers in the report: why it reports and the error's type
 (two reasons, 51 names or none); which of the task's steps it calls, in what order, and how each
-ends (the verdict, its kind, the step it names, a few counts such as attempts, a few bits such as
-which of Temporal's timeouts ended a call); a budget's figures, when a call runs out of budget,
-which follow the size of a model task's request (about 17 bits a report while its plain arguments,
-below, are open); when it reports (the comment's time, and an approval's request time); and that it
-reports once per run (the effect's cap, unless the policy raises the tool's `max_per_run`). The
-comment's hidden marker names the report's effect, and the effect is named only by what the comment
-shows: the repository, the commit, the reason and an error type the report names, not what else the
-report's call sends (an older Worker's outcome, `pr_url`, `report_ref`). One way out is still open:
-a model task's plain arguments (the ones that are not a blob) reach the model as they are, and the
-model's answer is the report (docs/m5-notes.md). The report shows no internal error's text: where
-agentd could not read something, or a tool's server failed, it says so and that
-agentd's log has the details; a model's or a tool's own words are shown fenced, when agentd's records
-hold them. When the outcome rests on everything it needs but other evidence was past agentd's
-bounds, the report says which, and that it does not change the outcome.
+ends (the verdict, its kind, the step it names, a few counts such as attempts and how many calls it
+made, a few bits such as which of Temporal's timeouts ended a call); when it reports (the comment's
+time, and an approval's request time); and that it reports once per run (the effect's cap, unless
+the policy raises the tool's `max_per_run`). A budget's figures, when a call runs out of budget,
+follow the size of the model's request, which the run's own blobs set: its diff, which its commit
+fixes. A model task takes only the inputs models.yaml declares for it, each a blob of the run's own
+(the security audit's: the run's diff), and agentd refuses a model call with any other argument
+before anything is reserved or sent: the model's answer is the report, and nothing else the
+workflow writes reaches the model. The comment's hidden marker names the report's effect, and the
+effect is named only by what the comment shows: the repository, the commit, the reason and an error
+type the report names, not what else the report's call sends (an older Worker's outcome, `pr_url`,
+`report_ref`). The report shows no internal error's text: where agentd could not read something, or
+a tool's server failed, it says so and that agentd's log has the details; a model's or a tool's own
+words are shown fenced, when agentd's records hold them. When the outcome rests on everything it
+needs but other evidence was past agentd's bounds, the report says which, and that it does not
+change the outcome.
 
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 

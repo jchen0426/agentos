@@ -38,7 +38,7 @@ BUDGET = 50_000
 def profiles(url: str) -> list[runner.Profile]:
     """Model a, over Anthropic's API and priced; model b, a local server on Chat Completions."""
     def task(model: str, **extra) -> dict:
-        return {"model": model, "max_tokens": 4096, "output_schema": str(AUDIT_SCHEMA), "blobs": ["patch"], **extra}
+        return {"model": model, "max_tokens": 4096, "inputs": ["diff_ref"], "output_schema": str(AUDIT_SCHEMA), "blobs": ["patch"], **extra}
     a = runner.Profile("a", json.dumps({"providers": {"anthropic": {"adapter": "anthropic", "base_url": url}},
                                         "tasks": {"audit_v1": task("anthropic/claude-opus-5-5")}}),
                        PRICES, "anthropic/claude-opus-5-5", paid=True)
@@ -340,7 +340,7 @@ def _product() -> tuple[dict, dict]:
 
 def test_the_profiles_are_the_products_configuration() -> None:
     providers, product = _product()
-    assert set(product) == {"model", "max_tokens", "effort", "prompt", "output_schema", "blobs", "fallback"}
+    assert set(product) == {"model", "max_tokens", "inputs", "effort", "prompt", "output_schema", "blobs", "fallback"}
     assert providers["local"]["efforts"] == ["low", "medium"]  # gpt-oss at medium (the pilot)
     for p in runner.PROFILES.values():
         config = json.loads(p.models)

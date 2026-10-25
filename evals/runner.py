@@ -104,7 +104,7 @@ class Profile:
 
 def _task(model: str, **extra) -> dict:
     # config/models.yaml's audit_v1, with this model.
-    return {"model": model, "max_tokens": 16000, "effort": "high",
+    return {"model": model, "max_tokens": 16000, "inputs": ["diff_ref"], "effort": "high",
             "prompt": str(REPO / "config/prompts/audit_v1/claude.md"),
             "output_schema": str(REPO / "config/schemas/audit_report.json"), "blobs": ["patch"], **extra}
 

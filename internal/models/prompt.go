@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"regexp"
@@ -16,24 +15,19 @@ import (
 // refName is the name part of a blob argument, "<name>_ref": it becomes the section's tag.
 var refName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 
-// userMessage lays out a call's arguments: every argument that names a blob ("<name>_ref")
-// becomes a section holding the blob, after the other arguments as one JSON section. Blobs
-// come last since they are the large part that changes from call to call. Each section's tag
-// carries a suffix taken from its content, so the content cannot close its own section. Only
-// blobs the calling run produced are read, each at most once.
+// userMessage lays out a call's arguments, its task's inputs: each names a blob of the calling
+// run's own ("<name>_ref") and becomes a section holding the blob, read at most once. Each
+// section's tag carries a suffix taken from its content, so the content cannot close its own
+// section. Nothing else of the call goes into the prompt: an argument that is not such a blob
+// fails it (the gateway refuses the call before it gets here, models.yaml's inputs).
 func userMessage(ctx context.Context, blobs BlobStore, workflowID string, args map[string]any) (string, error) {
-	plain := map[string]any{}
 	var sections []string
 	seen := map[string]bool{}
 	for _, k := range slices.Sorted(maps.Keys(args)) {
 		name, isRef := strings.CutSuffix(k, "_ref")
 		ref, isString := args[k].(string)
-		if !isRef || !isString || !strings.HasPrefix(ref, "sha256:") {
-			plain[k] = args[k]
-			continue
-		}
-		if !refName.MatchString(name) || seen[ref] {
-			return "", fmt.Errorf("%w: argument %q", ErrBadArguments, k)
+		if !isRef || !isString || !strings.HasPrefix(ref, "sha256:") || !refName.MatchString(name) || seen[ref] {
+			return "", fmt.Errorf("%w: an argument that is not a blob of the run's own", ErrBadArguments)
 		}
 		seen[ref] = true
 		b, err := blobs.GetRunBlob(ctx, workflowID, ref)
@@ -43,15 +37,7 @@ func userMessage(ctx context.Context, blobs BlobStore, workflowID string, args m
 		tag := sectionTag(name, b)
 		sections = append(sections, "<"+tag+">\n"+string(b)+"\n</"+tag+">")
 	}
-	var parts []string
-	if len(plain) > 0 {
-		b, err := json.Marshal(plain)
-		if err != nil {
-			return "", err
-		}
-		parts = append(parts, "<arguments>\n"+string(b)+"\n</arguments>")
-	}
-	return strings.Join(append(parts, sections...), "\n\n"), nil
+	return strings.Join(sections, "\n\n"), nil
 }
 
 func sectionTag(name string, content []byte) string {

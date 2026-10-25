@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
+	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/ledger"
 	"github.com/jchen0426/agentos/internal/ledger/db"
 	"github.com/jchen0426/agentos/internal/models"
@@ -44,7 +46,8 @@ func newResumeFixture(t *testing.T) *resumeFixture {
 		g: &Gateway{Ledger: l, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 }
 
-// call records an activity that sent the call (the loop guard's row) and what it returned.
+// call records an activity that sent the call (the loop guard's row) and what it returned: when it
+// returned something, its call record too, a moment after it was scheduled.
 func (f *resumeFixture) call(id string, at time.Time, outcome string) activity.Info {
 	f.t.Helper()
 	ctx := context.Background()
@@ -58,8 +61,21 @@ func (f *resumeFixture) call(id string, at time.Time, outcome string) activity.I
 			WorkflowID: "wf", ActivityID: id, ScheduledAt: scheduled}); err != nil {
 			f.t.Fatal(err)
 		}
+		f.ended(id, scheduled, at.Add(10*time.Millisecond), outcome)
 	}
 	return activity.Info{ActivityID: id, ScheduledTime: at, Attempt: 1}
+}
+
+// ended records the call record that ends an activity, at the time given, as the gateway writes it.
+func (f *resumeFixture) ended(id, scheduled string, at time.Time, status string) {
+	f.t.Helper()
+	clock := ledger.Clock
+	ledger.Clock = func() time.Time { return at }
+	defer func() { ledger.Clock = clock }()
+	if _, err := audit.Record(context.Background(), f.g.Ledger, audit.Event{WorkflowID: "wf", Type: "call", Actor: audit.Run,
+		Payload: map[string]any{"activity_id": audit.Text(id), "scheduled_at": scheduled, "status": status}}); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 // request records one request of an activity to hop, answered with status unless it is "".
@@ -182,6 +198,60 @@ func TestResumeAcrossBudgetPauses(t *testing.T) {
 	edited.PromptVersion = "audit.md@sha256:2"
 	if declined, _, _ := f.resume(c, edited, oss); slices.Contains(declined, true) {
 		t.Errorf("edited prompt: declined %v", declined)
+	}
+}
+
+// Calls of the same arguments at once (a model task takes only its declared inputs, so two calls of
+// the same diff are alike): one declined and broke the schema, then could not be reserved for on
+// its fallback, and waited; the other waited too. Neither resumed call takes the other's past, its
+// refusal or its broken answer, whatever order they were scheduled in, though every one of those
+// requests matches the hops (their provider, model, prompt and effort). One call's own activities,
+// one after another, carry theirs over (TestResumeAcrossBudgetPauses).
+func TestResumeTakesNoOtherCallsPast(t *testing.T) {
+	for _, otherFirst := range []bool{false, true} {
+		f := newResumeFixture(t)
+		t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
+		a, b := t0, t0.Add(time.Millisecond) // b scheduled while a runs
+		if otherFirst {
+			a, b = b, a
+		}
+		mine := f.call("1:audit_v1", a, StatusBudgetExhausted)
+		f.request(mine.ActivityID, 1, 1, opus, StatusInvalidOutput)
+		f.request(mine.ActivityID, 1, 2, opus, StatusRefused)
+		f.call("2:audit_v1", b, StatusBudgetExhausted)
+		// Sent again after the extension, in either order.
+		for i, at := range []time.Time{t0.Add(time.Second), t0.Add(2 * time.Second)} {
+			again := f.call(fmt.Sprintf("%d:audit_v1", 3+i), at, "")
+			p, err := f.g.resume(context.Background(), again, f.run, "args", []models.Route{opus, sol, oss})
+			if err != nil || p.answer != nil || p.refusal != nil || slices.Contains(p.declined, true) ||
+				!slices.Equal(p.invalid, []int{0, 0, 0}) || slices.ContainsFunc(p.lastInvalid, func(r *models.Response) bool { return r != nil }) {
+				t.Errorf("other first %v, resent %d: %+v %v", otherFirst, i, p, err)
+			}
+		}
+	}
+	// One that ended after the next was scheduled overlapped it: not this call's either.
+	f := newResumeFixture(t)
+	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
+	late := f.call("1:audit_v1", t0, "")
+	f.request(late.ActivityID, 1, 1, opus, StatusRefused)
+	if err := f.g.Ledger.Q.SetCallOutcome(context.Background(), db.SetCallOutcomeParams{Outcome: sql.NullString{String: StatusBudgetExhausted, Valid: true},
+		WorkflowID: "wf", ActivityID: late.ActivityID, ScheduledAt: t0.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	f.ended(late.ActivityID, t0.Format(time.RFC3339Nano), t0.Add(2*time.Second), StatusBudgetExhausted)
+	if declined, refusal, _ := f.resume(f.call("2:audit_v1", t0.Add(time.Second), ""), opus, sol); slices.Contains(declined, true) || refusal != nil {
+		t.Errorf("an overlapping one: declined %v, refusal %+v", declined, refusal)
+	}
+	// One whose end agentd cannot find (its record past what it reads) may have overlapped it too.
+	f = newResumeFixture(t)
+	unknown := f.call("1:audit_v1", t0, "")
+	f.request(unknown.ActivityID, 1, 1, opus, StatusRefused)
+	if err := f.g.Ledger.Q.SetCallOutcome(context.Background(), db.SetCallOutcomeParams{Outcome: sql.NullString{String: StatusBudgetExhausted, Valid: true},
+		WorkflowID: "wf", ActivityID: unknown.ActivityID, ScheduledAt: t0.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	if declined, refusal, _ := f.resume(f.call("2:audit_v1", t0.Add(time.Second), ""), opus, sol); slices.Contains(declined, true) || refusal != nil {
+		t.Errorf("one of no known end: declined %v, refusal %+v", declined, refusal)
 	}
 }
 

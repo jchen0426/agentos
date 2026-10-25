@@ -11,12 +11,16 @@ CALLS = 50
 
 @workflow.defn(name="security-audit")
 class FanOut(SecurityAudit):
-    """Sends CALLS model calls at once. A call the budget cannot cover waits in PAUSED_BUDGET
-    for the doorbell, like any call of the security audit, then asks again."""
+    """Reads the run's diff, then sends CALLS model calls at once, all of them with that diff: a
+    model task takes only the inputs models.yaml declares, each a blob of the run's own, and the
+    run has this one, so the calls are alike, argument for argument. A call the budget cannot
+    cover waits in PAUSED_BUDGET for the doorbell, like any call of the security audit, then asks
+    again."""
 
     @workflow.run
     async def run(self, a: AuditInput) -> dict:
-        results = await asyncio.gather(*(self.call("model", "audit_v1", diff_ref=f"fan-out-{i}") for i in range(CALLS)))
+        _, diff = await self.call("tool", "git.show_diff", repo=a.repo, commit=a.commit)
+        results = await asyncio.gather(*(self.call("model", "audit_v1", diff_ref=diff["blob"]) for _ in range(CALLS)))
         return {"statuses": [status for status, _ in results]}
 
     @workflow.signal

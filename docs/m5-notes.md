@@ -1562,3 +1562,32 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - `TestAReportPostsNothingAWorkerChose`（gateway）：报告调用自己的那部分改成连标记一起比整个 payload。旧 Worker 的 outcome 和 pr_url、报告不写名字的 error_type、带不带 report_ref（null），评论一字不差；报告会写名字的 error_type，就是另一条评论、另一个标记。调用之前、之后各比一次。上一轮“去掉标记再比”的做法拿掉了。
   - `TestAReportsEffectRecordedBeforeItsIdentity`（gateway）：旧 agentd 按全部参数记下 effect（PENDING）就停了；升级后的调用接着用它，账本里只有这一个，标记是旧 ID 的；参数不同的调用照旧被上限拒绝。
 - **改坏**：10 处都有测试失败：身份用全部参数；不含 reason；含任何 error_type；不含 error_type；含 outcome；含 report_ref；网关不管身份；不找旧 agentd 的 effect；找到了不用；报告写出任何 error_type。前 6 处只跑网关的测试也会失败；第一遍“不含 reason”只有 githubtool 的单元测试杀得掉，网关测试补了“另一个 reason 是另一条评论”。
+
+#### 模型任务只收声明的输入
+
+- **问题**：`models/prompt.go` 的 `userMessage` 把每个不是 blob 引用的参数都原样放进 `<arguments>` JSON 发给模型，网关又从不检查模型调用的参数（`dispatch` 的 model 分支）。被攻破的 Worker 往提示里放什么都行，模型的答复又就是公开的报告。预算不够时报告里的数字也跟着请求的大小走（上一轮写的约 17 位）。
+- **改法**：
+  - **models.yaml**：每个任务声明 `inputs`，比如 `audit_v1: inputs: [diff_ref]`。每个输入都是运行自己的 blob（`<name>_ref`，名字小写），而且都必须给。任务没写 inputs、写了空的、写了普通输入（不以 `_ref` 结尾）、名字不合规则、同一个写两遍，agentd 都拒绝启动。普通输入要有一个给它设界的类型，agentd 现在没有，配置的注释里写了。
+  - **网关**（`Gateway.inputs`）：模型调用的参数必须正好是任务声明的输入，一个不多一个不少，每个是 `sha256:<64 位十六进制>`、是运行自己的 blob、不重复。不是的就以不可重试的 BadArguments 拒绝。拒绝的位置照工具拒绝坏参数的做法：在问策略之前，所以在预算之前、在任何东西发给供应商之前，也就没有 call.started（“先有记录，才有调用”照旧：什么都没发出去，调用的记录在结尾写下这个错误）。错误的话只有任务名和它声明的输入，都是 agentd 自己配置里的；调用自己的参数名写进 agentd 的日志（截短）。
+  - **提示**：`userMessage` 只收 blob 引用，别的参数直接让请求失败（ErrBadArguments），`<arguments>` 那一节去掉了。网关已经先拒了，这是第二道。
+  - 改坏时有一处杀不掉：去掉“形如 sha256:<64 位十六进制>”的检查。它和“是运行自己的 blob”是等价的：不是这个形状的值，不可能是哪个 blob 的键，所有权检查照样拒绝它。形状检查只省一次查询，留着。
+- **调用方**：Worker、t10、t12 和 rogue 的工作流、评测程序发的都只有 `diff_ref=<运行自己的 diff>`；modelsim 的规则匹配的是 diff 的内容，不是参数。要改的只有：
+  - **T7 的 FanOut**（你同意的做法）：先调 git.show_diff，再拿同一个 diff_ref 发 50 个调用。它原来发的是 `diff_ref=f"fan-out-{i}"`，这些值不是引用，是当普通参数进提示的。T7 现在测的是参数完全相同的并发，docstring 写了为什么。逐个请求的对账照旧按 request_id（reserves、closes、供应商的记录），没有改成按内容或按个数对。设计文档里 T7 那一行没说参数不同，不用改。
+  - **Go 网关测试**里模型调用用的 `{"diff":"x"}`，改成运行自己的 diff_ref（`diffCall`）。直接调 `modelCallOnce` 的测试不经过检查，没动。
+  - **配置**：config/models.yaml、config/dev/models.yaml、harness 的四个 TEST_MODELS、T7、T13、跨供应商回退、补丁头、评测程序和它的测试、agentd 和 models 包的测试，都加了 `inputs: [diff_ref]`。T5、T6 不写 models.yaml。
+- **pausedBefore 是按参数连起来的，不是按调用**：一个等过预算的调用重发时用的是新活动，网关靠“同一个任务、同一组参数、紧挨着、以 budget_exhausted 结束”把它和之前的活动连起来，继承它们的拒答、答复不合格的次数和最后一个不合格的答复（按供应商、模型、提示版本和任务的 effort 对上）。参数一样的两个调用同时发，一个拒答之后在回退请求上预算不够，另一个重发时可能把前一个的拒答当成自己的。改了：连起来的那些活动必须一个接一个，每个都在下一个被调度之前结束（结束时间取它最后一条 call 记录的时间，最多读 10 万条，读不到就当重叠）；有重叠就什么都不继承，从头来。一个调用自己的几次暂停照旧连得上。剩下的：参数一样的调用一个接一个地发，还是分不出来，另一个调用在这个等预算时发出去，会被当成它的重发。安全审计的 Worker 只发一个模型调用，不会这样。
+- **报告里的预算数字回到几个位**：请求的大小由运行自己的 blob 决定，也就是它的 diff，而 diff 由运行的 commit 定下了。Worker 还能决定的是调不调、调几次。
+- **测试**：
+  - `TestModelsRefusesBadRoutes`：没有 inputs、空的、普通输入、名字不对、大写、写两遍，都不让加载；原来那些坏配置都补上了 inputs，所以每个都只因为它本来要测的毛病被拒。两个输入的任务能加载，路由里带着输入。
+  - `TestAnthropicReadsOnlyTheRunsOwnBlobs`：多一个普通参数、引用位置放普通值、值不是字符串，提示都不建，没有请求发出去。
+  - `TestAModelCallTakesOnlyItsInputs`（gateway）：多一个普通参数、多一个引用、没有参数、换了参数名、别的运行的 blob、没存过的 blob、不是字符串、不是引用、形状不对，九种都是不可重试的 BadArguments：没数过 token、没发请求、没问策略、没有 call.started、没有预算记录、没有 model_calls 行；错误里没有调用的参数名和值。照 Worker 的样子发的那个照常通过。
+  - `TestAModelTaskOfTwoInputsTakesTwoBlobs`：两个输入不能是同一个 blob。
+  - `TestAReportPostsNothingAWorkerAddsToAModelCall`：两个运行的模型调用只差 Worker 加的那个参数（1 个字节对两千多个），评论一字不差（连标记），说的是 analyze 失败、日志里有细节。
+  - `TestResumeTakesNoOtherCallsPast`：上面那个情形，两种调度顺序都试：一个调用答复不合格又拒答、在回退上预算不够，另一个也等预算，两个重发都不继承对方的东西（拒答、不合格的次数、最后一个不合格的答复）；结束得比下一个调度晚的、找不到结束时间的，也不继承。一个调用自己的暂停照旧继承（`TestResumeAcrossBudgetPauses`，夹具现在给结束的活动写 call 记录）。
+  - 黑盒 T13 加了 `test_t13_a_model_call_takes_only_its_inputs`，三种接口：工作流的模型调用多带一个自己的参数，被拒；modelsim 的请求日志里一个请求都没有，连数 token 的、问 Ollama 的都没有；没有预算记录；explain 说 analyze 的 model_error，带着拒绝的话；评论里没有那个参数，只说 analyze 失败。
+- **改坏**：15 处里 14 处都有测试失败：不检查；多的参数放过；别的运行的 blob 放过；同一个 blob 两次放过；错误里写出调用的参数名；先问策略；没有 inputs 的任务能加载；普通输入能加载；同一个输入写两遍能加载；提示收普通参数；路由里没有输入；同时发的调用当成一个；找不到结束时间当成不重叠；比较调度时间而不是结束时间。活下来的那一处就是上面说的形状检查，和所有权检查等价。第一遍有 4 处编译不过，换了写法。
+
+#### 跑过的（两部分都在，macOS）
+
+- `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过（每部分提交前各跑一遍）。
+- `make build` 之后，黑盒不加沙箱，带 `--verify-after-each`：T5、T6、T7、T12、T13、评测的三个测试文件，加上改了配置的跨供应商回退和补丁头两个：196 passed。76 个栈（60 个测试）：72 个 verify 以 0 退出，1 个和标注一致（T5 那个审批之后改了 payload 的，照设计以 1 退出），0 个失败，3 个照设计没验（agentd 不启动）。

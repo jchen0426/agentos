@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"maps"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -731,6 +732,44 @@ func produces(m *models.Config, tl tools.Registry, c tasks.Call, field string) e
 		"field of its output schema", c.Name, route.Blobs)
 }
 
+// blobRef is a model task's input: a blob's reference (tools.BlobPattern).
+var blobRef = regexp.MustCompile(tools.BlobPattern)
+
+// inputs checks that a model call's arguments are its task's inputs, all of them and no others, each
+// a blob of the run's own, once (models.yaml): nothing else of the call reaches the model, whose
+// answer is the run's public report. A call that is not is refused for good, as a tool's call with
+// arguments its schema refuses is: before the policy is asked, before the budget, before anything
+// goes to a provider. Its error names the task and its inputs only, which agentd's configuration
+// holds; agentd's log has the names of the call's own arguments.
+func (g *Gateway) inputs(ctx context.Context, run db.Run, route models.Route, args map[string]any) error {
+	ok := len(args) == len(route.Inputs)
+	seen := map[string]bool{}
+	for _, name := range route.Inputs {
+		ref, isString := args[name].(string)
+		if !ok || !isString || !blobRef.MatchString(ref) || seen[ref] {
+			ok = false
+			break
+		}
+		seen[ref] = true
+		owned, err := g.Ledger.Q.IsBlobOwner(ctx, db.IsBlobOwnerParams{WorkflowID: run.WorkflowID, Sha256: strings.TrimPrefix(ref, "sha256:")})
+		if err != nil {
+			return err
+		}
+		ok = owned != 0
+	}
+	if ok {
+		return nil
+	}
+	var names []string
+	for _, k := range slices.Sorted(maps.Keys(args)) {
+		names = append(names, audit.Text(k))
+	}
+	g.Log.Warn("model call refused: its arguments are not its task's inputs", "workflow_id", run.WorkflowID,
+		"task", route.Task, "inputs", route.Inputs, "arguments", names)
+	return temporal.NewNonRetryableApplicationError(fmt.Sprintf("the arguments of model task %s are not its inputs (%s), "+
+		"each a blob of the run's own", route.Task, strings.Join(route.Inputs, ", ")), "BadArguments", nil)
+}
+
 // dispatch runs the call, and notes the policy's verdict in its record (rec).
 func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, c *agentosv1.Call,
 	args map[string]any, canon []byte, fx faults.Effect, rec *callRecord) (*agentosv1.Result, error) {
@@ -739,6 +778,9 @@ func (g *Gateway) dispatch(ctx context.Context, info activity.Info, run db.Run, 
 		route, err := g.Models.Route(c.GetName())
 		if err != nil {
 			return nil, temporal.NewNonRetryableApplicationError(err.Error(), "UnknownModelTask", err)
+		}
+		if err := g.inputs(ctx, run, route, args); err != nil {
+			return nil, err
 		}
 		v := g.Policy.EvaluateModel(c.GetName(), route.Provider)
 		rec.policy = &v
@@ -1055,7 +1097,12 @@ func (g *Gateway) tooLate(ctx context.Context, info activity.Info, route models.
 }
 
 // pausedBefore lists, oldest first, the activities that sent the same model call just before
-// this one and returned budget_exhausted.
+// this one and returned budget_exhausted: the workflow sends a call that waited again, under a new
+// activity. Only the arguments link them, so they are this call's only while they come one after
+// another, each scheduled after the one before it ended (its call record), as one call's activities
+// are. Calls of the same arguments at once are told apart by nothing, and none of them takes another's
+// past: each starts afresh. (Calls of the same arguments one after another cannot be told apart
+// either: one sent while another waits for budget is taken for its resending.)
 func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.Run, task, argsHash string) ([]string, error) {
 	calls, err := g.Ledger.Q.ListSameCalls(ctx, db.ListSameCallsParams{
 		WorkflowID: run.WorkflowID, Kind: "model", Name: task, ArgsSha256: argsHash})
@@ -1073,11 +1120,57 @@ func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.R
 	self := slices.IndexFunc(calls, func(c db.Call) bool {
 		return c.ActivityID == info.ActivityID && c.ScheduledAt == info.ScheduledTime.UTC().Format(time.RFC3339Nano)
 	})
+	first := self
+	for first > 0 && calls[first-1].Outcome.String == StatusBudgetExhausted {
+		first--
+	}
+	if first == self {
+		return nil, nil
+	}
+	ended, err := g.callsEnded(ctx, run)
+	if err != nil {
+		return nil, err
+	}
 	var paused []string
-	for i := self - 1; i >= 0 && calls[i].Outcome.String == StatusBudgetExhausted; i-- {
-		paused = append([]string{calls[i].ActivityID}, paused...)
+	for i := first; i < self; i++ {
+		end, ok := ended[callKey{audit.Text(calls[i].ActivityID), calls[i].ScheduledAt}]
+		if !ok || !end.Before(at(calls[i+1])) {
+			return nil, nil // two at once: whose is whose is not known
+		}
+		paused = append(paused, calls[i].ActivityID)
 	}
 	return paused, nil
+}
+
+// callKey is one of the run's logical calls, as its records name it: its activity ID, bounded as
+// the records hold it, and the time Temporal first scheduled it.
+type callKey struct{ activityID, scheduledAt string }
+
+// maxCallRecords bounds the records callsEnded reads: a call past it has no known end, and is taken
+// to have overlapped the next.
+const maxCallRecords = 100_000
+
+// callsEnded is when each of the run's logical calls ended: the time of its latest call record.
+func (g *Gateway) callsEnded(ctx context.Context, run db.Run) (map[callKey]time.Time, error) {
+	rows, err := g.Ledger.Q.ListRunOwnCallRecords(ctx, db.ListRunOwnCallRecordsParams{WorkflowID: run.WorkflowID,
+		TemporalRunID: run.RunID.String, Max: maxCallRecords})
+	if err != nil {
+		return nil, err
+	}
+	out := map[callKey]time.Time{}
+	for _, r := range rows {
+		var p struct {
+			ActivityID  string `json:"activity_id"`
+			ScheduledAt string `json:"scheduled_at"`
+		}
+		if r.Type != "call" || json.Unmarshal([]byte(r.Payload), &p) != nil || p.ScheduledAt == "" {
+			continue
+		}
+		if at, err := time.Parse(time.RFC3339Nano, r.At); err == nil {
+			out[callKey{p.ActivityID, p.ScheduledAt}] = at
+		}
+	}
+	return out, nil
 }
 
 // guard records a logical call and returns why it is refused when it takes the run past a
