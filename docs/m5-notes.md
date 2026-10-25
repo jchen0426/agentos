@@ -1041,7 +1041,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
   - 报告取运行最新一个被接受的 audit_v1 答复（`tasks.AuditModel`），不管工作流给不给 report_ref；给了而不是它（比如 diff 的 blob），就拒绝（denied，报告没发出去）。
   - 目标 repo 和 commit：网关的 scope 检查本来就管，工作流给别的值，策略拒绝（`commit is not this run's`）。
   - PR 仍是 agentd 副作用记录里的 `#n`。
-  - 工作流只能说 `reason`（done、workflow_error）和 `error_type`（`^[A-Za-z_][A-Za-z0-9_.]{0,63}$`，只能和 workflow_error 一起）；agentd 把它写成工作流自己的说法：“The workflow says, as its own claim: the workflow reports that its own code failed (KeyError)…”。工作流的异常类型名不合这个规则（Python 允许非 ASCII 的类名）就不发 error_type，agentd 写“an error it did not name”。
+  - 工作流只能说 `reason`（done、workflow_error）和 `error_type`（`^[A-Za-z_][A-Za-z0-9_.]{0,63}$`，只能和 workflow_error 一起）；agentd 把它写成工作流自己的说法：“The workflow says, as its own claim: the workflow reports that its own code failed (KeyError)…”。工作流的异常类型名不合这个规则（Python 允许非 ASCII 的类名）就不发 error_type，agentd 写“an error it did not name”。（后来改了：现在写“an exception of another type”，名字只从一个固定集合里取，见最后的“报告里的异常类型”；报告里也不再写任务没有的调用，见最后的“报告里不写工作流编的调用”。）
   - 围栏外只有 agentd 自己的词：`Outcome: <verdict> at <step> (<kind>)`，verdict 和 kind 是固定词表，step 只在是任务按种类和名字起的步骤名时才写，render 里再按 `^[a-z][a-z0-9_]{0,63}$` 过一遍；cause（可能引用工具、模型、审批人的话）和 claim 在围栏里，单行、有界。
   - 兼容：`outcome` 改为可选，收下但不显示（旧 Worker 在途的运行还会发）；新 Worker 不再发。工作流的返回值 `{"outcome", "pr_url"}` 不变：评测读它。
   - 报告里发现的行号改成 json.Number，只显示前 20 位。
@@ -1100,7 +1100,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
   5. kill -9 Worker（先 SIGSTOP 让它领到工作流任务）→ ok，incident worker_stopped / analyze，证据是 WorkflowTaskTimedOut 事件。
   6. kill -9 agentd（模型调用第 1 次尝试中）→ ok，incident agentd_stopped / analyze / attempt 1，证据是第二条 agentd.started。
   7. kill -9 git 工具服务器，三个用到它的步骤各一次（第二轮）：fetch_diff、validate_patch、open_pr（open_pr 是在生成 payload、读补丁改的文件时）→ ok，incident tool_server_failed / 那个步骤 / attempt 1，证据是那次尝试的 error 记录，记录里 `error_cause: tool_server`。
-  8. 工作流自己的代码出错，四种（第二轮加了后两种）：缺键（fault 让 show_diff 返回空值）、5000 位的行号（modelsim 的脚本答复）、工作流自己的异常类型（`PatchUnreadable`）、名字不合规则的异常类型（`Fehlerä`）→ FAILED（不再一直 RUNNING），failed / workflow_error，claim 里有异常类型；报告发出去了，报告调用的参数是 `reason: workflow_error`，名字合规则的带 `error_type`，围栏里写着它；不合规则的不带，围栏里写“an error it did not name”。长整数那次，报告用的是运行被接受的答复，行号截到 20 位。
+  8. 工作流自己的代码出错，四种（第二轮加了后两种）：缺键（fault 让 show_diff 返回空值）、5000 位的行号（modelsim 的脚本答复）、工作流自己的异常类型（`PatchUnreadable`）、名字不合规则的异常类型（`Fehlerä`）→ FAILED（不再一直 RUNNING），failed / workflow_error，claim 里有异常类型；报告发出去了，报告调用的参数是 `reason: workflow_error`，名字合规则的带 `error_type`，围栏里写着它；不合规则的不带，围栏里写“an error it did not name”。长整数那次，报告用的是运行被接受的答复，行号截到 20 位。（后来改了，见最后的“报告里的异常类型”和“报告里不写工作流编的调用”。）
   9. 报告调用的结果读不了（第二轮）：`status` 故障加 `value`（评论 ID 5000 位）→ FAILED，claim 写着“ValueError on its report's result”，历史里没有一个 WorkflowTaskFailed。
   9a. 报告调用停住的时候取消运行（第二轮）：照样 CANCELLED（包住报告调用之后，取消仍是取消），explain 是 cancelled。
   10. 审批人改的补丁被检查拒绝（第二轮）：补丁改到 `.github/`，validate_patch / tool_denied，原因里有 `.github`；报告一致。
@@ -1135,7 +1135,7 @@ PR #36、#38。设计文档 rev 343–344 按你批准的清单改了：
   - 第 3 节：评论的字段（outcome 由 agentd 按 runs explain 的规则，从运行的历史和自己的记录生成；读不到历史就是 unknown；报告取运行自己最新一个被接受的答复；工作流只给 reason 和 error_type；围栏外只有 agentd 的词）。
   - 第 7 节：工作流的报告调用（不再发 outcome，发 reason、error_type）；`run()` 的异常处理（拦下自己代码的异常，发报告，再以 FAILED 结束；报告之后的任何错误也以 FAILED 结束）。
   - 第 5 节第 9 项：explain 的字段和判定规则，结果要过锚这一关，kind 只看 agentd 自己的字段，任务配置里要求的步骤；第 4 节：审计导出的格式（推送的链头、锚的 result_json，历史是 agentd 的编码）；D12：任务配置里加了 Steps（按种类和名字）、Report、Required。
-- **被攻破的 Worker 在报告里还能决定的**：reason 二选一（done 或 workflow_error），和 51 个名字里的一个，或者不给名字（只在围栏里，见最后的“报告里的异常类型”）。它也能少做步骤，但少了任务要求的那几个，判定就不是 ok。
+- **被攻破的 Worker 在报告里还能决定的**：这里原来只写了 reason 和 51 个名字，不对，漏了它编的调用（名字在报告里）。改过之后它还能决定什么、哪些还开着，见最后的“报告里不写工作流编的调用”。它也能少做步骤，但少了任务要求的那几个，判定就不是 ok。
 - **Temporal 命名空间里的人伪造的失败**：伪造的完成（结果）会被锚这一关拦下；伪造的失败（RespondActivityTaskFailedById）没有锚可查，explain 照历史说这一步失败了，用 agentd 对那次尝试的记录（如果有）说为什么。要查它，得把失败也带上记录的锚，网关返回错误时现在做不到。（第三轮做了：失败按那次尝试的记录和它的 error_type 判，见“第三轮”。）
 - **读账本的上限**：读的是每类行的前 N 条（按 seq 或时间），超了的运行，它后面的调用的结果不验锚，判定标为部分；不读后 N 条是因为前面的步骤也要过锚这一关。（第三轮改了：结果指的记录、失败那次尝试的记录都单独读，不受上限影响，见“第三轮”。）
 - **要求的步骤和 models.yaml 是连着的**：validate_patch、open_pr 的条件是 analyze 的结果里有 `patch_ref`，这个字段名来自 audit_v1 的 `blobs: [patch]`；改了那里，这里也要改，现在没有测试会提醒（可以让 agentd 启动时检查任务的条件字段在模型任务的输出里）。（第三轮做了：启动时检查，见“第三轮”。）
@@ -1453,7 +1453,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 - **问题**：被攻破的 Worker 能随意选 `error_type`。参数只按模式检查（`[A-Za-z0-9_.]`，最多 64 个字符），`explain.Report` 再把它写进公开的 GitHub 评论（“its own code failed (<type>)”）。这样每个报告都是一条几十字节的通道，Worker 想带什么出去都行。
 - **改法**：公开的报告只在类型属于一个固定集合时才写出名字（`explain.PublicErrorTypes`，就写在这一处，注释说明为什么是固定的）。集合是 Python 内置的异常，不含警告类；再加上工作流自己的代码会抛的 json 的 JSONDecodeError，一共 51 个（EnvironmentError、IOError 是 OSError 的别名，类型名就是 OSError）。别的名字，和不给名字，都写成“an exception of another type”，不带名字。大小写不同的、带点的路径、在内置名字前后多几个字的，都不算。本地的 runs explain 照旧引用工作流自己的话（它在 Temporal 里的失败）作为它的说法。参数的模式没动，报告调用的参数里照旧有工作流给的名字。
-- **剩下的通道**：done 或 workflow_error，再加 51 个名字里的一个或者不给名字，一个报告不到 6 位。
+- **剩下的通道**：这里原来写“done 或 workflow_error，再加 51 个名字里的一个或者不给名字，一个报告不到 6 位”。不对：工作流编的调用的名字也在报告里。见下一节。
 - **测试**：
   - `TestTheReportNamesOnlyBuiltinExceptionTypes`：集合里的写出来，比如 KeyError、JSONDecodeError。集合外的不写，比如 PatchUnreadable。照着集合里的名字造的也不写，比如 keyerror、KeyError.x、json.JSONDecodeError、builtins.KeyError、KeyErrorX。警告类、KeyboardInterrupt、不给名字也都不写。explain 的 claim 里照旧有 PatchUnreadable。
   - `TestTheReportsBounds`、`TestTheReportAgreesWithExplain` 的预期跟着改了。
@@ -1471,3 +1471,51 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - **跑过的**（macOS）：
   - `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过。
   - 黑盒，不加沙箱，带 `--verify-after-each`，跑了 T12 和 T13：30 passed。30 个栈：28 个以 0 通过，2 个照设计没验（agentd 不启动），0 个失败。
+
+### 报告里不写工作流编的调用（4c8d977 的两份审查之后）
+
+- **问题**（安全审查，高；上面“剩下的通道”那句因此不对）：被攻破的 Worker 编一个调用，比如 `Call(kind="tool", name="<两千来个字节>")`。agentd 以“no such tool”拒绝它（gateway.go 的 `dispatch`），记录里留着名字（`callFields`）。`stepName` 对任务没有的调用，加引号写出种类和名字，于是公开的 Cause 里就有它：workflow_error 是“its code failed after "tool <字节>" returned denied”，done 是“agentd refused "tool <字节>": "no such tool"”。一个报告大约 938 个字节。编一个模型任务名、编一个种类，或者调到没人服务的任务队列上让它超时（这时名字取自 Worker 写的历史输入），都一样。
+- **改法**：
+  1. **任务没有的步骤只有一个名字**：`Report` 里，凡是任务没有的步骤（`!s.mapped`）都叫“a call the task does not name”（`unnamedStep`），Step 和 Cause 里都是它；Cut 里本来就没有步骤名。改名之后 `s.step` 只用来写句子，判定都按种类和名字（`resolve`、`accepted`、`isReport`、`missingRequired`、`lastWith`），我逐个看过。本地的 runs explain 照旧带引号写出种类和名字。
+  2. **这样的步骤什么都不引**：新加的 `facts.quote` 在报告里遇到任务没有的步骤就返回空。拒绝的理由、错误、工具的话、模型的话（拒答的类别和解释、答复不合格的理由）、人的拒绝理由都不引，只说它怎么结束的。这些话里可能有调用的名字：未知模型任务的错误带着名字，旧 agentd 的循环保护理由带着名字，工具的话可能复述参数。
+  3. **循环保护的理由不写调用名**：现在是“loop guard: more than N calls of one tool with the same arguments”。旧 agentd 写下的、带名字的理由，任务没有的步骤不引（上面 2）；任务有的步骤，名字就是任务自己的工具名。
+  4. **逐个查报告引用的来源时，又找到三处 Worker 能写进去的，都改了**（任务有的步骤也算）：
+     - **没有 agentd 记录的失败**（`unrecorded`）：原来报告里写它的类型。Worker 可以把调用排到自己服务的任务队列上，自己让它失败，类型和消息都由它定。报告现在只写“by a failure with no record of agentd's”。
+     - **agentd 在那次尝试中途重启过、又没有记录的失败**：原来类型是 ToolFailed 的，就把 Temporal 里的消息当成工具的话写出来。这同样是 Worker 自己能写的（它让尝试一直开着，等 agentd 哪次重启）。报告现在写“agentd has no record of its error”。
+     - **不是 agentd 发的结果或失败**（`foreign`）：原来括号里写为什么不是，里面有 Worker 选的活动 ID、它在结果里写的 seq、结果的状态、失败的类型。报告现在只说不是 agentd 发的。
+  5. 小处：删了没人用的 `explain.ErrorType`；集合的注释和 README 改成：Python 3.12 里派生自 Exception 的内置异常，不含警告类，加上 JSONDecodeError；3.12 是 Worker 支持的最老的 Python。新版本加的（3.13 的 PythonFinalizationError）和 Temporal SDK 自己的（NondeterminismError、RestrictedWorkflowAccessError）都写成 another type，runs explain 里有原名。上面两处旧的“an error it did not name”加了指向这里的说明，没改原文。
+- **报告引用的每一处来源**（任务有的步骤；任务没有的步骤一概不引）：
+  - **策略的理由**（`policy.Verdict.Reason`）：都是固定的话。作用域的参数名来自任务配置，供应商和模型任务名来自配置。Worker 写不进去。
+  - **agentd 的拒绝理由**：“run cancelled”“no such tool”“approval applies to writes only”是固定的话。`g.scope` 的错误是 agentd 读运行参数时的错误。Worker 写不进去。
+  - **循环保护的理由**：改了之后只有限额的数字，见上面 3。
+  - **工具的拒绝和失败**（RefusedByTool、ToolFailed）：安全审计的四个工具里，repo、commit、base_branch 都由策略按运行的作用域检查；别的参数都是 blob 引用（patch_ref、report_ref），只能指向运行自己的 blob，也就是 diff（仓库的内容）或模型的答复。所以 Worker 只能经模型的答复写进去，就是下面没修的第 1 条。没有 agentd 记录时不再引，见上面 4。
+  - **模型的话**：拒答的类别和解释，答复不合格的理由（里面可能引答复本身）。是模型或供应商的话；Worker 经模型任务的普通参数影响模型，也是没修的第 1 条。
+  - **人的话**：拒绝的理由、审批人的名字。审批的到期时间是请求时间加 TTL，请求时间由 Worker 定。
+  - **数字**：预算不够时“需要多少、还剩多少”，Worker 能用输入的长度影响；失败前的尝试次数。算“几个计数”。
+  - **几个位**：哪一种 Temporal 超时，有没有被截断（Cut 是 agentd 自己的界限和表名）。
+  - **内部错误**：报告不写，只说 agentd 的日志里有（之前就是这样）。
+- **被攻破的 Worker 在报告里还能决定的**（README 和提交说明写的是同一份）：
+  - reason（两个里选一个），和 51 个名字之一，或者不给名字；
+  - 它调用任务的哪些步骤、按什么顺序、各自怎么结束：判定、kind、点名的那一步、几个计数、几个位；任务没有的调用只剩下它们怎么结束；
+  - 什么时候报告：评论的时间，还有审批请求的时间；
+  - 每个运行只有一个报告（effect 的上限）。
+- **设计文档要改的地方**：第 3 节评论的字段，任务没有的调用写成“a call the task does not name”，它的理由、错误和别的话都不引；没有 agentd 记录的失败、不是 agentd 发的结果，只说是这样，不引它们的话；再写上面这份“还能决定的”和下面没修的两条。第 5 节第 9 项不变（本地的 runs explain 照旧都写）。
+- **没修，留给后面**：
+  1. **模型任务的普通参数**：不是 blob 引用的参数原样放进 `<arguments>` JSON 发给模型（`models/prompt.go` 的 `userMessage`），而模型的答复就是公开的报告。下一个 PR 在 models.yaml 里给每个模型任务声明它的输入来修。
+  2. **评论里隐藏的标记**（这一轮写测试时发现的，不在审查里）：评论的最后一行是 `<!-- agent-effect:<effect ID> -->`，effect ID 是 sha256(工作流 ID、工具名、规范化的参数)。参数里有 Worker 可以随意选的：模式之内的 error_type、旧 Worker 的 outcome（最多 100000 个字符，收下不显示）、pr_url。Worker 知道工作流 ID 和编码，可以一遍遍换这些参数算哈希，直到标记的前几十位就是它想带出去的位：每多一位，算力翻一倍，几十位还算得起。网关测试里，两个只差 error_type 的报告，正文去掉标记之后一样，标记不一样，测试现在去掉标记再比，注释里写了这条。可能的修法：报告的 effect 只按它显示出来的参数算身份（reason，error_type 在集合里才算），别的在规范化之前去掉；或者标记由工作流 ID 和渲染出来的正文算。两种都改 effect ID 或标记，T5、T6 和测试工具（harness）都按 effect ID 找评论，升级时进行中的 effect 也要接得上，所以单独做，要你定。
+- **测试**：
+  - 原来断言名字在报告里的，改成断言不在，本地 explain 的断言留着：`TestStepsAreTheTasksByKindAndName`、`TestTheReportNamesOnlyTheTasksSteps`（挪到了新文件 public_test.go）、`TestTheTasksCallsByKindAndName`、gateway 的 `TestTheReportsVerdictIsRunsExplains`。`TestTheReportShowsNoInternalError` 里没有记录的两种也跟着改了，还加了一条：哪一种都不能有内部错误里的地址。
+  - `TestTheReportNamesOnlyBuiltinExceptionTypes`：51 个名字写在测试里，和集合两边都比（相等）。集合里的每个名字只改 claim；集合外的六百来个名字（每个名字加前缀、后缀、改大小写，BaseException 一族、警告类、别名、3.13 的、SDK 的、短名字、“XxxError”形状的），报告和不给名字时一字不差，调用之前、之后各比一次。
+  - `TestTheReportSaysNothingAWorkerChose`（explain）：编的调用有 15 种结局（agentd 拒绝、策略拒绝、旧循环保护、工具拒绝、agentd 的错误、工具的错误、模型拒答、答复不合格、这个 agentd 不认识的状态、返回 ok、没有记录的失败、agentd 重启过的没有记录的失败、没开始就超时、开始后超时、不是 agentd 发的结果），种类有 tool、model、mcp 和它自己编的，两种 reason；再加 5 种是任务自己的步骤，由 Worker 自己让它失败、超时或完成。两个运行只差 Worker 选的字节（1 个字节对 2,400 个，有引号、换行、转义），报告一字不差，这些字节哪里都没有；任务没有的调用，done 时的 Cause 每种都写死。
+  - `TestAReportPostsNothingAWorkerChose`（gateway）：经过 invoke 和账本，一直到 CommentCommit 记下的评论 payload（owner、repo、commit、正文、标记）。八种：agentd 没有的工具（被拒绝）、没有的模型任务（失败）、没有的种类、Worker 自己编的种类、排到没人服务的队列上超时的、Worker 自己让它失败的、任务自己的步骤由 Worker 自己让它失败的、Worker 自己完成的；两种 reason。两个运行的 payload 一字不差。时间固定：历史事件用固定的时间，记录的时间不进评论。账本里先有 StartRun 写的那种记录，这样审计日志开始得比历史早，没有记录的失败才算没有记录。集合外的 error_type，调用之前、之后各比一次，去掉标记再比（见没修的第 2 条）。
+  - `TestLoopGuard`：每一种限额的理由都写死，没有一个带调用名。原来的测试只看拒绝没拒绝，第七个调用其实是被总数限额拒绝的，模型调用的限额没测到；总数限额改成 7，三种都测到了。
+  - 黑盒 T12 加了 `test_t12_a_call_the_workflow_made_up_is_not_named_in_the_report`（done 和 workflow_error 两种）：Worker 编一个名字里带着自己的话的工具调用，评论里没有这些话，围栏里写“a call the task does not name”，explain 里有原名。
+- **改坏**（在工作区的副本里改，每处改完都复原）：
+  - 上一轮我的 7 处（N1 到 N7）重跑，都有测试失败。N3、N4 原来用 `regexp`，删了 `ErrorType` 之后 report.go 不再引入它，换成不用它的写法。
+  - 对抗性审查活下来的那几处，照它的文件重写了一遍（只读，没跑它的脚本），10 处都有测试失败：少了 TypeError、少了 AttributeError、放进 BaseException 一族、放进 4096 个名字、任何“XxxError”都放行、短名字都放行、去掉 `json.decoder.` 前缀、原样的类型接在 Cause 后面（调用之后、调用之前各一处）、原样的类型当成 Step。
+  - 这一轮的 19 处（C1 到 C19），都有测试失败：不改名；只在 Step 里改名；名字的长度说出来；只给 tool 改名；只给有 agentd 记录的改名；`quote` 在报告里也引；没有记录的失败的类型和消息、Temporal 里没有记录的失败的话、为什么不是 agentd 发的结果，又写进报告；任务没有的步骤的错误引工具的话；循环保护的理由带调用名；拒答的类别、拒答的解释、不合格答复的理由、agentd 的理由、循环保护的理由、工具的理由、策略的理由、不认识的状态和它的理由，又对任务没有的步骤引出来。C19 第一遍活下来了：没有哪个测试走到“这个 agentd 不认识的状态”那一支，加了这一种结局之后才被杀掉。
+  - 只跑网关的测试（渲染出来的评论）时，这 14 处里有 12 处失败；活下来的两处是 C8（agentd 中途重启过、没有记录的失败）和 C9（任务没有、agentd 又有的工具的错误）：网关测试里造不出那次重启（记录的时间来自账本的时钟），安全审计的工具又都是任务的步骤。explain 的测试杀掉了它们。
+  - 我改过的代码让旧组里 3 处对不上了（RP2、M41、V2），按新代码改了写法重跑，都有测试失败。另有 9 处在 4c8d977 上就对不上了（之前几轮重写过的代码），没动。
+- **跑过的**（macOS）：
+  - `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过。
+  - `make build` 之后，黑盒不加沙箱，带 `--verify-after-each`，跑了 T12 和 T13：32 passed（多了新加的两个）。32 个栈：30 个以 0 通过，2 个照设计没验（agentd 不启动），0 个失败。

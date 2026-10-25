@@ -334,7 +334,7 @@ func TestAWriteOnlyDryRun(t *testing.T) {
 // A step the task requires is met by a call of its kind and name, the latest accepted one for a
 // condition; the report is the task's call by its kind and name; a wait is gone on from by a call of
 // its kind and name; and a workflow's error is told at the step it names, by name only when the task
-// names it.
+// names it, else as a call the task does not name.
 func TestTheTasksCallsByKindAndName(t *testing.T) {
 	w := newWorld(t)
 	w.ok("git.show_diff")
@@ -399,7 +399,8 @@ func TestTheTasksCallsByKindAndName(t *testing.T) {
 	w.ok("git.show_diff")
 	w.returns("test.unsafe_write", statusOK, nil, nil)
 	w.schedule("github.comment_commit")
-	if o := w.report(ReasonWorkflowError, "KeyError"); o.Named || o.Step != `"tool test.unsafe_write"` {
+	if o := w.report(ReasonWorkflowError, "KeyError"); o.Named || o.Step != unnamedStep || strings.Contains(o.Cause, "unsafe") ||
+		o.Cause != "by the workflow's own account, its code failed after a call the task does not name returned ok" {
 		t.Fatalf("%+v", o)
 	}
 }

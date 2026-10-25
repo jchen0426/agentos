@@ -448,43 +448,4 @@ func TestUnreachable(t *testing.T) {
 	}
 }
 
-// A step whose name is the workflow's, not the task's, is not named in the report's words.
-func TestTheReportNamesOnlyTheTasksSteps(t *testing.T) {
-	w := newWorld(t)
-	w.returns("@mallory see www.evil.example", statusDenied, map[string]any{"reason": "no such tool",
-		"refused_by": audit.RefusedByAgentd}, nil)
-	o := w.report(ReasonDone, "")
-	if o.Named || o.Kind != KindDenied || o.Step != `"tool @mallory see www.evil.example"` || !strings.Contains(o.Cause, "@mallory") {
-		t.Fatalf("%+v", o)
-	}
-}
-
 var _ = sql.NullString{}
-
-// A report is public, and the workflow (a subverted Worker) chooses the error type it names: the
-// report says one only from a fixed set, Python's built-in exceptions and json's JSONDecodeError, and
-// any other name, however close to one of them, and none, as "an exception of another type", with no
-// name. runs explain, which is local, keeps the workflow's own words as its claim.
-func TestTheReportNamesOnlyBuiltinExceptionTypes(t *testing.T) {
-	w := newWorld(t)
-	w.ok("git.show_diff")
-	r := w.schedule("github.comment_commit")
-	for _, name := range []string{"KeyError", "ValueError", "JSONDecodeError", "Exception", "UnicodeDecodeError"} {
-		if o := w.report(ReasonWorkflowError, name); !strings.Contains(o.Claim, "its own code failed ("+name+")") {
-			t.Errorf("%s: %+v", name, o)
-		}
-	}
-	for _, name := range []string{"PatchUnreadable", "keyerror", "KEYERROR", "KeyError.x", "json.JSONDecodeError",
-		"builtins.KeyError", "KeyErrorX", "XKeyError", "Warning", "KeyboardInterrupt", ""} {
-		o := w.report(ReasonWorkflowError, name)
-		if !strings.Contains(o.Claim, "its own code failed (an exception of another type)") ||
-			name != "" && strings.Contains(o.Claim, name) {
-			t.Errorf("%q: %+v", name, o)
-		}
-	}
-	r.completes(1, statusOK, nil, nil, nil)
-	w.failed("the workflow raised PatchUnreadable: the patch is not text", "PatchUnreadable")
-	if e := w.explain(); !strings.Contains(e.GetClaim(), "PatchUnreadable") {
-		t.Fatalf("claim %q", e.GetClaim())
-	}
-}

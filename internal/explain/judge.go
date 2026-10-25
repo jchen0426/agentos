@@ -24,7 +24,7 @@ const (
 
 // kindOf is the kind and the cause of a step whose result changed the run's course. Its kind comes
 // from agentd's own fields of the call's record (who refused it, where its error came from) and from
-// Temporal's event types, never from a tool's or the Worker's words, which the cause quotes.
+// Temporal's event types, never from a tool's or the Worker's words, which the cause quotes (quote).
 func (f *facts) kindOf(s *step) (string, string) {
 	r := s.finalRec
 	reason := ""
@@ -36,7 +36,7 @@ func (f *facts) kindOf(s *step) (string, string) {
 		return KindModelRefused, f.refusal(s)
 	case statusInvalidOutput:
 		return KindModelInvalidOutput, fmt.Sprintf("%s: the model's answer broke the task's output schema, and so did the "+
-			"answer agentd asked for again%s", s.step, quoted(": ", reason))
+			"answer agentd asked for again%s", s.step, f.quote(s, ": ", reason))
 	case statusBudgetExhausted:
 		return KindBudgetExhausted, f.budgetCause(s)
 	case statusNeedsApproval:
@@ -48,17 +48,18 @@ func (f *facts) kindOf(s *step) (string, string) {
 	case statusEdited:
 		return KindApprovalEdited, fmt.Sprintf("a reviewer edited %s's write, and the run did not send the edit on", s.step)
 	case statusDenied:
-		return denial(s, r, reason)
+		return f.denial(s, r, reason)
 	case statusError:
 		text, _ := s.errorText()
 		kind := errorKind(s, s.errorRecord())
 		cause := fmt.Sprintf("%s failed%s", s.step, attemptsSaid(s))
 		if s.unrecorded {
-			// Temporal's word only, said as such: whose failure it is agentd cannot tell. Its type is
-			// all a report shows of it.
-			cause += ", by a failure with no record of agentd's; it says " + typeSaid(s.failure)
+			// Temporal's word only, said as such: whose failure it is agentd cannot tell. A report says
+			// nothing of it: whoever failed the call (a Worker can, on a task queue of its own) chose
+			// its type and its message.
+			cause += ", by a failure with no record of agentd's"
 			if !f.public {
-				cause += quoted(": ", s.failure.GetMessage())
+				cause += "; it says " + typeSaid(s.failure) + quoted(": ", s.failure.GetMessage())
 			}
 			return kind, cause
 		}
@@ -68,9 +69,14 @@ func (f *facts) kindOf(s *step) (string, string) {
 			if f.public {
 				return kind, cause + "; " + inTheLog
 			}
-		case f.public && !s.toolsWords():
+		case f.public && s.errorRecord() == nil:
+			// agentd started again during the attempt, and has no record of it: the failure's words are
+			// Temporal's, which whoever failed the call wrote, a tool's type and all.
+			return kind, cause + "; agentd has no record of its error"
+		case f.public && (!s.mapped || !s.toolsWords()):
 			// An error of agentd's own, its model adapter's or its ledger's can name hosts, ports and
-			// paths: a report says only where it is.
+			// paths, and one of a call the task does not name the call's own name: a report says only
+			// where it is.
 			return kind, cause + "; " + inTheLog
 		}
 		return kind, cause + quoted(": ", text)
@@ -85,19 +91,25 @@ func (f *facts) kindOf(s *step) (string, string) {
 		return KindDryRan, fmt.Sprintf("%s did not reach its system: the agentd that took it up could only dry-run it, though "+
 			"the run is not a dry run", s.step)
 	case statusForeign:
-		if s.foreignErr {
-			return KindForeignResult, fmt.Sprintf("%s failed, by a failure agentd did not send (%s), and agentd has no "+
-				"record of how the call ended", s.step, s.foreign)
+		// Why it is not agentd's quotes what its sender chose (the record it names, the activity IDs, its
+		// status, its type): a report says only that it is not.
+		why := ""
+		if !f.public {
+			why = " (" + s.foreign + ")"
 		}
-		return KindForeignResult, fmt.Sprintf("%s returned a result agentd did not send (%s), and agentd has no record of "+
-			"how the call ended", s.step, s.foreign)
+		if s.foreignErr {
+			return KindForeignResult, fmt.Sprintf("%s failed, by a failure agentd did not send%s, and agentd has no "+
+				"record of how the call ended", s.step, why)
+		}
+		return KindForeignResult, fmt.Sprintf("%s returned a result agentd did not send%s, and agentd has no record of "+
+			"how the call ended", s.step, why)
 	}
-	return KindDenied, fmt.Sprintf("%s returned %q%s", s.step, s.final, quoted(": ", reason))
+	return KindDenied, fmt.Sprintf("%s returned %q%s", s.step, s.final, f.quote(s, ": ", reason))
 }
 
 // denial is the kind and cause of a call that ended denied, by who refused it, as agentd's record of
 // it says (refused_by). A record from before agentd said so says only the policy's decision.
-func denial(s *step, r *rec, reason string) (string, string) {
+func (f *facts) denial(s *step, r *rec, reason string) (string, string) {
 	by := ""
 	if r != nil {
 		by = r.refusedBy
@@ -108,32 +120,44 @@ func denial(s *step, r *rec, reason string) (string, string) {
 		if why == "" {
 			why = reason
 		}
-		return KindPolicyDenied, fmt.Sprintf("the policy denied %s%s", s.step, quoted(": ", why))
+		return KindPolicyDenied, fmt.Sprintf("the policy denied %s%s", s.step, f.quote(s, ": ", why))
 	case audit.RefusedByLoopGuard:
-		return KindLoopGuard, fmt.Sprintf("agentd's loop guard refused %s%s", s.step, quoted(": ", reason))
+		return KindLoopGuard, fmt.Sprintf("agentd's loop guard refused %s%s", s.step, f.quote(s, ": ", reason))
 	case audit.RefusedByCancel:
 		return KindCancelled, fmt.Sprintf("agentd refused %s: the run was cancelled", s.step)
 	case audit.RefusedByTool:
-		return KindToolDenied, fmt.Sprintf("%s refused the call as it stood%s", s.step, quoted(": ", reason))
+		return KindToolDenied, fmt.Sprintf("%s refused the call as it stood%s", s.step, f.quote(s, ": ", reason))
 	case audit.RefusedByAgentd:
-		return KindDenied, fmt.Sprintf("agentd refused %s%s", s.step, quoted(": ", reason))
+		return KindDenied, fmt.Sprintf("agentd refused %s%s", s.step, f.quote(s, ": ", reason))
 	}
 	if r != nil && r.decision == "deny" {
 		why := r.policyWhy
 		if why == "" {
 			why = reason
 		}
-		return KindPolicyDenied, fmt.Sprintf("the policy denied %s%s", s.step, quoted(": ", why))
+		return KindPolicyDenied, fmt.Sprintf("the policy denied %s%s", s.step, f.quote(s, ": ", why))
 	}
 	who := "agentd's record of it does not say who refused it"
 	if r == nil {
 		who = "agentd has no record of it"
 	}
-	return KindDenied, fmt.Sprintf("%s was refused, and %s%s", s.step, who, quoted(": ", reason))
+	return KindDenied, fmt.Sprintf("%s was refused, and %s%s", s.step, who, f.quote(s, ": ", reason))
 }
 
 // inTheLog is where a report sends its reader for an internal error, whose text it does not show.
 const inTheLog = "agentd's log has the details"
+
+// quote is the words of step s (a reason, an error, a tool's, a model's or a person's) after prefix,
+// quoted, as agentd's sentence of the step quotes them: none in a report, of a step the task does
+// not name (unnamedStep). Its kind and name, which the workflow chose, can be in them: an unknown
+// model task's error names it, a refusal of an older agentd's loop guard did, a tool's can echo the
+// arguments.
+func (f *facts) quote(s *step, prefix, text string) string {
+	if f.public && !s.mapped {
+		return ""
+	}
+	return quoted(prefix, text)
+}
 
 // typeSaid is a failure's type, quoted, as the failure names it.
 func typeSaid(fl *failurepb.Failure) string {
@@ -208,11 +232,8 @@ func attemptsSaid(s *step) string {
 func (f *facts) refusal(s *step) string {
 	cause := s.step + ": the model declined to answer"
 	if q := f.lastRequest(s, statusRefused); q != nil {
-		cause += fmt.Sprintf(" (%s/%s", q.Provider, q.Model)
-		if q.Category != "" {
-			cause += fmt.Sprintf(", category %q", q.Category)
-		}
-		cause += ")" + quoted(": ", q.Explanation)
+		cause += fmt.Sprintf(" (%s/%s%s)", q.Provider, q.Model, f.quote(s, ", category ", q.Category)) +
+			f.quote(s, ": ", q.Explanation)
 	}
 	return cause
 }
@@ -254,7 +275,7 @@ func (f *facts) decision(s *step) (string, string) {
 		if d := f.decisions[a.ApprovalID]; d != nil && who(d.actor) != by {
 			by += " (as " + d.actor + ")"
 		}
-		cause = fmt.Sprintf("%s rejected %s's write at %s%s", by, s.step, a.DecidedAt.String, quoted(", saying ", a.Reason.String))
+		cause = fmt.Sprintf("%s rejected %s's write at %s%s", by, s.step, a.DecidedAt.String, f.quote(s, ", saying ", a.Reason.String))
 	}
 	return KindApprovalRejected, cause
 }

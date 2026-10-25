@@ -1,9 +1,6 @@
 package explain
 
-import (
-	"fmt"
-	"regexp"
-)
+import "fmt"
 
 // Why a workflow says it reports: the only words of its own a report takes from it.
 const (
@@ -11,16 +8,16 @@ const (
 	ReasonWorkflowError = "workflow_error" // its own code failed: it reports, then fails the run
 )
 
-// ErrorType is what an exception's type a workflow names may look like: an identifier.
-var ErrorType = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]{0,63}$`)
-
 // PublicErrorTypes are the exception types a report names, when the workflow says its own code failed
-// with one: Python's built-in exceptions (not its warnings), and json's JSONDecodeError, which the
-// workflow's own code can raise besides. The set is fixed, not a pattern: a subverted Worker chooses
-// the name, and a report is public, so a name it could choose freely would carry whatever it likes out
-// of agentd, a few dozen bytes a report. With this set it chooses one of these names, or none. Any other
-// name, and none, is said as "an exception of another type". runs explain, which is local, quotes the
-// workflow's own words (its failure in Temporal) as its claim.
+// with one: Python 3.12's built-in exceptions that derive from Exception (not its warnings), and json's
+// JSONDecodeError, which the workflow's own code can raise besides. 3.12 is the oldest Python the Worker
+// supports: what newer ones add (3.13's PythonFinalizationError), and the Temporal SDK's own exceptions
+// (NondeterminismError, RestrictedWorkflowAccessError), show as another type, which runs explain names.
+// The set is fixed, not a pattern: a subverted Worker chooses the name, and a report is public, so a
+// name it could choose freely would carry whatever it likes out of agentd, a few dozen bytes a report.
+// With this set it chooses one of these names, or none. Any other name, and none, is said as "an
+// exception of another type". runs explain, which is local, quotes the workflow's own words (its
+// failure in Temporal) as its claim.
 var PublicErrorTypes = map[string]bool{
 	"Exception": true, "ArithmeticError": true, "FloatingPointError": true, "OverflowError": true,
 	"ZeroDivisionError": true, "AssertionError": true, "AttributeError": true, "BufferError": true, "EOFError": true,
@@ -40,12 +37,14 @@ var PublicErrorTypes = map[string]bool{
 // Outcome is what a run's report says of the run: the verdict Explain gives a run that ends with
 // this report, by the same rules over the run's history and agentd's records, the report's own calls
 // left out (a report cannot report its own posting, which Explain, once the run has ended, covers
-// too). The workflow says only why it reports: done, or that its own code failed (with its
-// exception's type), which is its claim.
+// too). The workflow's own words in it are why it reports: done, or that its own code failed, with
+// its exception's type when it is one of PublicErrorTypes, which is its claim. What else of it the
+// report tells is what the workflow did, which a subverted Worker chooses too: which of the task's
+// steps it called (any other call is unnamedStep), in what order, how each ended (a verdict, a kind,
+// a few counts), and when it reported.
 type Outcome struct {
 	Verdict, Kind string
-	// Step is the step the verdict names; Named says it is one of the task's own names (D12), as
-	// against a call's kind and name, which the workflow chose.
+	// Step is the step the verdict names: the task's own name for it (Named, D12), else unnamedStep.
 	Step  string
 	Named bool
 	Cause string // agentd's words, which quote tools, models and people
@@ -63,6 +62,12 @@ type Outcome struct {
 // unread is the cause a report gives a verdict it does not know for want of the run's history.
 const unreadCause = "agentd could not read the run in Temporal; " + inTheLog
 
+// unnamedStep is what a report calls each step the task does not name (D12): a call of the workflow's
+// own making, whose kind, name and activity ID it chose, and whose refusal or error agentd's words
+// may quote them in (an unknown model task's error, a tool's echo of its arguments). The report says
+// how it ended and nothing it quotes (facts.quote); runs explain, which is local, names it.
+const unnamedStep = "a call the task does not name"
+
 // Report is the outcome of a run that reports now: in is what Temporal has of it (ReadTemporal), read
 // reads the ledger as Explain does, and reason and errorType are why the workflow says it reports.
 // Without the run's history the verdict is unknown, never ok: it is what a report rests on, when
@@ -70,7 +75,8 @@ const unreadCause = "agentd could not read the run in Temporal; " + inTheLog
 // (in.Unread, or as the history is read). A history Temporal could not be reached for, as it was
 // read, fails it (Unreachable says so), as does a ledger that cannot be read: a report is rendered
 // once, and should wait for the run's history rather than say for good that it was not there. A report
-// is public: it shows no internal error's text, only that agentd's log has it.
+// is public: it shows no internal error's text, only that agentd's log has it, and of a step the task
+// does not name only how it ended, as unnamedStep's.
 func Report(in Input, read func(Wanted) (Ledger, error), reason, errorType string) (Outcome, error) {
 	if in.Unread != "" {
 		return unknownOutcome(unreadCause, in.Unread), nil
@@ -94,9 +100,13 @@ func Report(in Input, read func(Wanted) (Ledger, error), reason, errorType strin
 	f.public = true
 	var steps []*step
 	for _, s := range f.steps {
-		if !s.isReport {
-			steps = append(steps, s)
+		if s.isReport {
+			continue
 		}
+		if !s.mapped {
+			s.step = unnamedStep
+		}
+		steps = append(steps, s)
 	}
 	f.steps = steps
 	o := report(f, reason, errorType)

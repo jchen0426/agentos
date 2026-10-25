@@ -100,6 +100,32 @@ class CancelledInItsCode(SecurityAudit):
         super().doorbell()
 
 
+# What a subverted Worker would carry out of agentd in a call's name: here, words of its own.
+CARRIED = "carried-out-0123456789abcdef"
+
+
+@workflow.defn(name="security-audit")
+class MakesUpACall(SecurityAudit):
+    """Makes a call of its own making after reading the diff: a tool agentd does not have, under a name
+    that carries words of its own, which agentd refuses. By the base branch, its audit then returns
+    the refusal, or raises KeyError: either way the run reports."""
+
+    async def audit(self, a: AuditInput) -> tuple[str, str | None, str | None]:
+        await self.call("tool", "git.show_diff", repo=a.repo, commit=a.commit)
+        status, _ = await self.call("tool", f"{CARRIED} {'x' * 900}")
+        if a.base_branch == "raises":
+            raise KeyError("blob")
+        return status, None, None
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        return await super().run(a)
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+
 class PatchUnreadable(Exception):
     """An exception type of the workflow's own: neither KeyError nor ValueError."""
 

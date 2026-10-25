@@ -181,11 +181,12 @@ func TestTheReportsVerdictIsRunsExplains(t *testing.T) {
 	if err != nil || v.Verdict != "step_failed" || v.Kind != "policy_denied" || v.Step != "write_it" || len(v.Cut) != 0 {
 		t.Fatalf("%+v %v", v, err)
 	}
-	// A step the task does not name is named in the verdict's words only.
+	// A step the task does not name is not named at all: not its kind and name, which the workflow
+	// chose, nor agentd's reason, which could quote them.
 	h = fakeHistory{}
 	h.called(t, g, l, noSuchTool)
 	v, err = ReportVerdicts{Ledger: l, Temporal: &h, Tasks: registry}.ReportVerdict(ctx, testWorkflowID, "done", "")
-	if err != nil || v.Kind != "denied" || v.Step != "" || !strings.Contains(v.Cause, "no.such.tool") {
+	if err != nil || v.Kind != "denied" || v.Step != "" || v.Cause != "agentd refused a call the task does not name" {
 		t.Fatalf("%+v %v", v, err)
 	}
 	// A history longer than agentd reads: what the run did past it is not known.

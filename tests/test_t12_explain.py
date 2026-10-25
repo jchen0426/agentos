@@ -399,6 +399,31 @@ def test_t12_a_report_takes_nothing_from_the_workflow(stack: Stack) -> None:
     assert OUTCOME.search(body.split("```")[0]).groups() == ("step_failed", "analyze", "step_missing"), body
 
 
+@pytest.mark.parametrize("base", ["main", "raises"])
+def test_t12_a_call_the_workflow_made_up_is_not_named_in_the_report(stack: Stack, base: str) -> None:
+    # A call of the workflow's own making, under a name that carries words of its own: agentd refuses
+    # it, and the report, which is public, names it only as a call the task does not name, with
+    # nothing of what the workflow chose. runs explain, which is local, names it.
+    from tests.t12_workflows import CARRIED
+    stack.start_agentd()
+    stack.start_worker(workflows="tests.t12_workflows:MakesUpACall")
+    run = stack.start_run(base=base)
+    assert stack.wait_state(run, TERMINAL)["state"] == ("FAILED" if base == "raises" else "SUCCEEDED")
+    body = stack.report_comment(run)
+    assert CARRIED not in body and "xxxx" not in body, body
+    fenced = body.split("```")[1]
+    e = stack.explain(run)
+    assert CARRIED in e["step"] and e["activity_id"].startswith("2:" + CARRIED), e
+    if base == "raises":
+        assert (e["verdict"], e["kind"]) == ("failed", "workflow_error"), e
+        assert OUTCOME.search(body.split("```")[0]).groups() == ("failed", None, "workflow_error"), body
+        assert "its code failed after a call the task does not name returned denied" in fenced, body
+    else:
+        assert (e["verdict"], e["kind"]) == ("step_failed", "denied") and "no such tool" in e["cause"], e
+        assert OUTCOME.search(body.split("```")[0]).groups() == ("step_failed", None, "denied"), body
+        assert "Outcome: agentd refused a call the task does not name\n" in fenced, body
+
+
 @pytest.mark.parametrize("base", ["main", "other-commit"])
 def test_t12_a_report_that_is_not_the_runs_own_is_refused(stack: Stack, base: str) -> None:
     # The diff as the report, or another commit as the target.

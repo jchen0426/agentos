@@ -22,8 +22,9 @@ import (
 // audited commit (section 3). agentd renders it from a fixed template and from its own records:
 // the outcome is its verdict on the run's calls before the report (runs explain's rules), the
 // report the run's latest accepted answer of its model task, the pull request its own effect's.
-// The workflow says only why it reports (reason), and a model can put neither links nor mentions in
-// it.
+// The workflow's own words in it are only why it reports (reason, and an exception's type from a fixed
+// set: internal/explain's Report), and a model can put neither links nor mentions in it. What else of
+// it a subverted Worker steers is what the run did, as the verdict tells it (README).
 type CommentCommit struct {
 	Client   *Client
 	Repos    map[string]Repo
@@ -175,8 +176,8 @@ func (t *CommentCommit) Prepare(ctx context.Context, req tools.Request) (json.Ra
 			}
 		}
 	}
-	// How the run went is agentd's verdict on its calls, from its own records; the workflow says only
-	// why it reports.
+	// How the run went is agentd's verdict on its calls, from its own records; the workflow's own words
+	// are only why it reports.
 	reason, errorType := tools.String(req.Args, "reason"), tools.String(req.Args, "error_type")
 	if errorType != "" && reason != "workflow_error" {
 		return nil, &tools.DeniedError{Reason: "error_type goes only with reason workflow_error"}

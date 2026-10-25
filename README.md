@@ -378,15 +378,29 @@ The run's report on the commit says the same: agentd writes its outcome by the s
 run's history and its own records of the calls before the report (without the history, the outcome
 is `unknown`, never `ok`: when Temporal answers that it has none, or with an error of its own; while
 agentd cannot reach Temporal, the report's call fails before anything of it is recorded, and
-Temporal tries it again once it answers), and takes the report from the run's own accepted audit;
-the workflow tells it only why it reports (done, or that its own code failed, and the error's type).
-The report names the type only if it is one of Python's built-in exceptions or json's
-JSONDecodeError: a name the Worker chose freely could carry something out of agentd in a public
-comment, so any other shows as "an exception of another type". `runs explain` quotes the workflow's
-own words. The report shows no internal error's text: where agentd could not read something, or a
-tool's server failed, it says so and that agentd's log has the details; a model's or a tool's own
-words are shown fenced. When the outcome rests on everything it needs but other evidence was past
-agentd's bounds, the report says which, and that it does not change the outcome.
+Temporal tries it again once it answers), and takes the report from the run's own accepted audit.
+The report is public, and whatever a subverted Worker could choose freely in it would carry
+something out of agentd, so the workflow's own words in it are why it reports: done, or that its own
+code failed, with the error's type only if it is one of Python 3.12's built-in exceptions that
+derive from `Exception` (not its warnings) or json's `JSONDecodeError`. Any other type, a newer
+Python's (3.13's `PythonFinalizationError`) or the Temporal SDK's own (`NondeterminismError`) among
+them, shows as "an exception of another type". A call the task does not name shows as "a call the
+task does not name", with nothing agentd's words of it would quote (a reason, an error, a tool's or
+a model's words), and nothing of what Temporal has of a call agentd has no record of: a Worker can
+fail or complete a call itself, on a task queue of its own. `runs explain`, which is local, names
+them all. What a subverted Worker still steers in the report: why it reports and the error's type
+(two reasons, 51 names or none); which of the task's steps it calls, in what order, and how each
+ends (the verdict, its kind, the step it names, a few counts such as attempts and a budget's
+figures, a few bits such as which of Temporal's timeouts ended a call); when it reports (the
+comment's time, and an approval's request time); and that it reports once per run (the effect's
+cap). Two ways out are still open: a model task's plain arguments (the ones that are not a
+blob) reach the model as they are, and the model's answer is the report; and the comment's hidden
+marker names the report's effect by a hash of the report call's arguments, which the Worker can
+choose until the hash says what it wants (docs/m5-notes.md). The report shows no internal error's
+text: where agentd could not read something, or a tool's server failed, it says so and that
+agentd's log has the details; a model's or a tool's own words are shown fenced, when agentd's records
+hold them. When the outcome rests on everything it needs but other evidence was past agentd's
+bounds, the report says which, and that it does not change the outcome.
 
 A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it carries on:
 
