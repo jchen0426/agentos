@@ -1677,3 +1677,118 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - 第 8 节威胁表“外传数据”一行（rev 394）：原来那句“Worker 能定的只有 reason 的两个取值和一个异常类型名”不对，改成照实列出它还能左右的东西，每个报告几个比特。
 - 第 9 节开头（rev 395）：工作流只给任务名和为它声明的输入，参数对不上的调用在问策略、预留预算之前就被拒绝。清单里这半句原来接在“两种适配器之一”后面，会把后面冒号引出的两种适配器隔开，所以挪进了括号，意思没变。
 - 第 12 节 M5 的完成记录（rev 396）：加了“报告的外传通道收窄”一条。M5 仍没记为完成，沙箱部分还剩 C2 和 C3。
+
+## C2a：agentd 拉起并看管 Worker（2026-10-25）
+
+范围：设计（`m5-c2c3-design.md`）里 PR 顺序的第 3 项。agentd 在 Runtime 入口开始服务之后拉起 Worker，不管怎么退出都重启；新加 `tests/test_worker_supervision.py`，三种环境都跑。现有测试都传 `--no-worker`，照旧自己起 Worker；迁移现有测试是 C2b。
+
+### 做了什么
+
+- **配置**：`agentd.yaml` 加 `worker` 一节。
+  - `sandbox`：启动脚本，没有 `--insecure-dev` 时必填。
+  - `python`：虚拟环境，`<python>/bin/python` 跑 Worker。`code`：代码目录，也是工作目录和 import 的根。
+  - `workflows`：默认 `agentos_worker.workflows:WORKFLOWS`。`deny_read`：macOS 额外要拒读的路径。
+  - `limits`：先留着位置，写了任何值都拒绝加载（这个 agentd 还不设上限，不能让人以为设了）；agentd.started 记 `{}`。
+  - 两个 dev 配置都加了这一节，用 macOS 的启动脚本、`../../.venv` 和 `../../python`。
+- **启动前就拒绝的**（在 agentd 动任何东西之前；`--no-worker` 时不查）：
+  - 没有 `worker.sandbox` 又没有 `--insecure-dev`；
+  - `python` 或 `code` 装着 agentd 的数据目录、任一个 socket 的目录、Temporal 客户端证书或私钥、任一个镜像，按名字、真实路径或同一个文件判断（和 `checkMirrors` 共用 `place`/`holds`）；
+  - `<python>/bin/python` 不在、`code` 不是目录、`workflows` 不是 `模块:属性`；
+  - 启动脚本用不了的 `runtime_listen`：macOS 加沙箱时必须是 `tcp://127.0.0.1:<端口>`（沙箱只放行这一个目的地）；Linux 加沙箱时必须是 `unix://`，而且 socket 所在的目录不能是、也不能装着数据目录或 Control socket 的目录（启动脚本把整个目录挂进沙箱）；不加沙箱时必须是 `tcp://`（SDK 只会连 host:port）。
+  - 不拒绝装着 agentd 配置文件的目录：配置里只有 `keyring:` 引用，`secrets.Resolve` 只认 `keyring:<service>[/<account>]`，别的一律拒绝（“a key itself never goes in the configuration”），所以配置里从来没有密钥本身；TLS 私钥、账本、镜像已经拒绝了。（一次自动安全审查提过，不适用。）
+- **拉起**（`internal/supervisor`，agentd 在 `cmd/agentd/worker.go` 里组命令）：
+  - macOS：`run-worker.sh <端口> <python> <code> -- <python>/bin/python -m agentos_worker --endpoint 127.0.0.1:<端口> --http-connect-proxy env --namespace … --task-queue … --workflows …`；
+  - Linux：`run-worker.sh <socket> <python> <code> -- … --endpoint 127.0.0.1:7233 …`；
+  - 不加沙箱：直接跑 `<python>/bin/python -m agentos_worker --endpoint <监听的 host:port> …`。端口和地址取自真正在听的那个 listener，`:0` 也行。
+  - 环境变量由 agentd 从零组：`PATH`、`HOME`（macOS 启动脚本要拒读它）、`LANG=C.UTF-8`、`AGENTOS_SANDBOX_DENY_READ`（toolDenyRead 加 deny_read）；macOS 加沙箱时每一代另加 `AGENTOS_SANDBOX_STATE` 和 `AGENTOS_SANDBOX_LIFELINE=3`。一个也不从 agentd 自己的环境继承。
+  - 日志里记每一代的环境，这是安全的：环境是上面这几个变量，从来没有密钥。Go 测试 `TestTheWorkersEnvironment` 按平台和有没有沙箱钉住了键的白名单（在 agentd 的环境里放了几个假密钥，一个也没漏进去），所以钉住的是“Worker 拿不到密钥”本身，不只是日志。（一次自动安全审查提过日志里有环境。）
+  - Worker 单独一个会话（setsid），也就单独一个进程组：组被整个杀掉；会话没有控制终端。
+- **第一个 Worker**：要在 60 秒内打出 "worker ready"，而且在 agentd 打出 "agentd ready" 之前；先退出了，或者到时没说（agentd 先把它停掉），agentd 就退出，错误里带上 Worker 最后 20 行输出。这期间 Control socket 已经在服务。
+- **重启**：不管怎么退出都重启，间隔 1 秒起、每次翻倍、最长 60 秒，跑满 60 秒（从启动算）后重置。不做存活探测。
+- **停**：先停看管 Worker 的部分：不再重启，SIGTERM 给启动脚本，5 秒后对整个进程组 SIGKILL，删状态目录和 worker.pid；然后才关 Control 和 Runtime 入口。关闭分支里加了一行日志 "the Runtime entry is closed"，测试按日志的先后核对 "worker stopped" 在它前面。
+- **输出**：每一行都读（Worker 不会因为 agentd 没读而卡住），看有没有就绪标记，留最后 20 行；日志里每行最多 2 KiB（截在字符边界，加“…”和原长度），每秒最多 20 行（令牌桶，一次最多 20 行），其余的计数，最晚一秒后或这一代结束时报出来。
+- **审计**：每次 agentd 没造成的退出写一条 `worker.exited`（agentd 自己的记录，workflow_id 为空）：generation、pid、exit_code 或 signal 或 start_error、ran_ms、ready、exited_at、restart_in_ms（agentd 因此退出时没有）、unrecorded。离上一条不到一分钟的退出先压着，这一分钟到了，写一条描述最新的那次，其余的计入 unrecorded；看管停下时也写。经 refusals 用的那个 `audit.Queue` 写，退出不等账本。
+  - 不用迁移，也不用改 schema 或查询：`ListAgentdStarts` 只选 `agentd.started`；verify 的 `attempts()` 跳过别的类型，`Projection.Apply` 没有这个类型的分支。坑在于 `Projection.Apply` 先把每条记录的 payload 解进同一个结构体：这条记录的键和那些字段都不重名。Go 测试把这三处都钉住了。
+  - `agentd.started` 加了 `no_worker`，看管时还有 `worker {sandbox, python, code, workflows, limits}`。
+- **macOS 的收尾**：
+  - 生命线：fd 3 是一个管道的读端，写端只有 agentd 拿着，从不写。启动脚本在 exec srt 之前起一个看门的子 shell（在沙箱外、在同一个进程组里；srt 只让沙箱里的进程给同一个沙箱里的进程发信号），读到 EOF 就杀整个进程组。
+  - 状态目录：`/tmp/agentos-worker.<agentd 的 pid>.*`，agentd 为每一代建，传给启动脚本，进程组没了再删；启动时清扫不再运行的 agentd 留下的。
+  - worker.pid：数据目录里，记启动脚本的 pid（也是会话和进程组的 id）和它的启动时间：macOS 用 kinfo_proc 的 p_starttime（微秒，墙上时间）；Linux 用 /proc/<pid>/stat 第 22 个字段加 boot_id（开机以来的时钟滴答每次开机重新算）。下一个 agentd 拿到数据目录的锁之后、开始监听之前清扫：进程在、启动时间对得上才杀整个进程组；pid 已经被别的进程用了，或进程没了，只删文件。`--no-worker` 时也清扫。T16 的第二个 agentd 在锁那里就失败了，到不了清扫。
+- **Worker 自己**（`python/agentos_worker/__main__.py`）：
+  - `max_concurrent_workflow_tasks=100`：SDK 的槽本来就是 100，但不设时执行器最多能开到 500 个线程；C3 的任务数上限数的是线程。
+  - stdout 和 stderr 遇到满的管道就等着，和阻塞模式一样：见下面“我定的几处”第 12 条。
+- **启动脚本**：macOS 的接 agentd 给的状态目录和生命线；有控制终端就拒绝运行（见第 13 条）。Linux 的只改了头部注释。测试里直接跑 macOS 启动脚本的三处（`test_sandbox.py` 两处、T9 一处）改成单独会话，和 harness 一直以来的做法一样。
+- **git 工具服务器**：agentd 原来只给它单独的进程组，还在 agentd 的会话里；agentd 在终端上跑时，它就有控制终端。改成 setsid，加了 Go 测试。
+- **`internal/statedir`**：原来在 gitmcp 里的状态目录的建、删、清扫挪出来共用，没改行为。
+- **harness**：`start_agentd(…, worker=False, workflows=None, terminal=False)`，默认传 `--no-worker`，现有的 168 处调用一处没改；`worker=True` 时写 `worker` 一节，并给这个栈一个自己的工作流队列，用来在全机器上认出它的 Worker。`stack.worker()`（pid、pause、kill、wait_ready(n)、output）、`kill_agentd()`（只杀 agentd）、`worker_processes()`；`close()` 杀掉这个栈残留的 Worker。
+- **README**：手动运行一节（agentd 现在自己起 Worker：要在 `sandbox/macos` 里 `npm ci`，要有家目录外的 Python；`--no-worker` 是原来的流程），新加“The Worker”一节，测试表和目录表各加一行。
+
+### 我定的几处（实现计划里的 1–11，你都同意了；12 起是实现时定的）
+
+1. harness 默认 `worker=False`：设计里写的是 `worker=True`，那样现在就要改全部 168 处调用，而且 C2b 之后大多数测试仍用 `--no-worker`。
+2. 用 setsid，不只是单独的进程组：只换进程组，Worker 还在 agentd 的会话里，带着它的控制终端；bwrap 有 `--new-session` 挡着，srt 没有。
+3. Linux 上每一代的启动 goroutine 锁住自己的线程（`runtime.LockOSThread`），直到这一代被回收：bwrap 的 `--die-with-parent` 是 PR_SET_PDEATHSIG，它在创建子进程的那个线程退出时就触发，不是进程退出时（go#27505）。
+4. 生命线只在有启动脚本时有：不加沙箱的 Worker（开发用）在 agentd 被 kill -9 后一直留着，直到下一个 agentd 清扫。让 Worker 自己盯着 fd 3，等于把这件事交给不可信的一方。
+5. `--no-worker` 时也清扫：不然残留的 Worker 会连上这个 `--no-worker` 的 agentd。
+6. 状态目录放在 /tmp，不放数据目录：srt 的 socket 要短路径，启动脚本本来就对所有 Worker 整体拒读 /private/tmp。删除用 gitmcp 原来的 Go 代码（不跟符号链接，处理 000 权限）；它不像 rm-state.py 那样清 uchg 标志：被钉住的文件留下（见“剩余风险”）。
+7. `limits` 留位置，写了就拒绝，记 `{}`：C3 之前什么都不限。
+8. 上限 100 写在 Worker 的代码里，不由 agentd 传：这是为了诚实 Worker 的稳定，被攻破的 Worker 本来就不会听。
+9. 第一个 Worker 起来期间 Control socket 已经在服务，"agentd ready" 仍然等它。
+10. Linux 上 SIGTERM 给 bwrap，沙箱直接被杀，Worker 没有机会优雅退出（见“剩余风险”）。
+11. 第一个 Worker 在就绪前退出要写记录；它就绪超时不写：那是 agentd 自己停掉的。
+12. **srt 让 Worker 的 stdout、stderr 变成非阻塞**：srt 把自己的 stdout、stderr 原样交给 Worker（同一个打开的文件描述），node 在 srt 第一次替 Worker 代理连接时把它们设成非阻塞。harness 自己起的 Worker 输出到文件，看不出来；agentd 给的是管道，管道满了写就失败（EAGAIN）：导入时打印很多的 Worker（`tests/chatty_worker.py`）直接死掉，工作流里的 print() 也会失败。实测：独立运行的启动脚本、Go 起的启动脚本、SDK 本身都不改这个标志，只要经 srt 的代理连一次就变。问题出在写的一方，所以修在 Worker 里：它的 stdout、stderr 按阻塞模式写（满了就等），不管描述处于什么模式。去掉这个修法，srt 下的输出测试就失败。
+13. **macOS 启动脚本有控制终端就拒绝运行**（C.4，你定的在这个 PR 里修）：srt 的配置允许对 /dev/tty 做 ioctl，在终端上跑的 Worker 能往终端里塞字符（TIOCSTI）。两条路里选了拒绝，没选自动脱离（fork 再 setsid）：脱离会改变调用方看到的进程结构（pid 不再是 srt、进程组信号够不着），拒绝没有这些问题。判断用打开 /dev/tty 是否成功，不解析 ps 的输出。手动运行的办法写在 README 里：用 perl fork 一次、子进程 setsid 再 exec 启动脚本，父进程转发 Ctrl-C；测试直接取 README 里的那段 perl 跑一遍。
+14. 关闭顺序的日志：黑盒改坏检查里，把看管放到 Runtime 入口关闭之后（B2），两种顺序在外面都看不出区别（两者之间只有几微秒，下一次重启至少隔 1 秒），所以加了 "the Runtime entry is closed" 这一行，测试按日志的先后核对。
+15. 输出里没记进日志的行数，原来只在下一行能记时才报；Worker 一阵猛写之后不再写，这个数就一直不出来。加了定时：一秒后报。
+
+### 用户定的
+
+- **测试用真的常数**（不加只给测试用的开关）：两个慢的用例，一个等 60 秒的就绪超时，一个等 60 秒的间隔重置。
+- **dev 配置加 `worker` 一节**，README 写明现在要 `npm ci` 和家目录外的 Python，`--no-worker` 是原来的流程。
+- **C.4（TIOCSTI）在这个 PR 里修**：启动脚本、直接调启动脚本的测试、README 的手动运行办法、git 工具服务器（上面第 13 条和“做了什么”）。
+- **C.2、C.3 不在 C2a 里**，记为后续：重启会导入磁盘上现在的代码，agentd.started 只记了目录；没有存活探测，被 SIGSTOP 的 Worker 会让所有运行悄悄卡住。
+
+### 测试怎么测
+
+- **`tests/test_worker_supervision.py`**（三种环境都跑，标了 srt 的只在 srt 下跑）：
+  - Worker 在 agentd 就绪之前就绪；agentd.started 里有 worker 一节；srt 下 srt 的设置在 agentd 为它建的状态目录里；worker.pid 指着启动脚本；一次运行成功。
+  - 第 1、2、3 代一就绪就 kill -9：间隔 1、2、4 秒，下一代都不早于间隔；马上写一条记录，一分钟到了再写一条（描述第 3 次退出，unrecorded 1）；第 4 代跑满 61 秒后杀掉，间隔回到 1 秒；verify 以 0 退出。
+  - 第一个 Worker 起不来（导入不存在的模块）或一直不就绪（`tests/worker_hangs.py`）：agentd 以 1 退出、没打 "agentd ready"，错误里带着 Worker 的输出；只起过一次；什么都没留下。
+  - SIGTERM：响应的 Worker 自己以 0 退出、5 秒内；被 SIGSTOP 的过了 5 秒被杀；"worker stopped" 在 "the Runtime entry is closed" 之前；之后没有新的一代；什么都没留下；没有审计记录；重启的 agentd 的日志能通过 verify。
+  - 只 kill -9 agentd：srt、bwrap 下 Worker 和启动脚本 10 秒内没了；none 下 Worker 还在；重启后旧的没了（none 靠清扫），全机器只有新 agentd 的一个 Worker；srt 下旧的状态目录被清扫。
+  - （srt）先杀掉生命线的看门进程，再 kill -9 agentd：Worker 还活着；下一个 agentd 在 "agentd ready" 之前把它清扫掉。
+  - T16：第二个 agentd 起不来；第一个的 Worker pid 和启动时间没变，worker.pid、状态目录都没变，也没有新的一代。
+  - 输出：导入时打印 2,000 多行（约 430 KB，一行 10 KB，带 ESC 和 U+202E）：agentd 照样就绪；日志里没有原样的 ESC 和 U+202E，没有超过 2 KiB 的行，每秒不超过上限，报了没记的行数。
+  - 四种拒绝：runtime_listen、code 装着数据目录、python 是镜像、没有沙箱（srt、bwrap）。
+  - `--no-worker`：没有起 Worker，agentd.started 记 `no_worker: true`。
+  - agentd 在伪终端上：agentd 有控制终端，Worker 和 git 工具服务器的所有进程都没有。
+  - （srt）启动脚本的协议：用 agentd 给的状态目录，并把它留给 agentd 删；生命线的写端一关，srt 和 Worker 都被杀。
+  - （srt）启动脚本在终端上拒绝运行；照 README 的 perl 办法能跑。
+- **Go 测试**：supervisor（间隔和重置、第一个 Worker 的三种结局、停的各种情形、输出的截断和限速、记录的频率和压着的记录、会话和环境、生命线在 agentd 被杀时读到 EOF、清扫各种情形、启动时间和僵尸进程）；statedir；gitmcp 的会话；agentd 的命令、环境白名单、拒绝；config 的 worker 一节和 CheckWorker；verify 跳过 worker.exited；runs explain 的 Starts 不含它。
+- **改坏检查**：Go 43 处，黑盒 4 处，最后全部抓到。
+  - 第一轮 Go 有 7 处“活下来”，其中 5 处是改法本身编译不过（变量没用上），重写后都被抓到；真正漏掉的两处（停下时不写压着的记录、一分钟到了不写）补了测试 `TestRecordsOfHeldExits`；另外为“正常退出也杀整个进程组”补了一个用例。
+  - 黑盒：清扫挪到锁之前（B1，T16 用例抓到）；看门进程不读（B3）；启动脚本不查终端（B4）；关闭顺序（B2）原来抓不到，加了日志后抓到。去掉 Worker 输出的修法，srt 下的输出用例失败。
+
+- **跑过的**（macOS，`--verify-after-each`；完整的三种套件和 Linux VM 由你跑）：新文件加 `test_sandbox.py`、T1 的两个文件、T9、T16。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 22 | 28 | 22 | 17 | 0 | 5 |
+  | macOS，srt | 47 | 3 | 29 | 23 | 0 | 6 |
+
+  `gofmt -l`、`go vet ./...` 没输出，`go test ./...` 全过，`make build`、`make build-linux` 都通过。
+
+### 剩余风险
+
+- **macOS：生命线和清扫只给诚实的 Worker 收尾，挡不住被攻破的 Worker**。被攻破的 Worker 能 fork 一个子进程离开进程组（setsid，或者两次 fork 让它挂到 launchd 下）：生命线的 kill 和 worker.pid 的清扫都按进程组杀，够不着它；按进程树找也挡不住两次 fork。它仍在沙箱里（Seatbelt 会继承），但能连上下一个 agentd 的固定 Runtime 端口，当一个 agentd 没起的 Worker。Linux 不受影响：bwrap 的 PID 命名空间随它的 init 一起死。可行的缓解：
+  - C3b 的 `ulimit -u`（Worker 不能 fork）；
+  - Runtime 入口给每一代 Worker 一个一次性凭据：agentd 交给每一代一个秘密，Runtime 入口只收当前这一代的，残留的或逃出来的 Worker 服务不了后来的 agentd。放进 C2a 还是以后做，由用户定。
+- **Linux 上 Worker 没有优雅退出**：SIGTERM 给 bwrap，bwrap 直接死，`--die-with-parent` 让沙箱里的进程都吃 SIGKILL。在途的工作流任务 10 秒后超时、交给下一个 Worker。以后可以用 bwrap 的 `--info-fd` 拿到沙箱里的 pid，把 SIGTERM 转进去。
+- **被钉住的文件留下**：agentd 删状态目录不清 uchg 标志（rm-state.py 会清）。Worker 钉住的文件留在 /tmp 下，别的 Worker 都读不到，下一个 agentd 启动时再试。
+- **不加沙箱的 Worker**（`--insecure-dev`）没有生命线：agentd 被 kill -9 后它一直留着，直到下一个 agentd 清扫，期间连不上任何 agentd。
+- agentd 在启动一代和写下 worker.pid 之间被 kill -9：这一代没有记录。加沙箱时由生命线（macOS）或 bwrap（Linux）兜底。
+- 清扫在“核对启动时间”和“kill”之间有几微秒的窗口：要 pid 在这几微秒里绕一整圈才会误杀。
+- 一代结束后先回收、再杀它的进程组（和 gitmcp 一样）：回收和 kill 之间 pid 若被重用，新进程还得恰好是进程组组长才会被波及。
+- 不做存活探测：被 SIGSTOP 的 Worker 一直停着，所有运行悄悄卡住（记为后续，见“用户定的”）。
+- 重启的 Worker 导入磁盘上当时的代码，agentd.started 只记目录（记为后续）。
+- srt 的 node 让 Worker 共用的 stdout、stderr 变成非阻塞：Worker 自己的写已经改成等着，但 SDK 的 Rust 核心直接写 fd 2，管道满时那一行会丢（只有 WARN 一类的行）。
