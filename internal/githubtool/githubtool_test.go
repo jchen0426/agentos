@@ -124,9 +124,13 @@ func TestTheReportsEffectIsWhatItShows(t *testing.T) {
 	if got := tool.Identity(with(map[string]any{"error_type": "KeyError"})); !maps.Equal(got, with(map[string]any{"error_type": "KeyError"})) {
 		t.Errorf("a named error type: %v", got)
 	}
-	// An older Worker's call, which gives no reason.
-	if got := tool.Identity(map[string]any{"repo": "acme/payments", "commit": "c", "outcome": "ok"}); len(got) != 2 {
-		t.Errorf("no reason: %v", got)
+	// A call that gives no reason reports as done, and is the same effect as one that says done.
+	noReason := tool.Identity(map[string]any{"repo": "acme/payments", "commit": "c", "outcome": "ok"})
+	if !maps.Equal(noReason, map[string]any{"repo": "acme/payments", "commit": "c", "reason": "done"}) {
+		t.Errorf("no reason: %v", noReason)
+	}
+	if done := tool.Identity(map[string]any{"repo": "acme/payments", "commit": "c", "reason": "done"}); !maps.Equal(noReason, done) {
+		t.Errorf("no reason %v, done %v", noReason, done)
 	}
 }
 

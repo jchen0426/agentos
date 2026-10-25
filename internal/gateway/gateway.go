@@ -1131,10 +1131,15 @@ func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.R
 	if err != nil {
 		return nil, err
 	}
+	// Whether one call ended before the next began is read from agentd's own clock at both ends:
+	// the previous call's last record (ended, agentd's At) against when agentd first counted the
+	// next (calls.created_at). The scheduled time is Temporal's, on another host, and the drift
+	// between the two clocks could make a short overlap look sequential.
+	created := func(c db.Call) time.Time { t, _ := time.Parse(time.RFC3339Nano, c.CreatedAt); return t }
 	var paused []string
 	for i := first; i < self; i++ {
 		end, ok := ended[callKey{audit.Text(calls[i].ActivityID), calls[i].ScheduledAt}]
-		if !ok || !end.Before(at(calls[i+1])) {
+		if !ok || !end.Before(created(calls[i+1])) {
 			return nil, nil // two at once: whose is whose is not known
 		}
 		paused = append(paused, calls[i].ActivityID)

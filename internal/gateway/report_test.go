@@ -269,50 +269,101 @@ func TestAReportPostsNothingAWorkerChose(t *testing.T) {
 			t.Fatalf("%s", named)
 		}
 	}
+	// A report with no reason, and one that says done: the same comment and the same marker (N1).
+	done := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done"}
+	none := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40)}
+	var same [2]string
+	for i, args := range []map[string]any{none, done} {
+		g, l := reporting(t)
+		var h fakeHistory
+		h.at(base, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, nil)
+		same[i] = posted(t, g, l, &h, args)
+	}
+	if same[0] != same[1] || !reMarker.MatchString(same[0]) {
+		t.Fatalf("no reason:\n%s\ndone:\n%s", same[0], same[1])
+	}
 }
 
 // An effect of the report an agentd from before recorded, by every argument of its call, and left
 // unfinished: the call goes on with it after the upgrade (its payload, its marker), not with another
 // effect, which the effect cap would refuse, so that the run would never report.
 func TestAReportsEffectRecordedBeforeItsIdentity(t *testing.T) {
-	g, l := reporting(t)
-	var h fakeHistory
-	h.through(t, time.Now().Add(time.Hour).Truncate(time.Second), g, l, &agentosv1.Call{Kind: "tool", Name: "git.show_diff", ArgsJson: `{}`})
-	cc := commenter(l, &h)
 	ctx := context.Background()
-	run, err := l.Q.GetRun(ctx, testWorkflowID)
-	if err != nil {
-		t.Fatal(err)
+	// legacyEffect records, as an agentd from before this change would, a report effect named by
+	// every argument of args, PENDING and unsent, and returns the gateway, its ledger, the run, the
+	// call and its legacy effect ID.
+	legacyEffect := func(t *testing.T, args map[string]any) (*Gateway, *ledger.Ledger, db.Run, *githubtool.CommentCommit, tools.Request, []byte, string) {
+		t.Helper()
+		g, l := reporting(t)
+		var h fakeHistory
+		h.through(t, time.Now().Add(time.Hour).Truncate(time.Second), g, l, &agentosv1.Call{Kind: "tool", Name: "git.show_diff", ArgsJson: `{}`})
+		cc := commenter(l, &h)
+		run, err := l.Q.GetRun(ctx, testWorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, canon := reportCall(t, cc, args)
+		older := req
+		older.EffectID = sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon)
+		if older.EffectID == req.EffectID {
+			t.Fatal("the effect is named by every argument")
+		}
+		if res, err := g.record(ctx, run, cc, cc.Class(), 1, nil, older, canon); res != nil || err != nil {
+			t.Fatalf("%v %v", res, err)
+		}
+		return g, l, run, cc, req, canon, older.EffectID
 	}
 	args := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done", "report_ref": nil, "pr_url": nil}
-	req, canon := reportCall(t, cc, args)
-	older := req
-	older.EffectID = sha256Hex([]byte(testWorkflowID), []byte(cc.Name()), canon)
-	if older.EffectID == req.EffectID {
-		t.Fatal("the effect is named by every argument")
-	}
-	// The older agentd recorded the effect (PENDING), and stopped before it sent it.
-	if res, err := g.record(ctx, run, cc, cc.Class(), 1, nil, older, canon); res != nil || err != nil {
-		t.Fatalf("%v %v", res, err)
-	}
-	if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
-		t.Fatalf("after the upgrade: %v %v", res, err)
-	}
-	effects, err := l.Q.ListRunEffects(ctx, db.ListRunEffectsParams{WorkflowID: testWorkflowID, Limit: 10})
-	if err != nil || len(effects) != 1 || effects[0].EffectID != older.EffectID || effects[0].Status != effectDryRun {
-		t.Fatalf("%+v %v", effects, err)
-	}
-	if p := payloadOfEffect(t, l, older.EffectID); !strings.Contains(p, older.EffectID) {
-		t.Fatalf("its marker: %s", p)
-	}
-	// A call with other arguments than the older agentd's finds no effect of its own: the cap refuses
-	// it, as it would have refused a second report before.
-	other := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done"}
-	req, canon = reportCall(t, cc, other)
-	if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil ||
-		res.GetStatus() != StatusDenied {
-		t.Fatalf("another call: %v %v", res, err)
-	}
+
+	// Nothing of the legacy effect went out: it is abandoned and a fresh one recorded under the
+	// identity ID, rendered by current code, and the comment carries the identity ID's marker.
+	t.Run("unsent, re-rendered fresh", func(t *testing.T) {
+		g, l, run, cc, req, canon, legacy := legacyEffect(t, args)
+		if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
+			t.Fatalf("after the upgrade: %v %v", res, err)
+		}
+		effects, err := l.Q.ListRunEffects(ctx, db.ListRunEffectsParams{WorkflowID: testWorkflowID, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		byID := map[string]db.Effect{}
+		for _, e := range effects {
+			byID[e.EffectID] = e
+		}
+		if len(effects) != 2 || byID[legacy].Status != effectAbandoned || byID[req.EffectID].Status != effectDryRun {
+			t.Fatalf("%+v", effects)
+		}
+		if p := payloadOfEffect(t, l, req.EffectID); !strings.Contains(p, req.EffectID) || strings.Contains(p, legacy) {
+			t.Fatalf("its marker: %s", p)
+		}
+		// A call of another identity finds no effect of its own: the cap (the fresh DRY_RUN counts,
+		// the ABANDONED one does not) refuses it, as it would have refused a second report before.
+		other, canon := reportCall(t, cc, map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "workflow_error", "error_type": "KeyError"})
+		if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, other, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusDenied {
+			t.Fatalf("another identity: %v %v", res, err)
+		}
+	})
+
+	// The legacy effect may have gone out (an attempt marked it maybe-sent): the call goes on with
+	// it, under the old marker, so no second comment is posted.
+	t.Run("maybe sent, kept", func(t *testing.T) {
+		g, l, run, cc, req, canon, legacy := legacyEffect(t, args)
+		if _, err := l.DB.ExecContext(ctx, "UPDATE effects SET maybe_sent = 1 WHERE effect_id = ?", legacy); err != nil {
+			t.Fatal(err)
+		}
+		// Not live here, and the effect may have been sent: agentd cannot tell, so the call ends
+		// needs_reconcile. The point is it goes on with the legacy effect, and posts no second one.
+		if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusNeedsReconcile {
+			t.Fatalf("after the upgrade: %v %v", res, err)
+		}
+		effects, err := l.Q.ListRunEffects(ctx, db.ListRunEffectsParams{WorkflowID: testWorkflowID, Limit: 10})
+		if err != nil || len(effects) != 1 || effects[0].EffectID != legacy {
+			t.Fatalf("%+v %v", effects, err)
+		}
+		if p := payloadOfEffect(t, l, legacy); !strings.Contains(p, legacy) {
+			t.Fatalf("its marker: %s", p)
+		}
+	})
 }
 
 // reporting is a gateway whose ledger holds the test execution's run as StartRun leaves it, its

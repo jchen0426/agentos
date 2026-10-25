@@ -226,8 +226,10 @@ still gives every field those rules read, and refuses to start, naming the field
 
 A model task's `inputs` are all it takes, each a blob of the run's own (`<name>_ref`; the audit's
 is `diff_ref`), and all are required: a call with any other argument is refused before anything is
-reserved or sent. agentd refuses to start with a task that lists none, or one that is not a blob: a
-plain input would need a type that bounds it, which v0.1 does not have.
+reserved or sent. A `_ref` names any blob the run produced, not only the one its name suggests; the
+workflow chooses which, but it is the run's own blob, never the Worker's to write. agentd refuses to
+start with a task that lists none, or one that is not a blob: a plain input would need a type that
+bounds it, which v0.1 does not have.
 
 ```bash
 printf 'add-generic-password -U -s agentos-openai-api-key -a %s -w %s\n' "$USER" "$(pbpaste)" | security -i
@@ -399,11 +401,13 @@ ends (the verdict, its kind, the step it names, a few counts such as attempts an
 made, a few bits such as which of Temporal's timeouts ended a call); when it reports (the comment's
 time, and an approval's request time); and that it reports once per run (the effect's cap, unless
 the policy raises the tool's `max_per_run`). A budget's figures, when a call runs out of budget,
-follow the size of the model's request, which the run's own blobs set: its diff, which its commit
-fixes. A model task takes only the inputs models.yaml declares for it, each a blob of the run's own
-(the security audit's: the run's diff), and agentd refuses a model call with any other argument
-before anything is reserved or sent: the model's answer is the report, and nothing else the
-workflow writes reaches the model. The comment's hidden marker names the report's effect, and the
+follow the size of the model's request, which is set by which of the run's own blobs the call names
+and how many calls came before it: a few bits. A model task takes only the inputs models.yaml
+declares for it, each a blob of the run's own, and agentd refuses a model call with any other
+argument before anything is reserved or sent: the model's answer is the report, and nothing else
+the workflow writes reaches the model. Which blob a `_ref` argument names (the audit's `diff_ref`
+takes any blob of the run's: its diff, a model's accepted answer, a patch, a reviewer's edited
+patch) the workflow chooses, but the blob is the run's own, never the Worker's to write. The comment's hidden marker names the report's effect, and the
 effect is named only by what the comment shows: the repository, the commit, the reason and an error
 type the report names, not what else the report's call sends (an older Worker's outcome, `pr_url`,
 `report_ref`). The report shows no internal error's text: where agentd could not read something, or

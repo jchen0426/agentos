@@ -46,14 +46,15 @@ func newResumeFixture(t *testing.T) *resumeFixture {
 		g: &Gateway{Ledger: l, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 }
 
-// call records an activity that sent the call (the loop guard's row) and what it returned: when it
-// returned something, its call record too, a moment after it was scheduled.
+// call records an activity that sent the call (the loop guard's row) and what it returned: agentd
+// first counts it at its scheduled time (created_at), and when it returned something, its call
+// record too, a moment later.
 func (f *resumeFixture) call(id string, at time.Time, outcome string) activity.Info {
 	f.t.Helper()
 	ctx := context.Background()
 	scheduled := at.UTC().Format(time.RFC3339Nano)
 	if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: id, ScheduledAt: scheduled,
-		Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: ledger.Now()}); err != nil {
+		Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: scheduled}); err != nil {
 		f.t.Fatal(err)
 	}
 	if outcome != "" {
@@ -252,6 +253,42 @@ func TestResumeTakesNoOtherCallsPast(t *testing.T) {
 	}
 	if declined, refusal, _ := f.resume(f.call("2:audit_v1", t0.Add(time.Second), ""), opus, sol); slices.Contains(declined, true) || refusal != nil {
 		t.Errorf("one of no known end: declined %v, refusal %+v", declined, refusal)
+	}
+}
+
+// Whether one call ended before the next began is read from agentd's own clock at both ends (the
+// previous call's last record, the next call's created_at), not from Temporal's scheduled time on
+// another host: a drift between the clocks must not make a short overlap look sequential. Here the
+// scheduled times would call the two calls sequential (the first ends after the second was
+// scheduled, so by scheduled time they overlap and nothing carries over), while agentd's own times
+// make the chain: the first ended before agentd counted the second.
+func TestResumeReadsOneClock(t *testing.T) {
+	f := newResumeFixture(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
+	// The paused call: scheduled at t0, agentd counted it at t0, its record at t0+10ms.
+	sched := t0.UTC().Format(time.RFC3339Nano)
+	if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: "1:audit_v1", ScheduledAt: sched,
+		Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: sched}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.g.Ledger.Q.SetCallOutcome(ctx, db.SetCallOutcomeParams{Outcome: sql.NullString{String: StatusBudgetExhausted, Valid: true},
+		WorkflowID: "wf", ActivityID: "1:audit_v1", ScheduledAt: sched}); err != nil {
+		t.Fatal(err)
+	}
+	refused := f.request("1:audit_v1", 1, 1, opus, StatusRefused)
+	f.ended("1:audit_v1", sched, t0.Add(10*time.Millisecond), StatusBudgetExhausted)
+	// The resuming call: Temporal scheduled it at t0+5ms (before the paused call's record), but agentd
+	// first counted it at t0+20ms (after it).
+	if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: "2:audit_v1",
+		ScheduledAt: t0.Add(5 * time.Millisecond).UTC().Format(time.RFC3339Nano), Kind: "model", Name: "audit_v1",
+		ArgsSha256: "args", CreatedAt: t0.Add(20 * time.Millisecond).UTC().Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	info := activity.Info{ActivityID: "2:audit_v1", ScheduledTime: t0.Add(5 * time.Millisecond), Attempt: 1}
+	if declined, refusal, _ := f.resume(info, opus, sol); !slices.Equal(declined, []bool{true, false}) ||
+		refusal == nil || refusal.Model != refused.Model {
+		t.Errorf("declined %v, refusal %+v", declined, refusal)
 	}
 }
 

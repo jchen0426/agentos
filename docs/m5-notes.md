@@ -1576,7 +1576,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - **Go 网关测试**里模型调用用的 `{"diff":"x"}`，改成运行自己的 diff_ref（`diffCall`）。直接调 `modelCallOnce` 的测试不经过检查，没动。
   - **配置**：config/models.yaml、config/dev/models.yaml、harness 的四个 TEST_MODELS、T7、T13、跨供应商回退、补丁头、评测程序和它的测试、agentd 和 models 包的测试，都加了 `inputs: [diff_ref]`。T5、T6 不写 models.yaml。
 - **pausedBefore 是按参数连起来的，不是按调用**：一个等过预算的调用重发时用的是新活动，网关靠“同一个任务、同一组参数、紧挨着、以 budget_exhausted 结束”把它和之前的活动连起来，继承它们的拒答、答复不合格的次数和最后一个不合格的答复（按供应商、模型、提示版本和任务的 effort 对上）。参数一样的两个调用同时发，一个拒答之后在回退请求上预算不够，另一个重发时可能把前一个的拒答当成自己的。改了：连起来的那些活动必须一个接一个，每个都在下一个被调度之前结束（结束时间取它最后一条 call 记录的时间，最多读 10 万条，读不到就当重叠）；有重叠就什么都不继承，从头来。一个调用自己的几次暂停照旧连得上。剩下的：参数一样的调用一个接一个地发，还是分不出来，另一个调用在这个等预算时发出去，会被当成它的重发。安全审计的 Worker 只发一个模型调用，不会这样。
-- **报告里的预算数字回到几个位**：请求的大小由运行自己的 blob 决定，也就是它的 diff，而 diff 由运行的 commit 定下了。Worker 还能决定的是调不调、调几次。
+- **报告里的预算数字回到几个位**：请求的大小由调用指的是运行的哪个 blob、前面调了几次决定，几个位。`diff_ref` 这个名字不限定指哪个 blob：运行自己产出的任何一个都行（diff、模型被接受的答复、补丁、审批人改过的补丁），工作流选哪个，但都是运行自己的，不是 Worker 写的。
 - **测试**：
   - `TestModelsRefusesBadRoutes`：没有 inputs、空的、普通输入、名字不对、大写、写两遍，都不让加载；原来那些坏配置都补上了 inputs，所以每个都只因为它本来要测的毛病被拒。两个输入的任务能加载，路由里带着输入。
   - `TestAnthropicReadsOnlyTheRunsOwnBlobs`：多一个普通参数、引用位置放普通值、值不是字符串，提示都不建，没有请求发出去。
@@ -1591,3 +1591,25 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 - `gofmt -l`、`go vet ./...` 没有输出，`go test ./...` 25 个包全过（每部分提交前各跑一遍）。
 - `make build` 之后，黑盒不加沙箱，带 `--verify-after-each`：T5、T6、T7、T12、T13、评测的三个测试文件，加上改了配置的跨供应商回退和补丁头两个：196 passed。76 个栈（60 个测试）：72 个 verify 以 0 退出，1 个和标注一致（T5 那个审批之后改了 payload 的，照设计以 1 退出），0 个失败，3 个照设计没验（agentd 不启动）。
+
+#### 两份审查和两处黑盒失败之后的修订（da72588 之上）
+
+- **两处黑盒失败**（bwrap 套件在 da72588 上）：`test_write_limits.py` 的两个上限测试都拿到三个 ok，不是 `["ok","denied","denied"]` / `["ok","ok","denied"]`。原因：`rogue_workflows.ManyReports` 只改 `outcome`，而 outcome 不再进 effect 的身份，所以三个调用是同一个 effect，一条评论、每个都 ok。
+  - 改法：ManyReports 现在发三个评论认得出的报告（done；workflow_error + KeyError；workflow_error + ValueError），两个上限测试又测到上限了。docstring 跟着改。
+  - 加了 `SameReportThrice` 和 `test_reports_the_comment_does_not_tell_apart_are_one`：三个只差评论不显示的东西（outcome、pr_url、报告不写名字的 error_type）的报告是一个 effect，一条评论，每个都 ok，同一个标记。
+  - 搜了 tests/，只有 ManyReports 这一处靠改不显示的参数来再发报告。
+- **安全审查（全是低危和 nit）**：
+  - **N1**：不给 reason 和 `reason: done` 渲染出一样的评论，却得到不同的标记。`Identity` 里把没给的 reason 当成 done。加了 `TestAReportPostsNothingAWorkerChose` 的一条端到端断言和 githubtool 单元测试的一条。
+  - **L3**：`pausedBefore` 原来拿上一个调用的结束时间（审计记录的 At，agentd 的账本时钟）和下一个调用的 `scheduled_at`（Temporal 的时钟）比。两台主机的时钟有偏差时，短于偏差的重叠会被当成前后相继。改成两头都用 agentd 自己的时钟：上一个调用最后一条记录的 At，和下一个调用的 `created_at`（agentd 第一次数到它的时间）。加了 `TestResumeReadsOneClock`：调度时间看起来前后相继、agentd 的时间看起来重叠时，按 agentd 的时间判。夹具现在给调用写 created_at（= 它的调度时间），给结束的活动写 call 记录。
+  - **L1**：升级后，一个按旧 ID 记下、PENDING、没被认领、`maybe_sent == 0` 的 legacy effect，原来会拿旧 agentd 存的 payload 直接发，不重新渲染；#54 之前那个 payload 可能带着编造的调用名。改法：这样的 effect 直接作废（`unsent` + ABANDONED，不算进上限），在身份 ID 下重记一个，让当前代码重新渲染；只有可能已经发出去的（被认领，或 `maybe_sent != 0`）才还走 legacy 那条路，靠旧标记的 Find 防止发第二条。`TestAReportsEffectRecordedBeforeItsIdentity` 拆成两种：没发出去的（作废 + 重渲染，两个 effect，身份 ID 的标记）、可能发出去的（沿用 legacy，旧标记）。
+  - **L2（措辞）**：`diff_ref` 收的是运行自己的任何一个 blob（diff、被接受的答复、补丁、审批人改过的补丁），都不是 Worker 写的，但文档原来说“它的 diff，由 commit 定下”。README、notes、配置注释都改成：`_ref` 指运行的哪个 blob 由工作流选，但都是运行自己产出的。预算数字的说法也跟着改：请求大小跟着“指的是哪个 blob、前面调了几次”走，还是几个位。
+- **一直就有的，只记为剩余风险**：草稿 PR 的分支名带补丁哈希的 8 个十六进制字符（`githubtool/pr.go:136`）。Worker 选运行的哪个 blob 当 patch_ref，所以这是几个位，而且在一个人批准之后才发生。加进下面的剩余风险清单。
+- **改坏**：5 处都有测试失败：没给的 reason 不当成 done；给了的 reason 不保留（N1 两处）；重叠按调度时间（Temporal 的时钟）判（L3）；没发出去的 legacy effect 照旧沿用、不重渲染；可能发出去的也被作废（L1 两处）。
+- **跑过的**：`gofmt -l`、`go vet ./...` 没输出，`go test ./...` 25 个包全过。`make build` 之后，黑盒不加沙箱，带 `--verify-after-each`，跑了 test_write_limits.py（两个上限测试和新加的那个）、T5、T6、T7、T12、T13：44 passed。44 个栈：41 个 verify 以 0 退出，1 个和标注一致（T5 审批之后改 payload 那个，照设计以 1 退出），0 个失败，2 个照设计没验（agentd 不启动）。
+
+#### 剩余风险（这个 PR 之后）
+
+- 被攻破的 Worker 在报告里还能决定的：reason 和 51 个名字之一（或不给）；调用任务的哪些步骤、顺序、各自怎么结束（判定、kind、点名的步、几个计数、几个位）；什么时候报告；一个运行一个报告（除非策略放宽 max_per_run）。
+- 预算数字：请求大小跟着调用指运行的哪个 blob、前面调了几次走，几个位。
+- 草稿 PR 的分支名带 patch_ref 所指 blob 的哈希的 8 个十六进制字符；Worker 选哪个 blob，几个位，在人批准之后。
+- 升级要先把在途的报告 effect 放干：#54 之后、这个 PR 之前记下而没做完、可能已发出去的报告 effect，升级后沿用旧标记（不会发第二条），但它的 payload 是旧 agentd 渲染的。没发出去的会重新渲染，没有这个问题。

@@ -119,13 +119,12 @@ func (t *CommentCommit) Settle() time.Duration { return t.Client.settle() }
 // error type when the report names it. The rest the workflow sends changes nothing the comment
 // shows: an older Worker's outcome and its pr_url are taken and not shown, and report_ref is
 // refused unless it is the run's latest accepted answer of the model task, which the comment shows
-// whatever the workflow sends.
+// whatever the workflow sends. A missing reason reports as done (Prepare reads it so), and is the
+// same effect.
 func (t *CommentCommit) Identity(args map[string]any) map[string]any {
-	id := map[string]any{}
-	for _, k := range []string{"repo", "commit", "reason"} {
-		if v, ok := args[k]; ok {
-			id[k] = v
-		}
+	id := map[string]any{"repo": args["repo"], "commit": args["commit"], "reason": "done"}
+	if r := tools.String(args, "reason"); r != "" {
+		id["reason"] = r
 	}
 	if name := tools.String(args, "error_type"); name != "" && t.Verdicts.NamesErrorType(name) {
 		id["error_type"] = name

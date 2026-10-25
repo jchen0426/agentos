@@ -20,8 +20,10 @@ tasks:
     max_tokens: 16000                      # bounds the budget reservation of every request
     # The task's arguments, all required: each a blob of the run's own (<name>_ref), its section
     # of the prompt. The gateway refuses a call with any other argument before anything is sent:
-    # the model's answer is the run's public report. A plain input (text, a number) would need a
-    # type that bounds it, which agentd does not have yet.
+    # the model's answer is the run's public report. A _ref may name any blob the run produced, not
+    # only the one its name suggests (the workflow chooses which, the run's own, never the Worker's
+    # to write). A plain input (text, a number) would need a type that bounds it, which agentd does
+    # not have yet.
     inputs: [diff_ref]
     effort: high
     prompt: prompts/audit_v1/claude.md     # prompts may differ per model; the version is recorded per call

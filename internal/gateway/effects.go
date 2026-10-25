@@ -153,15 +153,25 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 	rule *approvalRule, req tools.Request, canon []byte, fx faults.Effect) (*agentosv1.Result, error) {
 	e, err := g.Ledger.Q.GetEffect(ctx, req.EffectID)
 	if _, named := t.(tools.Identifier); named && errors.Is(err, sql.ErrNoRows) {
-		// An agentd from before the tool named its effect by some arguments only named it by all of
-		// them. A call whose effect it recorded, and left unfinished, goes on with that effect (its
-		// payload, its marker): not with a second one, which the effect cap would refuse, or would
-		// send.
+		// An agentd from before the tool named its effect by every argument now named it by some only.
+		// A call whose effect that agentd recorded, and left unfinished, is found by the old ID.
 		if legacy := sha256Hex([]byte(run.WorkflowID), []byte(t.Name()), canon); legacy != req.EffectID {
-			if old, oerr := g.Ledger.Q.GetEffect(ctx, legacy); oerr == nil {
-				e, err, req.EffectID = old, nil, legacy
-			} else if !errors.Is(oerr, sql.ErrNoRows) {
+			switch old, oerr := g.Ledger.Q.GetEffect(ctx, legacy); {
+			case errors.Is(oerr, sql.ErrNoRows):
+			case oerr != nil:
 				return nil, oerr
+			case old.Status == effectPending && !old.ClaimedBy.Valid && old.MaybeSent == 0:
+				// Nothing of it went out, and its payload was rendered by that older agentd, which could
+				// put in it what current code keeps out of a report. Abandon it (ABANDONED does not count
+				// toward the cap) and record a fresh effect under the identity ID, rendered by current
+				// code. Its marker is the identity ID, and nothing with the old marker is out to clash.
+				if _, serr := g.unsent(ctx, old, effectAbandoned, "re-rendered after an upgrade changed the effect's identity"); serr != nil {
+					return nil, serr
+				}
+			default:
+				// It may have gone out (claimed, or an attempt may have sent it): a comment of it carries
+				// the old marker, so the call goes on with that effect rather than post a second one.
+				e, err, req.EffectID = old, nil, legacy
 			}
 		}
 	}

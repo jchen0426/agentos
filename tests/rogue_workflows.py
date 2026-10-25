@@ -40,14 +40,36 @@ class IgnoresCancel(SecurityAudit):
 
 @workflow.defn(name="security-audit")
 class ManyReports(SecurityAudit):
-    """Posts three reports on the commit, each a little different, so each is a new effect."""
+    """Posts three reports on the commit that the comment tells apart (why it reports, and the error
+    type the report names), so each is a new effect."""
+
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        statuses = []
+        for why in ({"reason": "done"}, {"reason": "workflow_error", "error_type": "KeyError"},
+                    {"reason": "workflow_error", "error_type": "ValueError"}):
+            status, _ = await self.call("tool", "github.comment_commit", repo=a.repo, commit=a.commit,
+                                        report_ref=None, **why)
+            statuses.append(status)
+        return {"statuses": statuses}
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+
+@workflow.defn(name="security-audit")
+class SameReportThrice(SecurityAudit):
+    """Posts three reports that differ only in what the comment does not show: an older Worker's
+    outcome, pr_url, and an error type the report does not name. They are one effect."""
 
     @workflow.run
     async def run(self, a: AuditInput) -> dict:
         statuses = []
         for i in range(3):
             status, _ = await self.call("tool", "github.comment_commit", repo=a.repo, commit=a.commit,
-                                        outcome=f"report {i}", report_ref=None, pr_url=None)
+                                        reason="workflow_error", error_type=f"Unnamed{i}", outcome=f"report {i}",
+                                        pr_url=f"https://example.invalid/{i}", report_ref=None)
             statuses.append(status)
         return {"statuses": statuses}
 
