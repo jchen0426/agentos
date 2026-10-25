@@ -14,17 +14,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"golang.org/x/sys/unix"
 
 	"github.com/jchen0426/agentos/internal/faults"
 	"github.com/jchen0426/agentos/internal/gitenv"
+	"github.com/jchen0426/agentos/internal/statedir"
 )
 
 // Client runs the git MCP server once per call, inside the sandbox its launcher builds, and
@@ -36,7 +35,6 @@ type Client struct {
 	deny    string // Options.DenyRead, as JSON
 	timeout time.Duration
 	log     *slog.Logger
-	prefix  string        // of this process's per-call directories in stateRoot
 	slots   chan struct{} // servers running at once
 }
 
@@ -70,12 +68,12 @@ const maxValues = 1000
 // report (Reason). The server's own are far shorter.
 const maxToolError = 4 << 10
 
-// stateRoot holds the per-call state directories, /tmp/agentos-tools.<pid>.<random>, each made
-// afresh (mode 0700, a name nobody could take first) and removed when its call ends. There is
-// no lasting directory for macOS's tmp_cleaner to remove when it is idle, or for another user
-// to plant in its place. sandbox-runtime, like the Worker's launcher, keeps its state under
-// /tmp.
-const stateRoot = "/tmp"
+// stateRoot holds the per-call state directories, /tmp/agentos-tools.<pid>.<random> (statedir).
+// sandbox-runtime, like the Worker's launcher, keeps its state under /tmp.
+const stateRoot = statedir.Root
+
+// stateKind names this package's state directories.
+const stateKind = "agentos-tools"
 
 // slotWait bounds the wait for a free slot; the Invoke activity heartbeats meanwhile.
 const slotWait = 2 * time.Minute
@@ -83,7 +81,7 @@ const slotWait = 2 * time.Minute
 // NewClient makes a client, and removes the state directories that agentd processes no longer
 // running left behind (one killed mid-call cannot clean up).
 func NewClient(o Options) (*Client, error) {
-	sweepStale()
+	statedir.Sweep(stateKind)
 	deny, err := json.Marshal(o.DenyRead)
 	if err != nil {
 		return nil, err
@@ -93,7 +91,7 @@ func NewClient(o Options) (*Client, error) {
 		n = 4
 	}
 	return &Client{server: o.Server, sandbox: o.Sandbox, deny: string(deny), timeout: o.Timeout, log: o.Log,
-		prefix: fmt.Sprintf("agentos-tools.%d.", os.Getpid()), slots: make(chan struct{}, n)}, nil
+		slots: make(chan struct{}, n)}, nil
 }
 
 // WithOwnSlots is a client like c whose calls take n slots of their own (4 when n is not
@@ -105,63 +103,6 @@ func (c *Client) WithOwnSlots(n int) *Client {
 	d := *c
 	d.slots = make(chan struct{}, n)
 	return &d
-}
-
-// sweepStale removes the state directories of agentd processes that no longer run: real
-// directories of this user's only, whatever else /tmp holds under such a name.
-func sweepStale() {
-	dirs, _ := filepath.Glob(filepath.Join(stateRoot, "agentos-tools.*"))
-	for _, d := range dirs {
-		parts := strings.SplitN(filepath.Base(d), ".", 3) // agentos-tools, <pid>, <random>
-		if len(parts) < 2 {
-			continue
-		}
-		pid, err := strconv.Atoi(parts[1])
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		fi, err := os.Lstat(d)
-		if err != nil || !fi.IsDir() {
-			continue
-		}
-		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
-			continue
-		}
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			removeAll(d)
-		}
-	}
-}
-
-// removeAll removes a call's directory. When that fails, the server may have taken the
-// permissions off part of it (a subverted one could, to leave its files behind; os.RemoveAll
-// changes no modes): the owner gets them back, and the directory goes.
-func removeAll(dir string) {
-	if os.RemoveAll(dir) == nil {
-		return
-	}
-	unlock(unix.AT_FDCWD, dir)
-	_ = os.RemoveAll(dir)
-}
-
-// unlock gives the owner rwx on the directory name in parent and every directory below it,
-// through file descriptors and never through a symbolic link: a server still running (one that
-// left the process group) could swap a directory for a link to one of the user's. On Linux
-// this needs fchmodat2 (Linux 6.6); there the sandbox never mounts the call's directory anyway.
-func unlock(parent int, name string) {
-	_ = unix.Fchmodat(parent, name, 0o700, unix.AT_SYMLINK_NOFOLLOW)
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return // gone, or not a directory (any more)
-	}
-	f := os.NewFile(uintptr(fd), name)
-	defer f.Close()
-	entries, _ := f.ReadDir(-1)
-	for _, e := range entries {
-		if e.IsDir() {
-			unlock(fd, e.Name())
-		}
-	}
 }
 
 // ToolError is the server's refusal: git failed on what it was given.
@@ -327,11 +268,11 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 	defer cancel()
 	// A directory of this call's own, removed afterwards however the server ends: the
 	// launcher keeps its state there, and an unsandboxed server its temporary files.
-	state, err := os.MkdirTemp(stateRoot, c.prefix)
+	state, err := statedir.Make(stateKind)
 	if err != nil {
 		return err
 	}
-	defer removeAll(state)
+	defer statedir.Remove(state)
 	argv := []string{c.server, "--mirror", mirror}
 	if len(c.sandbox) > 0 {
 		argv = append(append(slices.Clone(c.sandbox), mirror, "--"), argv...)
@@ -343,8 +284,10 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 		"LANG=C.UTF-8", "AGENTOS_SANDBOX_STATE=" + state, "AGENTOS_SANDBOX_DENY_READ=" + c.deny}
 	// The launcher and everything it starts form a process group, killed whole: on a timeout
 	// the server goes too, not just its launcher. (A process that starts a session of its own
-	// escapes this; on Linux bwrap's --die-with-parent still ends it.)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// escapes this; on Linux bwrap's --die-with-parent still ends it.) The group is a session's
+	// too, which has no controlling terminal: sandbox-runtime lets what it runs ioctl /dev/tty,
+	// so on the terminal agentd runs on, a subverted server could type into it (TIOCSTI).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second // a straggler holding the pipes open does not hold agentd
 	stderr := &limitedBuffer{max: 16 << 10}
@@ -413,11 +356,11 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 // user namespaces, a temporary directory the server cannot write), or a server without a tool
 // agentd uses, stops agentd instead of failing every run.
 func (c *Client) SelfCheck(ctx context.Context) error {
-	dir, err := os.MkdirTemp(stateRoot, c.prefix)
+	dir, err := statedir.Make(stateKind)
 	if err != nil {
 		return err
 	}
-	defer removeAll(dir)
+	defer statedir.Remove(dir)
 	git := func(args ...string) ([]byte, error) {
 		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 		cmd.Env = gitenv.Environ("GIT_AUTHOR_NAME=agentos", "GIT_AUTHOR_EMAIL=agentos@agentos.invalid",

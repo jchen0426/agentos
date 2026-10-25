@@ -1078,6 +1078,32 @@ func TestVerifyAuditOfTheAttemptsRecords(t *testing.T) {
 	}
 }
 
+// A Worker's exit that agentd did not cause (worker.exited, agentd's own record) is not a start of
+// agentd: it cuts no attempt short, and verify finds nothing in it to compare, and nothing wrong.
+func TestVerifyAuditOfTheWorkersExits(t *testing.T) {
+	f := newVerifyFixture(t)
+	run := f.run(t, 0)
+	wf, allow := run.GetRunId(), map[string]any{"decision": "allow"}
+	exited := func() {
+		t.Helper()
+		if _, err := audit.Record(context.Background(), f.s.Ledger, audit.Event{Type: "worker.exited", Actor: audit.Agentd,
+			Payload: map[string]any{"generation": 2, "pid": 4242, "signal": "killed", "ran_ms": 1500, "ready": true,
+				"exited_at": "2026-10-25T12:00:00Z", "restart_in_ms": 2000, "unrecorded": 3}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exited()
+	h := f.record(t, wf, "call.started", map[string]any{"activity_id": "1:x", "attempt": 1, "policy": allow})
+	exited()
+	f.record(t, wf, "call", map[string]any{"activity_id": "1:x", "attempt": 1, "status": "ok", "policy": allow, "started_seq": h.Seq})
+	exited()
+	rep := f.verify(t)
+	if got := callMismatches(rep); len(got) > 0 || len(rep.GetAttemptsCutShort()) != 0 || len(rep.GetStateMismatched()) != 0 ||
+		rep.GetBrokenAtSeq() != 0 || len(rep.GetAnchorsMismatched()) != 0 {
+		t.Fatalf("report %v", rep)
+	}
+}
+
 // Every table of the ledger is one VerifyAudit compares with the records, or one it names as
 // unchecked with why: a table added without either shows here.
 func TestEveryTableIsCheckedOrNamed(t *testing.T) {

@@ -40,13 +40,14 @@ wake their run through a doorbell outbox, which survives a crash ([docs/m4-notes
 | `internal/models`, `internal/secrets` | model routing (`config/models.yaml`), the Claude, OpenAI-compatible and fake adapters; keys from the OS keyring |
 | `config/prompts`, `config/schemas` | each model task's prompt and output schema |
 | `internal/runtimeproxy` | the Worker's only way to Temporal; an allowlist of WorkflowService methods |
+| `internal/supervisor`, `internal/statedir` | how agentd runs the Worker: its launcher, its restarts, its stop, its output, its records, the sweep of one a killed agentd left; the sandboxes' state directories |
 | `internal/control` | the Control service on the 0700 control socket, which records the uid of each caller |
 | `internal/audit` | agentd's hash-chained audit log: each policy decision, side effect and approval, with who made it |
 | `internal/explain` | why a run is where it is: its history in Temporal read with the ledger, for `agentctl runs explain` and the run's report |
 | `internal/ledger` | SQLite ledgers (goose migrations, sqlc queries) |
 | `python/agentos_worker` | the Worker and the `security-audit` workflow |
 | `sandbox/linux`, `sandbox/macos` | bubblewrap and sandbox-runtime launchers for the Worker (`run-worker.sh`) and the git tool server (`run-tool.sh`) |
-| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand) and its export (every hash recomputed, every anchor checked against the exported history), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T12 (`runs explain` names the step and the cause of a tool error, a model refusal, a policy denial, a budget run out, a Worker and agentd killed, the git tool server killed in each of the three steps that run it, the workflow's own code failing (on a call's result, on its report's, or with an exception of its own), a reviewer's edit the patch check refuses, an attempt that ends after the next, and a stuck run; each run's report says the same), T13 (the model APIs map 429s, 5xx, cut-off answers, refusals and broken output alike, and `runs explain` concludes alike), T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement, model patches whose hunk headers are wrong |
+| `tests/` | black-box tests: T1 (Worker and agentd kills), T2 (lookup recovery), the audit log (its chain, its anchors in Temporal's history, a ledger changed by hand) and its export (every hash recomputed, every anchor checked against the exported history), T3 (reconciliation), T4 (an approval across restarts of agentd and Temporal, and its expiry), T5 (the payload binding, edits), T6 (two decisions at once), T7 (concurrent calls against one budget), T8, T10, T12 (`runs explain` names the step and the cause of a tool error, a model refusal, a policy denial, a budget run out, a Worker and agentd killed, the git tool server killed in each of the three steps that run it, the workflow's own code failing (on a call's result, on its report's, or with an exception of its own), a reviewer's edit the patch check refuses, an attempt that ends after the next, and a stuck run; each run's report says the same), T13 (the model APIs map 429s, 5xx, cut-off answers, refusals and broken output alike, and `runs explain` concludes alike), T14 (a doorbell that agentd never delivered), T15 (cancel, then restart), T16 (one sender per effect), agentd's own Worker (started before agentd is ready, restarted with a growing delay, stopped first, never two after a kill -9 of agentd, no terminal for it or the git tool server), dry runs, the replay gate, the Worker's and the git tool server's sandbox probes, mTLS, gateway identity, agentd restart, cancel and its enforcement, model patches whose hunk headers are wrong |
 | `evals/`, `docs/eval/` | the first task's evaluation: the case set, its mirrors, the runner, the scoring and the per-model report (`python -m evals`); the reports |
 | `vm/lima/agentos.yaml` | the Linux VM for the bubblewrap side |
 
@@ -106,8 +107,26 @@ sandbox-runtime: run `npm ci` in `sandbox/macos` once):
 bin/agentd --config config/dev/agentd.yaml
 ```
 
-Without a sandbox for the git tool server, agentd refuses to start; `--insecure-dev` runs the
-server unsandboxed, for development only, and says so at every start.
+agentd starts the Worker itself, once its Runtime entry serves, in the sandbox its config's
+`worker` section names (below). The dev configs run it under `sandbox/macos/run-worker.sh`, with
+`.venv` as its Python environment and `python` as its code directory: that needs `npm ci` in
+`sandbox/macos`, and a Python outside the home directory, which the sandbox cannot read
+(`.venv/bin/python` must lead there: python.org's or Homebrew's, not one uv downloaded into the home
+directory). Without a sandbox for the git tool server or for the Worker, agentd refuses to start;
+`--insecure-dev` runs either unsandboxed when its `sandbox` is unset, for development only, and says
+so at every start. An unsandboxed Worker runs as you, and could read a key from the keychain: agentd
+refuses to start its own without a sandbox while its configuration names a real secret (a `keyring:`
+key in models.yaml, `github.token`, or the Temporal client key, with which a Worker could reach
+Temporal as agentd, past the Runtime proxy), and says which. That guards against a mistake; it contains
+nothing: an unsandboxed Worker can read whatever you can, secrets no configuration names too.
+`--no-worker` is the old flow, and the way out then: agentd starts no Worker, and you run one yourself
+(below).
+
+```bash
+bin/agentd --no-worker --config config/dev/agentd.yaml
+```
+
+That Worker runs unsandboxed, for development only (a sandboxed one by hand: see "The Worker" below):
 
 ```bash
 uv run python -m agentos_worker --endpoint 127.0.0.1:7244
@@ -422,20 +441,81 @@ A run that runs out of budget waits in `PAUSED_BUDGET`. Raise its limit and it c
 bin/agentctl budget extend <run-id> --usd 2.50
 ```
 
-That Worker runs unsandboxed, for development only. Sandboxed, it starts through
-`sandbox/macos/run-worker.sh` (macOS) or `sandbox/linux/run-worker.sh` (Linux), with `python`
-as its code directory; see the headers of those scripts. A sandboxed Worker can read all of its
-code directory and Python environment, so a launcher refuses either if it holds dev data
-(agentd's ledger, a `.agentos` directory, Temporal's database), a FIFO, or on Linux a Unix socket
-(a read-only mount does not stop `connect()`). On macOS the sandbox can also read everything
-outside the home directory and the shared temporary directories (`/tmp`, `/var/tmp`,
-`/var/folders`): keep
-agentd's data and the mirrors under the home directory, or list them in
-`AGENTOS_SANDBOX_DENY_READ`, a JSON array of paths.
+### The Worker
+
+agentd starts the Worker once its Runtime entry serves, and starts it again whenever it exits,
+however it exits: after 1 s, then twice as long each time, up to 60 s, and from 1 s again after a
+Worker that was up a minute. It never gives up, so that the Control socket keeps working and you can
+cancel the run that makes it crash. It has no liveness probe: a Worker that hangs, or that someone
+stopped (`kill -STOP`, as T1 does), is left as it is. The first Worker must say it is ready within
+60 s, before agentd says it is; otherwise agentd stops, and its error quotes the Worker's last lines.
+On SIGTERM or Ctrl-C agentd stops the Worker first, before it closes the Runtime entry: no more
+restarts, and the Worker is asked to stop through its stdin, a pipe whose write end only agentd holds
+(`--stop-on-stdin-eof`). It finishes the workflow tasks it holds and reports them, and exits, on every
+platform. One that does not within 5 s gets SIGTERM, then SIGKILL for its whole process group. A signal
+could not ask it: srt drops the connections it proxies, the Worker's included, before it passes
+SIGTERM on, and bwrap dies of SIGTERM, the sandbox with it. The pipe also ends when agentd dies, however
+it ends: an honest Worker then stops by itself. The delays start over after a Worker that was up a
+minute counted from its start, not from its readiness. agentd's log has each start (its generation,
+pid, argv and environment), each readiness and each exit (its status, how long it ran, the next delay,
+its last lines), and the Worker's own output, escaped, at most 2 KiB a line and 20 lines a second, with
+a count of the rest. The Worker's environment is agentd's own making, from scratch (agentd's own `PATH`
+and `HOME`, `LANG`, and the `AGENTOS_SANDBOX_*` variables below), so the log of it holds no secret: a
+Worker never gets one. Each exit agentd did not cause is also an audit record (`worker.exited`: its
+generation, pid, exit code or signal, how long it ran, whether it was ready, the next delay): an exit
+within a minute of the last record is held, and the next record, when the minute is up or agentd
+stops, describes the latest and counts the others (`unrecorded`). A `dropped` in one counts earlier
+`worker.exited` records the audit log lost. `audit verify` and `runs explain` read past these records;
+`agentd.started` names the Worker's launcher, code directory, workflows and limits (none yet).
+
+```yaml
+worker:
+  sandbox: [../../sandbox/macos/run-worker.sh]  # or ../../sandbox/linux/run-worker.sh; --insecure-dev runs without
+  python: ../../.venv                           # its Python environment: bin/python runs it
+  code: ../../python                            # its working directory, where it imports from
+  workflows: agentos_worker.workflows:WORKFLOWS # the default
+  deny_read: []                                 # macOS: more paths its sandbox may not read
+```
+
+A sandboxed Worker can read all of its code directory and Python environment: agentd refuses
+either if it holds its data directory, either socket's directory, the Temporal client certificate or
+key, or a mirror, and the launchers refuse either if it holds dev data (agentd's ledger, a `.agentos`
+directory, Temporal's database), a FIFO, or on Linux a Unix socket (a read-only mount does not stop
+`connect()`). agentd also refuses a Runtime entry the launcher cannot hand the Worker: on macOS
+`tcp://127.0.0.1:<port>`, the one destination its sandbox lets through; on Linux `unix://<path>`, in a
+directory of its own, which the sandbox mounts. On macOS it refuses a Python environment whose
+`bin/python` leads into the home directory (uv's own Pythons are there), which the sandbox cannot read. On macOS the sandbox can also read everything outside
+the home directory and the shared temporary directories (`/tmp`, `/var/tmp`, `/var/folders`): keep
+agentd's data and the mirrors under the home directory, or list them in `deny_read`. The Worker runs at
+most 100 workflow tasks at once, and so at most 100 threads of them.
+
+A Worker whose agentd was killed stops by itself (its stdin ends). If it does not: Linux ends the
+sandbox with agentd (bwrap's `--die-with-parent`); macOS has no such thing, so agentd gives the macOS
+launcher a lifeline, a pipe whose end only agentd holds, and the launcher kills the Worker when agentd
+is gone, however it ended; a Worker that outlived a killed agentd would reach the next one on the same
+port. agentd also records the running Worker's launcher, with when it started,
+in `worker.pid` in its data directory, and the next agentd on that data directory stops it once it
+holds the directory's lock, before it listens. These clean up after an honest Worker, not a
+subverted one: on macOS a subverted Worker can fork a child that leaves its process group (`setsid`, a
+double fork), which neither the lifeline nor the sweep reaches; still sandboxed, it could reach the
+next agentd's Runtime port. A Worker that could not fork (`ulimit -u`, M5 C3b), or a credential for
+each Worker at the Runtime entry, would close that. Each macOS launch keeps its state (srt's settings
+and sockets, the Worker's private directory) in `/tmp/agentos-worker.<agentd's pid>.*`, which agentd
+removes once the launch is gone, and the next agentd sweeps when agentd was killed. A file the Worker
+pinned there with the `uchg` flag stays, unreadable to every Worker.
+
+Neither the Worker nor the git tool server has a controlling terminal, whatever agentd's: agentd starts
+each in a session of its own. sandbox-runtime lets what it runs ioctl `/dev/tty`, and a Worker on your
+terminal could type into it (TIOCSTI), so the macOS launcher refuses to run with one. To run a Worker
+by hand (`--no-worker`), give it a session of its own, and nothing to read from your terminal; `perl`
+forks one and passes Ctrl-C on:
 
 ```bash
-sandbox/macos/run-worker.sh 7244 "$PWD/.venv" "$PWD/python" -- "$PWD/.venv/bin/python" -m agentos_worker --endpoint 127.0.0.1:7244 --http-connect-proxy env
+perl -MPOSIX -e '$p = fork // die "fork: $!"; unless ($p) { setsid; exec @ARGV; die "exec: $!" } $SIG{$_} = sub { kill TERM => $p } for qw(INT TERM HUP); 1 while waitpid($p, 0) < 0 && $!{EINTR}; exit $? >> 8' \
+  sandbox/macos/run-worker.sh 7244 "$PWD/.venv" "$PWD/python" -- "$PWD/.venv/bin/python" -m agentos_worker --endpoint 127.0.0.1:7244 --http-connect-proxy env </dev/null
 ```
+
+See the headers of `sandbox/macos/run-worker.sh` and `sandbox/linux/run-worker.sh`.
 
 ## Tests
 

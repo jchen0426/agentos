@@ -7,6 +7,9 @@ depends on how agentd is implemented.
 Environment:
   AGENTOS_SANDBOX  none (default), bwrap (Linux) or srt (macOS): how Workers are launched
   AGENTOS_BIN      directory with the agentd, agentctl and githubsim binaries (default: bin/)
+
+Most tests start their Workers themselves, and agentd with --no-worker; start_agentd(worker=True)
+has agentd start and supervise its own (stack.worker()).
 """
 
 from __future__ import annotations
@@ -119,8 +122,14 @@ def in_keychain(service: str) -> bool:
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               env={"PATH": "/usr/bin:/bin", "HOME": home}).returncode == 0
 
-# How agentd launches the git tool server in each sandbox mode.
+# How agentd launches the git tool server, and its own Worker, in each sandbox mode.
 TOOL_LAUNCHER = {"srt": REPO / "sandbox/macos/run-tool.sh", "bwrap": REPO / "sandbox/linux/run-tool.sh"}
+WORKER_LAUNCHER = {"srt": REPO / "sandbox/macos/run-worker.sh", "bwrap": REPO / "sandbox/linux/run-worker.sh"}
+DEFAULT_QUEUE = "agentos-workflows"  # the Worker's task queue, unless a stack's agentd runs its own
+
+# Runs its arguments with the terminal on its stdin as its controlling terminal: started in a
+# session of its own, as a shell on a terminal starts a session, then exec'd into the command.
+CTTY_EXEC = "import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])"
 
 # AGENTOS_MODEL=claude, openai or local sends the model task to a real model: Claude, OpenAI's
 # gpt-6.1-sol, or gpt-oss:20b on the Ollama server on this machine (README), with the real
@@ -279,14 +288,27 @@ def command_of(pid: int) -> str:
 
 
 class Proc:
-    """A child process with its output in a log file."""
+    """A child process with its output in a log file. With terminal, a pseudo-terminal is its
+    controlling terminal, as a terminal is a command's that a person starts in a shell; else stdin
+    is the file descriptor given, or this process's own."""
 
     def __init__(self, name: str, args: list[str], log: Path, env: dict[str, str] | None = None,
-                 cwd: Path | None = None, pass_fds: tuple[int, ...] = ()) -> None:
+                 cwd: Path | None = None, pass_fds: tuple[int, ...] = (), terminal: bool = False,
+                 stdin: int | None = None) -> None:
         self.name, self.log = name, log
         self._out = open(log, "w")
-        self.popen = subprocess.Popen([str(a) for a in args], stdout=self._out, stderr=subprocess.STDOUT,
-                                      env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
+        self._pty: int | None = None
+        tty = None
+        if terminal:
+            self._pty, tty = os.openpty()
+            stdin = tty
+            args = [sys.executable, "-c", CTTY_EXEC, *args]
+        try:
+            self.popen = subprocess.Popen([str(a) for a in args], stdin=stdin, stdout=self._out, stderr=subprocess.STDOUT,
+                                          env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
+        finally:
+            if tty is not None:
+                os.close(tty)  # the child has it; the terminal stays while _pty, its other end, is open
 
     def text(self) -> str:
         return self.log.read_text(errors="replace")
@@ -323,6 +345,9 @@ class Proc:
                 self.kill()
         self.signal_all(signal.SIGKILL)  # anything left behind, e.g. socat in a sandbox
         self._out.close()
+        if self._pty is not None:  # closed while the process runs, its terminal would hang up on it
+            os.close(self._pty)
+            self._pty = None
 
 
 class Worker(Proc):
@@ -338,6 +363,55 @@ class Worker(Proc):
     def pause(self) -> None:
         """SIGSTOP: the Worker keeps its connection and its outstanding polls, but does nothing."""
         os.kill(self.worker_pid(), signal.SIGSTOP)
+
+
+class SupervisedWorker:
+    """The Worker the stack's agentd runs itself (start_agentd(worker=True)), a generation after
+    another, as the current agentd's log tells of it."""
+
+    def __init__(self, stack: Stack) -> None:
+        self.stack = stack
+
+    def log(self, msg: str | None = None) -> list[dict]:
+        """The current agentd's log of its Worker, or the entries with msg."""
+        assert self.stack.agentd is not None
+        out = []
+        for line in self.stack.agentd.text().splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("component") == "worker" and (msg is None or e.get("msg") == msg):
+                out.append(e)
+        return out
+
+    def wait_ready(self, generation: int, timeout: float = 90) -> int:
+        """The Python process of generation, once agentd says it is ready."""
+        wait_for(lambda: any(e.get("generation") == generation for e in self.log("worker ready")),
+                 f"the Worker's generation {generation}", timeout=timeout)
+        return self.pid()
+
+    def pid(self) -> int:
+        """The running generation's Python process, under its launcher (bwrap, srt) under agentd."""
+        assert self.stack.agentd is not None
+        for pid in descendants(self.stack.agentd.popen.pid):
+            argv = command_of(pid).split()
+            # macOS framework builds re-exec as .../Python.app/Contents/MacOS/Python.
+            if argv and Path(argv[0]).name.lower().startswith("python") and "agentos_worker" in argv:
+                return pid
+        raise AssertionError(f"no Worker under agentd {self.stack.agentd.popen.pid}")
+
+    def pause(self) -> None:
+        """SIGSTOP: the Worker keeps its connection and its outstanding polls, but does nothing."""
+        os.kill(self.pid(), signal.SIGSTOP)
+
+    def kill(self) -> None:
+        """kill -9 the Python Worker: its launcher ends with it."""
+        os.kill(self.pid(), signal.SIGKILL)
+
+    def output(self) -> list[str]:
+        """The Worker's output lines that agentd logged."""
+        return [e["line"] for e in self.log("worker output")]
 
 
 def make_mirror(path: Path, live_repo: str = "") -> str:
@@ -392,6 +466,11 @@ class Stack:
         self.procs: list[Proc] = []
         self.workers: list[Worker] = []
         self.agentd: Proc | None = None
+        # agentd's own Worker (start_agentd(worker=True)) polls a queue of the stack's own, which
+        # tells its processes from any other's, wherever they run.
+        self.supervised = False
+        self.workflow_queue = DEFAULT_QUEUE
+        self._agentd_terminal = False
         self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
         # Temporal keeps these open, and with them any lock on them: the evaluation's state
         # directory stays locked while the Temporal a killed runner left behind still runs. Not
@@ -541,15 +620,30 @@ class Stack:
             return f"unix://{self.runtime_socket}"
         return f"tcp://127.0.0.1:{self.runtime_port}"
 
+    def worker_config(self, workflows: str | None = None) -> dict:
+        """The worker section of agentd.yaml: the launcher for AGENTOS_SANDBOX (none for none,
+        with --insecure-dev), this Python environment and the repository as its code directory, as
+        the harness's own Workers have them, and the same paths denied."""
+        w: dict = {"python": sys.prefix, "code": str(REPO), "deny_read": [str(p) for p in [self.tmp, *self.deny_read]]}
+        if SANDBOX in WORKER_LAUNCHER:
+            w["sandbox"] = [str(WORKER_LAUNCHER[SANDBOX])]
+        if workflows:
+            w["workflows"] = workflows
+        return w
+
     def start_agentd(self, faults: list[dict] | None = None, policy: str = TEST_POLICY,
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
                      test_tools: bool = False, run_id_delay: str | None = None,
-                     hold_doorbells: Path | None = None, repos: dict | None = None) -> Proc:
+                     hold_doorbells: Path | None = None, repos: dict | None = None,
+                     worker: bool = False, workflows: str | None = None, terminal: bool = False) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
         exists, agentd delivers no doorbell: they wait in its outbox. `repos` replaces the
         fixture's acme/payments; a stack without the fixture has no GitHub section at all, so
-        the GitHub tools only dry-run."""
+        the GitHub tools only dry-run. With `worker`, agentd starts and supervises the Worker
+        itself, serving `workflows` (stack.worker()); otherwise it runs with --no-worker, and the
+        test starts its own (start_worker). With `terminal`, agentd runs on a pseudo-terminal of its
+        own, its controlling terminal."""
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)
@@ -571,12 +665,22 @@ class Stack:
                            else {"api_url": self.github_url, "request_timeout": "2s", "settle": "3s"})}
                if self.fixture else {}),
             **({"git_tools": {"sandbox": [str(TOOL_LAUNCHER[SANDBOX])]}} if SANDBOX in TOOL_LAUNCHER else {}),
-            **(extra or {}),
         }
+        if worker:
+            if self.workflow_queue == DEFAULT_QUEUE:
+                self.workflow_queue = f"workflows-{os.urandom(4).hex()}"
+            config["task_queues"] = {"workflows": self.workflow_queue}
+            config["worker"] = self.worker_config(workflows)
+        config.update(extra or {})
+        if worker:  # the queue agentd serves, whatever extra says
+            self.workflow_queue = config.get("task_queues", {}).get("workflows", DEFAULT_QUEUE)
         (d / "agentd.yaml").write_text(json.dumps(config))
         self._agentd_args = [BIN / "agentd", "--config", d / "agentd.yaml"]
         if SANDBOX == "none":
             self._agentd_args.append("--insecure-dev")  # the git tool server runs unsandboxed too
+        if not worker:
+            self._agentd_args.append("--no-worker")  # the test starts its own
+        self.supervised, self._agentd_terminal = worker, terminal
         if test_tools:
             self._agentd_args.append("--test-tools")
         if faults or run_id_delay or hold_doorbells:
@@ -593,24 +697,52 @@ class Stack:
     def _launch_agentd(self) -> Proc:
         n = sum(p.name.startswith("agentd") for p in self.procs)
         name = "agentd" if n == 0 else f"agentd{n + 1}"
-        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log")
+        p = Proc(name, self._agentd_args, self.tmp / f"{name}.log", terminal=self._agentd_terminal)
         self.procs.append(p)
         self._remember()
         self.agentd = p
         if WATCH.on_start is not None:
             WATCH.on_start(self)
-        wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd")
+        # A Worker of agentd's own has 60 s to say it is ready, before agentd does.
+        wait_for(lambda: '"agentd ready"' in p.text() or not p.alive(), "agentd", timeout=90 if self.supervised else 30)
         assert p.alive(), p.text()
         return p
 
     def restart_agentd(self, kill: bool = False) -> Proc:
-        """Stop agentd (SIGTERM, or kill -9) and start it again on the same config, ledger and sockets."""
+        """Stop agentd (SIGTERM, or kill -9 with its whole process tree) and start it again on the
+        same config, ledger and sockets."""
         assert self.agentd is not None
         if kill:
             self.agentd.kill()
         else:
             self.agentd.stop()
         return self._launch_agentd()
+
+    def kill_agentd(self) -> None:
+        """kill -9 agentd alone, as a crash ends it: what it started is left to end without it.
+        restart_agentd() starts it again."""
+        assert self.agentd is not None
+        os.kill(self.agentd.popen.pid, signal.SIGKILL)
+        self.agentd.popen.wait(timeout=10)
+
+    def worker(self) -> SupervisedWorker:
+        """The Worker agentd runs itself (start_agentd(worker=True))."""
+        assert self.supervised, "start_agentd(worker=True) first"
+        return SupervisedWorker(self)
+
+    def worker_processes(self) -> list[int]:
+        """Every Python Worker on this machine that polls this stack's own workflow queue (a stack
+        whose agentd runs its Worker has one), whoever started it and wherever it runs now."""
+        out = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True, check=True,
+                             start_new_session=True).stdout
+        found = []
+        for line in out.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            argv = command.split()
+            if argv and Path(argv[0]).name.lower().startswith("python") and "agentos_worker" in argv \
+                    and self.workflow_queue in argv:
+                found.append(int(pid))
+        return found
 
     def worker_command(self, workflows: str | None) -> list[str]:
         cmd = [sys.executable, "-m", "agentos_worker"]
@@ -632,15 +764,19 @@ class Stack:
         denied = [str(p) for p in [self.tmp, *self.deny_read]]
         return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied)}
 
-    def start_worker(self, workflows: str | None = None) -> Worker:
+    def start_worker(self, workflows: str | None = None, args: tuple[str, ...] = (), stdin: int | None = None,
+                     ready: bool = True) -> Worker:
+        """A Worker run by hand (agentd with --no-worker), with args after its own, and stdin; once it
+        is ready, unless not ready."""
         n = len(self.workers) + 1
-        w = Worker(f"worker{n}", self.worker_command(workflows), self.tmp / f"worker{n}.log",
-                   env=self.sandbox_env(), cwd=REPO)
+        w = Worker(f"worker{n}", [*self.worker_command(workflows), *args], self.tmp / f"worker{n}.log",
+                   env=self.sandbox_env(), cwd=REPO, stdin=stdin)
         self.procs.append(w)
         self._remember()
         self.workers.append(w)
-        wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
-        assert w.alive(), w.text()
+        if ready:
+            wait_for(lambda: "worker ready" in w.text() or not w.alive(), f"worker{n}")
+            assert w.alive(), w.text()
         return w
 
     def _remember(self) -> None:
@@ -659,6 +795,12 @@ class Stack:
                 p.stop()
             except Exception as e:  # noqa: BLE001 - stop the others first
                 errors.append(e)
+        if self.supervised:  # a Worker whose agentd was killed, and whose launcher did not end it
+            for pid in self.worker_processes():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         shutil.rmtree(self.sock_dir, ignore_errors=True)
         if errors:
             raise errors[0]
@@ -754,7 +896,7 @@ class Stack:
         Temporal could. Returns its run ID."""
         async def start(c: Client) -> str:
             h = await c.start_workflow("security-audit", workflow_input, id=workflow_id,
-                                       task_queue="agentos-workflows")
+                                       task_queue=self.workflow_queue)
             return h.first_execution_run_id or h.result_run_id or ""
         return self._temporal(start)
 

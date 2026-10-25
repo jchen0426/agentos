@@ -272,8 +272,10 @@ def probe(stack: Stack, canary: Path, extra: dict) -> dict:
         args += ["--runtime", f"127.0.0.1:{stack.runtime_port}", "--proxy", "env"]
     launcher = stack.worker_command(None)[:5]  # the launcher and its arguments, up to "--"
     assert launcher[-1] == "--", launcher
+    # In a session of its own, as the harness starts Workers: the macOS launcher refuses a controlling terminal.
     r = subprocess.run([*map(str, launcher), *map(str, args)], capture_output=True, text=True, timeout=120, cwd=REPO,
-                       env={**stack.sandbox_env(), "AGENTOS_TEST_CANARY": "a secret the Worker must not see"})
+                       env={**stack.sandbox_env(), "AGENTOS_TEST_CANARY": "a secret the Worker must not see"},
+                       start_new_session=True)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
 

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +53,33 @@ func TestDevConfigLoads(t *testing.T) {
 	if _, err := os.Stat(c.GitTools.Sandbox[0]); err != nil {
 		t.Errorf("the git tool launcher: %v", err)
 	}
+	// agentd starts the Worker under its launcher, with the repository's environment and code.
+	repo, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := c.Worker; len(w.Sandbox) != 1 || w.Sandbox[0] != filepath.Join(repo, "sandbox/macos/run-worker.sh") ||
+		w.Python != filepath.Join(repo, ".venv") || w.Code != filepath.Join(repo, "python") || w.Workflows != DefaultWorkflows {
+		t.Errorf("worker: %+v", w)
+	}
+	// The dev Worker as agentd checks it on macOS, where the check applies: to a .venv (made by uv sync)
+	// whose Python is outside the home directory, as python.org's and Homebrew's are. A Python under
+	// $HOME (uv's own) is refused on macOS, as it should be; elsewhere the check is not macOS's.
+	t.Run("the dev Worker", func(t *testing.T) {
+		python := filepath.Join(repo, ".venv/bin/python")
+		real, err := filepath.EvalSymlinks(python)
+		if err != nil {
+			t.Skipf("no dev Worker to check: %v", err)
+		}
+		home, _ := os.UserHomeDir()
+		realHome, _ := filepath.EvalSymlinks(home)
+		if runtime.GOOS != "darwin" || home != "" && (within(real, home) || within(real, realHome)) {
+			t.Skipf("%s leads to %s: the macOS check applies on macOS, to a Python outside $HOME (%s)", python, real, home)
+		}
+		if err := c.CheckWorker("darwin", true); err != nil {
+			t.Errorf("the dev Worker: %v", err)
+		}
+	})
 	if _, err := policy.Load(c.PolicyFile); err != nil {
 		t.Error(err)
 	}
@@ -87,6 +116,10 @@ func TestDevClaudeConfigLoads(t *testing.T) {
 	}
 	if c.GitHub != nil {
 		t.Error("agentd-claude.yaml configures GitHub: the dev configs only dry-run")
+	}
+	// It holds a real key: its Worker runs in the sandbox, which keeps the keychain from it.
+	if len(c.Worker.Sandbox) != 1 {
+		t.Errorf("worker: %+v", c.Worker)
 	}
 }
 
@@ -449,4 +482,146 @@ func TestDesignDocModelsLoad(t *testing.T) {
 		t.Errorf("route: %+v", r)
 	}
 	priced(t, m, "../../config/prices.yaml")
+}
+
+// The worker section's paths are the config's, like every other: relative to the file, ~/ in the
+// home directory. A Worker serves the product's workflows unless the section says otherwise. Limits
+// are not set yet: a section that names any is refused, not taken for enforced.
+func TestWorkerSection(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	load := func(body string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\n"+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path)
+	}
+	c, err := load("worker: {sandbox: [launch/run-worker.sh, --flag], python: venv, code: ~/code, deny_read: [secret, /abs/x]}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := c.Worker
+	if !slices.Equal(w.Sandbox, []string{filepath.Join(dir, "launch/run-worker.sh"), "--flag"}) || w.Python != filepath.Join(dir, "venv") ||
+		w.Code != filepath.Join(dir, "home/code") || !slices.Equal(w.DenyRead, []string{filepath.Join(dir, "secret"), "/abs/x"}) ||
+		w.Workflows != DefaultWorkflows || len(w.Limits) != 0 {
+		t.Errorf("worker %+v", w)
+	}
+	if c, err := load("worker: {workflows: \"tests.rogue_workflows:StepsOutOfLine\", limits: {}}\n"); err != nil ||
+		c.Worker.Workflows != "tests.rogue_workflows:StepsOutOfLine" {
+		t.Errorf("workflows: %v, %+v", err, c)
+	}
+	if _, err := load("worker: {limits: {memory: 1GiB}}\n"); err == nil || !strings.Contains(err.Error(), "worker.limits") {
+		t.Errorf("limits: %v", err)
+	}
+	if _, err := load("worker: {pyhton: venv}\n"); err == nil {
+		t.Error("a misspelt field: loaded")
+	}
+}
+
+// A Worker can read all of its Python environment and its code directory: agentd refuses either
+// that holds what it keeps from the Worker, by name or through a symlink. And it refuses a Runtime
+// entry the platform's launcher cannot hand the Worker.
+func TestCheckWorker(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"venv/bin", "code", "data", "c", "s", "launch", "outer/data", "tls"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"venv/bin/python", "launch/run-worker.sh"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "outer"), filepath.Join(dir, "around")); err != nil {
+		t.Fatal(err)
+	}
+	// A home directory with a Python in it, as uv keeps its own; a venv elsewhere whose python leads
+	// there; and a code directory at home with a venv inside it.
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	for _, d := range []string{"home/.local/python/bin", "homevenv/bin", "home/code/venv/bin", "home/code/runtime/bin", "codevenv/bin"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"home/.local/python/bin/python3.12", "home/code/venv/bin/python3.12", "home/code/runtime/bin/python3.12"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "home/.local/python/bin/python3.12"), filepath.Join(dir, "homevenv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("python3.12", filepath.Join(dir, "home/code/venv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
+	// A venv outside the home directory whose python leads into the code directory, at home.
+	if err := os.Symlink(filepath.Join(dir, "home/code/runtime/bin/python3.12"), filepath.Join(dir, "codevenv/bin/python")); err != nil {
+		t.Fatal(err)
+	}
+	load := func(body string) *Config {
+		t.Helper()
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\ncontrol_socket: c/control.sock\n"+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	const sandbox = "sandbox: [launch/run-worker.sh], "
+	const tcp, sock = "runtime_listen: tcp://127.0.0.1:7244\n", "runtime_listen: unix://s/runtime.sock\n"
+	type check struct {
+		body, goos string
+		sandboxed  bool
+		refusal    string // "" for none
+	}
+	for name, c := range map[string]check{
+		"macOS":                 {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: venv, code: code}\n", "darwin", true, ""},
+		"Linux":                 {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: venv, code: code}\n", "linux", true, ""},
+		"unsandboxed":           {"data_dir: data\n" + tcp + "worker: {python: venv, code: code}\n", "linux", false, ""},
+		"code in the data dir":  {"data_dir: outer\n" + tcp + "worker: {python: venv, code: outer/data}\n", "darwin", false, ""},
+		"no python":             {"data_dir: data\n" + tcp + "worker: {code: code}\n", "darwin", false, "worker.python and worker.code are required"},
+		"no code":               {"data_dir: data\n" + tcp + "worker: {python: venv}\n", "darwin", false, "worker.python and worker.code are required"},
+		"bad workflows":         {"data_dir: data\n" + tcp + "worker: {python: venv, code: code, workflows: \"a b:c\"}\n", "darwin", false, "is not module:attribute"},
+		"code holds the data":   {"data_dir: outer/data\n" + tcp + "worker: {python: venv, code: outer}\n", "darwin", false, "holds the data directory " + dir + "/outer/data"},
+		"code is the data":      {"data_dir: data\n" + tcp + "worker: {python: venv, code: data}\n", "darwin", false, "holds the data directory"},
+		"code holds it, linked": {"data_dir: outer/data\n" + tcp + "worker: {python: venv, code: around}\n", "darwin", false, "(real paths: "},
+		"code holds control":    {"data_dir: data\n" + tcp + "worker: {python: venv, code: c}\n", "darwin", false, "holds the Control socket's directory"},
+		"code holds runtime":    {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: venv, code: s}\n", "linux", true, "holds the Runtime socket's directory"},
+		"python holds a mirror": {"data_dir: data\n" + tcp + "repos: {a/b: outer/data}\nworker: {python: outer, code: code}\n", "darwin", false, "holds repo a/b's mirror"},
+		"code holds the key":    {"data_dir: data\n" + tcp + "temporal: {tls: {cert_file: x.crt, key_file: tls/k.key}}\nworker: {python: venv, code: tls}\n", "darwin", false, "holds the Temporal client key"},
+		"code holds the cert":   {"data_dir: data\n" + tcp + "temporal: {tls: {cert_file: tls/x.crt, key_file: k.key}}\nworker: {python: venv, code: tls}\n", "darwin", false, "holds the Temporal client certificate"},
+		"no bin/python":         {"data_dir: data\n" + tcp + "worker: {python: code, code: code}\n", "darwin", false, "does not run the Worker"},
+		"code not there":        {"data_dir: data\n" + tcp + "worker: {python: venv, code: gone}\n", "darwin", false, "is not a directory"},
+		"no launcher":           {"data_dir: data\n" + tcp + "worker: {sandbox: [launch/gone.sh], python: venv, code: code}\n", "darwin", true, "worker.sandbox"},
+		"unsandboxed on a socket": {"data_dir: data\n" + sock + "worker: {python: venv, code: code}\n", "linux", false,
+			"a Worker without a sandbox reaches the Runtime entry by host:port only"},
+		"macOS on a socket":      {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: venv, code: code}\n", "darwin", true, "the macOS launcher lets the Worker reach 127.0.0.1:<port> only"},
+		"macOS on ::1":           {"data_dir: data\nruntime_listen: \"tcp://[::1]:7244\"\nworker: {" + sandbox + "python: venv, code: code}\n", "darwin", true, "127.0.0.1:<port> only"},
+		"Linux on a port":        {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: venv, code: code}\n", "linux", true, "give it unix:///<path>"},
+		"Linux socket with data": {"data_dir: data\nruntime_listen: unix://data/runtime.sock\nworker: {" + sandbox + "python: venv, code: code}\n", "linux", true, "holds the data directory"},
+		"Linux socket with control": {"data_dir: data\nruntime_listen: unix://c/runtime.sock\nworker: {" + sandbox + "python: venv, code: code}\n", "linux", true,
+			"holds the Control socket's directory"},
+		"Linux socket around data": {"data_dir: outer/data\nruntime_listen: unix://outer/runtime.sock\nworker: {" + sandbox + "python: venv, code: code}\n", "linux", true,
+			"holds the data directory"},
+		"another platform": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: venv, code: code}\n", "freebsd", true, "no Worker launcher for freebsd"},
+		// A Python in the home directory, which the macOS sandbox cannot read (uv's): refused there only.
+		"macOS, a Python at home": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: homevenv, code: code}\n", "darwin", true,
+			"in the home directory, which the macOS sandbox cannot read"},
+		"macOS, a Python at home, unsandboxed":  {"data_dir: data\n" + tcp + "worker: {python: homevenv, code: code}\n", "darwin", false, ""},
+		"Linux, a Python at home":               {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: homevenv, code: code}\n", "linux", true, ""},
+		"macOS, a Python in the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: home/code/venv, code: home/code}\n", "darwin", true, ""},
+		"macOS, a Python leading into the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: codevenv, code: home/code}\n",
+			"darwin", true, ""},
+	} {
+		err := load(c.body).CheckWorker(c.goos, c.sandboxed)
+		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {
+			t.Errorf("%s: %v, want %q", name, err, c.refusal)
+		}
+	}
 }

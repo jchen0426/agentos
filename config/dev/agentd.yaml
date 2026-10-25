@@ -2,9 +2,9 @@
 # the GitHub tools only dry-run (see the README to write to a test repository).
 # Paths are relative to this file, or to the home directory (~/). On Linux, use the default
 # unix:// Runtime socket instead. agentd keeps its data in the default data_dir, ~/.agentos, out
-# of this repository: a sandboxed Worker is given it as its code directory, and could read
-# anything in it. (Left out, not spelled ~/.agentos: an agentd built before ~/ paths existed
-# would make a directory named ~ here.)
+# of this repository: a sandboxed Worker is given part of it (python/) as its code directory, and
+# the tests give it all of it, and it could read anything in it. (Left out, not spelled ~/.agentos:
+# an agentd built before ~/ paths existed would make a directory named ~ here.)
 runtime_listen: tcp://127.0.0.1:7244
 temporal: {address: 127.0.0.1:7233}
 policy_file: policy.yaml
@@ -15,3 +15,8 @@ repos:
 # agentd reads repositories through the git tool server, run per call in this sandbox (macOS;
 # on Linux, ../../sandbox/linux/run-tool.sh). It needs `npm ci` in sandbox/macos.
 git_tools: {sandbox: [../../sandbox/macos/run-tool.sh]}
+# agentd starts the Worker itself, in this sandbox (macOS; on Linux, ../../sandbox/linux/run-worker.sh,
+# with the unix:// Runtime socket), and starts it again whenever it exits. It needs `npm ci` in
+# sandbox/macos, and a Python outside the home directory, which the sandbox cannot read: the
+# environment's bin/python must lead there. With --no-worker agentd starts none (README).
+worker: {sandbox: [../../sandbox/macos/run-worker.sh], python: ../../.venv, code: ../../python}
