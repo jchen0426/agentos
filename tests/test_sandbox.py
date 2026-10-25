@@ -170,8 +170,10 @@ def runtime_entry(stack: Stack) -> Path | int:
 def reach(launch: list[str], file: Path, way_out: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Runs REACH_PROBE in the sandbox. The interpreter itself, not a virtual environment's link
     to it: the Python environment the launcher is given need not be one."""
+    # In a session of its own, as agentd and the harness start a Worker: the macOS launcher refuses
+    # to run a Worker that has a controlling terminal.
     return subprocess.run([*launch, os.path.realpath(sys.executable), "-I", "-c", REACH_PROBE, str(file), str(way_out)],
-                          capture_output=True, text=True, timeout=60, cwd=REPO, env=env)
+                          capture_output=True, text=True, timeout=60, cwd=REPO, env=env, start_new_session=True)
 
 
 @contextlib.contextmanager
@@ -367,7 +369,7 @@ def test_worker_sandbox_writes_only_its_private_directory() -> None:
         try:
             r = subprocess.run([*launcher(port, sys.prefix, code), os.path.realpath(sys.executable), "-I", "-c",
                                 SRT_WRITE_PROBE, json.dumps({k: str(p) for k, p in writes.items()})],
-                               capture_output=True, text=True, timeout=60, cwd=REPO)
+                               capture_output=True, text=True, timeout=60, cwd=REPO, start_new_session=True)
         finally:
             escaped = [p for p in writes.values() if p.exists()]
             for p in escaped:

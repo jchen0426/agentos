@@ -32,6 +32,11 @@
 # charged to no process remains (memfd, SysV IPC, pipe and socket buffers); bounding it takes
 # a cgroup (docs/m1-notes.md).
 #
+# agentd starts this itself (agentd.yaml's worker section), in a session of its own, and starts it
+# again whenever it exits. bwrap's --die-with-parent ends the sandbox when agentd dies, however it
+# ends; --new-session keeps the Worker off any terminal. AGENTOS_SANDBOX_DENY_READ means nothing here:
+# the sandbox mounts only what it is given.
+#
 # Usage: run-worker.sh <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...]
 # Ubuntu 23.10+ also needs an AppArmor profile that grants bwrap user namespaces
 # (see vm/lima/agentos.yaml).

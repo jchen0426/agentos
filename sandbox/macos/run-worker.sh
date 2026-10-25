@@ -20,14 +20,24 @@
 #     need no such check: srt lets it connect to none
 #   - writes: only to a private directory, the Worker's HOME and TMPDIR. Not to /tmp/claude,
 #     which srt otherwise always allows and hands out as TMPDIR, to everything it runs
-#   - state: each launch has a directory, /tmp/agentos-sandbox.*, for srt's settings, srt's
-#     own sockets and the Worker's private directory. A Worker can read none of them but its
-#     own private directory, as it reads nothing else in /tmp. It goes when srt does, however
-#     srt ends (kill -9 included), with
-#     one exception: a kill of srt's whole process group (or SIGKILL/SIGSTOP) takes the remover
-#     too, so the directory stays, still out of every Worker's reach, until agentd owns this in
-#     M5. The remover (rm-state.py) walks fd-relative, never following a symlink, so untrusted
-#     task code cannot turn it into a delete of anything outside the state directory
+#   - state: each launch has a directory for srt's settings, srt's own sockets and the Worker's
+#     private directory. A Worker can read none of them but its own private directory, as it
+#     reads nothing else in /tmp. agentd makes it, /tmp/agentos-worker.<agentd's pid>.*, passes it
+#     as AGENTOS_SANDBOX_STATE, and removes it once the launch's whole process group is gone,
+#     however it ended (the next agentd sweeps what a killed one left). Without it, this script
+#     makes /tmp/agentos-sandbox.*, which goes when srt does, however srt ends (kill -9
+#     included), with one exception: a kill of srt's whole process group (or SIGKILL/SIGSTOP)
+#     takes the remover too, so the directory stays, still out of every Worker's reach. The
+#     remover (rm-state.py) walks fd-relative, never following a symlink, so untrusted task code
+#     cannot turn it into a delete of anything outside the state directory
+#   - lifeline: agentd passes fd 3, the read end of a pipe whose write end only agentd holds, and
+#     AGENTOS_SANDBOX_LIFELINE=3. macOS has no parent-death signal: a Worker that outlived a killed
+#     agentd would reach the next agentd on the same port, a second Worker beside its own. A watcher
+#     outside the sandbox, in this process group (srt lets the Worker signal nothing outside its
+#     sandbox), reads fd 3; at EOF, agentd is gone, however it ended, and the watcher kills the group
+#   - controlling terminal: none. srt lets what it runs ioctl /dev/tty, so a Worker in a session
+#     with a terminal could type into it (TIOCSTI). This script refuses to run with one: agentd
+#     starts it in a session of its own; by hand, see the README
 #   - environment: cleared, except what srt adds (its proxy variables, TMPDIR) and
 #     CLAUDE_CODE_TMPDIR, which srt hands out as TMPDIR
 #
@@ -47,6 +57,12 @@ fi
 port=$1 pyenv=$2 code=$3
 shift 4
 [[ $port =~ ^[0-9]{1,5}$ ]] || { echo "$0: bad port $port" >&2; exit 2; }
+# Opening /dev/tty succeeds only for a process with a controlling terminal.
+if { : </dev/tty; } 2>/dev/null; then
+  echo "$0: this has a controlling terminal, which the sandboxed Worker could type into (TIOCSTI):" \
+    "run the Worker through agentd, or by hand in a session of its own (see the README)" >&2
+  exit 2
+fi
 # -H: a directory given as a symlink is looked into. A scan fails when a directory goes away
 # under it (npm ci in the code directory, say): try again.
 scan() {
@@ -75,20 +91,26 @@ node_dir=$(dirname "$(command -v node)")
 rmstate="$pyenv/bin/python3"
 [[ -x $rmstate ]] || rmstate=$(command -v python3 2>/dev/null || true)
 
-state=$(mktemp -d /tmp/agentos-sandbox.XXXXXX)
-# Until srt is exec'd there is no sandboxed process yet, so a plain rm is safe here; this guards
-# the window before the reader below is in charge (a signal, or a failure building the settings).
-# exec'ing srt replaces this shell, so the trap does not fire once srt is running.
-trap 'rm -rf "$state"' EXIT
-trap 'exit 1' HUP INT QUIT TERM
-# srt holds fd 9 (the write end of a pipe) until it ends, whatever ends it, and hands it to
-# nothing it starts (libuv spawns with POSIX_SPAWN_CLOEXEC_DEFAULT on macOS). The reader runs
-# outside the Worker's process tree (whoever stops a Worker kills that tree) and, at EOF, removes
-# the state directory with rm-state.py (fd-relative, never follows a symlink). It ignores the
-# job-control and terminal signals it can; a kill of its whole process group still takes it.
-exec 9> >( (trap '' INT QUIT TSTP TTIN TTOU TERM HUP USR1 USR2
-  while read -r _; do :; done
-  [[ -n $rmstate ]] && "$rmstate" -I "$here/rm-state.py" "$state") <&0 >/dev/null 2>&1 & )
+if [[ -n ${AGENTOS_SANDBOX_STATE:-} ]]; then
+  # agentd's: made for this launch, and removed by agentd once the launch's process group is gone.
+  state=$AGENTOS_SANDBOX_STATE
+  [[ -d $state && ! -L $state ]] || { echo "$0: AGENTOS_SANDBOX_STATE is not a directory: $state" >&2; exit 2; }
+else
+  state=$(mktemp -d /tmp/agentos-sandbox.XXXXXX)
+  # Until srt is exec'd there is no sandboxed process yet, so a plain rm is safe here; this guards
+  # the window before the reader below is in charge (a signal, or a failure building the settings).
+  # exec'ing srt replaces this shell, so the trap does not fire once srt is running.
+  trap 'rm -rf "$state"' EXIT
+  trap 'exit 1' HUP INT QUIT TERM
+  # srt holds fd 9 (the write end of a pipe) until it ends, whatever ends it, and hands it to
+  # nothing it starts (libuv spawns with POSIX_SPAWN_CLOEXEC_DEFAULT on macOS). The reader runs
+  # outside the Worker's process tree (whoever stops a Worker kills that tree) and, at EOF, removes
+  # the state directory with rm-state.py (fd-relative, never follows a symlink). It ignores the
+  # job-control and terminal signals it can; a kill of its whole process group still takes it.
+  exec 9> >( (trap '' INT QUIT TSTP TTIN TTOU TERM HUP USR1 USR2
+    while read -r _; do :; done
+    [[ -n $rmstate ]] && "$rmstate" -I "$here/rm-state.py" "$state") <&0 >/dev/null 2>&1 & )
+fi
 mkdir "$state/work"
 # Built with node (which srt needs anyway) so that paths are JSON-escaped.
 node -e '
@@ -123,6 +145,17 @@ node -e '
   }, null, 2));
 ' "$port" "$pyenv" "$code" "$HOME" "$state" "${AGENTOS_SANDBOX_DENY_READ:-}" > "$state/srt-settings.json"
 
+if [[ -n ${AGENTOS_SANDBOX_LIFELINE:-} ]]; then
+  [[ $AGENTOS_SANDBOX_LIFELINE == 3 ]] && { : <&3; } 2>/dev/null ||
+    { echo "$0: AGENTOS_SANDBOX_LIFELINE must be 3, an open descriptor" >&2; exit 2; }
+  # This shell becomes srt, and leads the process group agentd made it (a session's): at EOF the
+  # watcher kills it all, srt, the Worker and itself. It ignores the signals it can, as the remover.
+  group=$$
+  (trap '' INT QUIT TSTP TTIN TTOU TERM HUP USR1 USR2
+    cat >/dev/null
+    kill -KILL -- "-$group") <&3 >/dev/null 2>&1 &
+  exec 3<&- # srt and the Worker hold nothing of it
+fi
 # srt keeps its own temporary files (its sockets) in the state directory, out of the Worker's
 # reach, and hands the Worker CLAUDE_CODE_TMPDIR as TMPDIR.
 exec env -i PATH="/usr/bin:/bin:$node_dir" HOME="$state/work" TMPDIR="$state" CLAUDE_CODE_TMPDIR="$state/work" \
