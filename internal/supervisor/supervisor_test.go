@@ -439,8 +439,6 @@ func TestTheFirstWorker(t *testing.T) {
 	})
 }
 
-// Stop: no Worker after it; the running one gets SIGTERM, then after the grace SIGKILL with its whole
-// process group. A stop while the supervisor waits to restart returns at once.
 // Stop: no Worker after it. The running one is asked to stop (its stop channel, stdin, ends); after
 // the grace it gets SIGTERM; after a little more SIGKILL, with its whole process group. A stop while
 // the supervisor waits to restart returns at once.
@@ -695,21 +693,34 @@ func TestTheDrainEnds(t *testing.T) {
 	}
 }
 
-// No generation starts once Stop has been called, however close the next start was: Stop closes its
-// channel under the lock that launch takes to start one.
+// No generation starts once Stop has been called, however close the next start was: launch looks at
+// the stop channel under the lock that Stop closes it under, and then starts the launcher. The test
+// stops the supervisor in the window a timing rarely hits: once the delay before the second
+// generation is over (so pause has gone by), before its launcher starts.
 func TestNoGenerationAfterStop(t *testing.T) {
-	for i := range 50 {
-		s, l, _, _ := worker(t, "planned", Timing{BackoffMin: time.Nanosecond, BackoffMax: time.Nanosecond}, "AGENTOS_TEST_PLAN=re")
-		s.Start()
-		readied(t, s)
-		wait(t, "a few generations", 10*time.Second, func() bool { return len(l.entries("worker started")) >= 3 })
-		s.Stop()
-		s.mu.Lock()
-		starts, atStop := s.starts, s.atStop
-		s.mu.Unlock()
-		if starts != atStop {
-			t.Fatalf("run %d: %d generations started, %d of them before Stop", i, starts, atStop)
+	s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond}, "AGENTOS_TEST_PLAN=re")
+	stopped := make(chan struct{})
+	s.beforeStart = func(n int) {
+		if n != 2 {
+			return
 		}
+		go func() {
+			s.Stop()
+			close(stopped)
+		}()
+		for deadline := time.Now().Add(5 * time.Second); !closed(s.stop) && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	s.Start()
+	readied(t, s)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+	if n := len(l.entries("worker started")); n != 1 {
+		t.Errorf("%d generations started, the last after Stop: %v", n, l.entries(""))
 	}
 }
 

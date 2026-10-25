@@ -117,8 +117,8 @@ type Supervisor struct {
 	started bool
 	gen     int
 	pid     int // the running generation's launcher; 0 between generations
-	starts  int // generations started, and how many had when stop closed (tests)
-	atStop  int
+
+	beforeStart func(n int) // tests: runs just before generation n's launcher is started
 
 	outMu     sync.Mutex
 	dropped   int         // lines not logged since the last one logged
@@ -173,7 +173,6 @@ func (s *Supervisor) Stop() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		close(s.stop)
-		s.atStop = s.starts
 		s.mu.Unlock()
 	})
 	s.mu.Lock()
@@ -377,7 +376,11 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 		// ends, not the process (go#27505): this goroutine keeps its thread until the launcher has.
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		// No generation starts once Stop has been called: Stop closes the channel under the same lock.
+		if s.beforeStart != nil {
+			s.beforeStart(n)
+		}
+		// No generation starts once Stop has been called, though the delay before it ended first: Stop
+		// closes the channel under the same lock.
 		s.mu.Lock()
 		if closed(s.stop) {
 			s.mu.Unlock()
@@ -385,9 +388,6 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 			return
 		}
 		err := cmd.Start()
-		if err == nil {
-			s.starts++
-		}
 		s.mu.Unlock()
 		if err != nil {
 			started <- err
