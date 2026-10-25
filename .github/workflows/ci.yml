@@ -1,8 +1,9 @@
 # The Go checks, and the black-box suite (T1, T8, T10, the replay gate, mTLS, ...) with
-# Workers unsandboxed and under bubblewrap, on every push to main and every pull request. The
-# design doc wants the fault-injection tests on every commit, and T10 relies on the replay gate
-# (tests/test_replay.py) stopping incompatible workflow changes here. A pull request that changes
-# only documentation skips them (the changes job); main runs them again once it is merged.
+# Workers unsandboxed and under bubblewrap on Linux, and under sandbox-runtime (srt) on macOS, on
+# every push to main and every pull request. The design doc wants the fault-injection tests on
+# every commit, and T10 relies on the replay gate (tests/test_replay.py) stopping incompatible
+# workflow changes here. A pull request that changes only documentation skips them (the changes
+# job); main runs them again once it is merged.
 name: CI
 
 on:
@@ -198,3 +199,81 @@ jobs:
       AGENTOS_SANDBOX: bwrap
       UV_PYTHON: /usr/bin/python3
     steps: *blackbox-steps
+
+  # The black-box suite with Workers under sandbox-runtime (Seatbelt), as on the author's Mac: the
+  # macOS sandbox's tests (T9's probes, the launcher's deny list and state directory) run only here.
+  blackbox-srt:
+    name: Black-box tests (AGENTOS_SANDBOX=srt, macOS)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
+    runs-on: macos-15
+    # The suite takes about 31 minutes on the author's Mac; GitHub's macOS runners are slower.
+    timeout-minutes: 60
+    env:
+      AGENTOS_SANDBOX: srt
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The sandboxed Worker can read the checkout, so no token in .git/config.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.13.1'
+
+      # The sandbox denies reads under the home directory, /Users/runner, where setup-python's tool
+      # cache and uv's own Pythons live, and lets the Worker read only its virtualenv and the
+      # checkout there. The virtualenv's interpreter is a symlink to its base Python, so that Python
+      # must live outside the home directory: Homebrew's, under /opt/homebrew.
+      - name: Install Python 3.12 with Homebrew
+        run: |
+          brew install python@3.12
+          echo "UV_PYTHON=$(brew --prefix python@3.12)/bin/python3.12" >> "$GITHUB_ENV"
+
+      # srt needs Node 22.12 or later; the image's Node is Homebrew's node@22.
+      - name: Check Node
+        run: |
+          node --version
+          node -e 'const [a, b] = process.versions.node.split(".").map(Number);
+            process.exit(a > 22 || (a === 22 && b >= 12) ? 0 : 1)'
+
+      - name: Install the Temporal CLI
+        env:
+          VERSION: 1.9.1
+          SHA256: 41e0425378fcb4fb5766340b97435e20fe47bbff2d7bf644ec2d51f7662b7c56
+        run: |
+          asset=temporal_cli_${VERSION}_darwin_arm64.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/temporalio/cli/releases/download/v$VERSION/$asset"
+          echo "$SHA256  $RUNNER_TEMP/$asset" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" temporal
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/temporal" --version
+
+      - name: Install the full Temporal server, for tests/test_temporal_mtls.py
+        run: ./scripts/fetch-temporal-server.sh
+
+      - run: make build
+      - run: uv sync --locked --group dev
+      # srt and its dependencies have no install scripts (sandbox/macos/package-lock.json).
+      - run: npm ci --ignore-scripts
+        working-directory: sandbox/macos
+
+      - name: pytest
+        # The test data stays outside the checkout, under the runner's temporary directory, which
+        # the sandbox denies too: the probes check that the Worker cannot read agentd's ledger.
+        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest"
+
+      - name: Upload the test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: blackbox-logs-srt
+          path: ${{ runner.temp }}/pytest
+          retention-days: 7
+          if-no-files-found: ignore
