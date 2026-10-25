@@ -35,14 +35,21 @@ pytestmark = pytest.mark.skipif(not SERVER.exists(), reason="run scripts/fetch-t
 def make_pki(d: Path) -> None:
     """A CA that signs only agentd and the server, and a rogue CA with an 'agentd' look-alike."""
     d.mkdir()
+    # Every call reads this configuration, not the installation's. OpenSSL 1.1.1's own (the one on
+    # GitHub's macOS image) has req -x509 add its v3_ca section, basicConstraints among it, and then
+    # -addext's extensions after it: the CA held basicConstraints twice, and Go refuses such a
+    # certificate, so Temporal could not load its client CA.
+    conf = d / "openssl.cnf"
+    conf.write_text("[req]\ndistinguished_name = dn\n[dn]\n"
+                    "[ca]\nbasicConstraints = critical,CA:TRUE\nkeyUsage = critical,keyCertSign,cRLSign\n")
+    env = {**os.environ, "OPENSSL_CONF": str(conf)}
 
     def ossl(*args: object) -> None:
-        subprocess.run(["openssl", *map(str, args)], check=True, capture_output=True)
+        subprocess.run(["openssl", *map(str, args)], check=True, capture_output=True, env=env)
 
     for ca in ("ca", "rogue-ca"):
         ossl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", f"/CN=agentos test {ca}",
-             "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-             "-keyout", d / f"{ca}.key", "-out", d / f"{ca}.pem")
+             "-config", conf, "-extensions", "ca", "-keyout", d / f"{ca}.key", "-out", d / f"{ca}.pem")
 
     def leaf(name: str, ca: str, cn: str, ext: str) -> None:
         (d / f"{name}.ext").write_text("basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n" + ext)
