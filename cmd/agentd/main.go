@@ -67,6 +67,7 @@ const (
 	anchorEvery     = 30 * time.Second   // how often, at most, the audit log's head goes out to Temporal
 	minRetention    = 7 * 24 * time.Hour // a shorter retention loses the anchors of runs sooner: agentd warns
 	refusalQueue    = 256                // refused Runtime calls waiting for their records
+	workerExitQueue = 64                 // the Worker's exits waiting for theirs
 	maxGatewayCalls = 200                // gateway calls agentd executes at once
 )
 
@@ -289,6 +290,15 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	refusalsDone := make(chan struct{})
 	go func() { refusals.Run(refusalsCtx); close(refusalsDone) }()
 	defer func() { stopRefusals(); <-refusalsDone }()
+	// The Worker's exits have a queue of their own: a queue's next record counts what that queue
+	// dropped (dropped), and a worker.exited must not carry the refusals' count, as if exits were lost.
+	exits := audit.NewQueue(led, workerExitQueue, func(err error) {
+		log.Error("could not record the Worker's exit in the audit log", "error", err)
+	})
+	exitsCtx, stopExits := context.WithCancel(context.Background())
+	exitsDone := make(chan struct{})
+	go func() { exits.Run(exitsCtx); close(exitsDone) }()
+	defer func() { stopExits(); <-exitsDone }()
 
 	bud := &budget.Budget{Ledger: led}
 	// Before any request is served: a reservation still open belongs to a request agentd
@@ -411,8 +421,8 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		if len(cfg.Worker.Sandbox) == 0 {
 			workerLog.Warn("THE WORKER RUNS WITHOUT A SANDBOX (--insecure-dev): development only")
 		}
-		// Its exits' records go through the refusals' queue: Add never waits for the ledger.
-		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, refusals.Add
+		// Its exits' records go through their own queue: Add never waits for the ledger.
+		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, exits.Add
 		sup = supervisor.New(o)
 	}
 	runtimeSrv := runtimeproxy.NewServer(backend, runtimeproxy.Rules{
