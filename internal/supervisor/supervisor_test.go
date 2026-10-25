@@ -74,6 +74,15 @@ func helper(mode string) {
 		_ = os.WriteFile(file, []byte(strconv.Itoa(child.Process.Pid)), 0o600)
 		ready()
 		time.Sleep(time.Hour)
+	case "leaves-child": // ready, then exits, leaving a child in its process group
+		child := exec.Command("/bin/sleep", "60")
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		_ = os.WriteFile(file, []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+		ready()
+		time.Sleep(200 * time.Millisecond)
+		os.Exit(1)
 	case "flood": // a long line first, then more lines than agentd logs, then the ready mark
 		fmt.Println(strings.Repeat("x", 2047) + strings.Repeat("é", 5000))
 		w := bufio.NewWriter(os.Stdout)
@@ -393,6 +402,18 @@ func TestStop(t *testing.T) {
 			t.Errorf("logs %v", l.entries(""))
 		}
 	})
+	t.Run("an exit ends its process group", func(t *testing.T) {
+		s, l, _, file := worker(t, "leaves-child", Timing{BackoffMin: 30 * time.Second})
+		s.Start()
+		readied(t, s)
+		wait(t, "the exit", 5*time.Second, func() bool { return len(l.entries("worker exited")) == 1 })
+		b, _ := os.ReadFile(file)
+		child, _ := strconv.Atoi(string(b))
+		if child == 0 {
+			t.Fatalf("no child: %q", b)
+		}
+		wait(t, "the Worker's child to end with its group", 5*time.Second, func() bool { return gone(child) })
+	})
 	t.Run("while it waits to restart", func(t *testing.T) {
 		s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 30 * time.Second}, "AGENTOS_TEST_PLAN=re")
 		s.Start()
@@ -479,6 +500,10 @@ func TestRecords(t *testing.T) {
 	readied(t, s)
 	wait(t, "a dozen exits", 20*time.Second, func() bool { return len(l.entries("worker exited")) >= 12 })
 	time.Sleep(450 * time.Millisecond)
+	// More than a window has passed since the first record: the held exits were recorded when it was up.
+	if before, _ := r.all(); len(before) < 2 {
+		t.Fatalf("%d records before the stop", len(before))
+	}
 	s.Stop()
 	exits := len(l.entries("worker exited"))
 	ev, at := r.all()
@@ -503,6 +528,38 @@ func TestRecords(t *testing.T) {
 	if counted != exits {
 		t.Errorf("%d exits, %d described or counted", exits, counted)
 	}
+}
+
+// Exits held for a window are recorded once it is up, though no exit comes after them to write them;
+// and those held as the supervisor stops, then.
+func TestRecordsOfHeldExits(t *testing.T) {
+	t.Run("once the window is up", func(t *testing.T) {
+		s, l, r, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: 20 * time.Millisecond,
+			RecordEvery: 400 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,re,re,ready")
+		s.Start()
+		readied(t, s)
+		wait(t, "the fourth Worker", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 4 })
+		wait(t, "the held exits' record", 5*time.Second, func() bool { ev, _ := r.all(); return len(ev) == 2 })
+		ev, _ := r.all()
+		if p := ev[1].Payload.(map[string]any); p["generation"] != 3 || p["unrecorded"] != 1 {
+			t.Errorf("the second record: %v", p)
+		}
+	})
+	t.Run("as the supervisor stops", func(t *testing.T) {
+		s, l, r, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: 20 * time.Millisecond,
+			RecordEvery: time.Hour}, "AGENTOS_TEST_PLAN=re,re,ready")
+		s.Start()
+		readied(t, s)
+		wait(t, "the third Worker", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 3 })
+		if ev, _ := r.all(); len(ev) != 1 {
+			t.Fatalf("records before the stop: %v", ev)
+		}
+		s.Stop()
+		ev, _ := r.all()
+		if len(ev) != 2 || ev[1].Payload.(map[string]any)["generation"] != 2 || ev[1].Payload.(map[string]any)["unrecorded"] != 0 {
+			t.Errorf("records %v", ev)
+		}
+	})
 }
 
 // A Worker runs in a session of its own, with no controlling terminal, in its working directory,
