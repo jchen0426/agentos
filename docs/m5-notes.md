@@ -1786,12 +1786,69 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - **macOS：生命线和清扫只给诚实的 Worker 收尾，挡不住被攻破的 Worker**。被攻破的 Worker 能 fork 一个子进程离开进程组（setsid，或者两次 fork 让它挂到 launchd 下）：生命线的 kill 和 worker.pid 的清扫都按进程组杀，够不着它；按进程树找也挡不住两次 fork。它仍在沙箱里（Seatbelt 会继承），但能连上下一个 agentd 的固定 Runtime 端口，当一个 agentd 没起的 Worker。Linux 不受影响：bwrap 的 PID 命名空间随它的 init 一起死。可行的缓解：
   - C3b 的 `ulimit -u`（Worker 不能 fork）；
   - Runtime 入口给每一代 Worker 一个一次性凭据：agentd 交给每一代一个秘密，Runtime 入口只收当前这一代的，残留的或逃出来的 Worker 服务不了后来的 agentd。放进 C2a 还是以后做，由用户定。
-- **Linux 上 Worker 没有优雅退出**：SIGTERM 给 bwrap，bwrap 直接死，`--die-with-parent` 让沙箱里的进程都吃 SIGKILL。在途的工作流任务 10 秒后超时、交给下一个 Worker。以后可以用 bwrap 的 `--info-fd` 拿到沙箱里的 pid，把 SIGTERM 转进去。
+- ~~Linux 上 Worker 没有优雅退出~~：第二轮用停止通道解决了（见下面“第二轮”），macOS 上原来也没有。
 - **被钉住的文件留下**：agentd 删状态目录不清 uchg 标志（rm-state.py 会清）。Worker 钉住的文件留在 /tmp 下，别的 Worker 都读不到，下一个 agentd 启动时再试。
-- **不加沙箱的 Worker**（`--insecure-dev`）没有生命线：agentd 被 kill -9 后它一直留着，直到下一个 agentd 清扫，期间连不上任何 agentd。
+- **不加沙箱的 Worker**（`--insecure-dev`）没有生命线：agentd 被 kill -9 后，诚实的 Worker 读到停止通道的 EOF 自己停（第二轮）；不读它的留到下一个 agentd 清扫，期间连不上任何 agentd。
 - agentd 在启动一代和写下 worker.pid 之间被 kill -9：这一代没有记录。加沙箱时由生命线（macOS）或 bwrap（Linux）兜底。
 - 清扫在“核对启动时间”和“kill”之间有几微秒的窗口：要 pid 在这几微秒里绕一整圈才会误杀。
 - 一代结束后先回收、再杀它的进程组（和 gitmcp 一样）：回收和 kill 之间 pid 若被重用，新进程还得恰好是进程组组长才会被波及。
 - 不做存活探测：被 SIGSTOP 的 Worker 一直停着，所有运行悄悄卡住（记为后续，见“用户定的”）。
 - 重启的 Worker 导入磁盘上当时的代码，agentd.started 只记目录（记为后续）。
 - srt 的 node 让 Worker 共用的 stdout、stderr 变成非阻塞：Worker 自己的写已经改成等着，但 SDK 的 Rust 核心直接写 fd 2，管道满时那一行会丢（只有 WARN 一类的行）。
+
+### 第二轮（两份审查和三种完整套件之后，2891293 之上）
+
+三种完整套件（你跑的）：none 293 通过、32 跳过；srt 320 通过、5 跳过；bwrap 305 通过、19 跳过、1 失败；verify 都没有失败。下面按你转来的清单改，每项一个或几个提交。
+
+- **A. bwrap 下失败的那个**（`test_the_workers_output_is_logged_escaped_and_bounded`）：没记进日志的行数由一秒的定时器写，bwrap 下运行在 "worker ready" 之后 0.4 秒就结束了，测试先读了日志。改成有上限地等那条记录出来再断言。
+- **B2. C.1 漏了 Temporal 的 mTLS 客户端私钥**（两份审查都报了）：`--insecure-dev`、没有 `worker.sandbox`、设了 `temporal.tls.key_file` 而没有 keyring 密钥时，agentd 会起一个不加沙箱的 Worker，它能读到私钥，以 agentd 的身份直连 Temporal，绕过 Runtime 代理。`secretsIn` 加上了 `temporal.tls.key_file`，加了测试。README 和这里都写明：C.1 防的是失误，不是隔离：不加沙箱的 Worker 能读它的用户能读的一切（钥匙串里别的条目、文件），配置里没点名的也一样。
+- **B3. macOS 上原来也没有优雅停止（ADV-1）**：srt 自己的 SIGTERM 监听比 CLI 的转发先注册，它先跑 `reset()`，把代理的每个连接都断掉，Worker 的 CONNECT 隧道也在内，然后才把 SIGTERM 转出去。审查用 srt 0.0.79 复现：SIGTERM 之后 3 毫秒对端读到 EOF，接着是 EPIPE。在途的工作流任务报不上去，10 秒后超时。Linux 上 bwrap 收到 SIGTERM 直接死，结果一样。
+  - 改法：停止通道。每一代的 stdin 是一个管道，写端只有 agentd 拿着（close-on-exec），从来不写。agentd 给 Worker 加 `--stop-on-stdin-eof`，Worker 用 asyncio 的 `add_reader` 盯着 fd 0，读到 EOF 就和 SIGTERM 一样优雅地停：做完手里的工作流任务，经还在服务的 Runtime 入口报上去，再退出。
+  - 停的顺序改成：关管道，等 5 秒；没退出就 SIGTERM，再等 1 秒；还没退出就对整个进程组 SIGKILL。
+  - 没有这个参数什么都不变：harness 自己起的 Worker、`--no-worker` 时手动起的 Worker 的 stdin 照旧，不会一起来就停。
+  - 查过：macOS 启动脚本只重新打开关着的 fd 0，管道原样保留；srt 对 fd 0 用 inherit；bwrap 也原样传下去。两个启动脚本的头部注释写了这一点。
+  - 附带的好处（不代替生命线）：agentd 死了，管道写端随之关掉，诚实的 Worker 在每个平台上都会自己停，不加沙箱的也一样。
+  - 黑盒测试：Worker 手里有一个工作流任务时（`tests.rogue_workflows:SlowTask` 在工作流任务里停 1.5 秒，在 SDK 2 秒的死锁上限之内），给 agentd 发 SIGTERM：历史里没有 WorkflowTaskTimedOut，执行已经完成，Worker 以 0 退出。三种环境都跑。黑盒改坏（B5：先 SIGTERM，管道 5 秒后才关，就是第一轮的做法）在 srt 下这个测试失败：历史停在 WorkflowTaskStarted，完成没报上去；none 下照样通过，没有启动脚本时 SIGTERM 直接到 Worker，本来就是优雅的。
+  - 跟着改的测试：SIGTERM 时响应的 Worker 在三种环境下都以 0 退出（bwrap 也是）；被 SIGSTOP 的过了 5 秒先吃 SIGTERM。kill -9 agentd 后三种环境下 Worker 都在 10 秒内没了。原来只在 srt 下跑的“生命线漏掉的 Worker”改成三种环境都跑：把 Worker SIGSTOP（这样它不能自己停），srt 下再杀掉看门进程，kill -9 agentd，下一个 agentd（带自己的 Worker，或者 `--no-worker`）在监听之前把它清扫掉；bwrap 下 `--die-with-parent` 已经结束了沙箱。这也补上了“`--no-worker` 时也清扫”的测试。
+- **B4. 第一代之后“从不放弃”没有测试钉住（ADV-2）**：S06（`if !wasReady` 代替 `first && !wasReady`）、S22（启动失败后 `return`）、S19（每一代都有就绪期限）都活了下来。加了 `TestLaterGenerations`：
+  - 第 2、3 代在就绪前就退出（plan `re, early, early, ready`）：照样重启，Failed 上什么都没有；
+  - 第 1 代之后启动脚本没了：一直按间隔重试（40ms、80ms、80ms…），恢复后又起来；
+  - 很短的 ReadyWithin，plan `re, never`：没有 Failed，也没有 "worker not ready"。
+- **C5. 排空的超时（ADV-3）**：一个 helper 留下一个 setsid 过的子进程，它拿着输出不放，helper 自己退出。Drain 设得很短：下一代照样起来，Stop 照样返回，日志里有 "the Worker's output is still open after its process group ended"。杀掉 S30。
+- **C6. Stop 前一刻的启动（ADV-5）**：原来退避结束和 Stop 同时到达时，select 可能选中计时器，再起一代（1 纳秒的间隔下 30 次里有 7 次）。现在 Stop 在锁里关停止信号，launch 在同一把锁里先查它再启动进程，Stop 之后一代都不会起。
+  - 测试：原来是 1 纳秒间隔、50 次，每次核对 Stop 之后启动的代数为 0。改坏检查发现它抓不到去掉这个检查的改坏：锁本身已经把窗口缩到“间隔结束”到“拿锁”之间的几微秒，50 次碰不上。现在加了一个测试用的钩子（`beforeStart`，在启动脚本启动之前调用）：测试在第 2 代的钩子里调 Stop，等停止信号关上再返回。去掉检查后第 2 代每次都会起来，测试每次都失败。只给旧测试用的两个计数删了。
+  - pause 里那一支（等间隔时收到 Stop 就返回 false）改成返回 true，测试照样通过（S8）：launch 的检查兜住了，两处互为备份。两处都去掉，`TestStop` 的 “while it waits to restart” 失败；把那一支整个去掉（S8b），Stop 要等满 30 秒的间隔，也失败。
+- **C7. 措辞和一个真 bug（ADV-6）**：
+  - 改了 terminate、cleanup 的注释（Linux 上 socat 不在进程组里，沙箱是自己的会话）；`Current()` 在两代之间返回 pid 0，文档写明；README 的 SIGTERM 一段（现在各平台都是优雅停止）；“每分钟最多一条”改成“这一分钟到了或 agentd 停下时写下一条”；“agentd 自己的环境一个不继承”改成“只有它自己的 PATH 和 HOME”；supervisor.go 里“Worker 从不等 agentd 读”和 `wait_on_output()` 矛盾，改成“Worker 等的不会比 agentd 读它的时间长”。
+  - **bug**：审计队列把它丢掉的条数（`dropped`）写进下一条记录，不管是哪种记录；worker.exited 和 refusals 共用一个队列，一条带 `dropped: N` 的 worker.exited 读起来像是丢了 N 次退出。现在 worker.exited 有自己的队列，`dropped` 只数丢掉的 worker.exited；refusals 队列的 onError 文字（“could not record a refused runtime call”）又对了，新队列有自己的文字。
+- **C8. ADV-7**：macOS 加沙箱时，CheckWorker 顺着 `<python>/bin/python` 的符号链接走：它通到家目录里、又不在 python 或 code 目录里（uv 自己的 Python 就是这样，沙箱读不到），就拒绝启动，并说明原因；原来要等启动脚本跑起来才失败。Linux 那条 `runtime_listen` 的拒绝也提到 `--no-worker`。
+- **C9. 测试的缺口**：
+  - `--no-worker` 时也清扫：见 B3 里改过的那个测试；
+  - 第 2 代及以后的 pid 文件、状态目录和生命线：`TestEachGenerationHasItsOwn`；
+  - 间隔重置从启动算起还是从就绪算起：定为从启动算起（启动脚本自己的启动时间也算 Worker 的），`TestTheDelaysStartOverCountedFromTheStart` 钉住，README 写明；
+  - 关闭顺序按调用来测：关闭分支的三个调用挪进了 `stopInOrder`，`TestTheWorkerStopsFirst` 用假的对象核对顺序。出错分支靠 defer 的后进先出，没有测试，写在测试的注释里。
+- **C10. 测试 helper 不比测试进程活得长**：supervisor 的 helper 在自己的会话里跑，测试失败、超时或改坏时会留下孤儿进程（你清掉了审查改坏时留下的 9 个，最长跑了一个小时）。现在每个 helper 从环境变量知道测试进程的 pid，每 200 毫秒查一次，测试进程没了就退出；helper 起的 `sleep` 最长 30 秒。
+- **E. 每一代的凭据**：用户还没定，没做。
+
+#### 第二轮的改坏检查和跑过的
+
+- **改坏检查**：Go 60 处（第一轮的 46 处在新代码上重跑，S6 的匹配文本跟着新的 terminate 改了；新加 14 处），59 处抓到，1 处是等价的（S8，见 C6）。
+  - 新加的：停止通道一直不关（N1）；过了期限不发 SIGTERM（N2）；stdin 不接管道（N3）；两代之间 `Current()` 还报旧 pid（N4）；ADV-2 的 S06、S19（每一代都有就绪期限）、S22；ADV-3 的 S30；ADV-5 的检查（第一次没抓到，见 C6）；pause 不理 Stop（S8b）；C.1 不数 Temporal 的私钥（A8）；不给 `--stop-on-stdin-eof`（A9）；关闭顺序颠倒（A10）；家目录里的 Python 照收（C9）。
+  - S6（SIGTERM 之后不 SIGKILL）是靠 go test 的 90 秒超时抓到的：对两者都不理的 Worker，Stop 永远不返回。
+  - 黑盒：B5（见 B3）srt 下失败、none 下通过，和预期一致；B2（关闭顺序，现在在 `stopInOrder` 里）按新代码重写，none 下抓到。
+- **跑过的**（macOS，`--verify-after-each`，两种环境同时跑；完整的三种套件和 Linux VM 由你跑）：none 下 `test_worker_supervision.py`；srt 下它、`test_sandbox.py` 和 T16（srt 在伪终端上跑，和第一轮一样）。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 18 | 3 | 18 | 13 | 0 | 5 |
+  | macOS，srt | 42 | 3 | 24 | 18 | 0 | 6 |
+
+  跑完没有留下 Worker、agentd 或状态目录。`gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；supervisor、cmd/agentd、config 在 `-race` 下也过；`make build`、`make build-linux` 都通过，`bin/` 和 `bin/linux-arm64/` 是最后的代码（d314cb0，之后只改了这份笔记）。bwrap 下的路径（停止通道经 bwrap 传下去、在途任务的测试、kill -9 后 10 秒内没了）我没跑。
+
+#### 剩余风险（对抗审查列的，第二轮加上）
+
+- 服务管理器把停止信号发给整个 cgroup 时（比如 systemd），Worker 会在 agentd 的看管停掉它之前就退出，被记成一次意外退出，多一条 `worker.exited`。
+- 压着没写的退出记录，agentd 被 kill -9 时就丢了。
+- 就绪和期限同时到达时的竞争：期限的那一支可能先被选中。
+- 输出里任何一行带 "worker ready" 都算就绪：工作流或 Worker 自己能提前打开这道门（只影响 agentd 什么时候说自己就绪）。
+- Linux 上 agentd 如果在启动脚本扫描目录的那几秒里死了，bwrap 起来时父进程已经是 init，PDEATHSIG 设在了 init 上，永远不会触发；这时只能靠停止通道（诚实的 Worker）或下一个 agentd 的清扫。
