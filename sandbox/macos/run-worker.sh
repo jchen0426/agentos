@@ -34,7 +34,11 @@
 #     AGENTOS_SANDBOX_LIFELINE=3. macOS has no parent-death signal: a Worker that outlived a killed
 #     agentd would reach the next agentd on the same port, a second Worker beside its own. A watcher
 #     outside the sandbox, in this process group (srt lets the Worker signal nothing outside its
-#     sandbox), reads fd 3; at EOF, agentd is gone, however it ended, and the watcher kills the group
+#     sandbox), reads fd 3; at EOF, agentd is gone, however it ended, and the watcher kills the group.
+#     That, and agentd's sweep of worker.pid (by group too), clean up after an honest Worker; they do
+#     not contain a subverted one, which can fork a child that leaves the group (setsid, or a double
+#     fork): still sandboxed, it could reach the next agentd's port. Not fixed here: C3b's ulimit -u
+#     (no fork), or a per-generation credential at the Runtime entry, would close it
 #   - controlling terminal: none. srt lets what it runs ioctl /dev/tty, so a Worker in a session
 #     with a terminal could type into it (TIOCSTI). This script refuses to run with one: agentd
 #     starts it in a session of its own; by hand, see the README
