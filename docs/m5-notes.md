@@ -1568,24 +1568,24 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - **问题**：`models/prompt.go` 的 `userMessage` 把每个不是 blob 引用的参数都原样放进 `<arguments>` JSON 发给模型，网关又从不检查模型调用的参数（`dispatch` 的 model 分支）。被攻破的 Worker 往提示里放什么都行，模型的答复又就是公开的报告。预算不够时报告里的数字也跟着请求的大小走（上一轮写的约 17 位）。
 - **改法**：
   - **models.yaml**：每个任务声明 `inputs`，比如 `audit_v1: inputs: [diff_ref]`。每个输入都是运行自己的 blob（`<name>_ref`，名字小写），而且都必须给。任务没写 inputs、写了空的、写了普通输入（不以 `_ref` 结尾）、名字不合规则、同一个写两遍，agentd 都拒绝启动。普通输入要有一个给它设界的类型，agentd 现在没有，配置的注释里写了。
-  - **网关**（`Gateway.inputs`）：模型调用的参数必须正好是任务声明的输入，一个不多一个不少，每个是 `sha256:<64 位十六进制>`、是运行自己的 blob、不重复。不是的就以不可重试的 BadArguments 拒绝。拒绝的位置照工具拒绝坏参数的做法：在问策略之前，所以在预算之前、在任何东西发给供应商之前，也就没有 call.started（“先有记录，才有调用”照旧：什么都没发出去，调用的记录在结尾写下这个错误）。错误的话只有任务名和它声明的输入，都是 agentd 自己配置里的；调用自己的参数名写进 agentd 的日志（截短）。
+  - **网关**（`Gateway.inputs`）：模型调用的参数必须正好是任务声明的输入，一个不多一个不少，每个是 `sha256:<64 位十六进制>`、是运行自己的 blob、不重复。不是的就以不可重试的 BadArguments 拒绝。拒绝的位置照工具拒绝坏参数的做法：在循环保护数过它之后（所以留下一行 calls 和一条 call.counted，被拒的调用照样用掉这次运行的循环额度），在问策略之前，所以在 call.started、数 token、预算和任何请求之前（“先有记录，才有调用”照旧：什么都没发出去，调用的记录在结尾写下这个错误）。错误的话只有任务名和它声明的输入，都是 agentd 自己配置里的；调用自己的参数名写进 agentd 的日志（截短）。
   - **提示**：`userMessage` 只收 blob 引用，别的参数直接让请求失败（ErrBadArguments），`<arguments>` 那一节去掉了。网关已经先拒了，这是第二道。
-  - 改坏时有一处杀不掉：去掉“形如 sha256:<64 位十六进制>”的检查。它和“是运行自己的 blob”是等价的：不是这个形状的值，不可能是哪个 blob 的键，所有权检查照样拒绝它。形状检查只省一次查询，留着。
+  - 改坏时原来有一处杀不掉：去掉“形如 sha256:<64 位十六进制>”的检查。我原来说它和“是运行自己的 blob”等价，不对（对抗审查 R3-3）：blob_owners 存的是不带前缀的十六进制，查找时又先去掉 `sha256:`，所以一个运行自己的 blob 的裸十六进制能过所有权检查，只有形状检查拦得住它。`TestAModelCallTakesOnlyItsInputs` 加了这一种，现在这个改坏也被杀掉了。
 - **调用方**：Worker、t10、t12 和 rogue 的工作流、评测程序发的都只有 `diff_ref=<运行自己的 diff>`；modelsim 的规则匹配的是 diff 的内容，不是参数。要改的只有：
   - **T7 的 FanOut**（你同意的做法）：先调 git.show_diff，再拿同一个 diff_ref 发 50 个调用。它原来发的是 `diff_ref=f"fan-out-{i}"`，这些值不是引用，是当普通参数进提示的。T7 现在测的是参数完全相同的并发，docstring 写了为什么。逐个请求的对账照旧按 request_id（reserves、closes、供应商的记录），没有改成按内容或按个数对。设计文档里 T7 那一行没说参数不同，不用改。
   - **Go 网关测试**里模型调用用的 `{"diff":"x"}`，改成运行自己的 diff_ref（`diffCall`）。直接调 `modelCallOnce` 的测试不经过检查，没动。
   - **配置**：config/models.yaml、config/dev/models.yaml、harness 的四个 TEST_MODELS、T7、T13、跨供应商回退、补丁头、评测程序和它的测试、agentd 和 models 包的测试，都加了 `inputs: [diff_ref]`。T5、T6 不写 models.yaml。
-- **pausedBefore 是按参数连起来的，不是按调用**：一个等过预算的调用重发时用的是新活动，网关靠“同一个任务、同一组参数、紧挨着、以 budget_exhausted 结束”把它和之前的活动连起来，继承它们的拒答、答复不合格的次数和最后一个不合格的答复（按供应商、模型、提示版本和任务的 effort 对上）。参数一样的两个调用同时发，一个拒答之后在回退请求上预算不够，另一个重发时可能把前一个的拒答当成自己的。改了：连起来的那些活动必须一个接一个，每个都在下一个被调度之前结束（结束时间取它最后一条 call 记录的时间，最多读 10 万条，读不到就当重叠）；有重叠就什么都不继承，从头来。一个调用自己的几次暂停照旧连得上。剩下的：参数一样的调用一个接一个地发，还是分不出来，另一个调用在这个等预算时发出去，会被当成它的重发。安全审计的 Worker 只发一个模型调用，不会这样。
+- **pausedBefore 是按参数连起来的，不是按调用**：一个等过预算的调用重发时用的是新活动，网关靠“同一个任务、同一组参数、紧挨着、以 budget_exhausted 结束”把它和之前的活动连起来，继承它们的拒答、答复不合格的次数和最后一个不合格的答复（按供应商、模型、提示版本和任务的 effort 对上）。参数一样的两个调用同时发，一个拒答之后在回退请求上预算不够，另一个重发时可能把前一个的拒答当成自己的。改了：连起来的那些活动必须一个接一个，每个都在下一个被调度之前结束（结束时间取它最后一条 call 记录的时间，最多读 10 万条，读不到就当重叠）；有重叠就什么都不继承，从头来。（后来又改了两次，见下一节的 L3 和最后一节的 R3-1、L4：现在比的是带 budget_exhausted 的那条记录的时间，对下一个调用的 created_at，两头都是 agentd 的时钟。）一个调用自己的几次暂停照旧连得上。剩下的：参数一样的调用一个接一个地发，还是分不出来，另一个调用在这个等预算时发出去，会被当成它的重发。安全审计的 Worker 只发一个模型调用，不会这样。
 - **报告里的预算数字回到几个位**：请求的大小由调用指的是运行的哪个 blob、前面调了几次决定，几个位。`diff_ref` 这个名字不限定指哪个 blob：运行自己产出的任何一个都行（diff、模型被接受的答复、补丁、审批人改过的补丁），工作流选哪个，但都是运行自己的，不是 Worker 写的。
 - **测试**：
   - `TestModelsRefusesBadRoutes`：没有 inputs、空的、普通输入、名字不对、大写、写两遍，都不让加载；原来那些坏配置都补上了 inputs，所以每个都只因为它本来要测的毛病被拒。两个输入的任务能加载，路由里带着输入。
   - `TestAnthropicReadsOnlyTheRunsOwnBlobs`：多一个普通参数、引用位置放普通值、值不是字符串，提示都不建，没有请求发出去。
-  - `TestAModelCallTakesOnlyItsInputs`（gateway）：多一个普通参数、多一个引用、没有参数、换了参数名、别的运行的 blob、没存过的 blob、不是字符串、不是引用、形状不对，九种都是不可重试的 BadArguments：没数过 token、没发请求、没问策略、没有 call.started、没有预算记录、没有 model_calls 行；错误里没有调用的参数名和值。照 Worker 的样子发的那个照常通过。
+  - `TestAModelCallTakesOnlyItsInputs`（gateway）：多一个普通参数、多一个引用、没有参数、换了参数名、别的运行的 blob、没存过的 blob、不是字符串、不是引用、形状不对，九种（后来加了第十种：运行自己的 blob 的裸十六进制）都是不可重试的 BadArguments：没数过 token、没发请求、没问策略、没有 call.started、没有预算记录、没有 model_calls 行（循环保护照样数过它：有一行 calls、一条 call.counted）；错误里没有调用的参数名和值。照 Worker 的样子发的那个照常通过。
   - `TestAModelTaskOfTwoInputsTakesTwoBlobs`：两个输入不能是同一个 blob。
   - `TestAReportPostsNothingAWorkerAddsToAModelCall`：两个运行的模型调用只差 Worker 加的那个参数（1 个字节对两千多个），评论一字不差（连标记），说的是 analyze 失败、日志里有细节。
   - `TestResumeTakesNoOtherCallsPast`：上面那个情形，两种调度顺序都试：一个调用答复不合格又拒答、在回退上预算不够，另一个也等预算，两个重发都不继承对方的东西（拒答、不合格的次数、最后一个不合格的答复）；结束得比下一个调度晚的、找不到结束时间的，也不继承。一个调用自己的暂停照旧继承（`TestResumeAcrossBudgetPauses`，夹具现在给结束的活动写 call 记录）。
   - 黑盒 T13 加了 `test_t13_a_model_call_takes_only_its_inputs`，三种接口：工作流的模型调用多带一个自己的参数，被拒；modelsim 的请求日志里一个请求都没有，连数 token 的、问 Ollama 的都没有；没有预算记录；explain 说 analyze 的 model_error，带着拒绝的话；评论里没有那个参数，只说 analyze 失败。
-- **改坏**：15 处里 14 处都有测试失败：不检查；多的参数放过；别的运行的 blob 放过；同一个 blob 两次放过；错误里写出调用的参数名；先问策略；没有 inputs 的任务能加载；普通输入能加载；同一个输入写两遍能加载；提示收普通参数；路由里没有输入；同时发的调用当成一个；找不到结束时间当成不重叠；比较调度时间而不是结束时间。活下来的那一处就是上面说的形状检查，和所有权检查等价。第一遍有 4 处编译不过，换了写法。
+- **改坏**：15 处里 14 处都有测试失败：不检查；多的参数放过；别的运行的 blob 放过；同一个 blob 两次放过；错误里写出调用的参数名；先问策略；没有 inputs 的任务能加载；普通输入能加载；同一个输入写两遍能加载；提示收普通参数；路由里没有输入；同时发的调用当成一个；找不到结束时间当成不重叠；比较调度时间而不是结束时间。活下来的那一处就是上面说的形状检查；它不是等价的，后来加了裸十六进制的测试，现在也被杀掉了（见上面）。第一遍有 4 处编译不过，换了写法。
 
 #### 跑过的（两部分都在，macOS）
 
@@ -1600,16 +1600,40 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - 搜了 tests/，只有 ManyReports 这一处靠改不显示的参数来再发报告。
 - **安全审查（全是低危和 nit）**：
   - **N1**：不给 reason 和 `reason: done` 渲染出一样的评论，却得到不同的标记。`Identity` 里把没给的 reason 当成 done。加了 `TestAReportPostsNothingAWorkerChose` 的一条端到端断言和 githubtool 单元测试的一条。
-  - **L3**：`pausedBefore` 原来拿上一个调用的结束时间（审计记录的 At，agentd 的账本时钟）和下一个调用的 `scheduled_at`（Temporal 的时钟）比。两台主机的时钟有偏差时，短于偏差的重叠会被当成前后相继。改成两头都用 agentd 自己的时钟：上一个调用最后一条记录的 At，和下一个调用的 `created_at`（agentd 第一次数到它的时间）。加了 `TestResumeReadsOneClock`：调度时间看起来前后相继、agentd 的时间看起来重叠时，按 agentd 的时间判。夹具现在给调用写 created_at（= 它的调度时间），给结束的活动写 call 记录。
+  - **L3**：`pausedBefore` 原来拿上一个调用的结束时间（审计记录的 At，agentd 的账本时钟）和下一个调用的 `scheduled_at`（Temporal 的时钟）比。两台主机的时钟有偏差时，短于偏差的重叠会被当成前后相继。改成两头都用 agentd 自己的时钟：上一个调用的结束时间，和下一个调用的 `created_at`（agentd 第一次数到它的时间）。结束时间原来取它最后一条记录的 At，后来改成带 budget_exhausted 的那条（见最后一节 R3-1）。加了 `TestResumeReadsOneClock`：调度时间看起来前后相继、agentd 的时间看起来重叠时，按 agentd 的时间判。夹具现在给调用写 created_at（= 它的调度时间），给结束的活动写 call 记录。
   - **L1**：升级后，一个按旧 ID 记下、PENDING、没被认领、`maybe_sent == 0` 的 legacy effect，原来会拿旧 agentd 存的 payload 直接发，不重新渲染；#54 之前那个 payload 可能带着编造的调用名。改法：这样的 effect 直接作废（`unsent` + ABANDONED，不算进上限），在身份 ID 下重记一个，让当前代码重新渲染；只有可能已经发出去的（被认领，或 `maybe_sent != 0`）才还走 legacy 那条路，靠旧标记的 Find 防止发第二条。`TestAReportsEffectRecordedBeforeItsIdentity` 拆成两种：没发出去的（作废 + 重渲染，两个 effect，身份 ID 的标记）、可能发出去的（沿用 legacy，旧标记）。
   - **L2（措辞）**：`diff_ref` 收的是运行自己的任何一个 blob（diff、被接受的答复、补丁、审批人改过的补丁），都不是 Worker 写的，但文档原来说“它的 diff，由 commit 定下”。README、notes、配置注释都改成：`_ref` 指运行的哪个 blob 由工作流选，但都是运行自己产出的。预算数字的说法也跟着改：请求大小跟着“指的是哪个 blob、前面调了几次”走，还是几个位。
 - **一直就有的，只记为剩余风险**：草稿 PR 的分支名带补丁哈希的 8 个十六进制字符（`githubtool/pr.go:136`）。Worker 选运行的哪个 blob 当 patch_ref，所以这是几个位，而且在一个人批准之后才发生。加进下面的剩余风险清单。
 - **改坏**：5 处都有测试失败：没给的 reason 不当成 done；给了的 reason 不保留（N1 两处）；重叠按调度时间（Temporal 的时钟）判（L3）；没发出去的 legacy effect 照旧沿用、不重渲染；可能发出去的也被作废（L1 两处）。
 - **跑过的**：`gofmt -l`、`go vet ./...` 没输出，`go test ./...` 25 个包全过。`make build` 之后，黑盒不加沙箱，带 `--verify-after-each`，跑了 test_write_limits.py（两个上限测试和新加的那个）、T5、T6、T7、T12、T13：44 passed。44 个栈：41 个 verify 以 0 退出，1 个和标注一致（T5 审批之后改 payload 那个，照设计以 1 退出），0 个失败，2 个照设计没验（agentd 不启动）。
 
+#### 第三轮：对抗审查（da72588）和安全审查（8f402ca）之后（8f402ca 之上）
+
+- **R3-1（中）：诚实的重发调用可能丢掉自己的过去**。`pausedBefore` 原来把一个链接的结束时间取成那个活动的最后一条 call 记录。暂停的那个调用如果有一次更早的尝试，在心跳超时后还在 agentd 里跑，等重发已经被数过之后才写下它的记录，这个链接就读成重叠，重发又去问主模型、又付一次钱。改法：结束时间取带着那个活动 budget_exhausted 结果的那条记录，照旧对下一个调用的 `created_at`，两头都是 agentd 的时钟。加了 `TestResumeTakesItsOwnPastByItsBudgetRecord`：
+  - (a) 更早的尝试晚写的记录：重发留住自己的过去；
+  - (b) 门铃在暂停的调用还在跑时就响了，重发紧接着来：留住过去；
+  - (c) 更早的尝试早写了记录，但 budget_exhausted 在下一个调用被数过之后才来：两者重叠，从头来。
+  “结束 = 最后一条记录”被 (a) 杀掉，“结束 = 第一条记录”（审查里活下来的 `pb_first_record`）被 (c) 杀掉。
+- **R3-2（中）：没有测试检查两个运行拿到不同的报告 effect ID**。身份现在是 repo、commit、reason（加上写得出名字的类型），两个审同一个 commit 的运行只差工作流 ID。哈希里去掉工作流 ID，原来的测试都过，而第二个运行会找到第一个运行的评论、再也不发。加了 `TestTwoRunsReportingOneCommitAreTwoEffects`：两个运行发一样的报告参数，得到两个 effect、两个标记。
+- **R3-3（低）：形状检查不是等价的**。见上面“模型任务只收声明的输入”里改过的那条：裸十六进制能过所有权检查。加了这一种测试，那个改坏现在也被杀掉了。da72588 的提交说明里说它等价，那是已经提交的历史，改不了；这个提交的说明里改正了。
+- **R3-5（措辞）**：输入的拒绝在循环保护数过它之后，所以留下一行 calls、一条 call.counted，被拒的调用照样用掉这次运行的循环额度；它在策略、call.started、数 token、预算和任何请求之前。上面改了；da72588 的提交说明里写的“no count”也是这个意思的错，同上，在这个提交的说明里改正。
+- **R3-7**：`PublicErrorTypes` 上加了警告：改这个集合会给错误类型跨过集合边界的、没做完的报告 effect 换一个 ID。升级时的查找只从“全部参数”那种 ID 接过来，所以这样的重试找不到 effect，再记一个，被上限拒掉，运行以“报告没发出去”失败。换一个改了集合的 agentd 之前，先让在途的报告做完。
+- **R3-8**：T7 现在不再端到端地显示“重发留住自己的过去”：它的第一波都是重叠的，每个重发都从头来。覆盖这一点的是 Go 测试：`TestResumeAcrossBudgetPauses`、`TestResumeReadsOneClock`、`TestResumeTakesItsOwnPastByItsBudgetRecord` 的 (a) 和 (b)。
+- **审查里活下来、我认为等价或没测的**：
+  - `pb_equal_ok`（时间相等时当成前后相继）：只在两个时间精确到纳秒都相等时才不一样；agentd 写记录和数下一个调用在两个事务里，实际不会相等。等价。
+  - `e_legacy_no_reqid`（legacy 那条路上不设 `req.EffectID`）：之后只有审批（`gate`）会读它，而 comment_commit 没有审批。对这个工具等价；以后要是有带审批的 Identifier 工具，就不等价了。
+  - `e_legacy_any_err`（查 legacy ID 时把任何错误都当成“没有”）：只在数据库出错时不一样，没测。
+- **L4（低，措辞加剩余风险）**：`pausedBefore` 现在按 agentd 处理调用的先后连，不按工作流是不是同时调度的。工作流同时发的两个参数一样的调用，第二个直到第一个以 budget_exhausted 结束之后才被数到，就会共享过去。没有加“调度时间”的条件（带一个时钟偏差的余量）：那会让上面的 (b) 又从头来。改了 gateway.go 里 pausedBefore 的头注释和上面 L3 那一行，说清比的是什么；记进下面的剩余风险。影响：继承的只是供应商自己对同一个任务、同一组输入 blob 的更早的答复；路由仍在任务自己的跳点里，每一跳都过策略。
+- **N2（nit）**：L1 的作废原来不管有没有生效：`settle()` 在比较交换失败时返回 nil。改成有条件的：`abandonUnsent` 用 `AbandonUnclaimedEffect` 只在读到的那个版本仍是 PENDING、没被认领、maybe_sent 0 时作废，刚好改了一行才在身份 ID 下重记一个新的；否则 `takeOverLegacy` 重新读，照默认分支那样沿用 legacy 的 effect。在 `effect()` 里读和作废之间插进一次取消，没有钩子做不到确定地复现，所以把“作废还是沿用”挪进 `takeOverLegacy`，在函数这一层测：`TestAbandoningAnUnsentEffectIsConditional` 用三种“期间变了”（取消把它作废了、被认领了、可能发出去了）测 `abandonUnsent`，再测 `takeOverLegacy` 的两种结果（没变：作废、记新的；变了：沿用它现在的样子）。
+- **改坏**：8 处都有测试失败：结束取最后一条记录、取第一条记录（R3-1 两处）；effect ID 不带工作流 ID（R3-2）；去掉形状检查（R3-3）；作废不管改没改都当成功、作废不看版本、变了的 legacy 不重新读、作废了的也沿用（N2 四处）。第一遍有 1 处编译不过，换了写法。
+- **跑过的**：`gofmt -l`、`go vet ./...` 没输出，`go test ./...` 25 个包全过。`make build` 之后，黑盒不加沙箱，带 `--verify-after-each`，跑了 test_write_limits.py、T5、T6、T7、T12、T13：44 passed。44 个栈：41 个 verify 以 0 退出，1 个和标注一致（T5 审批之后改 payload 那个，照设计以 1 退出），0 个失败，2 个照设计没验（agentd 不启动）。
+- **L2/R3-4 复查**：grep 过 README、notes、配置注释：没有剩下“它的 diff，由 commit 定下”或者把 `_ref` 说成只能是 diff 的话。剩下的“the run's diff”说的都是 Worker、T7、T13 的工作流实际发的是什么。T7 的 docstring 改得更清楚了（“那时 diff 是运行唯一的 blob”）。
+
 #### 剩余风险（这个 PR 之后）
 
 - 被攻破的 Worker 在报告里还能决定的：reason 和 51 个名字之一（或不给）；调用任务的哪些步骤、顺序、各自怎么结束（判定、kind、点名的步、几个计数、几个位）；什么时候报告；一个运行一个报告（除非策略放宽 max_per_run）。
 - 预算数字：请求大小跟着调用指运行的哪个 blob、前面调了几次走，几个位。
 - 草稿 PR 的分支名带 patch_ref 所指 blob 的哈希的 8 个十六进制字符；Worker 选哪个 blob，几个位，在人批准之后。
+- `pausedBefore` 按 agentd 处理调用的先后连：工作流同时发的两个参数一样的调用，第二个直到第一个以 budget_exhausted 结束之后才被数到，会共享过去（供应商自己对同一个任务、同一组输入 blob 的更早的答复；路由仍在任务的跳点里，每跳过策略）。参数一样的调用一个接一个发，也分不出来。
+- 改 `PublicErrorTypes` 会给跨过集合边界的、没做完的报告 effect 换 ID：换 agentd 之前先让在途的报告做完。
 - 升级要先把在途的报告 effect 放干：#54 之后、这个 PR 之前记下而没做完、可能已发出去的报告 effect，升级后沿用旧标记（不会发第二条），但它的 payload 是旧 agentd 渲染的。没发出去的会重新渲染，没有这个问题。

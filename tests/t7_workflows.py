@@ -12,10 +12,10 @@ CALLS = 50
 @workflow.defn(name="security-audit")
 class FanOut(SecurityAudit):
     """Reads the run's diff, then sends CALLS model calls at once, all of them with that diff: a
-    model task takes only the inputs models.yaml declares, each a blob of the run's own, and the
-    run has this one, so the calls are alike, argument for argument. A call the budget cannot
-    cover waits in PAUSED_BUDGET for the doorbell, like any call of the security audit, then asks
-    again."""
+    model task takes only the inputs models.yaml declares, each a blob of the run's own, and at
+    that point the diff is the run's only blob, so the calls are alike, argument for argument. A
+    call the budget cannot cover waits in PAUSED_BUDGET for the doorbell, like any call of the
+    security audit, then asks again."""
 
     @workflow.run
     async def run(self, a: AuditInput) -> dict:

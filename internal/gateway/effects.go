@@ -119,6 +119,35 @@ func (g *Gateway) callTool(ctx context.Context, info activity.Info, run db.Run, 
 	return v.(*agentosv1.Result), nil
 }
 
+// takeOverLegacy settles what becomes of old, a legacy effect nothing of went out when it was read:
+// abandoned, so that the call records a fresh effect (keep false); or, when it changed meanwhile and
+// so was not abandoned, read again for the call to go on with as it is now (keep true).
+func (g *Gateway) takeOverLegacy(ctx context.Context, old db.Effect) (db.Effect, bool, error) {
+	abandoned, err := g.abandonUnsent(ctx, old, "re-rendered after an upgrade changed the effect's identity")
+	if err != nil || abandoned {
+		return db.Effect{}, false, err
+	}
+	cur, err := g.Ledger.Q.GetEffect(ctx, old.EffectID)
+	return cur, err == nil, err
+}
+
+// abandonUnsent abandons e, an effect nothing of went out, if it still is so at its version (PENDING,
+// unclaimed, maybe_sent 0), and reports whether it did. It settles nothing when e changed meanwhile.
+func (g *Gateway) abandonUnsent(ctx context.Context, e db.Effect, reason string) (bool, error) {
+	why := valid(reason)
+	err := g.Ledger.Tx(ctx, func(q *db.Queries) error {
+		if n, err := q.AbandonUnclaimedEffect(ctx, db.AbandonUnclaimedEffectParams{
+			Reason: why, UpdatedAt: ledger.Now(), EffectID: e.EffectID, Version: e.Version}); err != nil || n == 0 {
+			return cmp.Or(err, errChanged)
+		}
+		return noteSettled(ctx, q, e.WorkflowID, e.EffectID, effectAbandoned, why, sql.NullString{})
+	})
+	if errors.Is(err, errChanged) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // effectID names a write's effect: the run, the tool, and the call's arguments in their canonical
 // form (canon), or only those that make what it writes (tools.Identifier).
 func effectID(workflowID string, t tools.Writer, args map[string]any, canon []byte) (string, error) {
@@ -165,8 +194,14 @@ func (g *Gateway) effect(ctx context.Context, run db.Run, t tools.Writer, class 
 				// put in it what current code keeps out of a report. Abandon it (ABANDONED does not count
 				// toward the cap) and record a fresh effect under the identity ID, rendered by current
 				// code. Its marker is the identity ID, and nothing with the old marker is out to clash.
-				if _, serr := g.unsent(ctx, old, effectAbandoned, "re-rendered after an upgrade changed the effect's identity"); serr != nil {
-					return nil, serr
+				// Only if it is still so when it is abandoned: an attempt that claimed it meanwhile, or a
+				// cancel that settled it, wins, and the call goes on with that effect as it is now.
+				cur, keep, terr := g.takeOverLegacy(ctx, old)
+				if terr != nil {
+					return nil, terr
+				}
+				if keep {
+					e, err, req.EffectID = cur, nil, legacy
 				}
 			default:
 				// It may have gone out (claimed, or an attempt may have sent it): a comment of it carries

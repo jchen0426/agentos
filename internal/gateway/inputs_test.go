@@ -42,6 +42,11 @@ func TestAModelCallTakesOnlyItsInputs(t *testing.T) {
 		"no string":              func(string, string) map[string]any { return map[string]any{"diff_ref": 7} },
 		"no ref":                 func(string, string) map[string]any { return map[string]any{"diff_ref": carried} },
 		"a ref of another shape": func(string, string) map[string]any { return map[string]any{"diff_ref": "sha256:" + carried} },
+		// An owned blob's hash without its sha256: prefix: blob_owners holds the bare hex, so the
+		// ownership lookup (which trims the prefix) would take it; only the shape check refuses it.
+		"the run's own blob, bare hex": func(own, _ string) map[string]any {
+			return map[string]any{"diff_ref": strings.TrimPrefix(own, "sha256:")}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g, run, _ := fallbackGateway(t)

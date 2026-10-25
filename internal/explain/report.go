@@ -18,6 +18,13 @@ const (
 // With this set it chooses one of these names, or none. Any other name, and none, is said as "an
 // exception of another type". runs explain, which is local, quotes the workflow's own words (its
 // failure in Temporal) as its claim.
+//
+// Changing the set renames report effects: a report's effect is named by the error type only when
+// the report names it (githubtool's CommentCommit.Identity), so a name moved into or out of the set
+// gives an unfinished report of that type another effect ID. The retry then finds no effect (the
+// upgrade's lookup bridges only from the every-argument ID), records another, which the effect cap
+// refuses, and the run fails with its report not posted. Let in-flight reports finish before an
+// agentd with a changed set takes over.
 var PublicErrorTypes = map[string]bool{
 	"Exception": true, "ArithmeticError": true, "FloatingPointError": true, "OverflowError": true,
 	"ZeroDivisionError": true, "AssertionError": true, "AttributeError": true, "BufferError": true, "EOFError": true,

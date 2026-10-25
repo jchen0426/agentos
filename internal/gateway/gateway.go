@@ -1098,11 +1098,15 @@ func (g *Gateway) tooLate(ctx context.Context, info activity.Info, route models.
 
 // pausedBefore lists, oldest first, the activities that sent the same model call just before
 // this one and returned budget_exhausted: the workflow sends a call that waited again, under a new
-// activity. Only the arguments link them, so they are this call's only while they come one after
-// another, each scheduled after the one before it ended (its call record), as one call's activities
-// are. Calls of the same arguments at once are told apart by nothing, and none of them takes another's
-// past: each starts afresh. (Calls of the same arguments one after another cannot be told apart
-// either: one sent while another waits for budget is taken for its resending.)
+// activity. Only the arguments link them, and the order agentd processed them in: each link counts
+// only if the one before it ended (the call record that carried its budget_exhausted) before agentd
+// first counted the next (its created_at), both on agentd's clock. When agentd took two calls of the
+// same arguments at once, neither takes the other's past, and each starts afresh. What is compared is
+// when agentd processed them, not when the workflow scheduled them: two calls of the same arguments
+// the workflow sent together, the second counted only after the first ended budget_exhausted, are
+// taken for one call and its resending, and so is a call sent while another of the same arguments
+// waits for budget. What carries over is the provider's own earlier answers to the same task and the
+// same input blobs, each of the task's hops, checked by the policy.
 func (g *Gateway) pausedBefore(ctx context.Context, info activity.Info, run db.Run, task, argsHash string) ([]string, error) {
 	calls, err := g.Ledger.Q.ListSameCalls(ctx, db.ListSameCallsParams{
 		WorkflowID: run.WorkflowID, Kind: "model", Name: task, ArgsSha256: argsHash})
@@ -1155,7 +1159,10 @@ type callKey struct{ activityID, scheduledAt string }
 // to have overlapped the next.
 const maxCallRecords = 100_000
 
-// callsEnded is when each of the run's logical calls ended: the time of its latest call record.
+// callsEnded is when each of the run's logical calls that returned budget_exhausted ended: the time
+// of the call record that carried that outcome. Not its latest record: an earlier attempt of the same
+// call, still running in agentd after Temporal gave up on it (a heartbeat timeout), can write its
+// record after the call's resend was counted, and that late record is no end of the call.
 func (g *Gateway) callsEnded(ctx context.Context, run db.Run) (map[callKey]time.Time, error) {
 	rows, err := g.Ledger.Q.ListRunOwnCallRecords(ctx, db.ListRunOwnCallRecordsParams{WorkflowID: run.WorkflowID,
 		TemporalRunID: run.RunID.String, Max: maxCallRecords})
@@ -1167,8 +1174,10 @@ func (g *Gateway) callsEnded(ctx context.Context, run db.Run) (map[callKey]time.
 		var p struct {
 			ActivityID  string `json:"activity_id"`
 			ScheduledAt string `json:"scheduled_at"`
+			Status      string `json:"status"`
 		}
-		if r.Type != "call" || json.Unmarshal([]byte(r.Payload), &p) != nil || p.ScheduledAt == "" {
+		if r.Type != "call" || json.Unmarshal([]byte(r.Payload), &p) != nil || p.ScheduledAt == "" ||
+			p.Status != StatusBudgetExhausted {
 			continue
 		}
 		if at, err := time.Parse(time.RFC3339Nano, r.At); err == nil {

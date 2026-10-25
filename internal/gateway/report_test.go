@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"maps"
 	"regexp"
 	"strings"
 	"testing"
@@ -364,6 +366,136 @@ func TestAReportsEffectRecordedBeforeItsIdentity(t *testing.T) {
 			t.Fatalf("its marker: %s", p)
 		}
 	})
+}
+
+// The abandon of an unsent legacy effect takes effect only on the effect as it was read: PENDING,
+// unclaimed, maybe_sent 0, at that version. One that changed meanwhile (a cancel that settled it, an
+// attempt that claimed it, one that may have sent it) is left as it is, and the call goes on with it.
+func TestAbandoningAnUnsentEffectIsConditional(t *testing.T) {
+	ctx := context.Background()
+	g, l := reporting(t)
+	var h fakeHistory
+	cc := commenter(l, &h)
+	run, err := l.Q.GetRun(ctx, testWorkflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// fresh records a PENDING report effect of its own identity (why, the error type it names).
+	fresh := func(t *testing.T, why map[string]any) db.Effect {
+		t.Helper()
+		args := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40)}
+		maps.Copy(args, why)
+		req, canon := reportCall(t, cc, args)
+		if res, err := g.record(ctx, run, cc, cc.Class(), 0, nil, req, canon); res != nil || err != nil {
+			t.Fatalf("%v %v", res, err)
+		}
+		e, err := l.Q.GetEffect(ctx, req.EffectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	for name, c := range map[string]struct {
+		why    map[string]any
+		change string
+	}{
+		"settled meanwhile (a cancel)": {map[string]any{"reason": "done"},
+			"UPDATE effects SET status = 'ABANDONED', version = version + 1 WHERE effect_id = ?"},
+		"claimed meanwhile": {map[string]any{"reason": "workflow_error", "error_type": "KeyError"},
+			"UPDATE effects SET claimed_by = 'another-agentd', version = version + 1 WHERE effect_id = ?"},
+		"maybe sent meanwhile": {map[string]any{"reason": "workflow_error", "error_type": "ValueError"},
+			"UPDATE effects SET maybe_sent = 1, version = version + 1 WHERE effect_id = ?"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			read := fresh(t, c.why)
+			if _, err := l.DB.ExecContext(ctx, c.change, read.EffectID); err != nil {
+				t.Fatal(err)
+			}
+			before, err := l.Q.GetEffect(ctx, read.EffectID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if abandoned, err := g.abandonUnsent(ctx, read, "re-rendered"); err != nil || abandoned {
+				t.Fatalf("abandoned %v, %v", abandoned, err)
+			}
+			if after, err := l.Q.GetEffect(ctx, read.EffectID); err != nil || after.Version != before.Version || after.Status != before.Status {
+				t.Fatalf("changed: %+v -> %+v %v", before, after, err)
+			}
+		})
+	}
+	// Unchanged since it was read: abandoned.
+	read := fresh(t, map[string]any{"reason": "workflow_error"})
+	if abandoned, err := g.abandonUnsent(ctx, read, "re-rendered"); err != nil || !abandoned {
+		t.Fatalf("abandoned %v, %v", abandoned, err)
+	}
+	if after, err := l.Q.GetEffect(ctx, read.EffectID); err != nil || after.Status != effectAbandoned {
+		t.Fatalf("%+v %v", after, err)
+	}
+
+	// What the call does with it: a fresh effect when the legacy one was abandoned; when it changed
+	// meanwhile (here a cancel settled it), the legacy effect as it is now.
+	unchanged := fresh(t, map[string]any{"reason": "workflow_error", "error_type": "TypeError"})
+	if _, keep, err := g.takeOverLegacy(ctx, unchanged); err != nil || keep {
+		t.Fatalf("an unchanged one: keep %v, %v", keep, err)
+	}
+	changed := fresh(t, map[string]any{"reason": "workflow_error", "error_type": "OSError"})
+	if _, err := l.DB.ExecContext(ctx, "UPDATE effects SET status = 'ABANDONED', version = version + 1 WHERE effect_id = ?",
+		changed.EffectID); err != nil {
+		t.Fatal(err)
+	}
+	if cur, keep, err := g.takeOverLegacy(ctx, changed); err != nil || !keep || cur.EffectID != changed.EffectID ||
+		cur.Version != changed.Version+1 {
+		t.Fatalf("a changed one: %+v keep %v, %v", cur, keep, err)
+	}
+}
+
+// Two runs auditing one commit, whose reports send the same arguments, are two effects: the effect's
+// identity is the comment's repository, commit and reason, and the run's workflow ID names it too. A
+// second run that shared the first's ID would find the first run's comment, and never post its own.
+func TestTwoRunsReportingOneCommitAreTwoEffects(t *testing.T) {
+	g, l := reporting(t)
+	ctx := context.Background()
+	const other = "wf-other"
+	if err := l.Q.InsertRun(ctx, db.InsertRunParams{WorkflowID: other, Task: "security-audit", ParamsJson: "{}",
+		BudgetLimitMicros: 1, CreatedAt: ledger.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Q.SetRunID(ctx, db.SetRunIDParams{RunID: sql.NullString{String: "other-run-id", Valid: true}, WorkflowID: other}); err != nil {
+		t.Fatal(err)
+	}
+	var h fakeHistory
+	h.at(time.Now().Add(time.Hour).Truncate(time.Second), enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED, nil)
+	cc := commenter(l, &h)
+	args := map[string]any{"repo": "o/r", "commit": strings.Repeat("a", 40), "reason": "done"}
+	canon, err := encodeCanonical(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids, markers [2]string
+	for i, wf := range []string{testWorkflowID, other} {
+		run, err := l.Q.GetRun(ctx, wf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := effectID(wf, cc, args, canon)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := tools.Request{WorkflowID: wf, EffectID: id, Args: args}
+		if res, err := g.effect(ctx, run, cc, cc.Class(), 1, nil, req, canon, faults.Effect{}); err != nil || res.GetStatus() != StatusOK {
+			t.Fatalf("%s: %v %v", wf, res, err)
+		}
+		ids[i], markers[i] = id, reMarker.FindString(payloadOfEffect(t, l, id))
+	}
+	if ids[0] == ids[1] || markers[0] == "" || markers[0] == markers[1] {
+		t.Fatalf("effects %v, markers %v", ids, markers)
+	}
+	for i, wf := range []string{testWorkflowID, other} {
+		e, err := l.Q.GetEffect(ctx, ids[i])
+		if err != nil || e.WorkflowID != wf {
+			t.Fatalf("%s's effect: %+v %v", wf, e, err)
+		}
+	}
 }
 
 // reporting is a gateway whose ledger holds the test execution's run as StartRun leaves it, its

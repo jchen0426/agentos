@@ -292,6 +292,76 @@ func TestResumeReadsOneClock(t *testing.T) {
 	}
 }
 
+// A link's end is the record that carried the paused call's budget_exhausted, not its latest
+// record nor its first: an attempt of the call can write its record late or early.
+//   - (a) An earlier attempt, still running in agentd after a heartbeat timeout, writes its record
+//     after the resend was counted: the resend keeps its own past.
+//   - (b) The doorbell rang while the paused call was in flight, so the resend follows at once: it
+//     keeps its past.
+//   - (c) An earlier attempt wrote its record early, but the budget_exhausted came after the next
+//     call was counted: they overlap, and the next starts afresh.
+func TestResumeTakesItsOwnPastByItsBudgetRecord(t *testing.T) {
+	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	// paused records "1:audit_v1", scheduled and counted at t0, budget_exhausted, and its refusal; its
+	// call records are each case's own.
+	paused := func(f *resumeFixture) string {
+		sched := t0.UTC().Format(time.RFC3339Nano)
+		if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: "1:audit_v1",
+			ScheduledAt: sched, Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: sched}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.g.Ledger.Q.SetCallOutcome(ctx, db.SetCallOutcomeParams{Outcome: sql.NullString{String: StatusBudgetExhausted, Valid: true},
+			WorkflowID: "wf", ActivityID: "1:audit_v1", ScheduledAt: sched}); err != nil {
+			t.Fatal(err)
+		}
+		f.request("1:audit_v1", 1, 1, opus, StatusRefused)
+		return sched
+	}
+	resend := func(f *resumeFixture, counted time.Time) activity.Info {
+		at := counted.UTC().Format(time.RFC3339Nano)
+		if _, err := f.g.Ledger.Q.InsertCall(ctx, db.InsertCallParams{WorkflowID: "wf", ActivityID: "2:audit_v1",
+			ScheduledAt: at, Kind: "model", Name: "audit_v1", ArgsSha256: "args", CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+		return activity.Info{ActivityID: "2:audit_v1", ScheduledTime: counted, Attempt: 1}
+	}
+	keeps := func(f *resumeFixture, info activity.Info) bool {
+		declined, refusal, _ := f.resume(info, opus, sol)
+		return slices.Equal(declined, []bool{true, false}) && refusal != nil
+	}
+
+	// (a) The budget_exhausted record at t0+10ms; the resend counted at t0+1s; an earlier attempt's
+	// late record at t0+3s.
+	f := newResumeFixture(t)
+	sched := paused(f)
+	f.ended("1:audit_v1", sched, t0.Add(10*time.Millisecond), StatusBudgetExhausted)
+	info := resend(f, t0.Add(time.Second))
+	f.ended("1:audit_v1", sched, t0.Add(3*time.Second), "error")
+	if !keeps(f, info) {
+		t.Error("(a) a late record of an earlier attempt took the resend's past")
+	}
+
+	// (b) The resend counted a moment after the budget_exhausted record.
+	f = newResumeFixture(t)
+	sched = paused(f)
+	f.ended("1:audit_v1", sched, t0.Add(10*time.Millisecond), StatusBudgetExhausted)
+	if !keeps(f, resend(f, t0.Add(10*time.Millisecond+time.Microsecond))) {
+		t.Error("(b) a resend right after the doorbell lost its past")
+	}
+
+	// (c) An earlier attempt's record at t0+5ms, the next call counted at t0+1s, the budget_exhausted
+	// record only at t0+2s: they overlapped.
+	f = newResumeFixture(t)
+	sched = paused(f)
+	f.ended("1:audit_v1", sched, t0.Add(5*time.Millisecond), "error")
+	info = resend(f, t0.Add(time.Second))
+	f.ended("1:audit_v1", sched, t0.Add(2*time.Second), StatusBudgetExhausted)
+	if declined, refusal, _ := f.resume(info, opus, sol); slices.Contains(declined, true) || refusal != nil {
+		t.Errorf("(c) an overlapping call took another's past: declined %v, refusal %+v", declined, refusal)
+	}
+}
+
 func TestResumeChainStopsAtACallThatDidNotWait(t *testing.T) {
 	f := newResumeFixture(t)
 	t0 := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
