@@ -101,10 +101,10 @@ func workerPrivate(cfg *config.Config) []string {
 // launcher (sandboxed false): the Worker reads everything. It mirrors the launchers, and changes with
 // them:
 //   - sandbox/macos/run-worker.sh (srt's denyRead: its denied, through both): nothing in a home
-//     directory, $HOME's or the user database's, nor in a shared temporary directory, /tmp, /var/tmp
-//     or /var/folders, or /private's; by the path and by its real path, as the launcher lists both,
-//     whatever the case, as APFS compares names, and by the data volume's names for them
-//     (/System/Volumes/Data/Users/...), as Seatbelt resolves them.
+//     directory, $HOME's or the user database's, or its .agentos, nor in a shared temporary
+//     directory, /tmp, /var/tmp or /var/folders, or /private's; by the path and by its real path, as
+//     the launcher lists both, whatever the case, as APFS compares names, and by the data volume's
+//     names for them (/System/Volumes/Data/Users/...), as Seatbelt resolves them (darwinHidden).
 //   - sandbox/linux/run-worker.sh (bwrap's --ro-bind /usr /usr, and its links into it: /bin, /sbin,
 //     /lib, /lib64): only what is in /usr, by its real path; and by the path, whose first name the
 //     sandbox looks up in its own root, which holds nothing else of the host's.
@@ -117,25 +117,35 @@ func workerVisible(goos string, sandboxed bool) func(string) bool {
 	}
 	switch goos {
 	case "darwin":
-		hidden := []string{"/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders"}
+		var homes []string
 		if home, err := os.UserHomeDir(); err == nil {
-			hidden = append(hidden, home)
+			homes = append(homes, home)
 		}
 		if u, err := user.Current(); err == nil {
-			hidden = append(hidden, u.HomeDir)
+			homes = append(homes, u.HomeDir)
 		}
-		// And by the data volume's names for them, which Seatbelt hides as well: /Users and /private
-		// are firmlinks into /System/Volumes/Data, which no link resolves.
-		for _, h := range slices.Clone(hidden) {
-			if filepath.IsAbs(h) {
-				hidden = append(hidden, filepath.Join("/System/Volumes/Data", realPath(h)))
-			}
-		}
-		return hiddenIn(hidden)
+		return hiddenIn(darwinHidden(homes))
 	case "linux":
 		return shownIn("/usr", []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"})
 	}
 	return func(string) bool { return false } // a launcher agentd does not know: nothing
+}
+
+// darwinHidden is what the macOS launcher denies the Worker with homes, its home directories, but the
+// deny list: its denied, the homes and their .agentos among them (whose real path may be elsewhere);
+// and the data volume's names for them all, which Seatbelt hides as well: /Users and /private are
+// firmlinks into /System/Volumes/Data, which no link resolves.
+func darwinHidden(homes []string) []string {
+	hidden := []string{"/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders"}
+	for _, h := range homes {
+		hidden = append(hidden, h, filepath.Join(h, ".agentos"))
+	}
+	for _, h := range slices.Clone(hidden) {
+		if filepath.IsAbs(h) {
+			hidden = append(hidden, filepath.Join("/System/Volumes/Data", realPath(h)))
+		}
+	}
+	return hidden
 }
 
 // hiddenIn shows a path unless it is in one of dirs, by its name or its real path, compared with

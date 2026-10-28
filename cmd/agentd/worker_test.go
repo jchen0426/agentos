@@ -298,6 +298,17 @@ func TestWorkerVisible(t *testing.T) {
 	}
 }
 
+// The macOS launcher denies each home's .agentos wherever it really is, and the data volume's names
+// for what it denies.
+func TestDarwinHidden(t *testing.T) {
+	hidden := darwinHidden([]string{"/Users/u"})
+	for _, want := range []string{"/Users/u", "/Users/u/.agentos", "/tmp", "/System/Volumes/Data/Users/u", "/System/Volumes/Data/Users/u/.agentos"} {
+		if !slices.Contains(hidden, want) {
+			t.Errorf("%s not hidden: %q", want, hidden)
+		}
+	}
+}
+
 // macOS's sandbox judges a path by its real path, and APFS's names regardless of case: so does the
 // copy, for the directories it hides and for the path.
 func TestHiddenIn(t *testing.T) {
