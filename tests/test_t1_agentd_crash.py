@@ -1,4 +1,5 @@
-"""T1, the agentd half: kill -9 agentd around the moment a model result is recorded.
+"""T1, the agentd half: kill -9 agentd, its own Worker with it, around the moment a model result is
+recorded; the next agentd starts a Worker of its own.
 
 - After the result is in the ledger: the retry is served from the ledger and the provider
   was asked once (design doc, section 5: recorded results are reused).
@@ -7,9 +8,15 @@
   when agentd starts (section 9). The run is not lost and the second request is not hidden.
 """
 
-from tests.harness import MODEL_TIMEOUT, Stack, TERMINAL, gateway_calls, wait_for
+import pytest
+
+from tests.harness import KEYED_MODEL, MODEL_TIMEOUT, SANDBOX, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
+
+pytestmark = pytest.mark.skipif(KEYED_MODEL and SANDBOX == "none", reason=(
+    "a real model's key is a real secret, beside which agentd runs no Worker of its own without a sandbox "
+    "(--insecure-dev): run it under AGENTOS_SANDBOX=srt"))
 
 
 def model_attempt(stack: Stack, run: dict) -> int:
@@ -20,8 +27,7 @@ def model_attempt(stack: Stack, run: dict) -> int:
 def test_t1_kill_agentd_after_the_model_result_is_recorded(stack: Stack) -> None:
     hold = stack.tmp / "hold-after-record"
     hold.touch()
-    stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_after_record_while_exists": str(hold)}])
-    stack.start_worker()
+    stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_after_record_while_exists": str(hold)}], worker=True)
     run = stack.start_run()
     # The answer the call returns: a real model's first answer may break the schema and be
     # asked for again, and agentd holds only after the one that counts.
@@ -33,6 +39,7 @@ def test_t1_kill_agentd_after_the_model_result_is_recorded(stack: Stack) -> None
 
     final = stack.wait_state(run, TERMINAL, timeout=120)
     assert final["state"] == "SUCCEEDED", final
+    assert stack.worker_processes() == [stack.worker().pid()]  # the next agentd's own Worker
     assert model_attempt(stack, run) == 2  # Temporal retried the activity...
     rows = stack.model_calls(run)
     assert {r["attempt"] for r in rows} == {1}, [dict(r) for r in rows]  # ...and the ledger answered it
@@ -42,8 +49,7 @@ def test_t1_kill_agentd_after_the_model_result_is_recorded(stack: Stack) -> None
 def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded(stack: Stack) -> None:
     hold = stack.tmp / "hold-before-record"
     hold.touch()
-    stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_before_record_while_exists": str(hold)}])
-    stack.start_worker()
+    stack.start_agentd(faults=[{"name": MODEL, "attempt": 1, "hold_before_record_while_exists": str(hold)}], worker=True)
     run = stack.start_run()
     wait_for(lambda: stack.model_answered(run), "the provider to answer", timeout=MODEL_TIMEOUT)
     stack.restart_agentd(kill=True)  # the provider answered; the ledger has no result
@@ -51,6 +57,7 @@ def test_t1_kill_agentd_after_the_provider_answers_before_the_result_is_recorded
 
     final = stack.wait_state(run, TERMINAL, timeout=MODEL_TIMEOUT + 120)
     assert final["state"] == "SUCCEEDED", final
+    assert stack.worker_processes() == [stack.worker().pid()]  # the next agentd's own Worker
     rows = stack.model_calls(run)
     assert stack.provider_requests(run) == len(rows) >= 2  # asked again: agentd could not know
     # The unanswered attempt stays visible; the retry got the one accepted answer.

@@ -166,13 +166,14 @@ def test_t12_a_budget_run_out(stack: Stack) -> None:
 
 
 def test_t12_the_worker_crashes(stack: Stack) -> None:
+    """agentd's own Worker, paused while it holds a workflow task, then killed: agentd starts it again."""
     hold = stack.tmp / "hold-model"
     hold.touch()
-    stack.start_agentd(faults=[{"name": "audit_v1", "hold_while_exists": str(hold)}])
-    w1 = stack.start_worker()
+    stack.start_agentd(faults=[{"name": "audit_v1", "hold_while_exists": str(hold)}], worker=True)
+    w = stack.worker()
     run = stack.start_run()
     wait_for(lambda: len(stack.model_calls(run)) == 1, "the model call to start")
-    w1.pause()  # it keeps its polls: it takes the next workflow task, and never finishes it
+    w.pause()  # it keeps its polls: it takes the next workflow task, and never finishes it
     hold.unlink()
 
     def task_started_after_result() -> bool:
@@ -180,9 +181,10 @@ def test_t12_the_worker_crashes(stack: Stack) -> None:
         done = [i for i, ev in enumerate(events) if ev.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED]
         return len(done) == 2 and any(ev.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_STARTED for ev in events[done[1]:])
     wait_for(task_started_after_result, "the frozen Worker to take the workflow task", timeout=MODEL_TIMEOUT + 30)
-    w1.kill()
-    stack.start_worker()
+    w.kill()
+    w.wait_ready(2)
     assert stack.wait_state(run, TERMINAL, timeout=120)["state"] == "SUCCEEDED"
+    assert stack.worker_processes() == [w.pid()]
     e = stack.explain(run)
     points(e, "ok")
     assert incidents(e) == [("worker_stopped", "analyze", 0)], e["incidents"]

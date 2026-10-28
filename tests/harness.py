@@ -140,6 +140,9 @@ MODEL = os.environ.get("AGENTOS_MODEL", "fake")
 REAL_MODEL = MODEL != "fake"
 # How long a model call may take: a real one thinks for a while, one on this machine longer.
 MODEL_TIMEOUT = {"fake": 30, "local": 480}.get(MODEL, 240)
+# Claude's and OpenAI's keys are real secrets (keyring:), next to which agentd runs no Worker of its
+# own without a sandbox (C.1): the tests of agentd's own Worker skip them unsandboxed.
+KEYED_MODEL = MODEL in ("claude", "openai")
 if MODEL in ("openai", "local"):
     TEST_POLICY = TEST_POLICY.replace("allowed_providers: [fake, anthropic]", f"allowed_providers: [fake, anthropic, {MODEL}]")
 
@@ -471,6 +474,7 @@ class Stack:
         self.supervised = False
         self.workflow_queue = DEFAULT_QUEUE
         self._agentd_terminal = False
+        self._fault_script: dict | None = None  # the one agentd runs with, if any
         self.deny_read: list[Path] = []  # more paths the Worker's sandbox may not read
         # Temporal keeps these open, and with them any lock on them: the evaluation's state
         # directory stays locked while the Temporal a killed runner left behind still runs. Not
@@ -635,10 +639,13 @@ class Stack:
                      models: str = TEST_MODELS, prices: str = TEST_PRICES, extra: dict | None = None,
                      test_tools: bool = False, run_id_delay: str | None = None,
                      hold_doorbells: Path | None = None, repos: dict | None = None,
-                     worker: bool = False, workflows: str | None = None, terminal: bool = False) -> Proc:
+                     worker: bool = False, workflows: str | None = None, terminal: bool = False,
+                     hold_worker: Path | None = None) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
-        exists, agentd delivers no doorbell: they wait in its outbox. `repos` replaces the
+        exists, agentd delivers no doorbell: they wait in its outbox. While `hold_worker` exists,
+        agentd does not start its own Worker again: a window with no Worker running, once the test
+        has killed it (stack.worker().kill()). `repos` replaces the
         fixture's acme/payments; a stack without the fixture has no GitHub section at all, so
         the GitHub tools only dry-run. With `worker`, agentd starts and supervises the Worker
         itself, serving `workflows` (stack.worker()); otherwise it runs with --no-worker, and the
@@ -683,16 +690,23 @@ class Stack:
         self.supervised, self._agentd_terminal = worker, terminal
         if test_tools:
             self._agentd_args.append("--test-tools")
-        if faults or run_id_delay or hold_doorbells:
+        self._fault_script = None
+        if faults or run_id_delay or hold_doorbells or hold_worker:
             # A rule's "attempt" is Temporal's: it counts attempts the gateway refused before
             # the rules were consulted. A run's opening call that reaches agentd before StartRun
             # has recorded the run ID waits for it (up to 5 s) rather than being refused, so it
             # keeps attempt 1 even with a Worker that is already polling.
-            script = {"rules": faults or [], **({"run_id_delay": run_id_delay} if run_id_delay else {}),
-                      **({"hold_doorbells_while_exists": str(hold_doorbells)} if hold_doorbells else {})}
-            (d / "faults.json").write_text(json.dumps(script))
-            self._agentd_args += ["--fault-script", d / "faults.json"]
+            self._write_fault_script({"rules": faults or [], **({"run_id_delay": run_id_delay} if run_id_delay else {}),
+                                      **({"hold_doorbells_while_exists": str(hold_doorbells)} if hold_doorbells else {}),
+                                      **({"hold_worker_while_exists": str(hold_worker)} if hold_worker else {})})
         return self._launch_agentd()
+
+    def _write_fault_script(self, script: dict) -> None:
+        path = self.tmp / "agentd" / "faults.json"
+        path.write_text(json.dumps(script))
+        if self._fault_script is None:
+            self._agentd_args += ["--fault-script", path]
+        self._fault_script = script
 
     def _launch_agentd(self) -> Proc:
         n = sum(p.name.startswith("agentd") for p in self.procs)
@@ -708,14 +722,24 @@ class Stack:
         assert p.alive(), p.text()
         return p
 
-    def restart_agentd(self, kill: bool = False) -> Proc:
+    def restart_agentd(self, kill: bool = False, faults: list[dict] | None = None, workflows: str | None = None) -> Proc:
         """Stop agentd (SIGTERM, or kill -9 with its whole process tree) and start it again on the
-        same config, ledger and sockets."""
+        same config, ledger and sockets. With `faults`, on these fault rules instead: rules count
+        per agentd process, so a restart arms an "occurrence" rule again, unless faults leaves it
+        out. With `workflows`, agentd's own Worker serves these instead (new code, shipped)."""
         assert self.agentd is not None
         if kill:
             self.agentd.kill()
         else:
             self.agentd.stop()
+        if faults is not None:
+            self._write_fault_script({**(self._fault_script or {}), "rules": faults})
+        if workflows is not None:
+            assert self.supervised, "workflows are for agentd's own Worker: start_agentd(worker=True)"
+            path = self.tmp / "agentd" / "agentd.yaml"
+            config = json.loads(path.read_text())
+            config["worker"]["workflows"] = workflows
+            path.write_text(json.dumps(config))
         return self._launch_agentd()
 
     def kill_agentd(self) -> None:
@@ -914,8 +938,12 @@ class Stack:
             return d.close_time is not None
         return self._temporal(describe)
 
-    def signal(self, run: dict, name: str) -> None:
-        self._temporal(lambda c: c.get_workflow_handle(run["run_id"], run_id=run["temporal_run_id"]).signal(name))
+    def signal(self, run: dict, name: str, arg: Any = None) -> None:
+        """Signal the run, with arg if one is given."""
+        def send(c: Client) -> Any:
+            handle = c.get_workflow_handle(run["run_id"], run_id=run["temporal_run_id"])
+            return handle.signal(name) if arg is None else handle.signal(name, arg)
+        self._temporal(send)
 
     # --- agentd's ledger and logs ------------------------------------------------------------
 
