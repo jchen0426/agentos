@@ -163,4 +163,7 @@ func TestHandsOut(t *testing.T) {
 	if handsOut([]byte{0x0a, 0x05, 'x'}) { // a token cut short
 		t.Error("a broken response hands out a task")
 	}
+	if handsOut([]byte{0x0a, 0x00}) { // a token there, and empty
+		t.Error("an empty token hands out a task")
+	}
 }
