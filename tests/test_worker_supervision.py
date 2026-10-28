@@ -10,6 +10,7 @@ runs. Neither the Worker nor the git tool server has a controlling terminal, wha
 The tests of agentd's own Worker run in every environment (AGENTOS_SANDBOX none, srt, bwrap); those
 of the macOS launcher's protocol only under srt."""
 
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from temporalio.api.enums.v1 import EventType
 
 from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, TEST_MODELS, WORKER_LAUNCHER, Stack, command_of, descendants,
                            event_types, free_port, started_at, wait_for)
@@ -82,9 +84,17 @@ def test_agentd_starts_its_worker_before_it_says_it_is_ready(stack: Stack) -> No
     assert record["pid"] == launch["pid"] and record["generation"] == 1, record
     started = last_start(stack)
     assert started["no_worker"] is False, started
-    assert started["worker"] == {"sandbox": str(WORKER_LAUNCHER[SANDBOX]) if SANDBOX in WORKER_LAUNCHER else "",
-                                 "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS",
-                                 "limits": {}}, started
+    worker = started["worker"]
+    assert {k: worker.get(k) for k in ("sandbox", "python", "code", "workflows", "limits")} == {
+        "sandbox": str(WORKER_LAUNCHER[SANDBOX]) if SANDBOX in WORKER_LAUNCHER else "",
+        "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS", "limits": {}}, started
+    # The copy of the code it runs (M5 C2c), which the start's log names too, and the liveness thresholds.
+    assert re.fullmatch(r"[0-9a-f]{64}", worker["code_sha256"]) and launch["code_sha256"] == worker["code_sha256"], (worker, launch)
+    assert worker["code_files"] > 1000 and worker["code_bytes"] > 50 << 20, worker
+    assert any(d.startswith("temporalio==") for d in worker["distributions"]), worker["distributions"]
+    assert worker["interpreter"] == os.path.realpath(Path(sys.prefix) / "bin" / "python"), worker
+    assert worker["liveness"] == {"quiet_ms": 60_000, "hold_ms": 60_000}, worker
+    assert len(worker) == 11, sorted(worker)
     if SANDBOX == "srt":  # the launcher became srt, whose settings are in agentd's state directory for it
         found = re.search(r" --settings (\S+) ", command_of(launch["pid"]))
         assert found and Path(found.group(1)).parent in state_dirs(stack.agentd.popen.pid), command_of(launch["pid"])
@@ -303,6 +313,129 @@ def test_a_worker_whose_stdin_cannot_be_watched_runs_on(stack: Stack) -> None:
         worker = stack.start_worker(args=("--stop-on-stdin-eof",), stdin=null.fileno())
     assert worker.text().count("not watching stdin") == 1, worker.text()
     succeeds(stack)
+
+
+def code_dirs(agentd_pid: int) -> list[Path]:
+    """The copies of the Worker's code agentd process agentd_pid made."""
+    return sorted(Path("/tmp").glob(f"agentos-code.{agentd_pid}.*"))
+
+
+def test_agentd_starts_again_a_worker_that_stops_polling(stack: Stack) -> None:
+    """A Worker that has had no poll open for 60 s is not serving: agentd stops it and starts another. A
+    frozen one keeps the polls it had open until Temporal ends them (a long poll's minute or so), then
+    has none."""
+    stack.start_agentd(worker=True)
+    w = stack.worker()
+    w.wait_ready(1)
+    frozen = time.time()
+    w.pause()
+    w.wait_ready(2, timeout=240)
+    [found] = w.log("the Worker is not serving")
+    assert found["rule"] == "not_polling" and found["generation"] == 1, found
+    assert 60 <= at(found) - frozen <= 155 + 30, at(found) - frozen
+    [record] = exit_records(stack)
+    assert record["generation"] == 1 and record["unresponsive"] == "not_polling" and record["unresponsive_ms"] >= 60_000, record
+    succeeds(stack)
+
+
+def test_agentd_starts_again_a_worker_that_leaves_a_task_unanswered(stack: Stack) -> None:
+    """A Worker that has left a workflow task it was handed unanswered for 60 s is not serving: agentd
+    stops it and starts another, which takes the task once it times out (T1's frozen Worker, without the
+    kill). The run goes on: one model call, one timed-out workflow task."""
+    hold = stack.tmp / "hold-model"
+    hold.touch()
+    stack.start_agentd(faults=[{"name": "audit_v1", "hold_while_exists": str(hold)}], worker=True)
+    w = stack.worker()
+    run = stack.start_run()
+    wait_for(lambda: len(stack.model_calls(run)) == 1, "the model call to start")
+    w.pause()  # it keeps its polls: it is handed the next workflow task, and never answers
+    hold.unlink()
+
+    def handed() -> float | None:
+        events = stack.history(run)
+        done = [i for i, e in enumerate(events) if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED]
+        later = [e for e in events[done[-1]:] if e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_STARTED] if len(done) == 2 else []
+        return later[0].event_time.ToNanoseconds() / 1e9 if later else None
+    handed_at = wait_for(handed, "the frozen Worker to be handed the workflow task", timeout=90)
+    w.wait_ready(2, timeout=180)
+    [found] = w.log("the Worker is not serving")
+    assert found["rule"] == "not_answering" and found["generation"] == 1, found
+    assert 60 <= at(found) - handed_at <= 60 + 5 + 30, at(found) - handed_at
+    final = stack.wait_state(run, TERMINAL, timeout=120)
+    assert final["state"] == "SUCCEEDED", final
+    assert len(stack.model_calls(run)) == 1, [dict(r) for r in stack.model_calls(run)]
+    assert event_types(stack.history(run)).count("WORKFLOW_TASK_TIMED_OUT") == 1
+    [record] = exit_records(stack)
+    assert record["unresponsive"] == "not_answering" and record["unresponsive_ms"] >= 60_000, record
+
+
+PINNED = """\"\"\"The test's own workflow module (tests/test_worker_supervision.py): it says its version whenever it
+is imported, as the SDK's sandbox does at each workflow task.\"\"\"
+
+from temporalio import workflow
+
+from agentos_worker.workflows.security_audit import AuditInput, SecurityAudit
+
+print("pinned {version}", flush=True)
+
+
+@workflow.defn(name="security-audit")
+class Pinned(SecurityAudit):
+    @workflow.run
+    async def run(self, a: AuditInput) -> dict:
+        return await super().run(a)
+
+    @workflow.signal
+    def doorbell(self) -> None:
+        super().doorbell()
+
+
+WORKFLOWS = [Pinned]
+"""
+
+
+def test_the_worker_runs_the_code_agentd_pinned_at_its_start(stack: Stack) -> None:
+    """agentd copies the Worker's code when it starts, and every generation runs the copy: a change to
+    the code directory reaches neither the running Worker (whose sandbox imports workflow modules afresh
+    at every task) nor the next generation, only the next agentd. The copy's manifest is in the ledger;
+    the copy goes when agentd stops, and the next agentd sweeps one a killed agentd left."""
+    code = stack.tmp / "code"
+    code.mkdir()
+    module = code / "pinned_workflows.py"
+    module.write_text(PINNED.format(version="v1"))
+    stack.start_agentd(worker=True, extra={"worker": {**stack.worker_config("pinned_workflows:WORKFLOWS"), "code": str(code)}})
+    w = stack.worker()
+
+    def versions(generation: int | None = None) -> set[str]:
+        return {e["line"] for e in w.log("worker output") if e["line"].startswith("pinned ")
+                and (generation is None or e["generation"] == generation)}
+    succeeds(stack)
+    assert versions() == {"pinned v1"}, versions()
+    v1 = hashlib.sha256(module.read_bytes()).hexdigest()
+    module.write_text(PINNED.format(version="v2"))
+    succeeds(stack)  # the same generation, which imports the module afresh at each task
+    w.kill()
+    w.wait_ready(2)
+    succeeds(stack)
+    assert versions() == {"pinned v1"} and versions(2) == {"pinned v1"}, versions()
+    root = last_start(stack)["worker"]["code_sha256"]
+    [blob] = stack.ledger("SELECT bytes FROM blobs WHERE sha256 = ?", root)
+    assert hashlib.sha256(blob["bytes"]).hexdigest() == root
+    assert f"code/pinned_workflows.py\tfile\t-\t{len(PINNED.format(version='v1'))}\t{v1}" in blob["bytes"].decode(), blob["bytes"][:500]
+
+    first = stack.agentd.popen.pid
+    [copy] = code_dirs(first)
+    stack.restart_agentd()
+    assert not copy.exists(), copy  # gone with its agentd
+    assert last_start(stack)["worker"]["code_sha256"] != root
+    succeeds(stack)
+    assert {e["line"] for e in stack.worker().log("worker output") if e["line"].startswith("pinned ")} == {"pinned v2"}
+    killed = stack.agentd.popen.pid
+    [left] = code_dirs(killed)
+    stack.kill_agentd()
+    assert left.exists()
+    stack.restart_agentd()
+    assert not left.exists(), left  # swept by the next agentd
 
 
 def test_t16_a_second_agentd_leaves_the_first_ones_worker_alone(stack: Stack) -> None:
