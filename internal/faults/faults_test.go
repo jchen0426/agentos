@@ -44,6 +44,37 @@ func TestToolFaults(t *testing.T) {
 	StallInTool(context.Background())
 }
 
+// The Worker's hold, as the harness writes it, lasts while its file is there, and a script without
+// one, or no script, holds nothing.
+func TestHoldWorker(t *testing.T) {
+	dir := t.TempDir()
+	hold, path := filepath.Join(dir, "hold"), filepath.Join(dir, "faults.json")
+	b, err := json.Marshal(map[string]any{"rules": []any{}, "hold_worker_while_exists": hold})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.HoldWorker() {
+		t.Error("held with no file")
+	}
+	if err := os.WriteFile(hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !s.HoldWorker() {
+		t.Error("not held with the file there")
+	}
+	var none *Script
+	if (&Script{}).HoldWorker() || none.HoldWorker() {
+		t.Error("held by a script that names no file, or by no script")
+	}
+}
+
 // A status fault's value is the result's, numbers as written: a script can give the Worker a value
 // it cannot read. A value that is not an object is the script's mistake.
 func TestAStatusValue(t *testing.T) {

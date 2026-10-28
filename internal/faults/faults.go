@@ -1,7 +1,8 @@
 // Package faults is agentd's test-only fault injection, enabled with --fault-script. It
 // lets black-box tests make a gateway call hold, hang, skip heartbeats, return a scripted
 // status or fail as its tool would, to reproduce the failure scenarios of the design doc's
-// section 11, and make StartRun slow to record a run's ID.
+// section 11, make StartRun slow to record a run's ID, and keep agentd from starting its Worker
+// again.
 package faults
 
 import (
@@ -97,6 +98,10 @@ type Script struct {
 	// HoldDoorbellsWhileExists keeps the outbox from delivering any doorbell while this file
 	// exists: they wait in the ledger, as when agentd stops before it signals (T14).
 	HoldDoorbellsWhileExists string `json:"hold_doorbells_while_exists"`
+	// HoldWorkerWhileExists keeps agentd from starting its Worker again while this file exists: a
+	// window with no Worker running, once the test has killed the last (T1). The first starts all the
+	// same.
+	HoldWorkerWhileExists string `json:"hold_worker_while_exists"`
 
 	mu     sync.Mutex
 	counts map[string]int // workflow ID + name -> Invokes seen
@@ -128,6 +133,15 @@ func (s *Script) HoldDoorbells() bool {
 		return false
 	}
 	_, err := os.Stat(s.HoldDoorbellsWhileExists)
+	return err == nil
+}
+
+// HoldWorker reports whether agentd must not start its Worker again for now.
+func (s *Script) HoldWorker() bool {
+	if s == nil || s.HoldWorkerWhileExists == "" {
+		return false
+	}
+	_, err := os.Stat(s.HoldWorkerWhileExists)
 	return err == nil
 }
 
