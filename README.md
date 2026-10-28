@@ -532,7 +532,9 @@ Worker killed or paused, agentd killed), T9's probes of the Worker's sandbox, th
 (`tests/test_agentd_restart.py`, which also keeps a Worker run by hand across one), and T12's Worker
 crash. They kill or pause it through `stack.worker()`, and agentd starts it again; where a test needs
 a while with no Worker running, agentd's fault script holds the next one back
-(`hold_worker_while_exists`). Every other test runs agentd with `--no-worker` and starts its own.
+(`hold_worker_while_exists`). Besides these, only the tests of the supervision itself
+(`tests/test_worker_supervision.py`) and of the harness (`tests/test_harness.py`) run agentd's own
+Worker; the rest run agentd with `--no-worker` and start their own.
 
 `uv run pytest --verify-after-each` also runs `agentctl audit verify` on every agentd a test starts, before it stops: every honest flow must leave an audit log that verifies (exit 0), and a test that tampers on purpose declares the exit and the kinds of mismatch it expects (`@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])`).
 

@@ -1973,3 +1973,33 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，srt | 62 | 0 | 59 | 52 | 0 | 7 |
 
   跑完没有留下 Worker、agentd 或状态目录。bwrap 下的 T9 探测（Worker 里起子进程、bwrap 里的 /dev）我没跑。
+
+### 第二轮（两份审查和三种完整套件之后，1a40356 之上）
+
+你在 1a40356（已 rebase 到 main 的 46585aa）上跑的三种完整套件，带 `--verify-after-each`：none 300 通过、31 跳过；srt 326 通过、5 跳过；bwrap 313 通过、18 跳过；verify 都没有失败。两份审查都没有中等及以上的问题。这一轮只改测试和文档：
+
+- **启动脚本清空环境，又有了直接的测试**：T9 的探测搬进 agentd 的 Worker 以后，canary 放在 agentd 的环境里，而 agentd 本来就不转发它，所以要是启动脚本挑着放过某些变量，就没人看得出来了；README 里手动起 Worker 的办法正靠这一点。现在 `test_t9_the_worker_launcher_passes_on_none_of_its_callers_environment`（srt 和 bwrap）直接跑 `run-worker.sh`，像 `test_tool_sandbox.py` 跑 `run-tool.sh` 那样：调用者的整个环境加一个 canary 交给它，里面的命令看到的只能是 `WORKER_ENV` 里那些。改坏检查：让 macOS 启动脚本的 `env -i` 在调用者设了 canary 时放过它，这个测试失败，agentd 的 Worker 里的探测照样通过（agentd 不给启动脚本这个变量），这正是原来看不见的那一种。
+- **探测的 nonce**：信号里带一个 nonce，每一行报告都带着它；`report()` 只认这个 nonce 的行，并且要求这些行说的总行数一致。原来同一份日志里的第二次探测会拿到第一次的报告。
+- **C.1 的跳过放在一处**：`start_agentd(worker=True)` 在真模型的 key（Claude、OpenAI）加 none 时直接跳过，原因写在 `OWN_WORKER_REFUSED` 里。原来只有 T1 的两个文件有跳过，`test_agentd_restart.py` 的 agentd 自己那一种、`test_t12_the_worker_crashes`、`test_harness` 的新测试会大声失败。T1 的两个文件去掉了自己的那一份。`test_worker_supervision.py` 用 agentd 自己的 Worker 的测试也一样跳过。
+- **T1 的“模型调用期间杀掉 Worker”**：杀掉之后马上核对模型调用还没做完（`response_blob` 是 None），不然 hold 没起作用也能通过；调用做完时还核对 agentd 的日志里只有一次 "worker started"：`ps` 的快照可能漏掉一个提早放出来的第二代。
+- **README**：“其余测试都用 `--no-worker`”不对：`test_worker_supervision.py` 和 `test_harness.py` 也跑 agentd 自己的 Worker。改了这一句。
+
+#### 剩余风险和后续
+
+- **C3 要处理的**：T9 的探测是从 agentd 的 Worker fork 出来的子进程，C3b 在 macOS 上的 `ulimit -u`、Linux 的任务数上限都会管到它。到时候要么用这个栈自己的 `worker.limits` 给它豁免，要么把探测改成在 Worker 进程里跑。
+- **CI 的时间**：每套多 1–2 分钟。macOS 的 PR 跑到 60 分钟上限里的大约 49 分钟。
+- **原来就有的**：探测的 `internet_tcp` 把任何 OSError 都报成 refused。
+- **后续**：留在 `--no-worker` 的崩溃恢复测试（T2、T3、T4、T14、T15）看不到 Worker 跟着 agentd 一起死，而产品里正是这样。以后可以挑一个有代表性的，加一种 agentd 自己的 Worker。
+
+#### 第二轮跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过（这一轮没改 Go）。
+- `AGENTOS_MODEL=claude AGENTOS_SANDBOX=none`：T1 的两个文件、agentd 重启（agentd 自己的那一种）、T12 的 Worker 崩溃、`test_harness` 的新测试，一共 7 个，都在 `start_agentd` 那里跳过，理由相同，一个 agentd 都没起，也就没有调用真模型。手动起 Worker 的那一种会用真 key 跑真模型，没有跑它。
+- macOS，`--verify-after-each`，两种环境同时跑：T1 的两个文件、T9、`test_agentd_restart.py`、T12、`test_harness.py`、`test_sandbox.py`；bwrap 由你跑。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 37 | 25 | 36 | 35 | 0 | 1 |
+  | macOS，srt | 59 | 3 | 42 | 41 | 0 | 1 |
+
+  跑完没有留下 Worker、agentd 或状态目录。
