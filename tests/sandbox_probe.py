@@ -1,12 +1,16 @@
 """Runs inside the Worker sandbox and reports, as one JSON object on stdout, what the
-sandbox lets through. tests/test_t9_isolation.py launches it the way Workers are launched."""
+sandbox lets through. tests/test_t9_isolation.py has agentd's own Worker run it, as a child of its
+own (report_from_worker, which tests/probe_workflows.py calls)."""
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import socket
 import subprocess
+import sys
+import time
 
 from temporalio.api import workflowservice
 from temporalio.api.common.v1 import WorkflowExecution, WorkflowType
@@ -90,7 +94,27 @@ async def sdk(endpoint: str, proxy: str | None) -> tuple[str, Client | None]:
         return f"refused: {e.__class__.__name__}: {str(e)[:300]}", None
 
 
-async def forbidden(c: Client) -> dict[str, str]:
+# The lines a Worker writes the probe's report in, for agentd to log (report_from_worker).
+REPORT_LINE = "agentos-probe-report"
+
+
+def report_from_worker(args: list[str]) -> None:
+    """Runs this probe with args as a child of the calling process, a Worker: in its sandbox, with its
+    environment. The report goes to the Worker's stdout, which agentd logs: in base64, in lines of
+    REPORT_LINE <i>/<n> <part>, short and slow enough for agentd's log (2 KiB a line, 20 lines a
+    second)."""
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), *args], stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=300)
+    out = r.stdout.strip().splitlines()
+    body = out[-1] if r.returncode == 0 and out else json.dumps({"failed": r.returncode, "stderr": r.stderr[-3000:]})
+    data = base64.b64encode(body.encode()).decode()
+    parts = [data[i:i + 1500] for i in range(0, len(data), 1500)]
+    for i, part in enumerate(parts, 1):
+        print(f"{REPORT_LINE} {i}/{len(parts)} {part}", flush=True)
+        time.sleep(0.1)
+
+
+async def forbidden(c: Client, task_queue: str) -> dict[str, str]:
     """Calls the Worker must not be able to make through the Runtime entry."""
     ws = c.service_client.workflow_service
     wf = WorkflowExecution(workflow_id="any-run")
@@ -102,7 +126,7 @@ async def forbidden(c: Client) -> dict[str, str]:
             v1.TerminateWorkflowExecutionRequest(namespace="default", workflow_execution=wf)),
         "StartWorkflowExecution": lambda: ws.start_workflow_execution(
             v1.StartWorkflowExecutionRequest(namespace="default", workflow_id="x", workflow_type=WorkflowType(name="security-audit"),
-                                             task_queue=TaskQueue(name="agentos-workflows"))),
+                                             task_queue=TaskQueue(name=task_queue))),
         "PollActivityTaskQueue": lambda: ws.poll_activity_task_queue(
             v1.PollActivityTaskQueueRequest(namespace="default", task_queue=TaskQueue(name="gateway"))),
         "RespondActivityTaskCompletedById": lambda: ws.respond_activity_task_completed_by_id(
@@ -127,13 +151,14 @@ async def main() -> None:
     p.add_argument("--home", required=True)
     p.add_argument("--home-canary", required=True, help="a file in the home directory")
     p.add_argument("--ledger", required=True, help="agentd's ledger file")
+    p.add_argument("--task-queue", required=True, help="the Worker's own, where agentd starts runs")
     p.add_argument("--extra", default="{}", help="JSON: more reads, sockets and keychain items to try")
     a = p.parse_args()
     extra = json.loads(a.extra)
 
     report: dict = {}
     report["runtime_sdk"], client = await sdk(a.runtime, a.proxy)
-    report["forbidden"] = await forbidden(client) if client else {}
+    report["forbidden"] = await forbidden(client, a.task_queue) if client else {}
     report["temporal_sdk"], _ = await sdk(f"127.0.0.1:{a.temporal_port}", a.proxy)
     report["temporal_tcp"] = tcp("127.0.0.1", a.temporal_port)
     report["internet_tcp"] = tcp("1.1.1.1", 443)
