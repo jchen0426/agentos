@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jchen0426/agentos/internal/codesnap"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/supervisor"
@@ -29,16 +30,17 @@ func checkWorker(goos string, cfg *config.Config, insecureDev bool) error {
 	return cfg.CheckWorker(goos, sandboxed)
 }
 
-// workerLaunch is how agentd runs the Worker on goos, once the Runtime entry listens at runtime:
-// through its launcher, which takes the Runtime entry (macOS a port, Linux the socket), the Python
-// environment and the code directory, then the Worker's command; or, with no launcher
-// (--insecure-dev), the Worker's command alone. The environment is agentd's own making, from
-// scratch: what the launchers need (agentd's own PATH, for node, bwrap and socat, and HOME, which the
-// macOS launcher denies), and what agentd keeps from the Worker. Nothing else of agentd's own
-// environment, and no secret: a Worker never gets one.
-func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor.Options, error) {
+// workerLaunch is how agentd runs the Worker on goos, once the Runtime entry listens at runtime, from
+// snap, agentd's copy of the Python environment and the code directory: through its launcher, which
+// takes the Runtime entry (macOS a port, Linux the socket), the copies of the two directories, then the
+// Worker's command; or, with no launcher (--insecure-dev), the Worker's command alone. The live
+// directories are no part of it. The environment is agentd's own making, from scratch: what the
+// launchers need (agentd's own PATH, for node, bwrap and socat, and HOME, which the macOS launcher
+// denies), and what agentd keeps from the Worker. Nothing else of agentd's own environment, and no
+// secret: a Worker never gets one.
+func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runtime net.Addr) (supervisor.Options, error) {
 	w := cfg.Worker
-	python := filepath.Join(w.Python, "bin", "python")
+	python := filepath.Join(snap.Python, "bin", "python")
 	// The Worker stops, gracefully, when its stdin ends: the supervisor's stop channel.
 	args := []string{"--namespace", cfg.Temporal.Namespace, "--task-queue", cfg.TaskQueues.Workflows, "--workflows", w.Workflows,
 		"--stop-on-stdin-eof"}
@@ -55,7 +57,7 @@ func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor
 		env = append(env, "HOME="+home)
 	}
 	env = append(env, "LANG=C.UTF-8", "AGENTOS_SANDBOX_DENY_READ="+string(deny))
-	o := supervisor.Options{Env: env, Dir: w.Code}
+	o := supervisor.Options{Env: env, Dir: snap.Code, Code: snap.Root}
 	command := []string{python, "-m", "agentos_worker"}
 	switch {
 	case len(w.Sandbox) == 0:
@@ -66,7 +68,7 @@ func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor
 			return supervisor.Options{}, fmt.Errorf("the macOS launcher takes a port, not %s", runtime)
 		}
 		port := strconv.Itoa(tcp.Port)
-		o.Argv = slices.Concat(w.Sandbox, []string{port, w.Python, w.Code, "--"}, command,
+		o.Argv = slices.Concat(w.Sandbox, []string{port, snap.Python, snap.Code, "--"}, command,
 			[]string{"--endpoint", "127.0.0.1:" + port, "--http-connect-proxy", "env"}, args)
 		// A state directory of each launch's own, and the lifeline: macOS has no parent-death signal.
 		o.StateDirs, o.Lifeline = true, true
@@ -77,7 +79,7 @@ func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor
 		}
 		// Inside the sandbox socat listens on 127.0.0.1:7233 and forwards to the socket. bwrap's
 		// --die-with-parent ends the sandbox with agentd; the Worker writes nothing.
-		o.Argv = slices.Concat(w.Sandbox, []string{socket, w.Python, w.Code, "--"}, command,
+		o.Argv = slices.Concat(w.Sandbox, []string{socket, snap.Python, snap.Code, "--"}, command,
 			[]string{"--endpoint", "127.0.0.1:7233"}, args)
 	default:
 		return supervisor.Options{}, fmt.Errorf("agentd has no Worker launcher for %s", goos)
@@ -85,16 +87,20 @@ func workerLaunch(goos string, cfg *config.Config, runtime net.Addr) (supervisor
 	return o, nil
 }
 
-// workerRecord is the Worker in agentd.started: its launcher ("" for none), what it may read, what
-// it serves, and its limits, of which this agentd sets none.
-func workerRecord(cfg *config.Config) map[string]any {
+// workerRecord is the Worker in agentd.started: its launcher ("" for none), the directories it runs a
+// copy of, what it serves, and its limits, of which this agentd sets none; the copy (snap): its root,
+// which addresses the manifest's blob in the ledger, its size, the distributions in the environment and
+// the interpreter; and the liveness thresholds, t's.
+func workerRecord(cfg *config.Config, snap *codesnap.Snapshot, t supervisor.Timing) map[string]any {
 	w := cfg.Worker
 	sandbox := ""
 	if len(w.Sandbox) > 0 {
 		sandbox = w.Sandbox[0]
 	}
 	return map[string]any{"sandbox": sandbox, "python": w.Python, "code": w.Code, "workflows": w.Workflows,
-		"limits": map[string]any{}}
+		"limits": map[string]any{}, "code_sha256": snap.Root, "code_files": snap.Files, "code_bytes": snap.Bytes,
+		"distributions": slices.Clone(snap.Distributions), "interpreter": snap.Interpreter,
+		"liveness": map[string]any{"quiet_ms": t.QuietFor.Milliseconds(), "hold_ms": t.HoldFor.Milliseconds()}}
 }
 
 // checkUnsandboxedSecrets refuses to start agentd's Worker without a sandbox (--insecure-dev, no
