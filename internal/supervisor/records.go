@@ -16,6 +16,8 @@ type exit struct {
 	ready           bool
 	at              time.Time     // when it ended
 	restartIn       time.Duration // the delay before the next generation; 0 for none (agentd stops)
+	unresponsive    string        // the liveness rule it broke, and agentd stopped it for: not_polling, not_answering
+	unresponsiveFor time.Duration // how long it had then
 }
 
 // Event is the audit record of e: a record of agentd's own (no run's), with agentd's own words and
@@ -34,6 +36,9 @@ func (e exit) Event(unrecorded int) audit.Event {
 	}
 	if e.restartIn > 0 {
 		p["restart_in_ms"] = e.restartIn.Milliseconds()
+	}
+	if e.unresponsive != "" {
+		p["unresponsive"], p["unresponsive_ms"] = e.unresponsive, e.unresponsiveFor.Milliseconds()
 	}
 	return audit.Event{Type: ExitedType, Actor: audit.Agentd, Payload: p}
 }

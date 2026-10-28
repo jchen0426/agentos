@@ -157,6 +157,10 @@ func helper(mode string) {
 			ready()
 			time.Sleep(500 * time.Millisecond)
 			os.Exit(1)
+		case "slow": // ready only after 600 ms, then stays
+			time.Sleep(600 * time.Millisecond)
+			ready()
+			hold(true, true)
 		case "late-long": // ready late, up long enough only counted from its start, then exits
 			time.Sleep(300 * time.Millisecond)
 			ready()
@@ -772,11 +776,157 @@ func TestTheHold(t *testing.T) {
 	}
 }
 
+// fakeTally is a generation's tally as a test sets it (the Runtime proxy's, in agentd).
+type fakeTally struct {
+	mu                    sync.Mutex
+	polls                 int
+	quietSince, heldSince time.Time
+}
+
+func (f *fakeTally) Liveness() (int, time.Time, time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.polls, f.quietSince, f.heldSince
+}
+
+// tallies makes each generation's tally: quiet from its start, with the polls polls gives for the
+// generation (1-based), and a task held from its start if held says so.
+type tallies struct {
+	mu    sync.Mutex
+	n     int
+	polls func(n int) int
+	held  bool
+}
+
+func (ts *tallies) new() Tally {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.n++
+	f := &fakeTally{quietSince: time.Now()}
+	if ts.polls != nil {
+		f.polls = ts.polls(ts.n)
+	}
+	if ts.held {
+		f.heldSince = time.Now()
+	}
+	return f
+}
+
+// livenessTiming is the liveness thresholds at 300 ms, checked every 50 ms.
+var livenessTiming = Timing{QuietFor: 300 * time.Millisecond, HoldFor: 300 * time.Millisecond, CheckEvery: 50 * time.Millisecond,
+	BackoffMin: 10 * time.Millisecond, BackoffMax: 10 * time.Millisecond}
+
+// A generation that has had no poll open for QuietFor, or has left a task it was handed unanswered
+// for HoldFor, is stopped, logged, recorded, and started again.
+func TestAnUnresponsiveWorkerIsStartedAgain(t *testing.T) {
+	for _, c := range []struct {
+		rule string
+		ts   *tallies
+	}{
+		{"not_polling", &tallies{}},
+		{"not_answering", &tallies{polls: func(int) int { return 1 }, held: true}},
+	} {
+		t.Run(c.rule, func(t *testing.T) {
+			s, l, r, _ := worker(t, "ready", livenessTiming)
+			s.o.NewTally = c.ts.new
+			s.Start()
+			readied(t, s)
+			wait(t, "the second generation", 10*time.Second, func() bool { return len(l.entries("worker started")) == 2 })
+			found := l.entries("the Worker is not serving")
+			if len(found) == 0 || found[0]["rule"] != c.rule || found[0]["generation"] != float64(1) {
+				t.Fatalf("logs %v", l.entries(""))
+			}
+			if d, err := time.ParseDuration(found[0]["for"].(string)); err != nil || d < 300*time.Millisecond {
+				t.Errorf("for %v (%v), want 300ms or more", found[0]["for"], err)
+			}
+			exited := l.entries("worker exited")
+			if len(exited) == 0 || exited[0]["unresponsive"] != c.rule || exited[0]["restart_in"] == nil {
+				t.Errorf("exits %v", exited)
+			}
+			wait(t, "the record", 5*time.Second, func() bool { events, _ := r.all(); return len(events) > 0 })
+			events, _ := r.all()
+			if p, _ := events[0].Payload.(map[string]any); p["unresponsive"] != c.rule || p["unresponsive_ms"].(int64) < 300 || p["generation"] != 1 {
+				t.Errorf("record %v", p)
+			}
+		})
+	}
+}
+
+// A generation that keeps a poll open is alive, however long it makes no new call: a long poll lasts.
+func TestOpenPollsAreAlive(t *testing.T) {
+	ts := &tallies{polls: func(int) int { return 1 }}
+	s, l, _, _ := worker(t, "ready", livenessTiming)
+	s.o.NewTally = ts.new
+	s.Start()
+	readied(t, s)
+	time.Sleep(2 * livenessTiming.QuietFor)
+	if len(l.entries("worker started")) != 1 || len(l.entries("the Worker is not serving")) != 0 {
+		t.Errorf("logs %v", l.entries(""))
+	}
+}
+
+// The first generation is checked only once it is ready, ReadyWithin covering it till then: one that
+// is quiet for longer than QuietFor before it is ready is not stopped for that then.
+func TestTheFirstIsCheckedOnceReady(t *testing.T) {
+	ts := &tallies{}
+	s, l, _, _ := worker(t, "planned", livenessTiming, "AGENTOS_TEST_PLAN=slow")
+	s.o.NewTally = ts.new
+	s.Start()
+	readied(t, s)
+	wait(t, "a check after it was ready", 5*time.Second, func() bool { return len(l.entries("the Worker is not serving")) > 0 })
+	var msgs []string
+	for _, e := range l.entries("") {
+		if m := e["msg"].(string); m == "worker ready" || m == "the Worker is not serving" {
+			msgs = append(msgs, m)
+		}
+	}
+	if msgs[0] != "worker ready" {
+		t.Errorf("checked before it was ready: %v", msgs)
+	}
+}
+
+// A later generation that never polls is stopped and started again: only the first fails agentd.
+func TestALaterGenerationThatNeverPolls(t *testing.T) {
+	ts := &tallies{polls: func(n int) int { return map[bool]int{true: 1}[n == 1] }} // the first polls, the rest never
+	s, l, _, _ := worker(t, "planned", livenessTiming, "AGENTOS_TEST_PLAN=re,ready")
+	s.o.NewTally = ts.new
+	s.Start()
+	readied(t, s)
+	wait(t, "the third generation", 10*time.Second, func() bool { return len(l.entries("worker started")) >= 3 })
+	found := l.entries("the Worker is not serving")
+	if len(found) == 0 || found[0]["generation"] != float64(2) || found[0]["rule"] != "not_polling" {
+		t.Errorf("logs %v", l.entries(""))
+	}
+	select {
+	case err := <-s.Failed():
+		t.Errorf("failed: %v", err)
+	default:
+	}
+}
+
+// A Stop that comes while the supervisor stops an unresponsive generation starts no other.
+func TestAStopDuringACheckStartsNothing(t *testing.T) {
+	ts := &tallies{}
+	timing := livenessTiming
+	timing.StopGrace = 300 * time.Millisecond // it does not read its stop channel: SIGTERM after this
+	s, l, _, _ := worker(t, "deaf-stdin", timing)
+	s.o.NewTally = ts.new
+	s.Start()
+	readied(t, s)
+	wait(t, "the check", 5*time.Second, func() bool { return len(l.entries("the Worker is not serving")) > 0 })
+	s.Stop()
+	time.Sleep(100 * time.Millisecond)
+	if n := len(l.entries("worker started")); n != 1 {
+		t.Errorf("%d generations started: %v", n, l.entries(""))
+	}
+}
+
 // The defaults are the ones Timing's comments, and README.md, give.
 func TestTheDefaults(t *testing.T) {
 	want := Timing{ReadyWithin: time.Minute, BackoffMin: time.Second, BackoffMax: time.Minute, ResetAfter: time.Minute,
-		StopGrace: 5 * time.Second, TermGrace: time.Second, RecordEvery: time.Minute, Drain: 5 * time.Second}
-	if got := (Timing{}).withDefaults(); got != want {
+		StopGrace: 5 * time.Second, TermGrace: time.Second, RecordEvery: time.Minute, Drain: 5 * time.Second,
+		QuietFor: time.Minute, HoldFor: time.Minute, CheckEvery: 5 * time.Second}
+	if got := (Timing{}).WithDefaults(); got != want {
 		t.Errorf("%+v, want %+v", got, want)
 	}
 }
@@ -1244,6 +1394,8 @@ func TestTheExitRecord(t *testing.T) {
 		"a signal":                {generation: 4, pid: 43, signal: "killed", ran: time.Minute, ready: true, at: at, restartIn: time.Second},
 		"never started":           {generation: 5, startError: "fork/exec /x: no such file or directory", at: at, restartIn: 4 * time.Second},
 		"the first, agentd stops": {generation: 1, pid: 44, code: 2, at: at},
+		"unresponsive": {generation: 2, pid: 45, signal: "killed", ran: 2 * time.Minute, ready: true, at: at, restartIn: time.Second,
+			unresponsive: "not_answering", unresponsiveFor: 61500 * time.Millisecond},
 	} {
 		ev := e.Event(7)
 		if ev.Type != ExitedType || ev.Actor != audit.Agentd || ev.WorkflowID != "" {
@@ -1272,6 +1424,10 @@ func TestTheExitRecord(t *testing.T) {
 		}
 		if fields["unrecorded"] != json.Number("7") || fields["exited_at"] != "2026-10-25T11:00:00.123456789Z" ||
 			(e.restartIn == 0) != (fields["restart_in_ms"] == nil) {
+			t.Errorf("%s: %s", name, b)
+		}
+		if e.unresponsive == "" && (fields["unresponsive"] != nil || fields["unresponsive_ms"] != nil) ||
+			e.unresponsive != "" && (fields["unresponsive"] != e.unresponsive || fields["unresponsive_ms"] != json.Number("61500")) {
 			t.Errorf("%s: %s", name, b)
 		}
 	}
