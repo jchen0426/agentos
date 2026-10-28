@@ -8,15 +8,9 @@ recorded; the next agentd starts a Worker of its own.
   when agentd starts (section 9). The run is not lost and the second request is not hidden.
 """
 
-import pytest
-
-from tests.harness import KEYED_MODEL, MODEL_TIMEOUT, SANDBOX, Stack, TERMINAL, gateway_calls, wait_for
+from tests.harness import MODEL_TIMEOUT, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
-
-pytestmark = pytest.mark.skipif(KEYED_MODEL and SANDBOX == "none", reason=(
-    "a real model's key is a real secret, beside which agentd runs no Worker of its own without a sandbox "
-    "(--insecure-dev): run it under AGENTOS_SANDBOX=srt"))
 
 
 def model_attempt(stack: Stack, run: dict) -> int:

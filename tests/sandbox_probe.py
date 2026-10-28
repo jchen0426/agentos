@@ -98,11 +98,11 @@ async def sdk(endpoint: str, proxy: str | None) -> tuple[str, Client | None]:
 REPORT_LINE = "agentos-probe-report"
 
 
-def report_from_worker(args: list[str]) -> None:
+def report_from_worker(nonce: str, args: list[str]) -> None:
     """Runs this probe with args as a child of the calling process, a Worker: in its sandbox, with its
     environment. The report goes to the Worker's stdout, which agentd logs: in base64, in lines of
-    REPORT_LINE <i>/<n> <part>, short and slow enough for agentd's log (2 KiB a line, 20 lines a
-    second)."""
+    REPORT_LINE <nonce> <i>/<n> <part>, short and slow enough for agentd's log (2 KiB a line, 20 lines
+    a second). The nonce is the caller's, which tells this report from any other in the same log."""
     r = subprocess.run([sys.executable, os.path.abspath(__file__), *args], stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, timeout=300)
     out = r.stdout.strip().splitlines()
@@ -110,7 +110,7 @@ def report_from_worker(args: list[str]) -> None:
     data = base64.b64encode(body.encode()).decode()
     parts = [data[i:i + 1500] for i in range(0, len(data), 1500)]
     for i, part in enumerate(parts, 1):
-        print(f"{REPORT_LINE} {i}/{len(parts)} {part}", flush=True)
+        print(f"{REPORT_LINE} {nonce} {i}/{len(parts)} {part}", flush=True)
         time.sleep(0.1)
 
 

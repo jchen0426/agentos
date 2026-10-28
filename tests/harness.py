@@ -141,8 +141,11 @@ REAL_MODEL = MODEL != "fake"
 # How long a model call may take: a real one thinks for a while, one on this machine longer.
 MODEL_TIMEOUT = {"fake": 30, "local": 480}.get(MODEL, 240)
 # Claude's and OpenAI's keys are real secrets (keyring:), next to which agentd runs no Worker of its
-# own without a sandbox (C.1): the tests of agentd's own Worker skip them unsandboxed.
+# own without a sandbox (C.1): a test of agentd's own Worker is skipped then (start_agentd(worker=True)),
+# for this reason.
 KEYED_MODEL = MODEL in ("claude", "openai")
+OWN_WORKER_REFUSED = ("a real model's key is a real secret, beside which agentd runs no Worker of its own without a "
+                      "sandbox (--insecure-dev): run it under AGENTOS_SANDBOX=srt") if KEYED_MODEL and SANDBOX == "none" else ""
 if MODEL in ("openai", "local"):
     TEST_POLICY = TEST_POLICY.replace("allowed_providers: [fake, anthropic]", f"allowed_providers: [fake, anthropic, {MODEL}]")
 
@@ -645,12 +648,17 @@ class Stack:
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
         exists, agentd delivers no doorbell: they wait in its outbox. While `hold_worker` exists,
         agentd does not start its own Worker again: a window with no Worker running, once the test
-        has killed it (stack.worker().kill()). `repos` replaces the
+        has killed it (stack.worker().kill()); where agentd would refuse its own Worker (a real
+        key without a sandbox, OWN_WORKER_REFUSED), the test is skipped. `repos` replaces the
         fixture's acme/payments; a stack without the fixture has no GitHub section at all, so
         the GitHub tools only dry-run. With `worker`, agentd starts and supervises the Worker
         itself, serving `workflows` (stack.worker()); otherwise it runs with --no-worker, and the
         test starts its own (start_worker). With `terminal`, agentd runs on a pseudo-terminal of its
         own, its controlling terminal."""
+        if worker and OWN_WORKER_REFUSED:
+            import pytest  # only tests get here: the evaluation runs agentd with --no-worker
+
+            pytest.skip(OWN_WORKER_REFUSED)
         d = self.tmp / "agentd"
         d.mkdir(exist_ok=True)
         (d / "policy.yaml").write_text(policy)

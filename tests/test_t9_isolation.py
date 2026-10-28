@@ -20,6 +20,8 @@ import base64
 import json
 import os
 import secrets
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,7 +39,7 @@ from temporalio.api.workflowservice.v1.service_pb2_grpc import WorkflowServiceSt
 from temporalio.client import Client
 from temporalio.service import RPCError
 
-from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, SANDBOX, Stack, in_keychain, user_temp_dir, wait_for
+from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, Stack, in_keychain, user_temp_dir, wait_for
 from tests.sandbox_probe import REPORT_LINE
 from tests.rogue_workflows import T9_VICTIM
 
@@ -282,17 +284,20 @@ def probe(stack: Stack, canary: Path, extra: dict) -> dict:
     else:
         args += ["--runtime", f"127.0.0.1:{stack.runtime_port}", "--proxy", "env"]
     run = stack.start_run()
-    stack.signal(run, "probe", [str(a) for a in args])
+    nonce = secrets.token_hex(8)
+    stack.signal(run, "probe", {"nonce": nonce, "args": [str(a) for a in args]})
 
-    def report() -> dict | None:
+    def report() -> dict | None:  # this probe's lines only, whatever else is in the log
         parts: dict[int, str] = {}
-        n = 0
+        counts = set()
         for line in stack.worker().output():
-            if line.startswith(REPORT_LINE + " "):
-                _, count, part = (line + " ").split(" ", 2)
+            if line.startswith(f"{REPORT_LINE} {nonce} "):
+                _, _, count, part = (line + " ").split(" ", 3)
                 i, n = map(int, count.split("/"))
+                counts.add(n)
                 parts[i] = part.strip()
-        if not n or len(parts) < n:
+        assert len(counts) <= 1, f"the report's lines disagree on how many they are: {sorted(counts)}"
+        if not counts or len(parts) < (n := counts.pop()):
             return None
         return json.loads(base64.b64decode("".join(parts[i] for i in range(1, n + 1))))
     found = wait_for(report, "the probe's report in agentd's log of its Worker", timeout=180, interval=1)
@@ -344,6 +349,24 @@ def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack
     if SANDBOX == "bwrap":
         assert report["dev"] == ["full", "null", "random", "shm", "urandom", "zero"], report["dev"]
     assert set(report["env"]) <= WORKER_ENV[SANDBOX], sorted(set(report["env"]) - WORKER_ENV[SANDBOX])
+
+
+@sandboxed
+def test_t9_the_worker_launcher_passes_on_none_of_its_callers_environment(stack: Stack) -> None:
+    """The Worker's launcher, run directly, as a person runs a Worker by hand (--no-worker, README),
+    clears the environment it is given: a variable its caller exported does not reach the command,
+    whatever its name. agentd hands the launcher only what it chooses (the probe above), so only a
+    run like this one shows what the launcher itself lets through."""
+    stack.start_agentd()
+    launcher = stack.worker_command(None)[:5]  # the launcher and its arguments, up to "--"
+    assert launcher[-1] == "--", launcher
+    # In a session of its own, as the harness starts Workers: the macOS launcher refuses a controlling terminal.
+    r = subprocess.run([*map(str, launcher), sys.executable, "-c", "import json, os; print(json.dumps(sorted(os.environ)))"],
+                       capture_output=True, text=True, timeout=120, cwd=REPO, start_new_session=True,
+                       env={**stack.sandbox_env(), CANARY_ENV: "a secret the Worker must not see"})
+    assert r.returncode == 0, r.stderr
+    env = set(json.loads(r.stdout.strip().splitlines()[-1]))
+    assert CANARY_ENV not in env and env <= WORKER_ENV[SANDBOX], sorted(env - WORKER_ENV[SANDBOX])
 
 
 @pytest.mark.skipif(SANDBOX != "srt", reason="the macOS keychain")

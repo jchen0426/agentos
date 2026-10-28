@@ -1,20 +1,16 @@
 """T1: kill -9 the Worker at different points; the run finishes and every model call appears
 exactly once in the gateway's log (the model_calls ledger). The Worker is agentd's own, which agentd
 starts again; where a test needs no Worker running, agentd's fault script holds the next one back.
-Runs on the fake model, or on a real one with AGENTOS_MODEL (tests/harness.py)."""
+Runs on the fake model, or on a real one with AGENTOS_MODEL (tests/harness.py): Claude's or OpenAI's
+under a sandbox only (start_agentd(worker=True) skips them otherwise)."""
 
 import json
 
-import pytest
 from temporalio.api.enums.v1 import EventType
 
-from tests.harness import KEYED_MODEL, MODEL_TIMEOUT, REAL_MODEL, SANDBOX, Stack, TERMINAL, gateway_calls, wait_for
+from tests.harness import MODEL_TIMEOUT, REAL_MODEL, Stack, TERMINAL, gateway_calls, wait_for
 
 MODEL = "audit_v1"
-
-pytestmark = pytest.mark.skipif(KEYED_MODEL and SANDBOX == "none", reason=(
-    "a real model's key is a real secret, beside which agentd runs no Worker of its own without a sandbox "
-    "(--insecure-dev): run it under AGENTOS_SANDBOX=srt"))
 
 
 def model_activities(stack: Stack, run: dict) -> list[dict]:
@@ -49,11 +45,13 @@ def test_t1_kill_worker_during_model_call(stack: Stack) -> None:
     wait_for(lambda: len(stack.model_calls(run)) == 1, "the model call to start")
     no_worker.touch()  # agentd starts no Worker again while it is there
     w.kill()  # kill -9 while agentd is in the middle of the model call
+    assert stack.model_calls(run)[0]["response_blob"] is None, "the model call was over before the kill"
     wait_for(lambda: w.log("the fault script holds the Worker's next start"), "agentd to hold its next Worker back")
     hold.unlink()
     wait_for(lambda: stack.model_calls(run)[0]["response_blob"] is not None,
              "the model call to finish with no Worker alive", timeout=MODEL_TIMEOUT)
-    assert stack.worker_processes() == [], "a Worker was alive"
+    # No Worker now, nor one since the kill: agentd started only the first.
+    assert stack.worker_processes() == [] and len(w.log("worker started")) == 1, w.log()
 
     no_worker.unlink()
     w.wait_ready(2)
