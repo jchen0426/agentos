@@ -476,8 +476,8 @@ stops, describes the latest and counts the others (`unrecorded`). A `dropped` in
 (none yet), the copy of its code it runs (below), and the liveness thresholds (`liveness`).
 
 The Worker runs a copy of its code that agentd makes when it starts: the Python environment without
-its bytecode, the code directory's `*.py` and `*.so` files, and the directories a `.pth` names outside
-both, read-only, in `/tmp/agentos-code.<agentd's pid>.*`, which agentd removes when it stops (the next
+its bytecode, and the `*.py` and `*.so` files of the code directory and of each directory a `.pth` names
+outside both (no data: a package that reads its own files belongs in the environment), read-only, in `/tmp/agentos-code.<agentd's pid>.*`, which agentd removes when it stops (the next
 agentd sweeps one a killed agentd left). Every generation runs the copy, so an edit to the code takes
 effect when agentd starts again, never in a running Worker: the Temporal SDK's sandbox imports workflow
 modules afresh at every workflow task, and would take an edit to the live code directory at the next

@@ -2024,7 +2024,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - 拷什么：
     - `python/`：整个虚拟环境，去掉 `__pycache__` 和 `*.pyc`、`*.pyo`；
     - `code/`：`code` 下的 `*.py`、`*.so`，跳过点目录、`__pycache__` 和其中的虚拟环境（有 `pyvenv.cfg` 的目录）；
-    - `.pth` 指向两者以外的目录，拷进 `python/pinned/<i>/`，`.pth` 里的路径行改成相对 site-packages 的路径。
+    - `.pth` 指向两者以外的目录，按 code 目录的规则拷进 `python/pinned/<i>/`（只拷 `*.py`、`*.so`，跳过点目录、`__pycache__` 和其中的虚拟环境；第二轮之前是整个拷，见下），`.pth` 里的路径行改成相对 site-packages 的路径。
   - 链接一律拷成链接：在自己那棵树里的（Linux 虚拟环境的 `lib64 -> lib`）改成相对的；`bin/python*` 原样；指出树外的，指向原来的绝对路径。
   - 不收：import hook 方式的 editable 安装（setuptools 的 `__editable___*_finder`）；文件、目录、链接以外的东西；超过 1 GiB 或 10 万个文件。APFS 上用 clonefile。
   - 哈希：每个文件一行（路径、种类、可执行位、大小、sha256 或链接目标），排好序就是 manifest；根 `code_sha256` 是 manifest 的 sha256。字节码和时间不在里面。
@@ -2057,11 +2057,16 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   - 一棵树装着其中任何一个，就拒绝；
   - `.pth` 的目录（EvalSymlinks 之后）在其中任何一个里面，就拒绝；
   - 读到的每个路径都在其中任何一个里面，就拒绝。只有 `python` 和 `code` 本身例外：启动脚本不管它们在哪都让 Worker 读（srt 的 allowRead 对里面的东西优先），测试自己的 code 目录就在 deny list 里的 `stack.tmp` 下面。
-- **快照拷的东西，Worker 原来都能读**：
+- **快照拷的东西，只有 Worker 原来能读的**，例外是 `python`、`code` 以外的 `.pth` 目录里的 `*.py` 和 `*.so`：
   - `python` 和 `code` 里的东西，两种沙箱本来就让它读；
   - 链接不拷它指向的东西；
-  - 一个 `.pth` 目录，既不在 agentd 不让它读的路径里，也不装着这样的路径。
-- **记一笔，请你定**：一个在两者以外、又在家目录下的 `.pth` 目录（`code` 不是仓库时，editable 安装的源码），在 srt 下原来是读不到的（家目录被拒），钉住以后就读得到了。它是代码，不是数据，正是设计的第 5 条要钉的，所以检查里没有加 `$HOME`。钉住代码的测试就是这种情形：code 在 `stack.tmp/code`，`agentos_worker` 来自 `<repo>/python`。
+  - `.pth` 目录：沙箱原来可能不让 Worker 读它（srt：几个家目录和临时目录；bwrap：`/usr`、`python`、`code` 以外的一切），但一个 `.pth` 写着它，就是说 Worker 要 import 它。所以只拷 `.pth` 放上 import 路径的东西，按 code 目录的规则；agentd 不让 Worker 读的路径，在里面的、装着它的，一概拒绝。
+- **协调者定的：`.pth` 目录按 code 目录的规则拷，不加 `$HOME`，也不再整个拷**。理由：
+  - 放宽的不只是家目录：bwrap 下 Worker 原来除了 `/usr`、`python`、`code` 什么都读不到（run-worker.sh 只挂这些），srt 下读不到几个家目录、`/private/tmp`、`/private/var/tmp` 和 `/private/var/folders`。所以沙箱原来不让读的任何一个这样的 `.pth` 目录，经由副本都变得能读，Linux 上也一样。
+  - 一概拒绝，正是用户在第 5 条否掉的那个选项（“拒绝启动”），也是“不放宽”所要的代价；它还会拒绝一种现实的布局：工作流的代码目录和 editable 安装的 agentos_worker 分开放。
+  - 整个拷会把数据也拷进去：它跳过点目录，但不跳过点文件和数据。平铺布局的 `pip install -e ~/proj` 写的是 `~/proj`，它的 `.env`、`credentials.json` 和数据文件都会进副本。这正是任务说明排除的放宽。
+  - code 的规则只拷 `.pth` 放上 import 路径的东西：`*.py` 和 `*.so`，跳过点目录、`__pycache__` 和其中的虚拟环境。这样同一个 `<repo>/python`，不管经由 code（code 是仓库根）还是经由 `.pth` 到达，拷法都一样。`python/` 里除了 `.py` 只有 `.pyi` 存根，Worker 不缺它要的东西。
+  - 测试：`.pth` 目录里放一个 `.py`、一个 `.so`、`.env`、`data.json`、`notes.txt`、`__pycache__/x.pyc`、一个装着 `.py` 的点目录、一个装着 `.py` 的嵌套虚拟环境，副本和 manifest 里只有那个 `.py` 和 `.so`（`TestAPthDirectoryGetsTheCodeDirectorysRule`）。改坏检查 3 处都抓到：`.pth` 目录又整个拷；收点文件；收它的嵌套虚拟环境。
 
 ### 测试
 
@@ -2116,4 +2121,5 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - 根只盖副本，不盖解释器（`interpreter` 记了它在哪）。
 - 每次 agentd 启动多一个约 375 KB 的 manifest blob；代码不变时地址相同，只存一次。
 - 文件是只读的，但不加沙箱的 Worker 和 agentd 是同一个用户，可以改回来；两种沙箱都不让它写副本。
-- 两者以外、家目录下的 `.pth` 目录会被钉住（见“记一笔”）。
+- `python`、`code` 以外的 `.pth` 目录：它的 `*.py`、`*.so` 进了副本，即使沙箱原来不让 Worker 读那个目录（见“协调者定的”）。
+- 这样的目录里，运行时要读数据文件的包，在 Worker 里会失败：数据文件不进副本。它该装进虚拟环境，和 code 目录一样。
