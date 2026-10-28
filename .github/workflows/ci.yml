@@ -3,7 +3,9 @@
 # every push to main and every pull request. The design doc wants the fault-injection tests on
 # every commit, and T10 relies on the replay gate (tests/test_replay.py) stopping incompatible
 # workflow changes here. A pull request that changes only documentation skips them (the changes
-# job); main runs them again once it is merged.
+# job); main runs them again once it is merged. Every night, and when started by hand, main runs
+# everything again with --verify-after-each: agentctl audit verify after every test that starts an
+# agentd, so an honest flow that leaves the audit log unverifiable fails here.
 name: CI
 
 on:
@@ -13,6 +15,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # GitHub runs a schedule on the default branch only. 16:17 UTC is 03:17 in Sydney (UTC+11).
+  schedule:
+    - cron: '17 16 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +29,9 @@ defaults:
 
 env:
   GO_VERSION: '1.26.x'
+  # The black-box jobs' pytest gets this: the nightly run, and a run started by hand, verify the
+  # audit log after every test (tests/conftest.py's --verify-after-each).
+  VERIFY: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--verify-after-each' || '' }}
 
 # Pinned to Ubuntu 24.04 rather than ubuntu-latest: the bubblewrap setup below (AppArmor,
 # the system Python under /usr) is what M1 verified on 24.04.
@@ -178,7 +187,7 @@ jobs:
       - name: pytest
         # The test data stays outside the checkout, which the bwrap sandbox mounts: the
         # sandbox probe checks that the Worker cannot read agentd's ledger.
-        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest"
+        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest" $VERIFY
 
       - name: Upload the test logs
         if: failure()
@@ -267,7 +276,7 @@ jobs:
       - name: pytest
         # The test data stays outside the checkout, under the runner's temporary directory, which
         # the sandbox denies too: the probes check that the Worker cannot read agentd's ledger.
-        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest"
+        run: uv run --no-sync pytest tests/ -ra --durations=0 --basetemp="$RUNNER_TEMP/pytest" $VERIFY
 
       - name: Upload the test logs
         if: failure()
