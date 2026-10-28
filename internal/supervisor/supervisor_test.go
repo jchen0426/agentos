@@ -875,13 +875,55 @@ func TestTheFirstIsCheckedOnceReady(t *testing.T) {
 	readied(t, s)
 	wait(t, "a check after it was ready", 5*time.Second, func() bool { return len(l.entries("the Worker is not serving")) > 0 })
 	var msgs []string
+	var times []time.Time
 	for _, e := range l.entries("") {
 		if m := e["msg"].(string); m == "worker ready" || m == "the Worker is not serving" {
 			msgs = append(msgs, m)
+			at, _ := time.Parse(time.RFC3339Nano, e["time"].(string))
+			times = append(times, at)
 		}
 	}
 	if msgs[0] != "worker ready" {
 		t.Errorf("checked before it was ready: %v", msgs)
+	}
+	// Its quiet counts from its readiness: quiet since its start, it is not stopped at the first check.
+	if gap := times[1].Sub(times[0]); gap < livenessTiming.QuietFor {
+		t.Errorf("stopped %s after it was ready, want %s or more", gap, livenessTiming.QuietFor)
+	}
+}
+
+// When both rules hold, the one reported is not_answering: the Worker was handed a task it holds.
+func TestBothRulesHold(t *testing.T) {
+	ts := &tallies{held: true} // no poll open, and a task held, both since its start
+	s, l, _, _ := worker(t, "ready", livenessTiming)
+	s.o.NewTally = ts.new
+	s.Start()
+	readied(t, s)
+	wait(t, "the check", 5*time.Second, func() bool { return len(l.entries("the Worker is not serving")) > 0 })
+	if found := l.entries("the Worker is not serving"); found[0]["rule"] != "not_answering" {
+		t.Errorf("rule %v, want not_answering", found[0]["rule"])
+	}
+}
+
+// Each generation's tally is made before its launcher starts: a connection it makes counts in it.
+func TestTheTallyComesBeforeTheStart(t *testing.T) {
+	var mu sync.Mutex
+	started, seen := 0, []int{}
+	s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,re,ready")
+	s.startCmd = func(c *exec.Cmd) error { mu.Lock(); started++; mu.Unlock(); return c.Start() }
+	s.o.NewTally = func() Tally {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, started) // the generations started when this one's tally was made
+		return &fakeTally{polls: 1, quietSince: time.Now()}
+	}
+	s.Start()
+	readied(t, s)
+	wait(t, "the third generation", 10*time.Second, func() bool { return len(l.entries("worker ready")) == 3 })
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(seen[:3], []int{0, 1, 2}) {
+		t.Errorf("tallies made with %v generations started, want [0 1 2]", seen)
 	}
 }
 
@@ -909,7 +951,7 @@ func TestAStopDuringACheckStartsNothing(t *testing.T) {
 	ts := &tallies{}
 	timing := livenessTiming
 	timing.StopGrace = 300 * time.Millisecond // it does not read its stop channel: SIGTERM after this
-	s, l, _, _ := worker(t, "deaf-stdin", timing)
+	s, l, r, _ := worker(t, "deaf-stdin", timing)
 	s.o.NewTally = ts.new
 	s.Start()
 	readied(t, s)
@@ -918,6 +960,11 @@ func TestAStopDuringACheckStartsNothing(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if n := len(l.entries("worker started")); n != 1 {
 		t.Errorf("%d generations started: %v", n, l.entries(""))
+	}
+	// Its record says why it was stopped, and no restart, which there was none of.
+	events, _ := r.all()
+	if p, _ := events[0].Payload.(map[string]any); len(events) != 1 || p["unresponsive"] != "not_polling" || p["restart_in_ms"] != nil {
+		t.Errorf("records %v", events)
 	}
 }
 

@@ -143,7 +143,8 @@ type Supervisor struct {
 	gen     int
 	pid     int // the running generation's launcher; 0 between generations
 
-	beforeStart func(n int) // tests: runs just before generation n's launcher is started
+	beforeStart func(n int)           // tests: runs just before generation n's launcher is started
+	startCmd    func(*exec.Cmd) error // starts a launcher: (*exec.Cmd).Start, but in tests
 
 	outMu     sync.Mutex
 	dropped   int         // lines not logged since the last one logged
@@ -158,7 +159,8 @@ func New(o Options) *Supervisor {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Supervisor{o: o, t: o.Timing.WithDefaults(), log: log, lines: rate.NewLimiter(linesPerSecond, linesPerSecond),
-		stop: make(chan struct{}), done: make(chan struct{}), ready: make(chan struct{}), failed: make(chan error, 1)}
+		stop: make(chan struct{}), done: make(chan struct{}), ready: make(chan struct{}), failed: make(chan error, 1),
+		startCmd: (*exec.Cmd).Start}
 }
 
 // Start starts the first generation, and the rest as each exits, until Stop.
@@ -268,9 +270,11 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 		defer t.Stop()
 		deadline = t.C
 	}
-	// The liveness checks: the first generation's from its readiness, the others' from their start.
+	// The liveness checks: the first generation's from its readiness, the others' from their start. The
+	// first's quiet counts from its readiness at the earliest: it may have polled nothing before.
 	var check <-chan time.Time
 	var ticker *time.Ticker
+	var quietFrom time.Time
 	checking := func() {
 		if g.tally != nil && ticker == nil {
 			ticker = time.NewTicker(s.t.CheckEvery)
@@ -292,6 +296,7 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 		if first {
 			close(s.ready)
 			deadline = nil
+			quietFrom = time.Now()
 			checking()
 		}
 	}
@@ -300,7 +305,7 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 		case <-ready:
 			sawReady()
 		case now := <-check:
-			rule, d := s.unresponsive(g, now)
+			rule, d := s.unresponsive(g, now, quietFrom)
 			if rule == "" {
 				continue
 			}
@@ -311,11 +316,14 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			ran := g.ended.Sub(g.started)
 			e := exit{generation: g.n, pid: g.pid, ran: ran, ready: closed(g.ready), at: g.ended, unresponsive: rule, unresponsiveFor: d}
 			e.code, e.signal = exitStatus(g.cmd.ProcessState)
-			*backoff = s.next(*backoff, ran)
-			e.restartIn = *backoff
+			stopping := closed(s.stop) // a Stop came meanwhile: no generation follows
+			if !stopping {
+				*backoff = s.next(*backoff, ran)
+				e.restartIn = *backoff
+			}
 			s.logExit(g, e)
 			rec.exit(e)
-			return false
+			return stopping
 		case <-deadline:
 			s.terminate(g)
 			s.cleanup(g)
@@ -357,12 +365,15 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 }
 
 // unresponsive is the liveness rule the generation breaks at now, if any, and how long it has: a
-// task it was handed left unanswered for HoldFor (not_answering), or no poll open for QuietFor
-// (not_polling).
-func (s *Supervisor) unresponsive(g *generation, now time.Time) (rule string, d time.Duration) {
+// task it was handed left unanswered for HoldFor (not_answering, which goes first when both hold),
+// or no poll open for QuietFor (not_polling), its quiet counted from quietFrom at the earliest.
+func (s *Supervisor) unresponsive(g *generation, now, quietFrom time.Time) (rule string, d time.Duration) {
 	polls, quietSince, heldSince := g.tally.Liveness()
 	if !heldSince.IsZero() && now.Sub(heldSince) >= s.t.HoldFor {
 		return "not_answering", now.Sub(heldSince)
+	}
+	if quietSince.Before(quietFrom) {
+		quietSince = quietFrom
 	}
 	if polls == 0 && now.Sub(quietSince) >= s.t.QuietFor {
 		return "not_polling", now.Sub(quietSince)
@@ -474,7 +485,7 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 		if s.o.NewTally != nil { // its connections count from here on
 			g.tally = s.o.NewTally()
 		}
-		err := cmd.Start()
+		err := s.startCmd(cmd)
 		s.mu.Unlock()
 		if err != nil {
 			started <- err
