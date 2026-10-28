@@ -476,17 +476,32 @@ stops, describes the latest and counts the others (`unrecorded`). A `dropped` in
 (none yet), the copy of its code it runs (below), and the liveness thresholds (`liveness`).
 
 The Worker runs a copy of its code that agentd makes when it starts: the Python environment without
-its bytecode, and the `*.py` and `*.so` files of the code directory and of each directory a `.pth` names
-outside both (no data: a package that reads its own files belongs in the environment), read-only, in `/tmp/agentos-code.<agentd's pid>.*`, which agentd removes when it stops (the next
-agentd sweeps one a killed agentd left). Every generation runs the copy, so an edit to the code takes
-effect when agentd starts again, never in a running Worker: the Temporal SDK's sandbox imports workflow
-modules afresh at every workflow task, and would take an edit to the live code directory at the next
-one. A link is copied as a link, which the sandbox judges as before, and agentd refuses a copy that
-would hold anything the Worker may not read (its data, its sockets, the Temporal client's files, a
-mirror, the deny list). `agentd.started` records the copy as `code_sha256`, the sha256 of its manifest
-(each file's path, size and sha256, or a link's target; the ledger keeps it as the blob of that
-address), with `code_files`, `code_bytes`, the `distributions` in the environment and the
-`interpreter`; the log of each start names `code_sha256` too. The standard library is not copied.
+its bytecode, and the `*.py` and `*.so` files (none whose name begins with a dot) of the code directory
+and of each directory a `.pth` names outside both (no data: a package that reads its own files belongs
+in the environment), read-only, in `/tmp/agentos-code.<agentd's pid>.*`, which agentd removes when it
+stops (the next agentd sweeps one a killed agentd left). Every generation runs the copy, so an edit to
+what it holds takes effect when agentd starts again, not in a running Worker: the Temporal SDK's
+sandbox imports workflow modules afresh at every workflow task, and would take an edit to the live code
+directory at the next one. What the copy does not hold stays live: the standard library, and what a
+link leads to outside the copy. A link is copied as a link, which the sandbox judges as before, so a
+module linked into the code directory (or a flit `--symlink` install) is imported from where it leads.
+
+The copy holds nothing the Worker could not read before. A directory a `.pth` names outside both goes
+in only where the Worker's sandbox lets it read it (on macOS outside the home directories and the
+shared temporary directories, on Linux in `/usr`); where it does not, the copy leaves the `.pth`'s line
+out, and agentd's log names the directory: the sandboxed Worker imported nothing from it (macOS's
+sandbox lets it look the directory up, not list or read it; Linux's has none). Without a sandbox the
+Worker reads everything anyway. agentd refuses a copy that would hold anything the Worker may not read
+(its data, its sockets, the Temporal client's files, a mirror, the deny list); an environment whose
+`pyvenv.cfg` lets in the system's site-packages (`include-system-site-packages = true`), imported live;
+a `.pth` with an import line but virtualenv's and setuptools' own, as an editable install by import
+hook writes (setuptools' for most layouts, hatchling's `dev-mode-exact`, meson-python's,
+scikit-build-core's): install the package as a wheel, or editable by path (hatchling's default,
+setuptools' `editable_mode=compat`); and an interpreter in the code directory, of which the copy holds
+only the `*.py` and `*.so` files. `agentd.started` records the copy as `code_sha256`, the sha256
+of its manifest (each file's path, size and sha256, or a link's target; the ledger keeps it as the blob
+of that address), with `code_files`, `code_bytes`, the `distributions` in the environment and the
+`interpreter`; the log of each start names `code_sha256` too.
 
 ```yaml
 worker:
