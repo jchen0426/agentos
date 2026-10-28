@@ -2005,3 +2005,115 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，srt | 59 | 3 | 42 | 41 | 0 | 1 |
 
   跑完没有留下 Worker、agentd 或状态目录。
+
+## C2c：Worker 的活性和钉住的代码（2026-10-29）
+
+用户按推荐批准了设计（“按推荐批准”）：卡住 60 秒的 Worker 重启；阈值是常量，记进 agentd.started；代码用快照钉住；快照装整个虚拟环境，不含字节码；`.pth` 指向 `python`、`code` 以外的目录也钉住。协调者定的两处，没有异议：沿用 `worker.exited`，加 `unresponsive`；`--no-worker` 时不查活性。设计文档的改动由协调者在合并后改。
+
+### 做了什么
+
+- **活性，在 Runtime 代理那里判断**：
+  - 每一代一份 tally（`internal/runtimeproxy/tally.go`）：supervisor 在 `cmd.Start` 之前取一份新的，代理此后接受的连接都记进它。记的是：规则放过、还开着的 poll 数；最后一个 poll 结束的时间（没有 poll 时从这份 tally 开始算）；自 Worker 上一次回答以来，第一个发出去的任务的时间。
+  - “发出去”是 poll 的回应带着非空的 task_token（字段 1，在 `backendStream.RecvMsg` 里用 protowire 读）。“回答”是 RespondWorkflowTaskCompleted、Failed 或 RespondQueryTaskCompleted，规则放过也好、拒绝也好，都算。
+  - supervisor 每 5 秒查一次：第一代从 "worker ready" 起查（之前由 ReadyWithin 管），后面的代从启动起查。不在 poll：没有开着的 poll，且最后一个结束已满 60 秒（`not_polling`）；不回答：发出去的任务等了 60 秒以上（`not_answering`）。
+  - 违反时：日志打 "the Worker is not serving"（代数、pid、哪条规则、多久），照常 terminate，写一条 `worker.exited`，带 `unresponsive` 和 `unresponsive_ms`（走原来每分钟一条的限流），按原来的间隔重启。"worker exited" 那行日志也带 `unresponsive`。
+  - 常量放在 `Timing` 里（QuietFor 60 秒、HoldFor 60 秒、CheckEvery 5 秒），记进 `agentd.started.worker.liveness {quiet_ms, hold_ms}`。`--no-worker` 时没有 supervisor，什么都不查。
+- **钉住的代码，用启动时的快照**（`internal/codesnap`）：
+  - 为什么：SDK 的沙箱每个工作流任务都用新的 importer 建工作流实例，`max_cached_workflows=0` 又让每个任务都是新实例，所以工作流模块每个任务都从磁盘重读一遍，改动在运行中那一代的下一个任务就生效了。只核对哈希钉不住，只有副本钉得住。
+  - 何时、何处：拿到锁、清扫之后，写 agentd.started 之前；`/tmp/agentos-code.<pid>.*`（statedir），文件 0444（可执行的 0555），supervisor 停了以后删掉，下一个 agentd 启动时清扫被 kill 的 agentd 留下的。
+  - 拷什么：
+    - `python/`：整个虚拟环境，去掉 `__pycache__` 和 `*.pyc`、`*.pyo`；
+    - `code/`：`code` 下的 `*.py`、`*.so`，跳过点目录、`__pycache__` 和其中的虚拟环境（有 `pyvenv.cfg` 的目录）；
+    - `.pth` 指向两者以外的目录，拷进 `python/pinned/<i>/`，`.pth` 里的路径行改成相对 site-packages 的路径。
+  - 链接一律拷成链接：在自己那棵树里的（Linux 虚拟环境的 `lib64 -> lib`）改成相对的；`bin/python*` 原样；指出树外的，指向原来的绝对路径。
+  - 不收：import hook 方式的 editable 安装（setuptools 的 `__editable___*_finder`）；文件、目录、链接以外的东西；超过 1 GiB 或 10 万个文件。APFS 上用 clonefile。
+  - 哈希：每个文件一行（路径、种类、可执行位、大小、sha256 或链接目标），排好序就是 manifest；根 `code_sha256` 是 manifest 的 sha256。字节码和时间不在里面。
+  - 启动：给启动脚本的是快照的两个目录，跑 `<snap>/python/bin/python`，`Dir` 是 `<snap>/code`。启动脚本不用改，原来的目录不再进沙箱。CheckWorker 照旧查配置里的目录。
+  - 记录：`agentd.started.worker` 加了 `code_sha256`、`code_files`、`code_bytes`、`distributions`（site-packages 里每个 dist-info 的 METADATA 的 name==version）、`interpreter`；manifest 作为账本 blob 存，地址就是 `code_sha256`；"worker started" 那行日志带着根。
+  - 出错：快照的任何错误都让 agentd 在监听之前拒绝启动。快照里缺模块，会表现为第一个 Worker 的 ImportError。
+
+### 实现时定的
+
+- `.pth` 里指向 `python` 或 `code` 里面的路径行也改写，指到副本里对应的地方。设计只说了两者以外的目录，但测试里 editable 安装的 `.pth` 写的是 `<repo>/python`，在 `code`（仓库根）里面：不改写，副本就会去 import 原来的代码。指向不存在目录的行删掉：Python 本来也跳过它，留着的话，以后那里出现目录就会被 import 进来。
+- `distributions` 只读 site-packages 顶层的 dist-info，不读打包在别的包里的。
+- `Timing.WithDefaults` 导出了，agentd.started 要记阈值。Runtime 代理挪到 supervisor 之前创建，`NewTally` 要用它。
+- `workerPrivate(cfg)`（tools 不能读的，加上 deny list）同时给启动脚本的 `AGENTOS_SANDBOX_DENY_READ` 和快照用，两边不会对不上。
+
+### 要落实的几点
+
+- **连接能不能算到它来自的那一代**：查过了，可以。代理的 listener 在 accept 时把当时最新的 tally 放进 conn（`limits.go` 的 Accept）；这个连接上的每个调用（`checkRequest`、`backendStream.RecvMsg`）都记进 `conn.tally`。supervisor 在 `cmd.Start` 之前取新的 tally，所以新一代的连接都在它之后被 accept。`TestAConnectionCountsIntoTheTallyBeforeIt` 钉着：新 tally 之前的连接记进旧的，之后的记进新的。
+  - 剩余风险：残留的 Worker 之后才连上来，会算成当前这一代。一个还在 poll 的残留会掩护一个死掉的当前代（poll 数不为 0）；一个拿了任务又不回答的残留，会让当前代被判成 `not_answering`。在新 tally 和 `cmd.Start` 之间连上来的旧连接也一样。
+- **快照的复制成本**：
+  - macOS（APFS，clonefile，连哈希）：每个 agentd 启动中位数 0.75 秒，最长 1.6 秒（2362 个文件，117 MiB）；`test_worker_supervision.py` 加 T1、T12 一共复制 31 次，24–25 秒。
+  - Linux VM（ext4，没有 clonefile）：第一次 2.2 秒（冷缓存），之后 0.2–0.3 秒（2857 个文件，89 MiB）。
+  - 整套大约 38 次 `worker=True` 的 agentd 启动：Linux 多 10–15 秒，macOS 多半分钟左右。新的黑盒测试每个环境多约 3.6 分钟（不在 poll 那个约 130 秒，不回答那个约 77 秒，钉住代码那个约 10–20 秒），比设计估计的 5 分钟少，没有更糟。
+  - 所以没有把空闲 SIGSTOP 那个测试改成只在 nightly 跑：Linux 的 nightly 大约从 29 分钟到 33 分钟，上限 40；PR 运行没有 verify，更快。要是 CI 显示紧，按 `GITHUB_EVENT_NAME` 跳过它只要一行。
+- **C2b 记的 C3 那条**：T9 的探测是从 Worker fork 出来的，C3 以后再说，现在不用做。
+
+### 安全审查的两条中等（已修）
+
+- **指出树外的链接**：原来按它指向的文件拷贝。虚拟环境或 code 里一个指向 `~/.ssh/id_rsa`、账本或镜像文件的链接，原来 Worker 读不到（Seatbelt 按真实路径判断；bwrap 不挂载目标），拷进快照以后就能读了。现在一律拷成链接，指向原来的地方，由沙箱照旧判断。没有因此坏掉什么：macOS 的 uv 虚拟环境里只有 `bin/python*` 是链接，Linux 的还有 `lib64 -> lib`，都在树里。
+- **两者以外的 `.pth` 目录整个拷贝**：现在 `codesnap.Make` 收到 Worker 不能读的路径（`workerPrivate`：数据目录、两个 socket 的目录、TLS 证书和私钥、镜像，加 deny list），并且：
+  - 一棵树装着其中任何一个，就拒绝；
+  - `.pth` 的目录（EvalSymlinks 之后）在其中任何一个里面，就拒绝；
+  - 读到的每个路径都在其中任何一个里面，就拒绝。只有 `python` 和 `code` 本身例外：启动脚本不管它们在哪都让 Worker 读（srt 的 allowRead 对里面的东西优先），测试自己的 code 目录就在 deny list 里的 `stack.tmp` 下面。
+- **快照拷的东西，Worker 原来都能读**：
+  - `python` 和 `code` 里的东西，两种沙箱本来就让它读；
+  - 链接不拷它指向的东西；
+  - 一个 `.pth` 目录，既不在 agentd 不让它读的路径里，也不装着这样的路径。
+- **记一笔，请你定**：一个在两者以外、又在家目录下的 `.pth` 目录（`code` 不是仓库时，editable 安装的源码），在 srt 下原来是读不到的（家目录被拒），钉住以后就读得到了。它是代码，不是数据，正是设计的第 5 条要钉的，所以检查里没有加 `$HOME`。钉住代码的测试就是这种情形：code 在 `stack.tmp/code`，`agentos_worker` 来自 `<repo>/python`。
+
+### 测试
+
+- **Go**：
+  - tally：空的 poll 回应不算发出任务；被拒的回答照样清掉等待；被拒的 poll 不算；新 tally 之前的连接不算进它；空的 task_token 不算发出任务；
+  - supervisor（假 tally，300 毫秒的阈值）：两条规则各自重启、打日志、写记录；开着 poll、两倍阈值没有新调用也不重启；第一代就绪之前不查；后面一代从不 poll 会被重启，不进 Failed；检查期间 Stop，什么都不起；`TestTheDefaults`、`TestTheExitRecord` 加了新字段；
+  - codesnap：拷了哪些文件、`.pth` 的改写、各种拒绝；同样的代码两次快照根相同，改一个字节根就变，pyc 不影响；上限；清扫；树外链接仍是链接、它指向的内容哪个文件里都没有；`.pth` 指向数据目录、deny list 里的路径、装着数据目录的目录，都拒绝；`code` 装着数据目录，拒绝；配置的目录在私有路径下面，照收；
+  - cmd/agentd：`TestWorkerLaunch`（快照的路径）、`TestWorkerRecord`（新字段）、`TestWorkerPrivate`。
+- **黑盒**（三种环境都跑）：
+  - 空闲时 SIGSTOP：`not_polling` 在冻结后 60 秒以上、185 秒以内出现，然后是第二代、记录、一次成功的运行；
+  - T1 那样冻结、不杀：`not_answering` 在任务发出后 60 秒以上、95 秒以内出现，运行成功，只有一次模型调用、一次 WorkflowTaskTimedOut；
+  - 钉住的代码：同一代改了文件还是 v1，杀掉以后第二代还是 v1；manifest blob 里有 v1 的 sha256；重启 agentd 换了新的根，变成 v2；agentd 停了快照就没了（在下一个 agentd 能清扫之前就核对）；kill -9 之后下一个 agentd 清扫掉；
+  - 拒绝：code 装着 deny list 里的路径，agentd 不启动；
+  - `test_worker_supervision.py` 的 `worker` 字典改成逐项核对。
+
+### 改坏检查
+
+- **Go 34 处**：33 处抓到，1 处等价。
+  - tally 7 处：被拒的回答不算；被拒的 poll 算；每个 poll 回应都算发出；空 token 算发出；连接用最新的 tally；等待算最后一个任务的；poll 结束不记安静时间。
+  - supervisor 8 处：第一代就绪前就查；开着的 poll 不算；不回答从不触发；不回应时停掉整个 supervisor；不写记录；记录不说原因；不取 tally；Stop 被检查吞掉。
+  - codesnap 11 处：拷字节码；`.pth` 不改写；树里的链接指回原来的树；收 import hook；没有上限；文件可写；收点目录；收嵌套的虚拟环境；根不含内容；拒绝后快照留着；树外的 `.pth` 目录不钉。
+  - 安全修复 5 处：树外链接拷成它指向的内容；`.pth` 目录当成配置的目录放过；配置的目录不放过；deny list 不算私有；每个读到的路径都查。前四处抓到；最后一处是等价的改坏：树的根已经查过“装着”和“在里面”，逐个路径的检查是给以后的代码路径留的保险，协调者要的就是这个。
+  - cmd/agentd 3 处：启动原来的目录；记录里没有根；记录里没有活性阈值。
+- **黑盒 6 处**，none 下，都抓到：
+  - manifest 不进账本；
+  - agentd 停了快照留着（第一次没抓到：之前的检查放在 `restart_agentd()` 之后，下一个 agentd 的清扫把它删了。改成停了就查）；
+  - 不清扫快照；
+  - Worker 跑原来的代码；
+  - 快照不收私有路径；
+  - supervisor 拿不到 tally。
+
+### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。ruff 只报原来就有的三处。
+- macOS，`--verify-after-each`，两种环境同时跑：`test_worker_supervision.py`、T1 的两个文件、T12。三种完整套件、bwrap 全套由你跑。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 55 | 3 | 55 | 48 | 0 | 7 |
+  | macOS，srt | 58 | 0 | 56 | 48 | 0 | 8 |
+
+  跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+- Linux VM（bwrap，`~/agentos-venv-m5`）：两个活性测试，加 `--verify-after-each`，都过（约 131 秒、74 秒）；钉住代码、第一个测试、kill -9 那个也都过。
+
+### 剩余风险
+
+- 残留的 Worker 之后才连上来，会算成当前这一代（见上）。
+- 标准库不在副本里，在两个目录以外。
+- 链接指向的树外的东西不钉：manifest 只记链接的目标。
+- 规则按“自上一次回答以来第一个发出去的任务”算：一个 Worker 回答别的任务、只卡在一个任务上，算活着；那个任务由 Temporal 的工作流任务超时交给别人。
+- 空闲时被冻结的 Worker，要等它开着的长 poll 自己结束（一分钟左右）以后，再过 60 秒才判出来：1–2 分钟，不是 60 秒。
+- 根只盖副本，不盖解释器（`interpreter` 记了它在哪）。
+- 每次 agentd 启动多一个约 375 KB 的 manifest blob；代码不变时地址相同，只存一次。
+- 文件是只读的，但不加沙箱的 Worker 和 agentd 是同一个用户，可以改回来；两种沙箱都不让它写副本。
+- 两者以外、家目录下的 `.pth` 目录会被钉住（见“记一笔”）。
