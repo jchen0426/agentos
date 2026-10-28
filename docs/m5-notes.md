@@ -1682,6 +1682,8 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 范围：设计（`m5-c2c3-design.md`）里 PR 顺序的第 3 项。agentd 在 Runtime 入口开始服务之后拉起 Worker，不管怎么退出都重启；新加 `tests/test_worker_supervision.py`，三种环境都跑。现有测试都传 `--no-worker`，照旧自己起 Worker；迁移现有测试是 C2b。
 
+合并为 PR #58（aec9c3b，2026-10-26）。合并前一天，CI 加了 macOS srt 的黑盒任务，设成了必需检查（PR #57）。合并后，设计文档 rev 397–400 按你批准的清单改了：第 4 节组件表 agentd 一行（rev 397：经沙箱启动脚本拉起并看管 Worker，退避重启，第一个 Worker 就绪了 agentd 才算就绪，停止时先关 stdin、再 SIGTERM、再强杀进程组）和 Python Worker 一行（rev 398：由 agentd 拉起，环境变量只有 agentd 拼出的几项，`--no-worker` 时自己起）；第 8 节威胁表（rev 399：“偷密钥”一行加上不加沙箱时有真密钥就不拉起 Worker，新加“往终端里打字”和“Worker 赖着不走”两行）；第 12 节 M5 的记录（rev 400：#57 的 CI 和 C2a 的完成记录；M5 仍没记为完成，还剩 C2b、C3a、C3b）。每代 Worker 的一次性凭据没有放进 C2a，在“Worker 赖着不走”一行里写成留到后面。
+
 ### 做了什么
 
 - **配置**：`agentd.yaml` 加 `worker` 一节。
