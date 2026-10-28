@@ -1,19 +1,20 @@
 // Package codesnap pins the code agentd's own Worker runs (M5 C2c): a copy, made when agentd starts,
 // of the Worker's Python environment without its bytecode, and the *.py and *.so files of its code
-// directory and of each directory a .pth file names outside both; its files read-only, all of it
-// hashed into one root. The Temporal SDK's sandbox imports workflow modules afresh at every workflow
-// task, so a check of the code would not keep a running Worker on what it started with: only a copy
-// does. Every generation runs from the copy; the next agentd makes its own, of the code as it is then.
-// The standard library, outside both directories, is not copied.
+// directory and of each directory a .pth file names outside both that the Worker's sandbox shows it;
+// its files read-only, all of it hashed into one root. The Temporal SDK's sandbox imports workflow
+// modules afresh at every workflow task, so a check of the code would not keep a running Worker on what
+// it started with: only a copy does. Every generation runs from the copy; the next agentd makes its own,
+// of the code as it is then. The standard library, outside both directories, is not copied.
 //
-// The copy holds only what the Worker could read before, but for the *.py and *.so files of a .pth's
-// directory outside both. The launchers let the Worker read the Python environment and the code
-// directory wherever they are; a .pth's directory the sandbox may have kept from it (srt: the homes
-// and the temporary directories; bwrap: everything but /usr and the two directories), but a .pth that
-// names it says the Worker is to import it, and only what that puts on the import path is taken, by
-// the code directory's rule: no data, no dot-file. Nothing is taken from in or around a path agentd
-// keeps from the Worker. A link is copied as a link, never as what it leads to, so the sandbox judges
-// what it leads to as it would have.
+// The copy holds nothing the Worker could not read before. The launchers let it read the Python
+// environment and the code directory wherever they are. A directory a .pth names outside both goes in
+// only where the sandbox let the Worker read it (Options.Visible), and only what the .pth puts on the
+// import path: where the sandbox did not, the copy leaves the .pth's line out, and the directory: the
+// sandboxed Worker imported nothing from it (macOS's sandbox lets a hidden directory be looked up, so
+// that its site.py put it on the import path, but not listed or read; Linux's has no such directory).
+// Without a sandbox the Worker reads everything anyway. Nothing comes from in or around a path agentd
+// keeps from the Worker (Options.Private). A link is copied as a link, never as what it leads to, so
+// the sandbox judges what it leads to as it would have.
 package codesnap
 
 import (
@@ -27,8 +28,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"syscall"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jchen0426/agentos/internal/statedir"
 )
@@ -45,6 +50,22 @@ const (
 // The caps a snapshot is held to (tests lower them).
 var maxBytes, maxFiles int64 = MaxBytes, MaxFiles
 
+// maxDistributions bounds the distributions a snapshot names (tests lower it).
+var maxDistributions = 1000
+
+// Options say what the copy may not hold.
+type Options struct {
+	// Private are the paths the Worker must not read: agentd's data directory, its sockets'
+	// directories, the Temporal client's certificate and key, the mirrors, and the deny list. No path
+	// the copy is made from may be in one or hold one, but that python and code may be in one (the
+	// launchers let the Worker read them wherever they are).
+	Private []string
+	// Visible reports whether the Worker's sandbox shows it path (given as named; the function judges
+	// its real path too): a directory a .pth names outside python and code goes into the copy only
+	// then. nil shows everything (no sandbox).
+	Visible func(path string) bool
+}
+
 // Snapshot is the copy agentd's Worker runs from.
 type Snapshot struct {
 	Dir    string // the state directory, which holds python and code
@@ -59,19 +80,19 @@ type Snapshot struct {
 	Bytes         int64
 	Distributions []string // name==version of each distribution in the environment's site-packages
 	Interpreter   string   // where the environment's bin/python leads
+	// LeftOut are the directories outside python and code that the Worker's sandbox hid from it, of
+	// those a .pth names and those in one it names: the copy leaves them out, and a .pth's line that
+	// names one.
+	LeftOut []string
 }
 
-// Make copies python (a virtual environment) and code into a new state directory. private are the
-// paths the Worker must not read: agentd's data directory, its sockets' directories, the Temporal
-// client's certificate and key, the mirrors, and the deny list. No path the copy is made from may be
-// in one or hold one, but that python and code may be in one (the launchers let the Worker read them
-// wherever they are).
-func Make(python, code string, private []string) (*Snapshot, error) {
+// Make copies python (a virtual environment) and code into a new state directory.
+func Make(python, code string, o Options) (*Snapshot, error) {
 	dir, err := statedir.Make(Kind)
 	if err != nil {
 		return nil, err
 	}
-	s, err := make1(dir, python, code, private)
+	s, err := make1(dir, python, code, o)
 	if err != nil {
 		_ = statedir.Remove(dir)
 		return nil, err
@@ -82,17 +103,29 @@ func Make(python, code string, private []string) (*Snapshot, error) {
 // Remove removes the snapshot.
 func (s *Snapshot) Remove() error { return statedir.Remove(s.Dir) }
 
-func make1(dir, python, code string, private []string) (*Snapshot, error) {
-	python, code = filepath.Clean(python), filepath.Clean(code)
-	b := &builder{root: dir, python: python, code: code, pinned: map[string]string{}}
-	for _, p := range private {
-		b.private = append(b.private, real(p))
-	}
-	if err := b.tree(python, "python", b.inEnvironment, true); err != nil {
+func make1(dir, python, code string, o Options) (*Snapshot, error) {
+	// The real paths: a directory given as a link is walked where it is, and the .pth lines are
+	// compared with where python and code really are.
+	realPython, err := filepath.EvalSymlinks(python)
+	if err != nil {
 		return nil, fmt.Errorf("worker.python %s: %w", python, err)
 	}
-	if err := b.tree(code, "code", b.inCode, true); err != nil {
+	realCode, err := filepath.EvalSymlinks(code)
+	if err != nil {
 		return nil, fmt.Errorf("worker.code %s: %w", code, err)
+	}
+	b := &builder{root: dir, self: real(dir), python: realPython, code: realCode, visible: o.Visible, pinned: map[string]string{}}
+	for _, p := range o.Private {
+		b.private = append(b.private, real(p))
+	}
+	if err := b.tree(realPython, "python", b.inEnvironment, true); err != nil {
+		return nil, fmt.Errorf("worker.python %s: %w", python, err)
+	}
+	if err := b.tree(realCode, "code", b.inCode, true); err != nil {
+		return nil, fmt.Errorf("worker.code %s: %w", code, err)
+	}
+	if err := systemSite(filepath.Join(dir, "python", "pyvenv.cfg")); err != nil {
+		return nil, fmt.Errorf("worker.python %s: %w", python, err)
 	}
 	slices.SortFunc(b.entries, func(x, y entry) int { return strings.Compare(x.path, y.path) })
 	var m bytes.Buffer
@@ -105,12 +138,37 @@ func make1(dir, python, code string, private []string) (*Snapshot, error) {
 	}
 	sum := sha256.Sum256(m.Bytes())
 	s := &Snapshot{Dir: dir, Python: filepath.Join(dir, "python"), Code: filepath.Join(dir, "code"), Manifest: m.Bytes(),
-		Root: hex.EncodeToString(sum[:]), Files: b.files, Bytes: b.bytes}
+		Root: hex.EncodeToString(sum[:]), Files: b.files, Bytes: b.bytes, LeftOut: b.leftOut}
 	s.Distributions = distributions(s.Python)
-	if real, err := filepath.EvalSymlinks(filepath.Join(python, "bin", "python")); err == nil {
-		s.Interpreter = real
+	if interpreter, err := filepath.EvalSymlinks(filepath.Join(realPython, "bin", "python")); err == nil {
+		if err := plain(interpreter); err != nil {
+			return nil, fmt.Errorf("worker.python %s: its interpreter: %w", python, err)
+		}
+		s.Interpreter = interpreter
 	}
 	return s, nil
+}
+
+// systemSite refuses an environment whose pyvenv.cfg (the copy's, which the Worker runs with) lets in
+// the system's site-packages, and the user's with them, as Python's site.py reads it: they would be
+// imported live, and pinned by nothing.
+func systemSite(cfg string) error {
+	data, err := os.ReadFile(cfg)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok && strings.ToLower(strings.TrimSpace(key)) == "include-system-site-packages" &&
+			strings.ToLower(strings.TrimSpace(value)) == "true" {
+			return errors.New("its pyvenv.cfg sets include-system-site-packages = true: the system's and the user's " +
+				"site-packages would be imported live, past the copy; make the environment without " +
+				"--system-site-packages")
+		}
+	}
+	return nil
 }
 
 type entry struct {
@@ -122,12 +180,15 @@ type entry struct {
 }
 
 type builder struct {
-	root, python, code string
-	entries            []entry
-	files              int
-	bytes              int64
-	pinned             map[string]string // a directory a .pth names outside both, and its copy's path
-	private            []string          // the paths the Worker must not read, as their real paths
+	root, self   string // the snapshot's directory, and its real path
+	python, code string // the real paths of the two directories
+	visible      func(string) bool
+	entries      []entry
+	files        int
+	bytes        int64
+	pinned       map[string]string // a directory a .pth names outside both, and its copy's path
+	private      []string          // the paths the Worker must not read, as their real paths
+	leftOut      []string
 }
 
 // real is path's real path, or path itself, cleaned, where it does not resolve.
@@ -138,9 +199,27 @@ func real(path string) string {
 	return filepath.Clean(path)
 }
 
-// keptFrom refuses a tree whose real path is root if it holds a path the Worker must not read, or is
-// in one but where configured (python, code); it returns the check for each path read under it.
+// plain refuses a name the manifest, a link or the record would carry that holds a control or format
+// character (a newline, a tab, a bidirectional override), or is not UTF-8.
+func plain(s string) error {
+	if !utf8.ValidString(s) {
+		return fmt.Errorf("%q is not UTF-8", s)
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("%q holds a control or format character (%U)", s, r)
+		}
+	}
+	return nil
+}
+
+// keptFrom refuses a tree whose real path is root if it holds the snapshot itself, or a path the
+// Worker must not read, or is in one but where configured (python, code); it returns the check for
+// each path read under it.
 func (b *builder) keptFrom(root string, configured bool) (func(real string) error, error) {
+	if within(b.self, root) {
+		return nil, fmt.Errorf("it holds %s, the copy being made", b.self)
+	}
 	var holding []string // the private paths that hold the tree: those a configured tree may be in
 	for _, p := range b.private {
 		switch {
@@ -176,8 +255,8 @@ func (b *builder) inEnvironment(path, rel string, d fs.DirEntry) (bool, bool) {
 	return false, !strings.HasSuffix(name, ".pyc") && !strings.HasSuffix(name, ".pyo")
 }
 
-// inCode takes the code directory's *.py and *.so files, outside its dot-directories, __pycache__
-// and any virtual environment in it.
+// inCode takes the code directory's *.py and *.so files, what can be imported: none whose name begins
+// with a dot, nor in a dot-directory, __pycache__ or a virtual environment in it.
 func (b *builder) inCode(path, rel string, d fs.DirEntry) (bool, bool) {
 	name := d.Name()
 	if d.IsDir() {
@@ -187,7 +266,7 @@ func (b *builder) inCode(path, rel string, d fs.DirEntry) (bool, bool) {
 		_, err := os.Lstat(filepath.Join(path, "pyvenv.cfg"))
 		return strings.HasPrefix(name, ".") || name == "__pycache__" || err == nil, false
 	}
-	return false, strings.HasSuffix(name, ".py") || strings.HasSuffix(name, ".so")
+	return false, !strings.HasPrefix(name, ".") && (strings.HasSuffix(name, ".py") || strings.HasSuffix(name, ".so"))
 }
 
 // inPinned takes of a directory a .pth names what inCode takes of the code directory: what the .pth
@@ -196,18 +275,17 @@ func (b *builder) inPinned(path, rel string, d fs.DirEntry) (bool, bool) {
 	return b.inCode(path, rel, d)
 }
 
-// tree copies what sel takes of src to dst, a path in the snapshot: a configured directory (python,
-// code), or a .pth's.
+// tree copies what sel takes of the tree at src, a real path, to dst, a path in the snapshot: a
+// configured directory (python, code), or a .pth's.
 func (b *builder) tree(src, dst string, sel selection, configured bool) error {
-	fi, err := os.Stat(src)
+	fi, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
 	if !fi.IsDir() {
 		return errors.New("not a directory")
 	}
-	root := real(src)
-	check, err := b.keptFrom(root, configured)
+	check, err := b.keptFrom(src, configured)
 	if err != nil {
 		return err
 	}
@@ -229,106 +307,158 @@ func (b *builder) tree(src, dst string, sel selection, configured bool) error {
 		if rel == "." {
 			return nil
 		}
-		// The walk follows no link: below the tree's real root, a path's real path is root/rel.
-		if err := check(filepath.Join(root, rel)); err != nil {
+		if !configured && b.visible != nil && !b.visible(path) { // in a .pth's directory, what the sandbox hid
+			b.leaveOut(path)
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// The walk follows no link, from a real root: a path's real path is the path itself (but for a
+		// directory swapped for a link while it walks).
+		if err := check(path); err != nil {
 			return err
 		}
-		out := filepath.ToSlash(filepath.Join(dst, rel))
-		if strings.ContainsAny(out, "\t\n") {
-			return fmt.Errorf("%s: a name with a tab or newline", path)
+		t := d.Type()
+		if t.IsDir() || !take { // directories are made for what goes in them
+			return nil
 		}
-		switch t := d.Type(); {
-		case t.IsDir():
-			return os.MkdirAll(filepath.Join(b.root, out), 0o755)
+		out := filepath.ToSlash(filepath.Join(dst, rel))
+		if err := plain(out); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if err := os.MkdirAll(filepath.Join(b.root, filepath.Dir(out)), 0o755); err != nil {
+			return err
+		}
+		switch {
 		case t&fs.ModeSymlink != 0:
-			if take {
-				return b.link(src, dst, path, rel, out)
-			}
-			return nil
+			return b.link(src, path, out)
 		case t.IsRegular():
-			if take {
-				return b.file(path, out)
-			}
-			return nil
-		case take:
-			return fmt.Errorf("%s: neither a file, a directory nor a link (%s)", path, t)
+			return b.file(path, out)
 		default:
-			return nil
+			return fmt.Errorf("%s: neither a file, a directory nor a link (%s)", path, t)
 		}
 	})
 }
 
 // link copies a link as a link, never what it leads to, so that the sandbox judges that as it would
-// have: one that leads inside the tree it is in (a Linux environment's lib64, to lib) leads inside the
-// copy, relative; one of the environment's bin/python* keeps its target (the interpreter, or another
-// of them); any other leads where it led, by its absolute path. What a link leads outside to is not
-// pinned: the manifest has the link's target.
-func (b *builder) link(src, dst, path, rel, out string) error {
+// have: one that leads inside the tree it is in (a Linux environment's lib64, to lib; bin/python3, to
+// bin/python) leads inside the copy, relative; any other leads where it led, by its absolute path (the
+// environment's bin/python, to the interpreter). What a link leads outside to is not pinned: the
+// manifest has the link's target.
+func (b *builder) link(src, path, out string) error {
 	target, err := os.Readlink(path)
 	if err != nil {
 		return err
 	}
-	slashed := filepath.ToSlash(rel)
-	inBin := dst == "python" && strings.HasPrefix(slashed, "bin/python") && !strings.Contains(slashed[len("bin/"):], "/")
 	resolved := target
 	if !filepath.IsAbs(resolved) {
 		resolved = filepath.Join(filepath.Dir(path), target)
 	}
-	switch {
-	case inBin:
-	case within(resolved, src):
+	if within(resolved, src) {
 		if target, err = filepath.Rel(filepath.Dir(path), resolved); err != nil {
 			return err
 		}
-	default:
+	} else {
 		target = resolved
 	}
-	if strings.ContainsAny(target, "\t\n") {
-		return fmt.Errorf("%s: a link's target with a tab or newline", path)
+	if err := plain(target); err != nil {
+		return fmt.Errorf("%s: a link's target: %w", path, err)
 	}
 	b.entries = append(b.entries, entry{path: out, kind: "link", sum: target})
 	return os.Symlink(target, filepath.Join(b.root, out))
 }
 
-// file copies a regular file, its content checked and hashed, at 0444 (0555 if it was executable).
+// file copies a regular file, read through a descriptor opened without following a link, at 0444
+// (0555 if it was executable); a .pth in site-packages is written as pth makes it.
 func (b *builder) file(src, out string) error {
-	fi, err := os.Stat(src)
+	dst := filepath.Join(b.root, out)
+	var size int64
+	var sum string
+	var exec bool
+	var err error
+	if isPth(out) {
+		size, sum, exec, err = b.writePth(src, dst)
+	} else {
+		size, sum, exec, err = copyFile(src, dst)
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", src, err)
 	}
 	if b.files++; int64(b.files) > maxFiles {
 		return fmt.Errorf("more than %d files: too many to pin", maxFiles)
 	}
-	if b.bytes += fi.Size(); b.bytes > maxBytes {
+	if b.bytes += size; b.bytes > maxBytes {
 		return fmt.Errorf("more than %d bytes: too much to pin", maxBytes)
-	}
-	dst := filepath.Join(b.root, out)
-	exec := fi.Mode()&0o111 != 0
-	var size int64
-	var sum string
-	if isPth(out) {
-		content, err := b.pth(src)
-		if err != nil {
-			return fmt.Errorf("%s: %w", src, err)
-		}
-		if err := os.WriteFile(dst, content, 0o600); err != nil {
-			return err
-		}
-		h := sha256.Sum256(content)
-		size, sum = int64(len(content)), hex.EncodeToString(h[:])
-	} else if size, sum, err = copyFile(src, dst); err != nil {
-		return err
-	}
-	b.bytes += size - fi.Size()
-	mode := os.FileMode(0o444)
-	if exec {
-		mode = 0o555
-	}
-	if err := os.Chmod(dst, mode); err != nil {
-		return err
 	}
 	b.entries = append(b.entries, entry{path: out, kind: "file", exec: exec, size: size, sum: sum})
 	return nil
+}
+
+// mode is a copy's mode: read-only, executable where the original was.
+func mode(exec bool) os.FileMode {
+	if exec {
+		return 0o555
+	}
+	return 0o444
+}
+
+// openRegular opens path to read it, refusing a link (O_NOFOLLOW) and anything but a regular file,
+// as fstat says; O_NONBLOCK, so that a FIFO put in a file's place does not hold the open up.
+func openRegular(path string) (*os.File, os.FileInfo, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil && !fi.Mode().IsRegular() {
+		err = fmt.Errorf("not a regular file (%s)", fi.Mode().Type())
+	}
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	return f, fi, nil
+}
+
+// copyFile copies src to dst, a new file, by descriptor: a clone where the file system makes one
+// (APFS), the bytes otherwise. It returns the copy's size and sha256, hashed from the copy's
+// descriptor, which it also sets read-only.
+func copyFile(src, dst string) (int64, string, bool, error) {
+	in, fi, err := openRegular(src)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer in.Close()
+	exec := fi.Mode()&0o111 != 0
+	h := sha256.New()
+	var n int64
+	if cloneFile(in, dst) == nil {
+		out, _, err := openRegular(dst)
+		if err != nil {
+			return 0, "", false, err
+		}
+		defer out.Close()
+		if n, err = io.Copy(h, out); err != nil {
+			return 0, "", false, err
+		}
+		if err := out.Chmod(mode(exec)); err != nil {
+			return 0, "", false, err
+		}
+		return n, hex.EncodeToString(h.Sum(nil)), exec, nil
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return 0, "", false, err
+	}
+	n, err = io.Copy(io.MultiWriter(out, h), in)
+	if err == nil {
+		err = out.Chmod(mode(exec))
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), exec, err
 }
 
 // isPth reports whether out is a .pth file in the environment's site-packages, which Python reads
@@ -339,15 +469,77 @@ func isPth(out string) bool {
 		parts[3] == "site-packages" && strings.HasSuffix(parts[4], ".pth")
 }
 
-// pth is a .pth file's content for the copy: each directory it names (as a path, absolute or relative
-// to site-packages) becomes its copy's, relative to the copy's site-packages: one in the environment or
-// the code directory, the copy of it there; one outside both, a copy of its own in python/pinned. A
-// path that names nothing is left out. Import lines stay, but for an import-hook editable install
-// (setuptools' __editable___*_finder), which would import the live code: it is refused.
-func (b *builder) pth(src string) ([]byte, error) {
-	data, err := os.ReadFile(src)
+// writePth writes the copy of the .pth at src, as pth makes it, to dst.
+func (b *builder) writePth(src, dst string) (int64, string, bool, error) {
+	in, fi, err := openRegular(src)
 	if err != nil {
-		return nil, err
+		return 0, "", false, err
+	}
+	data, err := io.ReadAll(io.LimitReader(in, 1<<20+1))
+	in.Close()
+	if err != nil {
+		return 0, "", false, err
+	}
+	if len(data) > 1<<20 {
+		return 0, "", false, errors.New("a .pth over 1 MiB")
+	}
+	content, err := b.pth(src, data)
+	if err != nil {
+		return 0, "", false, err
+	}
+	exec := fi.Mode()&0o111 != 0
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return 0, "", false, err
+	}
+	_, err = out.Write(content)
+	if err == nil {
+		err = out.Chmod(mode(exec))
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	h := sha256.Sum256(content)
+	return int64(len(content)), hex.EncodeToString(h[:]), exec, err
+}
+
+// pthImports are the import lines a .pth may hold, as virtualenv and setuptools write them, after
+// their trailing whitespace: they import from site-packages, which the copy holds. Any other import
+// line is refused: agentd would have to run Python to know what it imports.
+var pthImports = []string{
+	"import _virtualenv",
+	"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; " +
+		"enabled and __import__('_distutils_hack').add_shim();",
+}
+
+// importHooks name the build backends whose editable installs import the live code through a hook.
+var importHooks = []struct{ mark, backend string }{
+	{"__editable__", "setuptools"},
+	{"_editable_impl_", "hatchling (dev-mode-exact)"},
+	{"editables", "editables"},
+	{"_editable_loader", "meson-python"},
+	{"scikit_build", "scikit-build-core"},
+	{"_editable", "scikit-build-core"},
+}
+
+// pthSeparator finds what Python's str.splitlines breaks a line at, besides "\n" and "\r\n": a .pth
+// that holds one would read differently there than here.
+var pthSeparator = regexp.MustCompile("\r[^\n]|\r$|[\f\v\x1c\x1d\x1e]|\u0085|\u2028|\u2029")
+
+// pth is a .pth file's content for the copy, as Python's site.py reads it (Lib/site.py's addpackage):
+// a line that begins with # is a comment, a blank one nothing, one that begins with "import " or
+// "import\t" is run (only pthImports are let through), and any other names a path, relative to
+// site-packages unless absolute, which goes on the import path if it exists. Each directory it names
+// becomes its copy's, relative to the copy's site-packages: one in the environment or the code
+// directory, the copy of it there; one outside both, a copy of its own in python/pinned, by the code
+// directory's rule, if the Worker's sandbox shows it, and left out if not. A path that names nothing,
+// or a file (a zip, an egg), is left out.
+func (b *builder) pth(src string, data []byte) ([]byte, error) {
+	if !utf8.Valid(data) {
+		return nil, errors.New("a .pth that is not UTF-8")
+	}
+	if m := pthSeparator.Find(data); m != nil {
+		return nil, fmt.Errorf("a .pth with %q in it, which Python reads as the end of a line", m)
 	}
 	site := filepath.Dir(src)
 	rel, err := filepath.Rel(b.python, site)
@@ -359,42 +551,44 @@ func (b *builder) pth(src string) ([]byte, error) {
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
-		line := sc.Text()
-		trimmed := strings.TrimRight(line, " \t\r")
+		line := strings.TrimSuffix(sc.Text(), "\r")
 		switch {
-		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+		case strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "":
 			out.WriteString(line + "\n")
 			continue
-		case strings.HasPrefix(trimmed, "import ") || strings.HasPrefix(trimmed, "import\t"):
-			if strings.Contains(trimmed, "__editable__") {
-				return nil, errors.New("an editable install by import hook (setuptools), which would import the live code: " +
-					"install it as a path (pip install -e with a .pth of paths, or a wheel)")
+		case strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "import\t"):
+			if trimmed := strings.TrimRightFunc(line, unicode.IsSpace); !slices.Contains(pthImports, trimmed) {
+				return nil, refusedImport(trimmed)
 			}
 			out.WriteString(line + "\n")
 			continue
 		}
-		dir := trimmed
+		dir := strings.TrimRightFunc(line, unicode.IsSpace) // as Python's str.rstrip
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(site, dir)
 		}
 		dir = filepath.Clean(dir)
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-			continue // Python leaves it out too
+			continue // nothing there, or a file Python would read as a zip: no part of the copy
 		}
+		realDir := real(dir)
 		var copied string
 		switch {
-		case within(dir, b.python):
-			r, _ := filepath.Rel(b.python, dir)
+		case within(realDir, b.python):
+			r, _ := filepath.Rel(b.python, realDir)
 			copied = filepath.Join(b.root, "python", r)
-		case within(dir, b.code):
-			r, _ := filepath.Rel(b.code, dir)
+		case within(realDir, b.code):
+			r, _ := filepath.Rel(b.code, realDir)
 			copied = filepath.Join(b.root, "code", r)
+		case b.visible != nil && !b.visible(dir):
+			b.leaveOut(dir)
+			continue // the Worker's sandbox hid it: the Worker imported nothing from it
 		default:
-			name, ok := b.pinned[dir]
+			name, ok := b.pinned[realDir]
 			if !ok {
 				name = filepath.ToSlash(filepath.Join("python", "pinned", fmt.Sprint(len(b.pinned))))
-				b.pinned[dir] = name
-				if err := b.tree(dir, name, b.inPinned, false); err != nil {
+				b.pinned[realDir] = name
+				if err := b.tree(realDir, name, b.inPinned, false); err != nil {
 					return nil, fmt.Errorf("the directory %s names: %w", dir, err)
 				}
 			}
@@ -412,38 +606,36 @@ func (b *builder) pth(src string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// copyFile copies src to dst, a new file, and returns its size and sha256: a clone where the file
-// system makes one (APFS), the bytes otherwise.
-func copyFile(src, dst string) (int64, string, error) {
-	if cloneFile(src, dst) == nil {
-		f, err := os.Open(dst)
-		if err != nil {
-			return 0, "", err
-		}
-		defer f.Close()
-		h := sha256.New()
-		n, err := io.Copy(h, f)
-		return n, hex.EncodeToString(h.Sum(nil)), err
+// leaveOut notes a path the copy leaves out, as the Worker's sandbox hid it.
+func (b *builder) leaveOut(path string) {
+	if !slices.Contains(b.leftOut, path) {
+		b.leftOut = append(b.leftOut, path)
 	}
-	in, err := os.Open(src)
-	if err != nil {
-		return 0, "", err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return 0, "", err
-	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h), in)
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	return n, hex.EncodeToString(h.Sum(nil)), err
 }
 
+// refusedImport is the refusal of a .pth's import line, naming the build backend that writes it where
+// it is one agentd knows.
+func refusedImport(line string) error {
+	what := "an import line agentd cannot judge without running it"
+	for _, h := range importHooks {
+		if strings.Contains(line, h.mark) {
+			what = "an editable install by import hook (" + h.backend + "), which would import the live code"
+			break
+		}
+	}
+	return fmt.Errorf("a .pth with %s (%.80q): install the package as a wheel, or as an editable install by path "+
+		"(hatchling's default, setuptools' editable_mode=compat)", what, line)
+}
+
+// PEP 508's names and PEP 440's public versions, as distributions records them.
+var (
+	distName    = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$`)
+	distVersion = regexp.MustCompile(`^(?i)v?(\d+!)?\d+(\.\d+)*((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?(\+[a-z0-9]+(\.[a-z0-9]+)*)?$`)
+)
+
 // distributions lists name==version of each distribution in the environment's site-packages, from its
-// dist-info's METADATA.
+// dist-info's METADATA: only names and versions as PEP 508 and PEP 440 spell them, at most
+// maxDistributions.
 func distributions(python string) []string {
 	metas, _ := filepath.Glob(filepath.Join(python, "lib", "python*", "site-packages", "*.dist-info", "METADATA"))
 	var out []string
@@ -462,12 +654,13 @@ func distributions(python string) []string {
 			}
 		}
 		f.Close()
-		if name != "" {
+		if distName.MatchString(name) && len(version) <= 64 && distVersion.MatchString(version) {
 			out = append(out, name+"=="+version)
 		}
 	}
 	slices.Sort(out)
-	return slices.Compact(out)
+	out = slices.Compact(out)
+	return out[:min(len(out), maxDistributions)]
 }
 
 // within reports whether path is dir or inside it, by their names.

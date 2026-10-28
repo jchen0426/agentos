@@ -138,12 +138,17 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	// The code the Worker runs, pinned: a copy, made now. The SDK's sandbox imports workflow modules
 	// afresh at every task, so a Worker running on the live directories would take an edit to them at
 	// its next one; every generation of this agentd's runs from the copy. The copy holds nothing the
-	// Worker may not read: none of what agentd keeps from it and from the tools, nor the deny list.
+	// Worker could not read before: nothing its launcher hides from it, and none of what agentd keeps
+	// from it and from the tools, nor the deny list. Without a launcher it reads everything anyway.
 	var snap *codesnap.Snapshot
 	if !noWorker {
 		began := time.Now()
-		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, workerPrivate(cfg)); err != nil {
+		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, codesnap.Options{Private: workerPrivate(cfg),
+			Visible: workerVisible(runtime.GOOS, len(cfg.Worker.Sandbox) > 0)}); err != nil {
 			return fmt.Errorf("pin the Worker's code: %w", err)
+		}
+		for _, dir := range snap.LeftOut {
+			workerLog.Info("the Worker's sandbox hides a directory a .pth names, or one in it: the copy of its code leaves it out", "dir", dir)
 		}
 		defer func() {
 			if err := snap.Remove(); err != nil {

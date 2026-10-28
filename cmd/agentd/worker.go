@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -92,6 +93,105 @@ func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runt
 // (AGENTOS_SANDBOX_DENY_READ), and the copy of its code holds none of it (codesnap.Make).
 func workerPrivate(cfg *config.Config) []string {
 	return slices.Concat(toolDenyRead(cfg), cfg.Worker.DenyRead)
+}
+
+// workerVisible is, for codesnap.Make, whether the Worker's launcher on goos lets it read a path
+// outside its Python environment and its code directory (which every launcher lets it read, wherever
+// they are): a directory a .pth names there goes into the copy of its code only if so. nil without a
+// launcher (sandboxed false): the Worker reads everything. It mirrors the launchers, and changes with
+// them:
+//   - sandbox/macos/run-worker.sh (srt's denyRead: its denied, through both): nothing in a home
+//     directory, $HOME's or the user database's, nor in a shared temporary directory, /tmp, /var/tmp
+//     or /var/folders, or /private's; by the path and by its real path, as the launcher lists both,
+//     whatever the case, as APFS compares names, and by the data volume's names for them
+//     (/System/Volumes/Data/Users/...), as Seatbelt resolves them.
+//   - sandbox/linux/run-worker.sh (bwrap's --ro-bind /usr /usr, and its links into it: /bin, /sbin,
+//     /lib, /lib64): only what is in /usr, by its real path; and by the path, whose first name the
+//     sandbox looks up in its own root, which holds nothing else of the host's.
+//
+// The deny list both launchers take (AGENTOS_SANDBOX_DENY_READ, workerPrivate) is not in it:
+// codesnap refuses to copy from in or around any of it.
+func workerVisible(goos string, sandboxed bool) func(string) bool {
+	if !sandboxed {
+		return nil
+	}
+	switch goos {
+	case "darwin":
+		hidden := []string{"/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders"}
+		if home, err := os.UserHomeDir(); err == nil {
+			hidden = append(hidden, home)
+		}
+		if u, err := user.Current(); err == nil {
+			hidden = append(hidden, u.HomeDir)
+		}
+		// And by the data volume's names for them, which Seatbelt hides as well: /Users and /private
+		// are firmlinks into /System/Volumes/Data, which no link resolves.
+		for _, h := range slices.Clone(hidden) {
+			if filepath.IsAbs(h) {
+				hidden = append(hidden, filepath.Join("/System/Volumes/Data", realPath(h)))
+			}
+		}
+		return hiddenIn(hidden)
+	case "linux":
+		return shownIn("/usr", []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"})
+	}
+	return func(string) bool { return false } // a launcher agentd does not know: nothing
+}
+
+// hiddenIn shows a path unless it is in one of dirs, by its name or its real path, compared with
+// theirs, whatever the case.
+func hiddenIn(dirs []string) func(string) bool {
+	var folded []string
+	for _, d := range dirs {
+		if filepath.IsAbs(d) {
+			folded = append(folded, strings.ToLower(filepath.Clean(d)), strings.ToLower(realPath(d)))
+		}
+	}
+	return func(path string) bool {
+		for _, p := range []string{filepath.Clean(path), realPath(path)} {
+			for _, d := range folded {
+				if inside(strings.ToLower(p), d) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+}
+
+// shownIn shows a path only if its real path is in root, and its name in one of names: root, and the
+// links to it the sandbox makes in its own root.
+func shownIn(root string, names []string) func(string) bool {
+	return func(path string) bool {
+		if !inside(realPath(path), root) {
+			return false
+		}
+		for _, n := range names {
+			if inside(filepath.Clean(path), n) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// realPath is path's real path, as the macOS launcher's real makes it: where path does not resolve,
+// the real path of its directory, and its name.
+func realPath(path string) string {
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		return r
+	}
+	dir := filepath.Dir(path)
+	if dir == path {
+		return path
+	}
+	return filepath.Join(realPath(dir), filepath.Base(path))
+}
+
+// inside reports whether path is dir or in it, by their names.
+func inside(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // workerRecord is the Worker in agentd.started: its launcher ("" for none), the directories it runs a

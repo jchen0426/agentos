@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -369,6 +370,8 @@ def test_agentd_starts_again_a_worker_that_leaves_a_task_unanswered(stack: Stack
     assert record["unresponsive"] == "not_answering" and record["unresponsive_ms"] >= 60_000, record
 
 
+LEFT_OUT = "the Worker's sandbox hides a directory a .pth names, or one in it: the copy of its code leaves it out"
+
 PINNED = """\"\"\"The test's own workflow module (tests/test_worker_supervision.py): it says its version whenever it
 is imported, as the SDK's sandbox does at each workflow task.\"\"\"
 
@@ -398,9 +401,14 @@ def test_the_worker_runs_the_code_agentd_pinned_at_its_start(stack: Stack) -> No
     """agentd copies the Worker's code when it starts, and every generation runs the copy: a change to
     the code directory reaches neither the running Worker (whose sandbox imports workflow modules afresh
     at every task) nor the next generation, only the next agentd. The copy's manifest is in the ledger;
-    the copy goes when agentd stops, and the next agentd sweeps one a killed agentd left."""
+    the copy goes when agentd stops, and the next agentd sweeps one a killed agentd left. The directory
+    the environment's .pth names outside it and the code directory (the repository's python, of the
+    editable install) is copied only where the Worker could read it: without a sandbox; the sandboxes
+    hide it (macOS's the home directory, Linux's all but /usr), and agentd says it left it out."""
     code = stack.tmp / "code"
     code.mkdir()
+    for package in ("agentos_worker", "agentos"):  # what the Worker imports, where the sandboxes show it
+        shutil.copytree(REPO / "python" / package, code / package, ignore=shutil.ignore_patterns("__pycache__"))
     module = code / "pinned_workflows.py"
     module.write_text(PINNED.format(version="v1"))
     stack.start_agentd(worker=True, extra={"worker": {**stack.worker_config("pinned_workflows:WORKFLOWS"), "code": str(code)}})
@@ -411,6 +419,13 @@ def test_the_worker_runs_the_code_agentd_pinned_at_its_start(stack: Stack) -> No
                 and (generation is None or e["generation"] == generation)}
     succeeds(stack)
     assert versions() == {"pinned v1"}, versions()
+    [copy] = code_dirs(stack.agentd.popen.pid)
+    pinned = copy / "python" / "pinned"
+    left_out = [Path(e["dir"]).resolve() for e in w.log(LEFT_OUT)]
+    if SANDBOX == "none":
+        assert pinned.is_dir() and not left_out, left_out
+    else:
+        assert not pinned.exists() and left_out == [(REPO / "python").resolve()], (sorted(pinned.glob("*")), left_out)
     v1 = hashlib.sha256(module.read_bytes()).hexdigest()
     module.write_text(PINNED.format(version="v2"))
     succeeds(stack)  # the same generation, which imports the module afresh at each task

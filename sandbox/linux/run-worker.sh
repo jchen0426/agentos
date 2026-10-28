@@ -74,6 +74,9 @@ for dir in "$pyenv" "$code"; do
 done
 
 inner_sock=/run/agentos/$sock_name
+# Of the host's files the sandbox has only /usr (and the links to it), the Python environment, the
+# code directory and the Runtime socket's directory. agentd mirrors the /usr lines in workerVisible
+# (cmd/agentd/worker.go), to copy only what the Worker can read: change them together.
 args=(
   --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8

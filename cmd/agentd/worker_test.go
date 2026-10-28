@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -247,5 +248,104 @@ func TestTheWorkerStopsFirst(t *testing.T) {
 	stopInOrder(slog.New(slog.DiscardHandler), stopping{"worker", &order}, stopping{"control", &order}, stopping{"runtime", &order})
 	if want := []string{"worker", "control", "runtime"}; !slices.Equal(order, want) {
 		t.Fatalf("stopped %q, want %q", order, want)
+	}
+}
+
+// The copy of the Worker's code takes a directory a .pth names outside its Python environment and its
+// code directory only where the Worker's launcher lets it read it: without one, everywhere; on macOS,
+// outside the homes and the shared temporary directories; on Linux, in /usr.
+func TestWorkerVisible(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		if workerVisible(goos, false) != nil {
+			t.Errorf("%s, unsandboxed: not everything", goos)
+		}
+	}
+	if workerVisible("plan9", true)("/usr/lib") {
+		t.Error("a launcher agentd does not know shows something")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	darwin := workerVisible("darwin", true)
+	for path, shown := range map[string]bool{
+		filepath.Join(home, "proj"): false, strings.ToUpper(filepath.Join(home, "proj")): false,
+		"/tmp/x": false, "/private/tmp/x": false, "/var/tmp/x": false, "/private/var/tmp/x": false,
+		"/var/folders/ab/T": false, "/private/var/folders/ab/T": false,
+		"/usr/lib/python3.12": true, "/opt/homebrew/lib/python3.12/site-packages": true, "/Library/Python": true,
+		// The data volume's names for the same directories, which Seatbelt hides too.
+		filepath.Join("/System/Volumes/Data", realPath(home), "proj"): false, "/System/Volumes/Data/private/tmp/x": false,
+		"/system/volumes/data/private/var/folders/ab": false, "/System/Volumes/Data/Library": true,
+	} {
+		if darwin(path) != shown {
+			t.Errorf("macOS: %s shown %v, want %v", path, !shown, shown)
+		}
+	}
+	if u, err := user.Current(); err == nil { // the user database's home, whatever $HOME says
+		t.Setenv("HOME", t.TempDir())
+		if workerVisible("darwin", true)(filepath.Join(u.HomeDir, "proj")) {
+			t.Errorf("macOS: %s shown", u.HomeDir)
+		}
+	}
+	linux := workerVisible("linux", true)
+	for path, shown := range map[string]bool{
+		"/usr/lib/python3/dist-packages": true, "/usr/local/lib/python3.12/site-packages": true,
+		"/home/u/proj": false, "/opt/proj": false, "/tmp/x": false, "/usrx": false,
+	} {
+		if linux(path) != shown {
+			t.Errorf("Linux: %s shown %v, want %v", path, !shown, shown)
+		}
+	}
+}
+
+// macOS's sandbox judges a path by its real path, and APFS's names regardless of case: so does the
+// copy, for the directories it hides and for the path.
+func TestHiddenIn(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range []string{"Home/sub", "other"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for link, target := range map[string]string{"home-link": "Home", "sneaky": "Home/sub"} {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shown := hiddenIn([]string{filepath.Join(dir, "home-link"), "relative"})
+	for path, want := range map[string]bool{
+		"home-link/x": false, "Home/sub": false, "Home/not-yet/x": false, "HOME/sub": false, "sneaky": false,
+		"other": true, "other/x": true, "Homes": true,
+	} {
+		if got := shown(filepath.Join(dir, path)); got != want {
+			t.Errorf("%s shown %v, want %v", path, got, want)
+		}
+	}
+}
+
+// Linux's sandbox has only /usr of the host's, and its links to it: the copy takes a path whose real
+// path is in /usr only if its first name is one of those, as the sandbox looks it up.
+func TestShownIn(t *testing.T) {
+	dir := t.TempDir()
+	usr := filepath.Join(dir, "usr")
+	for _, d := range []string{"usr/lib/py", "other"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for link, target := range map[string]string{"lib": "usr/lib", "opt": "usr/lib", "etc": "/nowhere", "usr/lib/out": "../../other"} {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shown := shownIn(realPath(usr), []string{usr, filepath.Join(dir, "lib")})
+	for path, want := range map[string]bool{
+		"usr/lib/py": true, "lib/py": true, "usr/lib/not-yet": true, "etc": false, "other": false,
+		"opt/py":      false, // in /usr by its real path, but the sandbox has no /opt
+		"usr/lib/out": false, // in /usr by its name, but it leads out
+	} {
+		if got := shown(filepath.Join(dir, path)); got != want {
+			t.Errorf("%s shown %v, want %v", path, got, want)
+		}
 	}
 }

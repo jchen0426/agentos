@@ -2,7 +2,10 @@
 
 package codesnap
 
-import "errors"
+import (
+	"errors"
+	"os"
+)
 
 // cloneFile clones nothing here: the bytes are copied.
-func cloneFile(string, string) error { return errors.ErrUnsupported }
+func cloneFile(*os.File, string) error { return errors.ErrUnsupported }
