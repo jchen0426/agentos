@@ -616,8 +616,14 @@ func TestCheckWorker(t *testing.T) {
 		"macOS, a Python at home, unsandboxed":  {"data_dir: data\n" + tcp + "worker: {python: homevenv, code: code}\n", "darwin", false, ""},
 		"Linux, a Python at home":               {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: homevenv, code: code}\n", "linux", true, ""},
 		"macOS, a Python in the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: home/code/venv, code: home/code}\n", "darwin", true, ""},
+		// Its interpreter in the code directory, which agentd's Worker runs a copy of the *.py and *.so of:
+		// refused on every platform, sandboxed or not (M5 C2c).
 		"macOS, a Python leading into the code directory": {"data_dir: data\n" + tcp + "worker: {" + sandbox + "python: codevenv, code: home/code}\n",
-			"darwin", true, ""},
+			"darwin", true, "in the code directory"},
+		"Linux, a Python leading into the code directory": {"data_dir: data\n" + sock + "worker: {" + sandbox + "python: codevenv, code: home/code}\n",
+			"linux", true, "in the code directory"},
+		"unsandboxed, a Python leading into the code directory": {"data_dir: data\n" + tcp + "worker: {python: codevenv, code: home/code}\n",
+			"darwin", false, "in the code directory"},
 	} {
 		err := load(c.body).CheckWorker(c.goos, c.sandboxed)
 		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {
