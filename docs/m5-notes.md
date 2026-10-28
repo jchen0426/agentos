@@ -1910,3 +1910,66 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，srt | 23 | 0 | 21 | 15 | 0 | 6 |
 
   跑完没有留下 Worker、agentd 或状态目录。
+
+## C2b：和 Worker 生命周期有关的测试改用 agentd 自己的 Worker（2026-10-28）
+
+范围是用户定的，协调者确认了窄的那一组：T1 的两个文件、T9 的沙箱探测、agentd 重启（`tests/test_agentd_restart.py`，设计文档的“守护进程重启”）、T12 的 Worker 崩溃。其余测试照旧用 `--no-worker`，自己起 Worker：T2（含 live）、T3、T4、T5、T10、T14、T15、T16，T12 的 agentd 崩溃和工具服务器崩溃，审计日志和导出，fallback，model output。这些测试的主题是 agentd 的账本和恢复，Worker 是附带的。T10 换代码时也还是自己起新 Worker。
+
+### 做了什么
+
+- **故障规则 `hold_worker_while_exists`**（agentd 的 fault script，只给测试用）：文件在时，agentd 不再起 Worker，第一个照起，好留出一段“没有 Worker 在跑”的窗口。
+  - supervisor 的 `Options.Hold` 和 outbox 的 `Hold` 一样，只给测试用：间隔等完以后每 50 毫秒问一次，等的时候照样处理 Stop 和压着的退出记录。第一次 hold 时日志打一行 "the fault script holds the Worker's next start"，测试等的就是这一行。
+  - Go 测试：`TestTheHold`（hold 期间下一代不起；hold 一结束就起；hold 期间 Stop 立即返回，一代也不起）；`TestHoldWorker`（按 harness 写的 JSON 读，文件在才 hold，没有脚本、脚本没写这一项都不 hold）。
+- **harness**：
+  - `start_agentd(hold_worker=)`。
+  - `restart_agentd(kill=, faults=, workflows=)`：`faults` 换掉规则（规则按 agentd 进程计次，普通的重启会让 occurrence 规则重新生效，比如 T10 的）；`workflows` 换掉 agentd 自己的 Worker 服务的工作流。`tests/test_harness.py` 里有它的测试：带着 T10 的规则起 agentd，用 `faults=[]` 重启后，运行不再停下来等审批；再用 `workflows=` 重启，新一代用的就是新的工作流。
+  - `signal(run, name, arg)`。
+  - `KEYED_MODEL`：Claude 和 OpenAI 的 key 是真秘密（`keyring:`）。
+- **T1**：
+  - Worker 崩溃：通过 `stack.worker()` 杀掉、暂停，再等 agentd 起的第二代（`wait_ready(2)`）。“模型调用期间杀掉 Worker”要一段没有 Worker 的窗口：先建 hold 文件，再杀，等 agentd 打出 hold 的那一行，再放开模型调用；调用做完时核对 `stack.worker_processes() == []`，然后删掉 hold 文件，等第二代。
+  - agentd 崩溃：kill -9 agentd，连同它的 Worker（harness 杀整个进程树，和原来一样），下一个 agentd 起自己的 Worker。
+  - 每个测试最后都核对：这个栈的队列上只有 agentd 的那一个 Worker（`worker_processes() == [stack.worker().pid()]`）。
+  - 真模型：Claude、OpenAI 的 key 是 `keyring:`，C.1 不许 agentd 在没有沙箱时起自己的 Worker，所以 none 下这两个文件跳过，并写明原因，不算失败；srt 下照跑。local（Ollama）没有 key，none 下照跑。真模型我没有跑。
+- **T9 的沙箱探测**：探测现在在 agentd 自己的 Worker 里跑。
+  - `tests/probe_workflows.py` 的 `SandboxProbe` 先等一个 probe 信号，信号里是探测的命令行；然后让跑它的 Worker 在一个后台线程里，把 `tests/sandbox_probe.py` 当子进程跑：同一个沙箱，同一套环境变量。
+  - 报告写到 Worker 的 stdout，agentd 记进日志：base64，每行 1500 个字符，每 0.1 秒一行（agentd 每行最多记 2 KiB，每秒最多 20 行）。测试从 agentd 的日志里拼回来。
+  - 坑：workflow 的沙箱按线程限制，新线程一开始也受限（`sandbox_unrestricted` 是 threading.local），第一版在线程里碰 `os.path` 就被拒了。线程自己也要进 `sandbox_unrestricted`。
+  - 为什么用信号传参数：探测要的东西（Temporal 的端口、Control socket、账本的路径、canary）Worker 自己不知道。agentd 给 Worker 的环境变量是从头建的，传不进去；运行的输入只有 repo、commit、base，base 还得是合法的分支名；Worker 能读的文件只有 python 和 code 目录，不想往源码树里写东西。信号走的是测试本来就有的、直连 Temporal 的通道。
+  - `sandbox_probe.py` 里的 StartWorkflowExecution 原来写死 `agentos-workflows`，现在用这个栈自己的队列（`--task-queue`），试的是 Worker 自己队列上的启动。Runtime 入口按方法就拒绝了，换哪个队列结果都一样，所以这一处改坏不了什么，只是让试的东西对路。
+  - 环境变量的 canary：原来测试把 `AGENTOS_TEST_CANARY` 放进启动脚本的环境；现在放进 agentd 的环境（monkeypatch），核对 agentd 的 Worker 拿不到 agentd 自己的任何环境变量。srt 下实测 Worker 的环境正好是 `WORKER_ENV["srt"]` 里那些，没有 canary，也没有 `AGENTOS_SANDBOX_*`。
+- **agentd 重启**（`tests/test_agentd_restart.py`）：按两种模式参数化，两条路径都留着测试。
+  - agentd 自己的 Worker：agentd 停时它跟着停；新的 agentd 起自己的第 1 代，服务第二个运行；核对旧的那个已经没了。
+  - 手动起的 Worker（`--no-worker`，M1 的形式）：它活过 agentd 的重启，经新的 agentd 接着连 Temporal（Linux 上要沙箱挂 Runtime socket 的目录）。
+- **T12 的 Worker 崩溃**：agentd 自己的 Worker 在拿着工作流任务时被暂停，再被杀，agentd 把它起回来。explain 的断言不变：worker_stopped，证据是 WorkflowTaskTimedOut。
+- README 的“Tests”一节写了哪些测试跑 agentd 自己的 Worker，以及真模型的 T1 在 none 下跳过。
+
+### 意思变了的地方
+
+- `test_agentd_restart.py` 原来只有“Worker 活过 agentd 的重启”这一种，现在是两种，原来那种（手动起的 Worker）还在。
+- T1 的 agentd 崩溃：原来手动起的 Worker 活过 kill -9，再连上新的 agentd；现在 Worker 跟着 agentd 一起被杀，由新的 agentd 重新起。注入的和断言的不变：第二次尝试、账本、对 provider 的请求、预算。Worker 重连这条路径由 `test_agentd_restart.py` 手动起 Worker 的那一种盖着。
+- T1 的“模型调用期间杀掉 Worker”：“没有 Worker 在跑”原来靠测试不起，现在靠 hold 文件，并且明确核对。
+- T9 的探测：原来测的是 harness 起 Worker 的方式（它的环境、它给启动脚本的参数）；现在测的是 agentd 起的 Worker（agentd 建的环境、状态目录、生命线、停止通道）。断言不变。
+- 两处只是多了断言，不是改了意思：每个迁移的测试最后都核对这个栈的队列上只有 agentd 的 Worker；T1 那一个测试明确核对“没有 Worker 在跑”。这样，要是 harness 哪天又让测试自己的 Worker 顶上，测试会失败（见下面的改坏检查）。
+
+### 改坏检查
+
+- **Go**：supervisor 不理 hold（`TestTheHold` 抓到）；`HoldWorker` 永远是 false；JSON 的键名写错（这两个都是 `TestHoldWorker` 抓到）。
+- **黑盒**（none 下）：
+  - harness 给 `start_agentd(worker=True)` 换成 `--no-worker`，外加一个测试自己起、跑在这个栈队列上的 Worker：T1 的两个文件、agentd 重启（agentd 自己的那一种）、T12 的 Worker 崩溃都失败（"no Worker under agentd"）。这正是“测试自己的 Worker 顶上”那种改坏。
+  - `stack.worker().kill()` 什么都不做；harness 不写 hold；agentd 不接 hold（main.go）：T1 的“模型调用期间杀掉 Worker”都失败，卡在等 agentd hold 的那一行。
+  - `restart_agentd` 不换规则：`tests/test_harness.py` 的测试卡在等审批；不换工作流：新一代的 argv 里没有新的工作流。
+- **抓不到的**：
+  - `sandbox_probe.py` 的队列改回写死：Runtime 入口按方法拒绝，换哪个队列都一样（见上）。
+  - agentd 把自己的环境传给 Worker（C2a 的 A2）：两个启动脚本都清空环境（`env -i`、`--clearenv`），沙箱下 T9 看不出来，靠 Go 的 `TestTheWorkersEnvironment`。
+
+### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。ruff 只报三处原来就有的。
+- macOS，`--verify-after-each`，两种环境同时跑：T1 的两个文件、`test_agentd_restart.py`、`test_t9_isolation.py`、`test_t12_explain.py`、`test_harness.py`；因为 harness 改了 agentd 的启动和重启，`test_worker_supervision.py` 也跑了。bwrap 和三种完整套件由你跑。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 57 | 5 | 56 | 50 | 0 | 6 |
+  | macOS，srt | 62 | 0 | 59 | 52 | 0 | 7 |
+
+  跑完没有留下 Worker、agentd 或状态目录。bwrap 下的 T9 探测（Worker 里起子进程、bwrap 里的 /dev）我没跑。
