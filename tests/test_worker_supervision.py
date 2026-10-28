@@ -425,8 +425,9 @@ def test_the_worker_runs_the_code_agentd_pinned_at_its_start(stack: Stack) -> No
 
     first = stack.agentd.popen.pid
     [copy] = code_dirs(first)
+    stack.agentd.stop()
+    assert not copy.exists(), copy  # gone with its agentd, before the next one could sweep it
     stack.restart_agentd()
-    assert not copy.exists(), copy  # gone with its agentd
     assert last_start(stack)["worker"]["code_sha256"] != root
     succeeds(stack)
     assert {e["line"] for e in stack.worker().log("worker output") if e["line"].startswith("pinned ")} == {"pinned v2"}
@@ -474,7 +475,8 @@ def test_the_workers_output_is_logged_escaped_and_bounded(stack: Stack) -> None:
 
 
 @pytest.mark.audit_verify(skip="agentd refuses to start by design")
-@pytest.mark.parametrize("what", ["runtime_listen", "code holds the data", "python holds a mirror", "no sandbox"])
+@pytest.mark.parametrize("what", ["runtime_listen", "code holds the data", "python holds a mirror", "no sandbox",
+                                  "code holds a denied path"])
 def test_agentd_refuses_a_worker_it_cannot_run(stack: Stack, what: str) -> None:
     if what == "no sandbox" and SANDBOX == "none":
         pytest.skip("--insecure-dev runs the Worker without one")
@@ -487,6 +489,12 @@ def test_agentd_refuses_a_worker_it_cannot_run(stack: Stack, what: str) -> None:
         worker["code"], want = str(stack.tmp / "agentd"), "holds the data directory"
     elif what == "python holds a mirror":
         worker["python"], want = str(stack.tmp / "mirror"), "holds repo acme/payments's mirror"
+    elif what == "code holds a denied path":  # the copy of the code would hold it (M5 C2c)
+        code = stack.tmp / "code"
+        (code / "secret").mkdir(parents=True)
+        (code / "secret" / "key.py").write_text("")
+        worker["code"], worker["deny_read"] = str(code), [*worker["deny_read"], str(code / "secret")]
+        want = "which the Worker must not read"
     else:
         del worker["sandbox"]
         want = "worker.sandbox is required"

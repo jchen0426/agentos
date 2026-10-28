@@ -137,11 +137,12 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	statedir.Sweep(codesnap.Kind)
 	// The code the Worker runs, pinned: a copy, made now. The SDK's sandbox imports workflow modules
 	// afresh at every task, so a Worker running on the live directories would take an edit to them at
-	// its next one; every generation of this agentd's runs from the copy.
+	// its next one; every generation of this agentd's runs from the copy. The copy holds nothing the
+	// Worker may not read: none of what agentd keeps from it and from the tools, nor the deny list.
 	var snap *codesnap.Snapshot
 	if !noWorker {
 		began := time.Now()
-		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code); err != nil {
+		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, workerPrivate(cfg)); err != nil {
 			return fmt.Errorf("pin the Worker's code: %w", err)
 		}
 		defer func() {

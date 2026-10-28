@@ -16,8 +16,11 @@ import (
 )
 
 // world is a Python environment and a code directory as agentd's Worker has them, with an
-// interpreter and a directory a .pth names outside both.
-type world struct{ dir, python, code, outside, interpreter string }
+// interpreter and a directory a .pth names outside both, and agentd's data directory and a denied
+// path, which the Worker must not read.
+type world struct{ dir, python, code, outside, interpreter, data, denied string }
+
+func (w world) private() []string { return []string{w.data, w.denied} }
 
 func write(t *testing.T, path, content string, mode os.FileMode) {
 	t.Helper()
@@ -43,7 +46,9 @@ func newWorld(t *testing.T) world {
 	t.Helper()
 	dir := t.TempDir()
 	w := world{dir: dir, python: filepath.Join(dir, "venv"), code: filepath.Join(dir, "code"), outside: filepath.Join(dir, "editable"),
-		interpreter: filepath.Join(dir, "base", "bin", "python3.12")}
+		interpreter: filepath.Join(dir, "base", "bin", "python3.12"), data: filepath.Join(dir, "data"), denied: filepath.Join(dir, "denied")}
+	write(t, filepath.Join(w.data, "ledger.db"), "agentd's ledger", 0o600)
+	write(t, filepath.Join(w.denied, "secret"), "a denied file", 0o600)
 	write(t, w.interpreter, "#!/bin/sh\n", 0o755)
 	site := filepath.Join(w.python, "lib", "python3.12", "site-packages")
 	link(t, w.interpreter, filepath.Join(w.python, "bin", "python"))
@@ -56,7 +61,9 @@ func newWorld(t *testing.T) world {
 	write(t, filepath.Join(site, "pkg", "__pycache__", "__init__.cpython-312.pyc"), "bytecode", 0o644)
 	write(t, filepath.Join(site, "pkg", "old.pyc"), "bytecode", 0o644)
 	write(t, filepath.Join(dir, "shared", "license.txt"), "a file a link leads to\n", 0o644)
-	link(t, filepath.Join(dir, "shared", "license.txt"), filepath.Join(site, "pkg", "LICENSE"))
+	link(t, "../../../../../shared/license.txt", filepath.Join(site, "pkg", "LICENSE")) // relative, out of the tree
+	link(t, filepath.Join(w.data, "ledger.db"), filepath.Join(site, "pkg", "ledger.db"))
+	link(t, w.denied, filepath.Join(site, "pkg", "elsewhere"))
 	write(t, filepath.Join(site, "pkg-1.2.dist-info", "METADATA"), "Metadata-Version: 2.1\nName: pkg\nVersion: 1.2\n\nName: not this\n", 0o644)
 	write(t, filepath.Join(site, "_editable.pth"), w.outside+"\n"+w.outside+"\n"+filepath.Join(w.code, "lib")+"\n"+
 		filepath.Join(dir, "gone")+"\n# a comment\nimport _virtualenv\n", 0o644)
@@ -76,7 +83,7 @@ func newWorld(t *testing.T) world {
 
 func makeOf(t *testing.T, w world) *Snapshot {
 	t.Helper()
-	s, err := Make(w.python, w.code)
+	s, err := Make(w.python, w.code, w.private())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +116,8 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		"python/bin/pip", "python/bin/python", "python/bin/python3",
 		"python/lib/python3.12/site-packages/_editable.pth", "python/lib/python3.12/site-packages/pkg-1.2.dist-info/METADATA",
 		"python/lib/python3.12/site-packages/pkg/LICENSE", "python/lib/python3.12/site-packages/pkg/__init__.py",
-		"python/lib/python3.12/site-packages/pkg/data.json", "python/lib64",
+		"python/lib/python3.12/site-packages/pkg/data.json", "python/lib/python3.12/site-packages/pkg/elsewhere",
+		"python/lib/python3.12/site-packages/pkg/ledger.db", "python/lib64",
 		"python/pinned/0/mypkg/__init__.py", "python/pinned/0/mypkg/schema.json", "python/pyvenv.cfg",
 	}
 	if !slices.Equal(paths, want) {
@@ -122,7 +130,10 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		"python/bin/pip":     {"file", "x"},
 		"code/lib/fast.so":   {"file", "x"},
 		"code/workflows.py":  {"file", "-", "6"},
-		"python/lib/python3.12/site-packages/pkg/LICENSE": {"file", "-", "23"}, // what the link leads to
+		// Links out of the trees stay links, to where they led: the sandbox judges that.
+		"python/lib/python3.12/site-packages/pkg/LICENSE":   {"link", "-", "0", filepath.Join(w.dir, "shared", "license.txt")},
+		"python/lib/python3.12/site-packages/pkg/ledger.db": {"link", "-", "0", filepath.Join(w.data, "ledger.db")},
+		"python/lib/python3.12/site-packages/pkg/elsewhere": {"link", "-", "0", w.denied},
 	} {
 		if got := m[path]; len(got) < len(f) || !slices.Equal(got[:len(f)], f) {
 			t.Errorf("%s: %v, want %v...", path, got, f)
@@ -146,12 +157,41 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		t.Errorf("the .pth's directory leads to %s (%v), not %s", target, err, pinned)
 	}
 	interpreter, _ := filepath.EvalSymlinks(w.interpreter)
-	if !slices.Equal(s.Distributions, []string{"pkg==1.2"}) || s.Interpreter != interpreter || s.Files != 12 {
+	if !slices.Equal(s.Distributions, []string{"pkg==1.2"}) || s.Interpreter != interpreter || s.Files != 11 {
 		t.Errorf("distributions %v, interpreter %s, %d files", s.Distributions, s.Interpreter, s.Files)
 	}
 	if !strings.HasPrefix(filepath.Base(s.Dir), statedir.Prefix(Kind)) || s.Code != filepath.Join(s.Dir, "code") {
 		t.Errorf("dir %s, code %s", s.Dir, s.Code)
 	}
+	// Nothing a link leads out to was copied: no file of the copy holds its bytes.
+	err = filepath.WalkDir(s.Dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		for _, what := range []string{"a file a link leads to", "agentd's ledger", "a denied file"} {
+			if bytes.Contains(b, []byte(what)) {
+				t.Errorf("%s holds %q", path, what)
+			}
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The configured directories may be in a path the Worker must not read: the launchers let it read
+// them wherever they are.
+func TestTheConfiguredDirectoriesMayBeInAPrivatePath(t *testing.T) {
+	w := newWorld(t)
+	// No .pth directory outside both, which would be in it too, and refused for that.
+	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/_editable.pth"), filepath.Join(w.code, "lib")+"\n", 0o644)
+	s, err := Make(w.python, w.code, append(w.private(), w.dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Remove()
 }
 
 // The root is the same for the same code, whatever its bytecode and times; one byte changed in it
@@ -176,26 +216,37 @@ func TestTheRoot(t *testing.T) {
 // What the snapshot cannot pin is refused, and nothing of it stays.
 func TestTheSnapshotRefuses(t *testing.T) {
 	for name, c := range map[string]struct {
-		change func(t *testing.T, w world)
+		change func(t *testing.T, w *world)
 		says   string
 	}{
-		"an import-hook editable install": {func(t *testing.T, w world) {
+		"an import-hook editable install": {func(t *testing.T, w *world) {
 			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/__editable__.x.pth"), "import __editable___x_finder; __editable___x_finder.install()\n", 0o644)
 		}, "editable install by import hook"},
-		"a link to a directory outside": {func(t *testing.T, w world) {
-			link(t, w.outside, filepath.Join(w.python, "lib/python3.12/site-packages/elsewhere"))
-		}, "a link to a directory outside"},
-		"a FIFO": {func(t *testing.T, w world) {
+		"a .pth naming the data directory": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/data.pth"), w.data+"\n", 0o644)
+		}, "which the Worker must not read"},
+		"a .pth naming a denied path's subdirectory": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.denied, "sub", "x.py"), "", 0o644)
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/denied.pth"), filepath.Join(w.denied, "sub")+"\n", 0o644)
+		}, "which the Worker must not read"},
+		"a .pth naming a directory that holds the data directory": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/all.pth"), w.dir+"\n", 0o644)
+		}, "it holds"},
+		"the data directory in the code directory": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.code, "state", "x.py"), "", 0o644)
+			w.data = filepath.Join(w.code, "state")
+		}, "which the Worker must not read"},
+		"a FIFO": {func(t *testing.T, w *world) {
 			if err := syscall.Mkfifo(filepath.Join(w.python, "fifo"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}, "neither a file, a directory nor a link"},
-		"too many files": {func(t *testing.T, w world) {
+		"too many files": {func(t *testing.T, w *world) {
 			old := maxFiles
 			maxFiles = 5
 			t.Cleanup(func() { maxFiles = old })
 		}, "too many to pin"},
-		"too many bytes": {func(t *testing.T, w world) {
+		"too many bytes": {func(t *testing.T, w *world) {
 			old := maxBytes
 			maxBytes = 50
 			t.Cleanup(func() { maxBytes = old })
@@ -203,9 +254,9 @@ func TestTheSnapshotRefuses(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := newWorld(t)
-			c.change(t, w)
+			c.change(t, &w)
 			before, _ := filepath.Glob(filepath.Join(statedir.Root, statedir.Prefix(Kind)+"*"))
-			s, err := Make(w.python, w.code)
+			s, err := Make(w.python, w.code, w.private())
 			if err == nil {
 				_ = s.Remove()
 				t.Fatalf("no refusal")

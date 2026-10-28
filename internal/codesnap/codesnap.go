@@ -5,6 +5,11 @@
 // task, so a check of the code would not keep a running Worker on what it started with: only a copy
 // does. Every generation runs from the copy; the next agentd makes its own, of the code as it is then.
 // The standard library, outside both directories, is not copied.
+//
+// The copy holds nothing the Worker could not read before: what is in the Python environment and the
+// code directory, which the launchers let it read wherever they are, and a .pth's directory that is in
+// none of the paths agentd keeps from it, nor holds one. A link is copied as a link, never as what it
+// leads to, so the sandbox judges what it leads to as it would have.
 package codesnap
 
 import (
@@ -52,13 +57,17 @@ type Snapshot struct {
 	Interpreter   string   // where the environment's bin/python leads
 }
 
-// Make copies python (a virtual environment) and code into a new state directory.
-func Make(python, code string) (*Snapshot, error) {
+// Make copies python (a virtual environment) and code into a new state directory. private are the
+// paths the Worker must not read: agentd's data directory, its sockets' directories, the Temporal
+// client's certificate and key, the mirrors, and the deny list. No path the copy is made from may be
+// in one or hold one, but that python and code may be in one (the launchers let the Worker read them
+// wherever they are).
+func Make(python, code string, private []string) (*Snapshot, error) {
 	dir, err := statedir.Make(Kind)
 	if err != nil {
 		return nil, err
 	}
-	s, err := make1(dir, python, code)
+	s, err := make1(dir, python, code, private)
 	if err != nil {
 		_ = statedir.Remove(dir)
 		return nil, err
@@ -69,13 +78,16 @@ func Make(python, code string) (*Snapshot, error) {
 // Remove removes the snapshot.
 func (s *Snapshot) Remove() error { return statedir.Remove(s.Dir) }
 
-func make1(dir, python, code string) (*Snapshot, error) {
+func make1(dir, python, code string, private []string) (*Snapshot, error) {
 	python, code = filepath.Clean(python), filepath.Clean(code)
 	b := &builder{root: dir, python: python, code: code, pinned: map[string]string{}}
-	if err := b.tree(python, "python", b.inEnvironment); err != nil {
+	for _, p := range private {
+		b.private = append(b.private, real(p))
+	}
+	if err := b.tree(python, "python", b.inEnvironment, true); err != nil {
 		return nil, fmt.Errorf("worker.python %s: %w", python, err)
 	}
-	if err := b.tree(code, "code", b.inCode); err != nil {
+	if err := b.tree(code, "code", b.inCode, true); err != nil {
 		return nil, fmt.Errorf("worker.code %s: %w", code, err)
 	}
 	slices.SortFunc(b.entries, func(x, y entry) int { return strings.Compare(x.path, y.path) })
@@ -111,6 +123,40 @@ type builder struct {
 	files              int
 	bytes              int64
 	pinned             map[string]string // a directory a .pth names outside both, and its copy's path
+	private            []string          // the paths the Worker must not read, as their real paths
+}
+
+// real is path's real path, or path itself, cleaned, where it does not resolve.
+func real(path string) string {
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		return r
+	}
+	return filepath.Clean(path)
+}
+
+// keptFrom refuses a tree whose real path is root if it holds a path the Worker must not read, or is
+// in one but where configured (python, code); it returns the check for each path read under it.
+func (b *builder) keptFrom(root string, configured bool) (func(real string) error, error) {
+	var holding []string // the private paths that hold the tree: those a configured tree may be in
+	for _, p := range b.private {
+		switch {
+		case within(p, root):
+			return nil, fmt.Errorf("it holds %s, which the Worker must not read", p)
+		case within(root, p):
+			if !configured {
+				return nil, fmt.Errorf("it is in %s, which the Worker must not read", p)
+			}
+			holding = append(holding, p)
+		}
+	}
+	return func(real string) error {
+		for _, p := range b.private {
+			if within(real, p) && !slices.Contains(holding, p) {
+				return fmt.Errorf("%s is in %s, which the Worker must not read", real, p)
+			}
+		}
+		return nil
+	}, nil
 }
 
 // selection says what of a tree is copied: whether to skip a directory (path, rel in the tree), and
@@ -148,14 +194,20 @@ func (b *builder) inPinned(path, rel string, d fs.DirEntry) (bool, bool) {
 	return b.inEnvironment(path, rel, d)
 }
 
-// tree copies what sel takes of src to dst, a path in the snapshot.
-func (b *builder) tree(src, dst string, sel selection) error {
+// tree copies what sel takes of src to dst, a path in the snapshot: a configured directory (python,
+// code), or a .pth's.
+func (b *builder) tree(src, dst string, sel selection, configured bool) error {
 	fi, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 	if !fi.IsDir() {
 		return errors.New("not a directory")
+	}
+	root := real(src)
+	check, err := b.keptFrom(root, configured)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Join(b.root, dst), 0o755); err != nil {
 		return err
@@ -175,6 +227,10 @@ func (b *builder) tree(src, dst string, sel selection) error {
 		if rel == "." {
 			return nil
 		}
+		// The walk follows no link: below the tree's real root, a path's real path is root/rel.
+		if err := check(filepath.Join(root, rel)); err != nil {
+			return err
+		}
 		out := filepath.ToSlash(filepath.Join(dst, rel))
 		if strings.ContainsAny(out, "\t\n") {
 			return fmt.Errorf("%s: a name with a tab or newline", path)
@@ -183,7 +239,10 @@ func (b *builder) tree(src, dst string, sel selection) error {
 		case t.IsDir():
 			return os.MkdirAll(filepath.Join(b.root, out), 0o755)
 		case t&fs.ModeSymlink != 0:
-			return b.link(src, dst, path, rel, out, sel)
+			if take {
+				return b.link(src, dst, path, rel, out)
+			}
+			return nil
 		case t.IsRegular():
 			if take {
 				return b.file(path, out)
@@ -197,10 +256,12 @@ func (b *builder) tree(src, dst string, sel selection) error {
 	})
 }
 
-// link copies a link: one of the environment's bin/python* stays a link to the interpreter, and so
-// does one that leads inside the tree it is in (a Linux environment's lib64, to lib); one that leads
-// outside is copied as the file it leads to. A link to a directory outside is refused.
-func (b *builder) link(src, dst, path, rel, out string, sel selection) error {
+// link copies a link as a link, never what it leads to, so that the sandbox judges that as it would
+// have: one that leads inside the tree it is in (a Linux environment's lib64, to lib) leads inside the
+// copy, relative; one of the environment's bin/python* keeps its target (the interpreter, or another
+// of them); any other leads where it led, by its absolute path. What a link leads outside to is not
+// pinned: the manifest has the link's target.
+func (b *builder) link(src, dst, path, rel, out string) error {
 	target, err := os.Readlink(path)
 	if err != nil {
 		return err
@@ -211,29 +272,20 @@ func (b *builder) link(src, dst, path, rel, out string, sel selection) error {
 	if !filepath.IsAbs(resolved) {
 		resolved = filepath.Join(filepath.Dir(path), target)
 	}
-	if inBin || within(resolved, src) {
-		if !inBin { // a relative target, inside the copy as it was inside the tree
-			if target, err = filepath.Rel(filepath.Dir(path), resolved); err != nil {
-				return err
-			}
+	switch {
+	case inBin:
+	case within(resolved, src):
+		if target, err = filepath.Rel(filepath.Dir(path), resolved); err != nil {
+			return err
 		}
-		b.entries = append(b.entries, entry{path: out, kind: "link", sum: target})
-		return os.Symlink(target, filepath.Join(b.root, out))
+	default:
+		target = resolved
 	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
+	if strings.ContainsAny(target, "\t\n") {
+		return fmt.Errorf("%s: a link's target with a tab or newline", path)
 	}
-	if fi.IsDir() {
-		return fmt.Errorf("%s: a link to a directory outside it (%s)", path, target)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%s: a link to neither a file nor a directory (%s)", path, target)
-	}
-	if _, take := sel(path, rel, fs.FileInfoToDirEntry(fi)); !take {
-		return nil
-	}
-	return b.file(path, out)
+	b.entries = append(b.entries, entry{path: out, kind: "link", sum: target})
+	return os.Symlink(target, filepath.Join(b.root, out))
 }
 
 // file copies a regular file, its content checked and hashed, at 0444 (0555 if it was executable).
@@ -340,8 +392,8 @@ func (b *builder) pth(src string) ([]byte, error) {
 			if !ok {
 				name = filepath.ToSlash(filepath.Join("python", "pinned", fmt.Sprint(len(b.pinned))))
 				b.pinned[dir] = name
-				if err := b.tree(dir, name, b.inPinned); err != nil {
-					return nil, fmt.Errorf("%s: %w", dir, err)
+				if err := b.tree(dir, name, b.inPinned, false); err != nil {
+					return nil, fmt.Errorf("the directory %s names: %w", dir, err)
 				}
 			}
 			copied = filepath.Join(b.root, name)

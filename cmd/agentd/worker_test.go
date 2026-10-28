@@ -161,6 +161,19 @@ func TestCheckWorker(t *testing.T) {
 
 // agentd.started says how the Worker runs: its launcher, what it may read, what it serves, and its
 // limits, none yet.
+// What the Worker must not read, which its launcher denies and the copy of its code may not hold:
+// agentd's data, its sockets' directories, the Temporal client's files, the mirrors, and the deny list.
+func TestWorkerPrivate(t *testing.T) {
+	cfg := workerConfig()
+	cfg.RuntimeListen = "unix:///run/agentos/runtime/runtime.sock"
+	cfg.Temporal.TLS = &config.TLS{CertFile: "/etc/agentos/client.crt", KeyFile: "/etc/agentos/client.key"}
+	want := []string{"/srv/agentos/data", "/run/agentos/control", "/run/agentos/runtime", "/etc/agentos/client.crt",
+		"/etc/agentos/client.key", "/srv/mirrors/b", "/srv/more"}
+	if got := workerPrivate(cfg); !slices.Equal(got, want) {
+		t.Errorf("%q, want %q", got, want)
+	}
+}
+
 func TestWorkerRecord(t *testing.T) {
 	r := workerRecord(workerConfig(), snap, supervisor.Timing{}.WithDefaults())
 	if r["sandbox"] != "/opt/agentos/run-worker.sh" || r["python"] != "/opt/venv" || r["code"] != "/opt/code" ||

@@ -44,7 +44,7 @@ func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runt
 	// The Worker stops, gracefully, when its stdin ends: the supervisor's stop channel.
 	args := []string{"--namespace", cfg.Temporal.Namespace, "--task-queue", cfg.TaskQueues.Workflows, "--workflows", w.Workflows,
 		"--stop-on-stdin-eof"}
-	deny, err := json.Marshal(slices.Concat(toolDenyRead(cfg), w.DenyRead))
+	deny, err := json.Marshal(workerPrivate(cfg))
 	if err != nil {
 		return supervisor.Options{}, err
 	}
@@ -85,6 +85,13 @@ func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runt
 		return supervisor.Options{}, fmt.Errorf("agentd has no Worker launcher for %s", goos)
 	}
 	return o, nil
+}
+
+// workerPrivate is what the Worker must not read: what the tools must not (agentd's data, its sockets'
+// directories, the Temporal client's files, the mirrors), and the deny list. Its launcher denies it
+// (AGENTOS_SANDBOX_DENY_READ), and the copy of its code holds none of it (codesnap.Make).
+func workerPrivate(cfg *config.Config) []string {
+	return slices.Concat(toolDenyRead(cfg), cfg.Worker.DenyRead)
 }
 
 // workerRecord is the Worker in agentd.started: its launcher ("" for none), the directories it runs a
