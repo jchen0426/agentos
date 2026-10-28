@@ -119,8 +119,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
-    # The suite took about 16 minutes before the audit log's tests; it now runs past 20.
-    timeout-minutes: 40
+    # The suite took about 16 minutes before the audit log's tests; recent runs took 27 to 30, and
+    # M5 C2c's tests of the Worker's liveness and pinned code add about 4.
+    timeout-minutes: 50
     env:
       AGENTOS_SANDBOX: none
       # The system Python: bubblewrap mounts /usr and the virtualenv into the sandbox, but
@@ -203,7 +204,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40 # as blackbox-none's
+    timeout-minutes: 50 # as blackbox-none's
     env:
       AGENTOS_SANDBOX: bwrap
       UV_PYTHON: /usr/bin/python3
@@ -216,8 +217,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs-only != 'true' }}
     runs-on: macos-15
-    # The suite takes about 31 minutes on the author's Mac; GitHub's macOS runners are slower.
-    timeout-minutes: 60
+    # The suite takes about 31 minutes on the author's Mac; GitHub's macOS runners are slower: recent
+    # runs took 42 to 49, before M5 C2c's tests added about 4.
+    timeout-minutes: 75
     env:
       AGENTOS_SANDBOX: srt
       HOMEBREW_NO_AUTO_UPDATE: '1'
