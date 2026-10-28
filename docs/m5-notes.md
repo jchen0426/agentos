@@ -1915,6 +1915,8 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 范围是用户定的，协调者确认了窄的那一组：T1 的两个文件、T9 的沙箱探测、agentd 重启（`tests/test_agentd_restart.py`，设计文档的“守护进程重启”）、T12 的 Worker 崩溃。其余测试照旧用 `--no-worker`，自己起 Worker：T2（含 live）、T3、T4、T5、T10、T14、T15、T16，T12 的 agentd 崩溃和工具服务器崩溃，审计日志和导出，fallback，model output。这些测试的主题是 agentd 的账本和恢复，Worker 是附带的。T10 换代码时也还是自己起新 Worker。
 
+合并为 PR #61（141d46b，2026-10-28）。前一天，CI 加了每晚的全量运行，带 `--verify-after-each`（PR #60，46585aa）；手动触发的那次和第一次定时运行都全绿，macOS 带 verify 用了 45 分钟。合并后，设计文档 rev 401–402 按你批准的清单改了：第 11 节写明 CI 在 Linux 上不加沙箱和 bubblewrap 下各跑一遍、在 macOS 上用 srt 跑一遍、每晚在 main 上再全量跑一遍并带 `--verify-after-each`（rev 401）；第 12 节 M5 的记录加了每晚的 CI 和 C2b（rev 402；M5 仍没记为完成，还剩 C2c、C3a、C3b）。
+
 ### 做了什么
 
 - **故障规则 `hold_worker_while_exists`**（agentd 的 fault script，只给测试用）：文件在时，agentd 不再起 Worker，第一个照起，好留出一段“没有 Worker 在跑”的窗口。
