@@ -1,15 +1,19 @@
 // Package codesnap pins the code agentd's own Worker runs (M5 C2c): a copy, made when agentd starts,
-// of the Worker's Python environment without its bytecode, the *.py and *.so files of its code
-// directory, and the directories a .pth file names outside both; its files read-only, all of it
+// of the Worker's Python environment without its bytecode, and the *.py and *.so files of its code
+// directory and of each directory a .pth file names outside both; its files read-only, all of it
 // hashed into one root. The Temporal SDK's sandbox imports workflow modules afresh at every workflow
 // task, so a check of the code would not keep a running Worker on what it started with: only a copy
 // does. Every generation runs from the copy; the next agentd makes its own, of the code as it is then.
 // The standard library, outside both directories, is not copied.
 //
-// The copy holds nothing the Worker could not read before: what is in the Python environment and the
-// code directory, which the launchers let it read wherever they are, and a .pth's directory that is in
-// none of the paths agentd keeps from it, nor holds one. A link is copied as a link, never as what it
-// leads to, so the sandbox judges what it leads to as it would have.
+// The copy holds only what the Worker could read before, but for the *.py and *.so files of a .pth's
+// directory outside both. The launchers let the Worker read the Python environment and the code
+// directory wherever they are; a .pth's directory the sandbox may have kept from it (srt: the homes
+// and the temporary directories; bwrap: everything but /usr and the two directories), but a .pth that
+// names it says the Worker is to import it, and only what that puts on the import path is taken, by
+// the code directory's rule: no data, no dot-file. Nothing is taken from in or around a path agentd
+// keeps from the Worker. A link is copied as a link, never as what it leads to, so the sandbox judges
+// what it leads to as it would have.
 package codesnap
 
 import (
@@ -186,12 +190,10 @@ func (b *builder) inCode(path, rel string, d fs.DirEntry) (bool, bool) {
 	return false, strings.HasSuffix(name, ".py") || strings.HasSuffix(name, ".so")
 }
 
-// inPinned takes all of a directory a .pth names but its bytecode and dot-directories.
+// inPinned takes of a directory a .pth names what inCode takes of the code directory: what the .pth
+// puts on the import path, its *.py and *.so files, and none of its data.
 func (b *builder) inPinned(path, rel string, d fs.DirEntry) (bool, bool) {
-	if d.IsDir() && rel != "." && strings.HasPrefix(d.Name(), ".") {
-		return true, false
-	}
-	return b.inEnvironment(path, rel, d)
+	return b.inCode(path, rel, d)
 }
 
 // tree copies what sel takes of src to dst, a path in the snapshot: a configured directory (python,

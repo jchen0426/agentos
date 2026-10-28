@@ -118,7 +118,7 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		"python/lib/python3.12/site-packages/pkg/LICENSE", "python/lib/python3.12/site-packages/pkg/__init__.py",
 		"python/lib/python3.12/site-packages/pkg/data.json", "python/lib/python3.12/site-packages/pkg/elsewhere",
 		"python/lib/python3.12/site-packages/pkg/ledger.db", "python/lib64",
-		"python/pinned/0/mypkg/__init__.py", "python/pinned/0/mypkg/schema.json", "python/pyvenv.cfg",
+		"python/pinned/0/mypkg/__init__.py", "python/pyvenv.cfg", // the .pth's directory, by the code's rule: not its schema.json
 	}
 	if !slices.Equal(paths, want) {
 		t.Errorf("paths\n%s\nwant\n%s", strings.Join(paths, "\n"), strings.Join(want, "\n"))
@@ -157,7 +157,7 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 		t.Errorf("the .pth's directory leads to %s (%v), not %s", target, err, pinned)
 	}
 	interpreter, _ := filepath.EvalSymlinks(w.interpreter)
-	if !slices.Equal(s.Distributions, []string{"pkg==1.2"}) || s.Interpreter != interpreter || s.Files != 11 {
+	if !slices.Equal(s.Distributions, []string{"pkg==1.2"}) || s.Interpreter != interpreter || s.Files != 10 {
 		t.Errorf("distributions %v, interpreter %s, %d files", s.Distributions, s.Interpreter, s.Files)
 	}
 	if !strings.HasPrefix(filepath.Base(s.Dir), statedir.Prefix(Kind)) || s.Code != filepath.Join(s.Dir, "code") {
@@ -173,6 +173,48 @@ func TestWhatTheSnapshotHolds(t *testing.T) {
 			if bytes.Contains(b, []byte(what)) {
 				t.Errorf("%s holds %q", path, what)
 			}
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A directory a .pth names outside both gets the code directory's rule: only what the .pth puts on
+// the import path, its *.py and *.so files; not its data, its dot-files, its bytecode, nor what is in a
+// dot-directory or a virtual environment of its own.
+func TestAPthDirectoryGetsTheCodeDirectorysRule(t *testing.T) {
+	w := newWorld(t)
+	proj := filepath.Join(w.dir, "proj") // a flat-layout pip install -e ~/proj names ~/proj
+	for name, content := range map[string]string{
+		"mod.py": "m = 1\n", "fast.so": "elf", ".env": "TOKEN=a secret of the project's\n",
+		"data.json": `{"a": "data of the project's"}`, "notes.txt": "notes of the project's\n",
+		"__pycache__/mod.cpython-312.pyc": "bytecode of the project's", ".hidden/hook.py": "a dot-directory's module\n",
+		"venv/pyvenv.cfg": "home = /usr/bin\n", "venv/lib/site.py": "a virtual environment's module\n",
+	} {
+		write(t, filepath.Join(proj, name), content, 0o644)
+	}
+	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/_editable.pth"), proj+"\n", 0o644)
+	s := makeOf(t, w)
+	var pinned []string
+	for path := range manifest(s) {
+		if strings.HasPrefix(path, "python/pinned/") {
+			pinned = append(pinned, path)
+		}
+	}
+	slices.Sort(pinned)
+	if want := []string{"python/pinned/0/fast.so", "python/pinned/0/mod.py"}; !slices.Equal(pinned, want) {
+		t.Errorf("pinned %q, want %q", pinned, want)
+	}
+	err := filepath.WalkDir(s.Dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if bytes.Contains(b, []byte("of the project's")) || bytes.Contains(b, []byte("a dot-directory's")) ||
+			bytes.Contains(b, []byte("a virtual environment's")) {
+			t.Errorf("%s holds %q", path, b)
 		}
 		return err
 	})
