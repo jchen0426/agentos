@@ -97,6 +97,9 @@ type Options struct {
 	// Record takes the audit record of each exit agentd did not cause, at most one a minute: it must
 	// not wait (audit.Queue.Add).
 	Record func(audit.Event)
+	// Hold is for tests only (agentd's fault script): while it reports true, no generation after the
+	// first starts, though the delay before it is over: a window with no Worker running.
+	Hold   func() bool
 	Timing Timing
 }
 
@@ -295,14 +298,23 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 	}
 }
 
-// pause waits d before the next generation, and reports false if the supervisor stops meanwhile.
+// pause waits d before the next generation, and on while the hold lasts (Options.Hold); it reports
+// false if the supervisor stops meanwhile.
 func (s *Supervisor) pause(d time.Duration, rec *records) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
+	held := false
 	for {
 		select {
 		case <-t.C:
-			return true
+			if s.o.Hold == nil || !s.o.Hold() {
+				return true
+			}
+			if !held {
+				held = true
+				s.log.Warn("the fault script holds the Worker's next start")
+			}
+			t.Reset(50 * time.Millisecond)
 		case <-s.stop:
 			return false
 		case <-rec.due():

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -737,6 +738,37 @@ func TestNoGenerationAfterStop(t *testing.T) {
 	// Nor is the start that Stop prevented taken for one that failed: one record, of the first's exit.
 	if events, _ := r.all(); len(events) != 1 || len(l.entries("could not start the Worker")) != 0 {
 		t.Errorf("records %v, logs %v", events, l.entries(""))
+	}
+}
+
+// While the hold (agentd's fault script) lasts, no generation after the first starts, however short
+// the delay: a window with no Worker running. The next starts once the hold is over; a stop during
+// it starts none.
+func TestTheHold(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stopped during it %v", stop), func(t *testing.T) {
+			var held atomic.Bool
+			held.Store(true)
+			s, l, _, _ := worker(t, "planned", Timing{BackoffMin: 10 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,ready")
+			s.o.Hold = held.Load
+			s.Start()
+			readied(t, s)
+			wait(t, "the first generation's exit", 5*time.Second, func() bool { return len(l.entries("worker exited")) == 1 })
+			time.Sleep(300 * time.Millisecond)
+			if n := len(l.entries("worker started")); n != 1 || len(l.entries("the fault script holds the Worker's next start")) != 1 {
+				t.Fatalf("%d generations started during the hold: %v", n, l.entries(""))
+			}
+			if stop {
+				start := time.Now()
+				s.Stop()
+				if took := time.Since(start); took > time.Second || len(l.entries("worker started")) != 1 {
+					t.Errorf("Stop took %s; logs %v", took, l.entries(""))
+				}
+				return
+			}
+			held.Store(false)
+			wait(t, "the second generation", 5*time.Second, func() bool { return len(l.entries("worker ready")) == 2 })
+		})
 	}
 }
 

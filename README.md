@@ -527,11 +527,21 @@ make test-linux  # in the Lima VM, Workers under bubblewrap
 
 `tests/test_temporal_mtls.py` also needs the full Temporal server: `make temporal-server`.
 
+The tests of the Worker's lifecycle run agentd's own Worker, as agentd runs it in use: T1 (the
+Worker killed or paused, agentd killed), T9's probes of the Worker's sandbox, the agentd restart
+(`tests/test_agentd_restart.py`, which also keeps a Worker run by hand across one), and T12's Worker
+crash. They kill or pause it through `stack.worker()`, and agentd starts it again; where a test needs
+a while with no Worker running, agentd's fault script holds the next one back
+(`hold_worker_while_exists`). Besides these, only the tests of the supervision itself
+(`tests/test_worker_supervision.py`) and of the harness (`tests/test_harness.py`) run agentd's own
+Worker; the rest run agentd with `--no-worker` and start their own.
+
 `uv run pytest --verify-after-each` also runs `agentctl audit verify` on every agentd a test starts, before it stops: every honest flow must leave an audit log that verifies (exit 0), and a test that tampers on purpose declares the exit and the kinds of mismatch it expects (`@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])`).
 
 T1 on a real model instead of the fake one: `AGENTOS_MODEL=claude`, `openai` (gpt-6.1-sol) or
 `local` (gpt-oss:20b on the Ollama server above, which is free). Claude and OpenAI cost money,
-a few cents a run; the Worker runs under its sandbox because agentd holds a real key. Check the
+a few cents a run. Their keys are real secrets, next to which agentd runs no Worker of its own
+without a sandbox, so T1 skips them under `AGENTOS_SANDBOX=none`: run them under srt. Check the
 key, or the Ollama server, first: `-run LiveCountTokens` for Claude, `LiveOpenAI` (a token
 count, at most a fraction of a cent) or `LiveOllama` (its version, the model, and the window it
 runs with).

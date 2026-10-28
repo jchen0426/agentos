@@ -423,6 +423,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		}
 		// Its exits' records go through their own queue: Add never waits for the ledger.
 		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, exits.Add
+		o.Hold = script.HoldWorker // the fault script's, for tests: none without one
 		sup = supervisor.New(o)
 	}
 	runtimeSrv := runtimeproxy.NewServer(backend, runtimeproxy.Rules{

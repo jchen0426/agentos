@@ -16,6 +16,7 @@ nobody polls. And the outcome a workflow reports is its own text, which agentd s
 report it posts (docs/m5-notes.md).
 """
 
+import base64
 import json
 import os
 import secrets
@@ -39,6 +40,7 @@ from temporalio.client import Client
 from temporalio.service import RPCError
 
 from tests.harness import KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, Stack, in_keychain, user_temp_dir, wait_for
+from tests.sandbox_probe import REPORT_LINE
 from tests.rogue_workflows import T9_VICTIM
 
 NOBODY_POLLS = "t9-nobody-polls"
@@ -260,35 +262,59 @@ WORKER_ENV = {
 }
 
 
+# agentd's environment holds it, its Worker's must not.
+CANARY_ENV = "AGENTOS_TEST_CANARY"
+
+
+def start_probing_agentd(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
+    """agentd, with a secret in its environment, running its own Worker on tests/probe_workflows.py."""
+    monkeypatch.setenv(CANARY_ENV, "a secret the Worker must not see")
+    stack.start_agentd(worker=True, workflows="tests.probe_workflows:SandboxProbe")
+
+
 def probe(stack: Stack, canary: Path, extra: dict) -> dict:
-    """tests/sandbox_probe.py in the Worker's sandbox, launched as the harness launches Workers."""
-    args = [sys.executable, REPO / "tests/sandbox_probe.py",
-            "--temporal-port", stack.temporal_address.rsplit(":", 1)[1],
+    """tests/sandbox_probe.py inside agentd's own Worker (start_probing_agentd), in its sandbox and
+    with its environment: a run of SandboxProbe gets what to probe by a signal, and the Worker reports
+    in its output, which agentd logs."""
+    args = ["--temporal-port", stack.temporal_address.rsplit(":", 1)[1],
             "--control-socket", stack.control_socket, "--home", Path.home(), "--home-canary", canary,
-            "--ledger", stack.data_dir / "ledger.db", "--extra", json.dumps(extra)]
+            "--ledger", stack.data_dir / "ledger.db", "--task-queue", stack.workflow_queue, "--extra", json.dumps(extra)]
     if SANDBOX == "bwrap":
         args += ["--runtime", "127.0.0.1:7233"]
     else:
         args += ["--runtime", f"127.0.0.1:{stack.runtime_port}", "--proxy", "env"]
-    launcher = stack.worker_command(None)[:5]  # the launcher and its arguments, up to "--"
-    assert launcher[-1] == "--", launcher
-    # In a session of its own, as the harness starts Workers: the macOS launcher refuses a controlling terminal.
-    r = subprocess.run([*map(str, launcher), *map(str, args)], capture_output=True, text=True, timeout=120, cwd=REPO,
-                       env={**stack.sandbox_env(), "AGENTOS_TEST_CANARY": "a secret the Worker must not see"},
-                       start_new_session=True)
-    assert r.returncode == 0, r.stderr
-    return json.loads(r.stdout.strip().splitlines()[-1])
+    run = stack.start_run()
+    nonce = secrets.token_hex(8)
+    stack.signal(run, "probe", {"nonce": nonce, "args": [str(a) for a in args]})
+
+    def report() -> dict | None:  # this probe's lines only, whatever else is in the log
+        parts: dict[int, str] = {}
+        counts = set()
+        for line in stack.worker().output():
+            if line.startswith(f"{REPORT_LINE} {nonce} "):
+                _, _, count, part = (line + " ").split(" ", 3)
+                i, n = map(int, count.split("/"))
+                counts.add(n)
+                parts[i] = part.strip()
+        assert len(counts) <= 1, f"the report's lines disagree on how many they are: {sorted(counts)}"
+        if not counts or len(parts) < (n := counts.pop()):
+            return None
+        return json.loads(base64.b64decode("".join(parts[i] for i in range(1, n + 1))))
+    found = wait_for(report, "the probe's report in agentd's log of its Worker", timeout=180, interval=1)
+    assert "failed" not in found, found
+    return found
 
 
 @sandboxed
-def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack) -> None:
-    """Inside the sandbox the Temporal SDK reaches Temporal through agentd's Runtime entry and
-    nothing else: not Temporal's own port, the Control socket, the network, the home directory,
-    agentd's ledger, the keychain (macOS) or the session bus (Linux), where a desktop's
-    Secret Service would hand out keys. On macOS it reads nothing in the shared temporary
-    directories either (/tmp, /var/tmp, the user's own under /var/folders), which hold other
-    programs' files. Its environment holds only what the launcher gave it."""
-    stack.start_agentd()
+def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inside agentd's own Worker's sandbox the Temporal SDK reaches Temporal through agentd's Runtime
+    entry and nothing else: not Temporal's own port, the Control socket, the network, the home
+    directory, agentd's ledger, the keychain (macOS) or the session bus (Linux), where a desktop's
+    Secret Service would hand out keys. Through the entry it starts no workflow, not even on its own
+    task queue. On macOS it reads nothing in the shared temporary directories either (/tmp, /var/tmp,
+    the user's own under /var/folders), which hold other programs' files. Its environment holds only
+    what agentd and the launcher gave it: nothing of agentd's own."""
+    start_probing_agentd(stack, monkeypatch)
     tag = secrets.token_hex(4)
     canary = Path.home() / f".agentos-canary-{tag}"
     planted = []
@@ -325,8 +351,26 @@ def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack
     assert set(report["env"]) <= WORKER_ENV[SANDBOX], sorted(set(report["env"]) - WORKER_ENV[SANDBOX])
 
 
+@sandboxed
+def test_t9_the_worker_launcher_passes_on_none_of_its_callers_environment(stack: Stack) -> None:
+    """The Worker's launcher, run directly, as a person runs a Worker by hand (--no-worker, README),
+    clears the environment it is given: a variable its caller exported does not reach the command,
+    whatever its name. agentd hands the launcher only what it chooses (the probe above), so only a
+    run like this one shows what the launcher itself lets through."""
+    stack.start_agentd()
+    launcher = stack.worker_command(None)[:5]  # the launcher and its arguments, up to "--"
+    assert launcher[-1] == "--", launcher
+    # In a session of its own, as the harness starts Workers: the macOS launcher refuses a controlling terminal.
+    r = subprocess.run([*map(str, launcher), sys.executable, "-c", "import json, os; print(json.dumps(sorted(os.environ)))"],
+                       capture_output=True, text=True, timeout=120, cwd=REPO, start_new_session=True,
+                       env={**stack.sandbox_env(), CANARY_ENV: "a secret the Worker must not see"})
+    assert r.returncode == 0, r.stderr
+    env = set(json.loads(r.stdout.strip().splitlines()[-1]))
+    assert CANARY_ENV not in env and env <= WORKER_ENV[SANDBOX], sorted(env - WORKER_ENV[SANDBOX])
+
+
 @pytest.mark.skipif(SANDBOX != "srt", reason="the macOS keychain")
-def test_t9_the_worker_finds_no_key_in_the_keychain(stack: Stack) -> None:
+def test_t9_the_worker_finds_no_key_in_the_keychain(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
     """agentd's keys live in the login keychain, which the Worker's sandbox cannot read. The
     sandbox lets it reach securityd all the same (sandbox-runtime allows those Mach services, and
     has no setting to stop it): asked for by name, the way agentd reads them, the items must still
@@ -335,7 +379,7 @@ def test_t9_the_worker_finds_no_key_in_the_keychain(stack: Stack) -> None:
     items = [s for s in KEYCHAIN_ITEMS if in_keychain(s)]
     if not items:
         pytest.skip("no agentos item in the login keychain")
-    stack.start_agentd()
+    start_probing_agentd(stack, monkeypatch)
     canary = Path.home() / f".agentos-canary-{secrets.token_hex(4)}"
     canary.write_text("a file the Worker must not read")
     try:
