@@ -2313,3 +2313,130 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - CI：试验 PR #65（已关）显示 GitHub 的 ubuntu-24.04 机器本来就开着 linger，用户管理器在跑，委派了 cpu、memory、pids，只需导出 XDG_RUNTIME_DIR。
 
 设计全文在共享笔记 `m5-c3a-design.md`。设计文档的改动由协调者在合并后改。
+
+### 做了什么
+
+- **配置**（`internal/config`）：`worker.limits`、`git_tools.limits` 改成有类型的上限，各有 `memory`（整数个 MiB 或 GiB：`512MiB`、`1GiB`）和 `tasks`；没写的取默认值：Worker 1 GiB、512，工具调用 512 MiB、128；至少 16 MiB、16 个。交换空间没有键，一律为 0。别的写法（字节数、`1G`、`1.5GiB`、`0x40`、`swap`、拼错的键）拒绝。`CheckLimits(goos)`：Linux 以外写了上限就拒绝启动，和以前一样。
+- **启动脚本**：新加 `sandbox/linux/limits.sh`，`run-worker.sh` 和 `run-tool.sh` 查完用法后从自己的目录 source 它：
+  - 输入：`AGENTOS_LIMIT_MEMORY`（字节）、`AGENTOS_LIMIT_TASKS`、`AGENTOS_LIMIT_UNIT`（scope 的名字）、`XDG_RUNTIME_DIR`；或者只有 `AGENTOS_LIMITS=off`（`--insecure-dev`）。别的一律拒绝：什么都没有、`AGENTOS_LIMITS` 不是 off（空串也算）、off 又带着上限、数字不对、名字不是 `*.scope`、`XDG_RUNTIME_DIR/systemd/private` 不是 socket。
+  - 还不在 scope 里：设上 `AGENTOS_LIMIT_IN_SCOPE=1`，`exec systemd-run --user --scope --quiet --unit=… --property=MemoryMax=… --property=MemorySwapMax=0 --property=TasksMax=… --property=OOMPolicy=stop -- "$0" "$@"`，不加 `--collect`。
+  - 在 scope 里：`/proc/self/cgroup` 只有一行 cgroup v2 的，以 `/<unit>` 结尾；`memory.max`、`memory.swap.max`（必须有）、`pids.max` 读回来和要的一样；不对就写明原因、退出 1。然后照旧 exec bwrap。
+  - 两个启动脚本的头部注释改了：run-worker.sh 那段“bounding it takes a cgroup”改成现在由 cgroup 管；run-tool.sh 的上限列表加了整个调用的那一项。
+- **agentd**（`internal/scope`、`cmd/agentd/limits.go`、supervisor、gitmcp）：
+  - 每次启动一个随机串（8 字节，16 个十六进制字符）；scope 叫 `agentos-<串>-worker-<代数>.scope`、`agentos-<串>-tool-<n>.scope`，探测用的叫 `agentos-<串>-probe-worker.scope`、`-probe-tool.scope`。
+  - 只给 Linux 的启动脚本：上限的四个变量（`XDG_RUNTIME_DIR` 用 agentd 自己的，是绝对路径时，否则 `/run/user/<uid>`），或者 `--insecure-dev` 时的 `AGENTOS_LIMITS=off`；没有启动脚本的（不加沙箱）什么都不给。
+  - 启动检查（Linux、配了启动脚本、没加 `--insecure-dev`）：在 checkWorker 之后、建数据目录之前，每组上限起一个探测 scope（加 `--collect`），里面的 `/bin/sh` 打出 `/proc/self/cgroup` 和三个文件，agentd 核对。分开两种错误：`ErrNoManager`（`systemd/private` 不在，或 systemd-run 连不上 bus），写明 uid、`XDG_RUNTIME_DIR`、登录会话或 `sudo loginctl enable-linger <用户>`、`--insecure-dev`；`ErrNotHeld`（不是只有 cgroup v2、不在自己的 scope 里、文件没有、值不对），写明哪个文件、`cgroup.controllers` 在哪、`--insecure-dev`。`--no-worker` 时只探测工具的那组。
+  - Worker 非正常退出后（agentd 自己停的、判为不在服务的不算）：`systemctl --user show --property=ActiveState,Result -- <unit>`，等 systemd 处理完这个 scope（见“实现时定的”），`Result=oom-kill` 就是被杀：日志写 "the Worker went over its memory limit, and the kernel killed it"（代数、pid、`memory_limit`、scope），"worker exited" 和 `worker.exited` 都带 `oom_kill: true`，照常重启；scope 是 failed 就 `reset-failed`，不管它的错。问不了 systemd 时记一行 Warn，记录里不写 `oom_kill`。第一代就绪前就被杀，agentd 退出的错误里写明内存上限。
+  - 工具服务器失败后（`ServerFailure` 那条路，启动失败的除外）：等服务器退出，问同样的问题；`oom-kill` 就返回 `ToolError`："the commit is too large for the git tool server to read within its memory limit of 64MiB"，日志写 "the git tool call went over its memory limit, and the kernel killed it: refused"。网关因此按 `RefusedError` 走，不可重试（`ToolFailed`），调用记录没有 `error_cause`，runs explain 判为 `tool_error`，报告照引它的话，和超 CPU 时间一样。
+  - systemctl 和 systemd-run 经 `scope.Runner` 调，Go 测试换成假的。
+  - 记录：`agentd.started` 的 `worker.limits` 和新加的 `git_tools_limits`：`{memory_bytes, tasks, swap_bytes: 0, enforcement}`，`enforcement` 是 `systemd_user_scope`、`off`（`--insecure-dev`）或 `none`（macOS）。上限有效时日志记一行，带两组数值和 scope 名字的式样；`--insecure-dev` 时记 Warn "THE RESOURCE LIMITS ARE OFF (--insecure-dev)…"。
+- **CI**：共用的黑盒步骤里加了一步，只在 bwrap 跑：`sudo loginctl enable-linger "$USER"`，等 `/run/user/$UID/systemd/private`（最多 10 秒），把 `XDG_RUNTIME_DIR` 写进 `$GITHUB_ENV`，再起一个 64M/16 的 scope，读回来不对这一步就失败。
+- **README**：要求一节加了 systemd 用户管理器；新加“Resource limits”一节：上限、默认值、配置键、探测、超了以后怎样、`--insecure-dev`、手动跑 Linux 启动脚本要给什么、`agentd.started` 怎么记；示例里的 `limits` 注释掉了（macOS 照抄会被拒绝）。
+
+### 实现时定的
+
+- **scope 上显式写 `OOMPolicy=stop`**：设计靠的是默认值（`DefaultOOMPolicy=stop`）。用户的 `user.conf` 改成 continue 的话，内核杀掉一个进程以后 systemd 不停 scope，`Result` 也不会是 oom-kill，agentd 就认不出来。systemd 255 的 scope 收这个属性（VM 上量过）。
+- **进 scope 的标记 `AGENTOS_LIMIT_IN_SCOPE`**：再 exec 以后的启动脚本凭它知道该核对，而不是再起一个 scope；它只说“应该在”，核对照做。不在就写明“not in its scope”，不会因为名字已被占用而报 systemd 自己的错。bwrap 的 `--clearenv` 不让这些变量进沙箱。
+- **启动脚本先看 `systemd/private`**：XDG_RUNTIME_DIR 指向空目录时，systemd-run 自己的错是 "Failed to connect to bus: No such file or directory"，不说是谁、缺什么。现在写明没有用户管理器、怎么开。
+- **问 Result 时等 systemd 处理完**：VM 上量过，正常退出（exit 1）后 scope 还是 active 约 10–15 毫秒（10 次里每次问 1–5 遍），然后 inactive、被回收；OOM 后第一次查就是 failed/oom-kill（15 次 15 次）。所以 `OOMKilled` 每 10 毫秒问一次 `ActiveState,Result`，直到不是 active/activating/deactivating/reloading/refreshing，最多 3 秒；到时还没完，就按当时的 Result 说。只在非正常退出后问，正常的路径不多花时间。
+- **探测的环境里不放 `DBUS_SESSION_BUS_ADDRESS`**：只有 PATH、LANG、XDG_RUNTIME_DIR，和启动脚本拿到的一样。量过：XDG_RUNTIME_DIR 指向空目录、但 shell 里有 `DBUS_SESSION_BUS_ADDRESS` 时，systemd-run 连不上 `systemd/private` 会退回 session bus，照样成功；启动脚本没有那个变量，会失败。探测带着它，就会在启动脚本失败的地方通过。
+- **探测加 `--collect`**：它不需要 Result。
+- **内存只收整数 MiB 或 GiB**：内核按页存 `memory.max`（VM 上 `MemoryMax=67108865` 读回来是 67108864），启动脚本要求读回来相等；整数 MiB 在 4K、16K、64K 页上都整除。
+- **`Bytes`、`Count` 自己解析标量**：`Limits` 上不能写 `UnmarshalYAML`：yaml.v3 的 `Node.Decode` 不带 `KnownFields`，拼错的键会被吞掉；`int64` 又会把 `1.5` 解成 1。
+- **macOS 的 agentd.started 照写数值**（默认值），`enforcement: none`。记录的样子在三个平台上一样。
+- **测试里手动起的 Linux Worker 也给默认上限**（harness 的 `launcher_limits`，每次一个新名字），不给 `AGENTOS_LIMITS=off`：bwrap 套件里所有经启动脚本跑的 Worker 都和生产一样进 scope，测量也算上它们。`test_sandbox.py`、`test_tool_sandbox.py` 直接跑启动脚本的地方一样补上。
+- **`workerLaunch` 收 `*scope.Set`**：把 nil 的 `*scope.Set` 赋给接口会得到非 nil 的接口，所以只在非 nil 时赋；放进 `workerLaunch` 也让 `TestWorkerLaunch` 能查到它。
+- **工具调用的计数在 `WithOwnSlots` 出来的客户端之间共用**（`*atomic.Int64`）：resolve_commit 用的是另一个客户端，名字不能撞。
+
+### 测试
+
+- **Go**：
+  - config（`TestLimits`）：默认值；各种写法收与不收（裸字节数，九位和十位都试；`1G`、`1.5GiB`、`0MiB`、`512KiB`、`0x40`、列表、低于下限、`swap`、拼错的键、`named`）；`Bytes.String`；`CheckLimits` 在 linux、darwin、freebsd 上。
+  - scope：`TestEnv`（名字带启动的串和序号、四个变量、off 只给 `AGENTOS_LIMITS=off`、`Memory()` 的写法）；`TestRuntimeDir`；`TestProbe`（每组一个探测，参数、环境里没有 session bus；没有 socket、bus 连不上算没有用户管理器；起不了 scope 两者都不是；缺 memory.max、缺 memory.swap.max、值不对、有 v1、不在自己的 scope 里算上限不生效；两种错误各自带着怎么办）；`TestOOMKilled`（被杀、等 systemd 处理完再被杀、正常退出、别的失败；只对 failed 的 reset-failed；到时还没完就按当时的 Result；systemctl 出错；off、没有 scope 不问）。
+  - 启动脚本的一半（`TestTheLaunchersTakeWhatEnvGives`，macOS 和 Linux 都跑）：用 Set.Env 给的变量跑 limits.sh，假的 systemd-run 记下参数再 exec：参数一个不差，然后启动脚本发现不在 scope 里，不往下走；off 时直接往下走；什么都没有、`AGENTOS_LIMITS=on` 或空、off 又带上限、内存写成 `1GiB`、没有内存、任务数 0、名字是路径或 `.service`、没有 XDG_RUNTIME_DIR、那里没有用户管理器、相对路径、自称已在 scope 里：都拒绝，而且都不调 systemd-run。
+  - supervisor：`TestAWorkerOverItsMemory`（每一代的启动脚本拿到自己的 scope 名字；只问 agentd 没停的那两代；被杀的那代有日志、`oom_kill`、照常 20 毫秒后重启；没被杀的没有）；`TestTheFirstWorkerOverItsMemory`（第一代就绪前被杀，错误里写明；问不了 systemd 时记 Warn，不写 `oom_kill`）；`TestTheExitRecord` 加了 `oom_kill` 那种。
+  - gitmcp：`TestACallOverItsMemory`（被杀的就拒绝，文字一字不差，日志带上限和服务器自己的 stderr；别的失败和问不了 systemd 照旧是失败；回答了、拒绝了的不问；`WithOwnSlots` 出来的客户端和原来的共用序号）。
+  - cmd/agentd：`TestResourceLimits`（Linux、`--no-worker`、`--insecure-dev`、什么都没加沙箱、macOS、没有工具的启动脚本：谁拿到什么、探测了哪几组；macOS 上写了上限拒绝；没有用户管理器拒绝，`--insecure-dev` 时不管）；`TestStartRecordsTheToolLimits`；`TestWorkerRecord`、`TestWorkerLaunch` 加了上限；`TestTheGitToolCallsGetTheirLimits`（gitServer 把上限交给启动脚本：有效、off、没有）。
+- **黑盒**（`tests/test_resource_limits.py`，只在 bwrap 下跑，别的环境跳过，写明原因；`tests/limits_workflows.py` 的工作流）：
+  - 每次运行一个自己的 scope：配置 768MiB/300、384MiB/100，从宿主经 `/proc/<pid>/cgroup` 读 Worker 的、和挂住的 git.show_diff 的服务器的 scope：名字、三个值都对；agentd.started 和那行日志记着；杀掉 Worker 后下一代是 worker-2，上一代的 scope 没了（not-found），记录里没有 `oom_kill`，没有留下 failed 的。
+  - Worker 超内存（192MiB，工作流的线程一次 16 MiB 地要 1024 MiB）：被杀，`worker.exited` 有 `oom_kill: true`，日志写明 192MiB，1 秒后重启；第二代重放 go 信号那个工作流任务时不再分配，finish 信号后运行成功；没有留下 failed 的。
+  - 线程到上限（tasks 64）：工作流的线程起了 49 个，第 50 个 "can't start new thread"；`pids.peak` 等于 64，`pids.events` 的 max 至少 1；同一代接着服务，运行成功。
+  - 工具调用超内存（64MiB，一个提交把 150 万行随机的 `a`/`b` 换成另 150 万行）：show_diff 只试了一次，记录的错误是 "tool git.show_diff: the commit is too large for the git tool server to read within its memory limit of 64MiB (type: ToolFailed, retryable: false)"，没有 `error_cause`；runs explain 是 step_failed、tool_error、fetch_diff，报告和它一致并引了这句话；没有留下 failed 的。agentd 启动时自检的四次调用在 64MiB 里过了。
+  - 启动脚本核对自己的 scope：前面放一个改参数的 systemd-run，名字不同、内存多、允许交换、任务多，各自被拒绝并写明读到了什么；照原样的能往下走。
+  - 没有用户管理器（XDG_RUNTIME_DIR 指向空目录）：agentd 不启动，错误里有原因、`loginctl enable-linger`、`--insecure-dev`，数据目录都没建。
+  - `--insecure-dev` 加 bwrap 启动脚本（XDG_RUNTIME_DIR 也指向空目录）：Warn 那行、agentd.started 两组都是 `off`、Worker 不在 agentos 的 scope 里、启动脚本拿到 `AGENTOS_LIMITS=off` 而没有别的上限变量；运行成功。
+  - 改了的老测试：`test_worker_supervision.py` 第一个测试按环境核对 `worker.limits`；harness 给手动起的 Linux 启动脚本默认上限（`launcher_limits`），`test_sandbox.py`、`test_tool_sandbox.py` 直接跑启动脚本的地方也给。
+
+### 测量：余量
+
+- 量法：整套 bwrap 测试（d5267bb，带 `--verify-after-each`）跑的时候，VM 里另起一个进程，每 5 毫秒读一遍用户管理器下所有 `agentos-*` scope 的 `memory.peak`、`pids.peak`（都只增不减），留下每个 scope 最后读到的值，也就是它没了之前最多 5 毫秒时的峰值。没改任何文件。按名字里的序号核对，1816 次工具调用、52 代 Worker 一个不缺。
+- 默认上限的 scope：
+
+  | | 个数 | memory.peak 最大 | 中位数 | 占上限 | pids.peak 最大 | 中位数 | 占上限 |
+  |---|---|---|---|---|---|---|---|
+  | agentd 的 Worker（1 GiB、512） | 47 代 | 88.4 MiB | 46.3 MiB | 8.6% | 23 | 14 | 4.5% |
+  | 测试手动起的 Worker（同样的默认值） | 143 | 128.4 MiB | 38.2 MiB | 12.5% | 15 | 14 | 2.9% |
+  | 工具调用（512 MiB、128） | 1801 | 12.1 MiB | 10.8 MiB | 2.4% | 9 | 8 | 7.0% |
+  | 探测（两组） | 281 | 1.5 MiB | 1.1 MiB | | 2 | 2 | |
+
+  都远在一半以下，所以没有停下来问。测试特意设的小上限，各自到了上限：192 MiB 的 Worker、64 MiB 的工具调用、64 个任务的 Worker。
+- 套件之外，量了 show_diff 让 git 去 diff 的最坏的形状：一个文件正好 4 MiB（`MaxFileBytes`），209 万行随机的两字节行。同样经 `run-tool.sh`、默认上限：
+  - 整个文件换成另一份这样的：git diff-tree 15.5 秒（在 30 秒的 CPU 上限以内），scope 的 `memory.peak` 269 MiB，占 512 MiB 的 52%（含 8.8 MB 输出的页缓存）。这样的提交 show_diff 本来也会拒绝（diff 超过 1 MiB），但内存在输出之前就用掉了。
+  - 只改中间一行：0.41 秒，diff 151 字节，`memory.peak` 165 MiB，32%。
+  - 所以对这种刻意的形状，512 MiB 的余量约 1.9 倍（整个换掉的）和 3 倍（改一行的）；套件里的工具调用是 42 倍。M3 在 M 系列 Mac 上量的那个是 360 MB。默认值是 10-25 定的，没改；要不要改交给协调者。
+
+### 改坏检查
+
+- **Go 53 处**，第一遍 51 处抓到，2 处活下来，各补了一个测试，再跑都抓到：
+  - 探测 12 处：不查 cgroup 是不是 scope 的；收 v1；不比 memory.max、memory.swap.max、pids.max；文件缺了照收；不查 socket；连不上 bus 不算没有用户管理器；探测带 agentd 自己的环境；不写 OOMPolicy=stop；off 的那组也探测；只探测第一组。
+  - 读 Result 5 处：不等 systemd 处理完；任何失败都算被杀；不 reset-failed；什么状态都 reset-failed；问不了 systemd 时不报错。
+  - Env 3 处：名字里没有启动的串；没有 XDG_RUNTIME_DIR；off 什么都不给。
+  - supervisor 9 处：从来不问；启动脚本拿不到上限；问不了算被杀；日志不写上限；agentd 自己停的也问；第一代的错误不提内存；"worker exited" 不带 `oom_kill`；记录不带、记录总带。
+  - gitmcp 7 处：被杀也不拒绝；拒绝不写上限；当成失败（会重试）；回答和拒绝也问；启动脚本拿不到上限；`WithOwnSlots` 各自计数；问不了 systemd 算被杀。
+  - config 7 处：别的默认值；没有下限；Named 不设；macOS 收写了的上限；收裸字节数；任务数 0 取默认；不查 git_tools.limits。
+  - cmd/agentd 10 处：`--insecure-dev` 也探测、也加上限；不探测各组；`--no-worker` 也给 Worker 上限；不调 CheckLimits；macOS 记成 off；swap 不记；agentd.started 不记工具的；Worker 记成工具的；Worker 的启动不带上限；git 工具的启动不带上限。
+  - 活下来的两处：收九位以内的裸字节数（测试只试了十位的 `1073741824`，改坏的正则限九位，照样拒绝；加了 `536870912`）；gitServer 不把上限交给 gitmcp（没有 Go 测试走到 gitServer；加了 `TestTheGitToolCallsGetTheirLimits`，用记环境的假启动脚本）。
+- **limits.sh 13 处**，用 Linux 上的 `TestTheLaunchersTakeWhatEnvGives`（交叉编译，在 VM 里跑，脚本是现读的）和核对 scope 的黑盒测试：
+  - 抓到 11 处：不查 cgroup 的名字（两边都抓到）；不比 memory.max、memory.swap.max、pids.max（黑盒抓到；Go 的假 systemd-run 不建 cgroup，抓不到）；什么都没有照样跑、`AGENTOS_LIMITS` 什么值都算 off、off 加上限照收、没有用户管理器照样调 systemd-run（Go 抓到）；在 scope 里什么都不查、不要求不许交换、不给 unit 名字（两边都抓到）。
+  - 活下来 2 处：收 cgroup v1（hybrid 的 `/proc/self/cgroup` 有多行）、缺了文件照收（`memory.swap.max` 不存在）。VM 和 CI 都是纯 cgroup v2、控制器都委派了，造不出这两种机器；agentd 的探测在启动时做同样的检查，Go 的 `TestProbe` 抓得到那两处的改坏（S2、S6）。所以这样的机器上 agentd 不会启动，启动脚本的这两处是第二道。
+- **黑盒 4 处**（agentd 的改坏版本，`AGENTOS_BIN` 指过去，跑 `test_resource_limits.py`）：
+  - 不做启动检查：抓到。没有用户管理器时 agentd 照样往下走，到自检才失败，错误只剩 "the git tool server does not work: the git tool server failed on resolve_commit; agentd's log has the details"。
+  - 探测不起各组的 scope（只查 socket）：黑盒没抓到，VM 的用户管理器本来就守得住上限；Go 的 `TestResourceLimits` 抓到。
+  - Result 永远不是 oom-kill：两个超内存的测试都失败；工具调用被当作服务器失败，同一个提交试了 5 次，次次被杀（设计里没选的那条路）。
+  - 被杀的工具调用当作失败：工具那个测试失败，同样试了 5 次。
+
+### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过；ruff 对改过的测试文件没意见（`tests/` 里只有原来就有的一处，`test_t16_one_executor.py` 的 F401）。改到的包（scope、supervisor、config、cmd/agentd，gitmcp 的客户端那几个测试）交叉编译成 Linux 的，在 VM 里跑也都过（VM 里没有 Go）。
+- VM 里先手动量过 systemd 的行为（scope 的 Result、状态多久才定、`OOMPolicy=stop`、没有用户管理器时的错、页对齐），记在上面。
+- 新的和受影响的测试，`--verify-after-each`，三种环境同时跑（510a221 的二进制；90229af 只加了一个 Go 测试）：`test_worker_supervision.py`、T1 的两个文件、T9、`test_agentd_restart.py`、T12、`test_harness.py`、`test_sandbox.py`、`test_resource_limits.py`（当时 6 个）、`test_tool_sandbox.py`、`test_audit_log.py`。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验（照设计不启动等） | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 84 | 36 | 84 | 60 | 17 | 0 | 7 | 20 分 3 秒 |
+  | macOS，srt | 111 | 9 | 92 | 67 | 17 | 0 | 8 | 22 分 43 秒 |
+  | Linux VM，bwrap | 104 | 16 | 97 | 71 | 17 | 0 | 9 | 18 分 44 秒 |
+
+  后加的核对 scope 的 5 个测试（b4b8d0b），bwrap 下 `test_resource_limits.py` 11 个都过。
+- 三种完整套件，`--verify-after-each`，同时跑，d5267bb：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 304 | 43 | 179 | 151 | 19 | 0 | 9 | 38 分 9 秒 |
+  | macOS，srt | 331 | 16 | 187 | 158 | 19 | 0 | 10 | 42 分 53 秒 |
+  | Linux VM，bwrap | 329 | 18 | 192 | 162 | 19 | 0 | 11 | 34 分 48 秒 |
+
+  和 C2c 第三轮（a9fb46a）比：none 和 srt 通过数不变，多跳过的 11 个是 `test_resource_limits.py`；bwrap 多通过 11 个。跑完 VM 里没有留下 failed 的 agentos scope、活着的 agentos scope、Worker、`agentos-code.*` 或 `agentos-tools.*`；两边都没有留下我起的 agentd。另一个会话的两个 agentd 没碰。
+- eabf434（探测起不了 scope 时的错误里写明要 systemd 253，README 同）之后：`go test ./...` 全过；bwrap 下 `test_resource_limits.py`、第一个 Worker 测试和 `test_tool_sandbox.py`，带 `--verify-after-each`：13 过、1 跳过；macOS 不加沙箱：1 过、11 跳过。
+
+### 剩余风险
+
+- macOS 没有内存和任务数的上限（C3b 只加 ulimit）。
+- Worker 没有 CPU 上限：被攻破的 Worker 能把 CPU 跑满、拖慢机器。
+- 上限归用户管理器管：同一用户在沙箱外的进程能改（`systemctl --user set-property`），不在威胁模型里。
+- 要 systemd 253 或更新：scope 的 `OOMPolicy=` 是 253 加的（systemd.scope(5)：Added in version 253），之前的 scope 被内核杀掉进程后既不停、也不记 oom-kill。agentd 显式写了这个属性，更老的 systemd 上探测应该起不了 scope，agentd 不启动（没在老版本上试过，按文档推断）。Ubuntu 24.04 是 255；Debian 12（252）、Ubuntu 22.04（249）跑不了，只能 `--insecure-dev`。
+- agentd 只在启动时探测一次。之后用户管理器没了（没开 linger 时最后一个会话退出），启动脚本会拒绝：Worker 起不来，按退避一直重启；工具调用失败、重试。日志里有启动脚本的原话（"no systemd user manager listens at ..."）。
+- agentd 来不及 reset-failed 就退出时，被杀的 scope 留在 `systemctl --user --failed` 里，无害；README 写了怎么清。测试里手动起的 Worker 的 scope 没人清，但没有测试让它们超内存。
+- `OOMKilled` 最多等 3 秒：systemd 这么久还没处理完一个 scope 时，按当时的 Result 判断，之后才到的 OOM 会被漏掉（Worker 的记录没有 `oom_kill`；工具调用当作失败，会重试）。
+- memory.peak、memory.current 也算进第一次读进来的页缓存（比如工具调用读镜像的 pack）；内存紧时内核先回收缓存再杀进程，所以峰值看起来比实际要的大。
+- 启动脚本的两处检查（只有 cgroup v2、文件必须存在）在 VM 和 CI 上造不出反例，靠 agentd 的探测在启动时先拦住（见改坏检查）。
