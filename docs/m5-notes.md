@@ -2215,3 +2215,57 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
 - Linux VM（bwrap，`~/agentos-venv-m5`）：钉住代码那个测试，带 `--verify-after-each`，过了；agentd 的日志记着仓库的 `python` 被去掉了，副本里没有 `python/pinned`。
 - 6fd3015（`.agentos` 那个提交）之后重编，钉住代码那个测试和拒绝启动的那组，带 `--verify-after-each`，在三种环境下又各跑了一遍：none 5 过、1 跳过；srt 6 过；bwrap 6 过。起了 agentd、又不是照设计拒绝启动的栈，verify 都以 0 退出。测量用的“之后”也是这个版本。
+
+### 第三轮（a9fb46a 之上）
+
+协调者在 a9fb46a 上跑的三种完整套件都过了，verify 没有失败：none 304 过、32 跳过，37 分 5 秒，179 个栈；srt 331 过、5 跳过，41 分 42 秒，187 个栈；bwrap 318 过、18 跳过，33 分 7 秒，186 个栈。对 a9fb46a 的两份复审（对抗性审查、安全审查）都没有中等及以上的发现。这一轮修几条便宜的低：
+
+- **R3-1，照 site.py 读 pyvenv.cfg**（`Lib/site.py` 的 `venv()`）：
+  - `bin/pyvenv.cfg` 是文件就读它，否则读 `pyvenv.cfg`；`system_site` 起始为 "true"。
+  - 每个带 "=" 的行在第一个 "=" 处切开，键 strip 后小写，值 strip；最后一个 include-system-site-packages 算数，再小写；只有 "true" 打开系统的和用户的 site-packages。
+  - 按 UTF-8 读，不去 BOM：site.py 用的是 utf-8，不是 utf-8-sig，BOM 成了第一个键的一部分。按 universal newlines 分行（`\r`、`\n`、`\r\n`）。
+  - strip 和 lower 照 Python 的做：Python 的 `str.strip` 比 Go 的 `TrimSpace` 多去 U+001C–U+001F；Python 把 U+0130 小写成两个字符 "i̇"，Go 是 "i"。我用 Python 和 Go 把整个 Unicode 对过一遍，差别只有这两处（开尔文符号 U+212A 两边都小写成 "k"）。
+  - 生效的值是 "true" 就拒绝，键缺了或拼错了也算；完全没有 pyvenv.cfg 也拒绝：不是虚拟环境，用户的 site-packages 是开着的。Go 测试里只写 `home = ...` 的 fixture 改了。
+- **R3-2，查 site.py 读的东西，不看路径的样子**：
+  - 拒绝 site-packages 里是链接的 `*.pth`，指向树里树外都拒绝：Python 会把它指向的文件当 .pth 读，那个文件没被当 .pth 查过。
+  - 拒绝 `lib*`、`lib*/*`、`lib*/*/site-packages` 是指出环境的链接：那样整个环境都是活的。
+  - 拒绝 site-packages 里的 sitecustomize 和 usercustomize，不管是 .py、包目录还是扩展模块，按名字第一个点之前的部分判断。
+  - `python/lib*/*/site-packages` 下的每个 `*.pth` 都查：lib64 作为独立目录的、PyPy 的 `lib/pypy3.X` 都算。
+- **R3-3，允许名单**：加了 setuptools 60 之前的 distutils-precedence 那一行（默认值是 'stdlib'）。`*-nspkg.pth` 单独一条拒绝信息：这是旧 wheel 里 setuptools 给命名空间包写的 .pth，建议从新一点的 wheel 重装，或者删掉它，不给 editable 安装的建议。
+- **R3-4，改坏 M18**：`codesnap.Options` 在 `snapOptions` 里构造，`TestSnapOptions` 查它。`Visible: nil` 现在 Go 测试就抓得到，不只靠黑盒测试。
+- **R3-5，`TestAStopDuringACheckStartsNothing` 不再 flaky**：原来要在 "not serving" 那行日志之后 300 毫秒的 StopGrace 之内调 Stop，负载高的机器赶不上。现在 terminate 开头有个测试钩子 `terminating`（生产代码里是 nil），在停止开始时调 Stop，等它关掉 stop 通道再往下走。四个 CPU 打满时连跑 10 次都过。
+- **L-a，/lib64**：只在 `/usr/lib64` 存在时才把 `/lib64` 算进去，和启动脚本一样（`bwrapShown`，测试时用自己的 root）。
+- **R3-6 查过，不适用**：这是协调者查的。darwin 上 Go 1.26 的 `user.Current` 在 CGO_ENABLED=0 时也读用户数据库；把 HOME 设到别处，两种构建打印的都是 /Users/joechen。
+
+#### 我定的几处
+
+- `pyvenv.cfg`（两个位置任一个）是链接就拒绝：site.py 会跟着链接读，读到的东西副本钉不住。这比 site.py 严，出错时是关着的。
+- `.pth` 的行也照 Python 的空白定义 strip（空行判断、import 行的行尾、路径行的 rstrip），和 pyvenv.cfg 一致。
+- sitecustomize 按模块名判断，不只看 `sitecustomize.py`：包目录、扩展模块（`sitecustomize.cpython-312-darwin.so`）一样会被 `import sitecustomize` 导入。
+
+#### 剩余风险（新增）
+
+- L-b：`.pth` 写着私有路径里面的目录时，整个启动被拒绝，而不是去掉那一行。这样出错时是关着的，保留。
+
+#### 改坏检查
+
+- Go 23 处，都抓到：
+  - pyvenv.cfg 10 处：先读 `pyvenv.cfg`；缺键当成关；没有 pyvenv.cfg 照收；第一个算数；用 Go 的 TrimSpace；去 BOM；用 Go 的 ToLower；只按 `\n` 分行；链接当没有；不是 UTF-8 照收。
+  - site.py 读的东西 6 处：.pth 链接照收；sitecustomize 照收；只认 `sitecustomize.py`；lib 的链接出去照收；只把 site-packages 当根；只查 `lib/python*` 下的 .pth。
+  - 允许名单 2 处：拒绝旧的 setuptools 行；nspkg 给 editable 的建议。
+  - agentd 2 处：Visible 为 nil；没有私有路径。
+  - /lib64 2 处：总是算；从不算。
+  - 去掉 flaky 以后，那个测试钉的改坏（Stop 时的记录带 `restart_in_ms`）照样抓到。
+
+#### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。改到的三个包（codesnap、supervisor、cmd/agentd）的测试交叉编译后在 VM 里跑，也都过。
+- macOS，`--verify-after-each`，两种环境同时跑：`test_worker_supervision.py`、T1 的两个文件、T12。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） | 用时 |
+  |---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 55 | 3 | 55 | 48 | 0 | 7 | 13 分 50 秒 |
+  | macOS，srt | 58 | 0 | 56 | 48 | 0 | 8 | 14 分 55 秒 |
+
+  跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+- Linux VM（bwrap，`~/agentos-venv-m5`）：钉住代码的测试和拒绝启动的那组，带 `--verify-after-each`：6 过；6 个栈，1 个 verify 以 0 退出，0 个失败，5 个照设计拒绝启动没验。
