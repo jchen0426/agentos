@@ -543,6 +543,8 @@ func TestLimits(t *testing.T) {
 		"worker: {limits: {memory: 768MiB}}\n":              {{Memory: 768 << 20, Tasks: 512, Named: true}, DefaultToolLimits},
 		"git_tools: {limits: {tasks: 64}}\n":                {DefaultWorkerLimits, {Memory: 512 << 20, Tasks: 64, Named: true}},
 		"git_tools: {limits: {memory: 16MiB, tasks: 16}}\n": {DefaultWorkerLimits, {Memory: 16 << 20, Tasks: 16, Named: true}},
+		"worker: {limits: {tasks: 4194304}}\n":              {{Memory: 1 << 30, Tasks: 4194304, Named: true}, DefaultToolLimits},
+		"worker: {limits: {memory: 999999999GiB}}\n":        {{Memory: 999999999 << 30, Tasks: 512, Named: true}, DefaultToolLimits},
 		"worker: {limits: {}}\ngit_tools: {limits: {}}\n":   {DefaultWorkerLimits, DefaultToolLimits},
 	} {
 		c, err := load(body)
@@ -564,6 +566,7 @@ func TestLimits(t *testing.T) {
 		"worker: {limits: {tasks: 0}}\n":              "write a whole number, at least 1",
 		"worker: {limits: {tasks: -3}}\n":             "write a whole number, at least 1",
 		"worker: {limits: {tasks: 15}}\n":             "worker.limits.tasks: 15 is below the least, 16",
+		"git_tools: {limits: {tasks: 4194305}}\n":     "git_tools.limits.tasks: 4194305 is above the most, 4194304",
 		"git_tools: {limits: {tasks: 1.5}}\n":         "write a whole number, at least 1",
 		"git_tools: {limits: {tasks: 0x40}}\n":        "write a whole number, at least 1",
 		"git_tools: {limits: {tasks: [64]}}\n":        "write a whole number, at least 1",

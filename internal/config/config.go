@@ -125,6 +125,10 @@ var (
 	leastLimits         = Limits{Memory: 16 << 20, Tasks: 16}
 )
 
+// mostTasks is the kernel's PID_MAX_LIMIT on 64-bit: systemd sets no pids.max above it, and leaves the
+// scope at max.
+const mostTasks = 4 << 20
+
 // Bytes is a size, in bytes; agentd.yaml writes a whole number of MiB or GiB (512MiB, 1GiB), which
 // is a whole number of pages, as the kernel holds memory.max.
 type Bytes int64
@@ -178,13 +182,17 @@ func (l Limits) withDefaults(def Limits) Limits {
 	return l
 }
 
-// check refuses limits below the least, which no Worker or call would start within.
+// check refuses limits below the least, which no Worker or call would start within, and tasks above
+// the kernel's most.
 func (l Limits) check(key string) error {
 	if l.Memory < leastLimits.Memory {
 		return fmt.Errorf("%s.memory: %s is below the least, %s", key, l.Memory, leastLimits.Memory)
 	}
 	if l.Tasks < leastLimits.Tasks {
 		return fmt.Errorf("%s.tasks: %d is below the least, %d", key, l.Tasks, leastLimits.Tasks)
+	}
+	if l.Tasks > mostTasks {
+		return fmt.Errorf("%s.tasks: %d is above the most, %d (the kernel's PID_MAX_LIMIT)", key, l.Tasks, mostTasks)
 	}
 	return nil
 }
