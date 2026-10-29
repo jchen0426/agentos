@@ -2539,7 +2539,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 两份审查（安全审查、对抗审查）看的是修复轮 1 的改动（b50f8bd..dc9d5a4），都没有 Critical、High 或 Medium。这一轮按协调者的清单改那几条低的，次序照清单。这轮照旧不做、等用户定的：所有 scope 加起来的总上限；`OOMPolicy=stop` 和 systemd 253。
 
 1. **刚退出的启动脚本，不是不在 scope 里的启动脚本**（两份审查，低，都演示过）。supervisor 一见启动脚本退出就收尸（`cmd.Wait`）。一代在说就绪和核对之间退出的话，InScope 读 `/proc/<pid>/cgroup` 会失败（ENOENT；在 open 和 read 之间被释放时是 ESRCH），agentd 就以“不在 scope 里”这个错误的理由永久停下，而修复轮 1 以前这样的一代会被重启。安全审查：普通 sh 的启动脚本 3 次 3 次，经 run-worker.sh 的 bwrap 链约 3490 代 1 次；对抗审查：Worker 是 `echo 'worker ready'; exit 0` 时 300 次 120 次（GOMAXPROCS=1 时 51 次），经 run-worker.sh 120 次 0 次。协调者在 VM 上量过：还没收尸、systemd 已经删掉 scope 的进程，读到的是 `0::/.../<unit> (deleted)`。
-   - scope：InScope 先去掉 ` (deleted)` 再比名字：是自己的 scope 的，就是它在过、已经结束了的 scope，目录已经没了，所以第 3 条读上限时也不算错；别的 cgroup 带 ` (deleted)` 的照样拒绝。
+   - scope：InScope 先去掉 ` (deleted)` 再比名字：是自己的 scope 的，就是它在过、已经结束了的 scope，目录已经没了，所以第 3 条读上限时也不算错；别的 cgroup 带 ` (deleted)` 的照样拒绝。更正（修复轮 3）：对一个就叫这个名字的、活着的 cgroup 不对。有委派子树的启动脚本能建一个叫 `<unit> (deleted)` 的 cgroup、搬进去：去掉后缀后名字对上，去掉后缀的目录又不存在，InScope 就返回 nil，什么上限都没有（对抗审查第三轮演示过）。修复轮 3 第 1 条改成只在读到的那个路径不存在时才去掉。
    - supervisor：InScope 失败时，先问启动脚本还在不在：`g.cmd.Process.Signal(syscall.Signal(0))`，Linux 上经它的 pidfd，收尸以后是 `os.ErrProcessDone`（僵尸进程还算在）。不在了，就是这一代退出了：等 `g.exited`，走 `<-g.exited` 那条路（它看得见退出之前的就绪标记：记退出、按退避重启，第一代的就绪照样算 agentd 的）。只有还在、又不在 scope 里的，才停下 agentd。
    - 测试：Go 的 `TestAWorkerThatExitsAsItSaysItIsReady`：每代说完就绪立刻退出（计划 `re,re,ready`），假的 InScope 像 /proc 那样：等到这个 pid 被收尸（`kill(pid, 0)` 是 ESRCH）才读，读就失败（ENOENT）；没等到（第三代一直在）就算在 scope 里。前两代都重启，第三代留下，Failed 上什么都没有，两次退出都记着 ready。没有这个修复时 macOS 上 10 次 10 次失败（"…did not run it in its systemd user scope…: cannot tell the cgroup of the process agentd started for the worker (pid N): open /proc/N/cgroup: file does not exist"）；有修复时 macOS 上 30 次、GOMAXPROCS=1 下 20 次、`-race` 下 5 次都过，VM 里 GOMAXPROCS=1 和默认各 20 次也都过。`TestInScope` 加了 ` (deleted)` 的两种：自己的 scope 的（过），别的 cgroup 的（拒绝）。
    - 测试改了一处：修复轮 1 的 `TestAWorkerOutsideItsScope` 里，不在 scope 里的第一代用的是 `re`（说完就绪就退出）。有了这个修复，它若在核对之前就被收尸，就按退出处理、重启，测试就等不到失败：VM 里 GOMAXPROCS=1 下单独跑 20 遍失败 1 遍，和新测试一起跑 20 遍失败了至少 10 遍。现在不在 scope 里的那一代一直留着（`ready`），像 Worker 那样；第二代那种，第一代用 `long`（就绪后留 500 毫秒，核对过了再退出）。改了以后 VM 里 GOMAXPROCS=1 和默认各跑 20 遍都过。
@@ -2560,7 +2560,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 #### 我定的几处
 
-- ` (deleted)` 不单开一条路：去掉后缀再比名字，目录没了，自然不算错。原来单独返回的那条路，改坏检查表明和不单开的等价（见下），就删了。
+- ` (deleted)` 不单开一条路：去掉后缀再比名字，目录没了，自然不算错。原来单独返回的那条路，改坏检查表明和不单开的等价（见下），就删了。（修复轮 3：去掉之前先看读到的那个路径在不在，见那里的第 1 条。）
 - reaped 只看 Signal(0)。清单写的是它“或” `g.exited` 关了；`g.exited` 关了必然 Wait 过，Signal 也就是 ErrProcessDone，两个都看是多余的。Worker 的 Stdout、Stderr 是 `*os.File`，`cmd.Wait` 收完尸不再等别的，所以 reaped 之后的 `<-g.exited` 马上就到，不会卡住 supervisor 的循环。
 - 第 3 条读的次序（先上限、后目录），理由见那里。
 - 错误里的种类用 Set 自己的（worker、tool）："the process agentd started for the tool (pid N)"。
@@ -2606,3 +2606,51 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 - agentd 自己停掉的 Worker 代（不在服务、没按时就绪、Stop）照旧不问 systemd：这样一代的 scope 若被 OOM 杀过、留在 failed，要到 agentd 停下时的 reset-failed 才清。之后还会起新一代的只有“不在服务”那一条，个数受退避限制。
 - 停下时 reset-failed 的那个 defer（main.go 的 `run()`）没有测试：修复轮 1 黑盒改坏检查活下来的那处（BBd），照旧。
 - 原来的几条照旧：所有 scope 的总量没有上限（等用户定）；按用户算的内核上限（README 现在写了）；macOS 没有内存和任务数的上限；Worker 没有 CPU 上限；上限归用户管理器管；要 systemd 253；本身就超了 Worker 上限的工作流任务，重放时每一代都会被杀；修复轮 1 第 2 条只限了 Go 和 tokio 的线程。
+
+### 修复轮 3（第三轮的两份审查之后，0792133 之上）
+
+两份审查（安全审查、对抗审查）看的是修复轮 2 的改动（dc9d5a4..0f2ba73），都没有 Critical、High 或 Medium；修复轮 2 的每一条都修好了，两边都重跑了自己的演示（竞争 1000 次 0 次、2516 次 0 次；留下的 failed scope 4 次都清了；同名、上限不同的 scope 被拒绝）。剩下三条低的，次序照清单。这轮照旧不做：所有 scope 加起来的总上限；`OOMPolicy=stop` 和 systemd 253；第二次尝试马上就跑。
+
+1. **` (deleted)` 只在没有哪个 cgroup 有这个路径时，才是内核的标记**（对抗审查，低，演示过）。InScope 不问读到的 cgroup 是不是真的删了，就去掉 ` (deleted)`。有委派子树的启动脚本（`systemd-run --user --scope -p Delegate=yes`）能在里面建一个叫 `<unit> (deleted)` 的 cgroup、搬进去：去掉后缀的名字对上了，去掉后缀的目录不存在，cgroup.procs 读出 ENOENT，InScope 返回 nil，什么上限都没有。
+   - 改：读到的 cgroup 以 ` (deleted)` 结尾时，只在 `/sys/fs/cgroup<读到的路径>` 不存在时才去掉（经注入的读函数读它的 cgroup.procs，“不存在”和第 2 条的算法一样）。活着的、这样命名的 cgroup 留着它的名字，名字的核对照常拒绝，措辞照旧。
+   - 测试：`TestInScope` 加了：一个叫 `<unit> (deleted)`、确实存在的 cgroup（读得到它的 cgroup.procs）：拒绝；内核的标记、读那个路径是 ENODEV：算结束了的 scope。内核的标记、没有那个路径的那种照旧过。
+   - 对抗审查的演示，前后各跑一次：它的 `deleted.sh` 和 `zz_adv_deleted_test.go`（先读过；我的副本只换了目录和名字，测试经 `go test -overlay` 编进 scope 的测试，不往工作区写），在 VM 里一个 `Delegate=yes` 的 scope 里跑。改之前（0792133），叫 `<unit> (deleted)` 的那个：`InScope(…, agentos-c3a-r3-x.scope): <nil>`；改之后："the process agentd started for the worker (pid N) is in the cgroup …/c3a-r3-demo-after.scope/agentos-c3a-r3-x.scope (deleted), not in its scope agentos-c3a-r3-x.scope: its launcher does not source sandbox/linux/limits.sh, or a wrapper runs the launcher without exec"。对照的那个（名字就是 unit，没有控制器）前后都拒绝（"has no memory.max"）。跑完 VM 里没有留下那两个 scope 和它们的 cgroup。
+   - 另外在 VM 里看了真的标记还认得：systemd-run 起的 scope 里的 `true` 退出、不收尸，systemd 删掉 scope 以后，它读到的是 `0::/…/c3a-r3-zombie-N.scope (deleted)`，改后的 InScope 3 次都是 nil（同样经 `-overlay`，没提交）。
+2. **ENODEV 也是 cgroup 没了**（对抗审查，低，推断）。kernfs 对一个和 cgroup 的删除赛跑的 open 或 read 回答 ENODEV（`kernfs_fop_open`、`kernfs_seq_start` 里 `kernfs_get_active` 失败），而 `errors.Is(err, fs.ErrNotExist)` 不认它。InScope 原来只把 cgroup.procs 的 ENOENT 当作 scope 结束：一个退出了、还没收尸（僵尸，reaped 为假）的启动脚本，正赶上 systemd 删它的 scope，可能读到一个上限文件没了、cgroup.procs 是 ENODEV，held 就说“没有 memory.swap.max”，agentd 以错误的理由永久停下。窗口极小，修起来便宜。
+   - 改：一个小函数 `gone(dir)`：读这个 cgroup 的 cgroup.procs，ENOENT 或 ENODEV 都算没了，注释写明为什么；读完上限以后的那次核对、第 1 条，都用它。
+   - 测试：cgroup.procs 是 ENODEV（上限文件也读不到）：nil；一个上限文件是 ENODEV、cgroup.procs 是 ENOENT：nil。
+3. **Worker 的拒绝说的比知道的多**（安全审查，低，演示过，只是措辞）：supervisor 的日志和 Failed 的错误开头是 "the Worker's launcher did not run it in its systemd user scope, which holds its limits"，启动脚本在一个同名、上限不同的 scope 里时这句不对（冒号后面的细节是对的）。两处都改成 "did not run it in a systemd user scope that holds its limits"，跟着它的 `supervisor_test.go` 两处、`tests/test_resource_limits.py` 一处同改。
+4. **笔记**：修复轮 2 第 1 条说去掉 ` (deleted)` 后对上了自己的 scope 名字，“就是它在过、已经结束了的 scope”：对这样命名的活 cgroup 不对，更正了，指到这里；修复轮 2 “我定的几处”里那条也加了指向。
+
+#### 我定的几处
+
+- `gone` 收的是目录，读它的 cgroup.procs，而不是对一个错误下判断：清单要用它的两处问的都是“这个 cgroup 还在不在”，读的是同一个文件。上限文件读不到照旧只是“没有这个文件”，是不是 scope 结束了，由后面那次 `gone` 定。
+- 第 1 条看的是读到的那个路径（带 ` (deleted)`）在不在，不是去掉后缀的那个：去掉后缀的路径对伪造的那个也不存在（改坏检查里那一处）。
+
+#### 改坏检查
+
+- **Go 6 处**，都抓到：一律去掉 ` (deleted)`；从不去掉；ENODEV 不算没了；标记查的是去掉后缀的路径；`gone` 读的是 memory.max 而不是 cgroup.procs；读完上限以后那次核对只认 ENOENT。
+- 黑盒没做改坏版本：这几处黑盒测试走不到（要一个有委派子树的启动脚本，或者一次和删除赛跑的读）。
+
+#### 跑过的（修复轮 3，4db682d）
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build-linux` 通过；ruff 对改过的测试文件没意见。改到的包（scope、supervisor）交叉编译成 Linux 的，在 VM 里跑也都过；supervisor 那两个测试在 VM 里 GOMAXPROCS=1 下又跑了 10 遍。
+- 黑盒只跑 VM 的 bwrap（协调者定的）：改到的代码只在上限生效的地方（Linux）跑；supervisor 的措辞在 macOS 上由 Go 测试管着；PR 的 CI 会在最后的提交上跑 macOS。
+- 新的和受影响的测试（和前两轮同一组文件），`--verify-after-each`，4db682d：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | Linux VM，bwrap | 112 | 16 | 100 | 71 | 17 | 0 | 12 | 18 分 29 秒 |
+
+- 完整套件，`--verify-after-each`，4db682d：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | Linux VM，bwrap | 332 | 18 | 195 | 162 | 19 | 0 | 14 | 34 分 3 秒 |
+
+  两张表都和修复轮 2 的 bwrap 那一行数一个不差。跑完 VM 里没有留下 failed 的 agentos scope、活着的 agentos scope、演示用的 scope 或状态目录；另一个会话的两个 agentd 没碰。
+
+#### 剩余风险（修复轮 3 之后）
+
+- 修复轮 2 之后的那些照旧（见那里）：第二次尝试马上就跑；说完就绪、还没核对就退出并被收尸的一代按退出处理；agentd 自己停掉的 Worker 代不问 systemd；停下时 reset-failed 的 defer 没有测试；所有 scope 的总量没有上限（等用户定）；按用户算的内核上限；macOS 没有内存和任务数的上限；Worker 没有 CPU 上限；上限归用户管理器管；要 systemd 253。
+- 这一轮看清的一条（不是这一轮改出来的）：核对只看 agentd 起的那个进程的 cgroup。一个有委派子树的、用户自己写的启动脚本，可以把那个进程留在一个上限对的 cgroup 里，把别的进程挪到上限不对的 cgroup 去；这样的启动脚本是写来绕过核对的，不在它要拦的范围里（它拦的是没有 source limits.sh 的旧副本或自己写的启动脚本，和不用 exec 的包装）。
