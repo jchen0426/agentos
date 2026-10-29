@@ -56,7 +56,7 @@ func newWorld(t *testing.T) world {
 	link(t, w.interpreter, filepath.Join(w.python, "bin", "python"))
 	link(t, "python", filepath.Join(w.python, "bin", "python3"))
 	write(t, filepath.Join(w.python, "bin", "pip"), "#!/usr/bin/env python\n", 0o755)
-	write(t, filepath.Join(w.python, "pyvenv.cfg"), "home = /usr/bin\n", 0o644)
+	write(t, filepath.Join(w.python, "pyvenv.cfg"), "home = /usr/bin\ninclude-system-site-packages = false\n", 0o644)
 	link(t, "lib", filepath.Join(w.python, "lib64"))
 	write(t, filepath.Join(site, "pkg", "__init__.py"), "x = 1\n", 0o644)
 	write(t, filepath.Join(site, "pkg", "data.json"), "{}\n", 0o644)
@@ -306,11 +306,22 @@ func TestAPthsImportLines(t *testing.T) {
 			t.Errorf("%q: %v, want %q", line, err, says)
 		}
 	}
+	for _, def := range []string{"local", "stdlib"} { // setuptools' own, before 60 and since
+		w := newWorld(t)
+		write(t, filepath.Join(w.python, "lib/python3.12/site-packages/distutils-precedence.pth"),
+			"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, '"+def+"') == 'local'; enabled and "+
+				"__import__('_distutils_hack').add_shim(); \n", 0o644)
+		makeOf(t, w)
+	}
+	// A namespace package's .pth, as old setuptools wrote into a wheel: refused, with its own advice.
 	w := newWorld(t)
-	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/distutils-precedence.pth"),
-		"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and "+
-			"__import__('_distutils_hack').add_shim(); \n", 0o644)
-	makeOf(t, w)
+	write(t, filepath.Join(w.python, "lib/python3.12/site-packages/zope.interface-5.0-py3.8-nspkg.pth"),
+		"import sys, types, os;has_mfs = sys.version_info > (3, 5);p = os.path.join(sys._getframe(1).f_locals['sitedir'], *('zope',))\n", 0o644)
+	_, err := Make(w.python, w.code, Options{Private: w.private()})
+	if err == nil || !strings.Contains(err.Error(), "namespace package") || !strings.Contains(err.Error(), "newer wheel") ||
+		strings.Contains(err.Error(), "editable install by path") {
+		t.Errorf("an nspkg.pth: %v", err)
+	}
 }
 
 // A .pth with what Python's str.splitlines ends a line at, besides "\n" and "\r\n", would read
@@ -417,6 +428,72 @@ func TestTheCodesDotFilesStayOut(t *testing.T) {
 	}
 }
 
+// moveOut moves the environment's dir out of it, and leaves a link to where it went in its place.
+func moveOut(t *testing.T, w *world, dir string) {
+	t.Helper()
+	out := filepath.Join(w.dir, "moved")
+	if err := os.Rename(filepath.Join(w.python, dir), out); err != nil {
+		t.Fatal(err)
+	}
+	link(t, out, filepath.Join(w.python, dir))
+}
+
+// The copy's pyvenv.cfg is read as Python's site.py reads it: bin/pyvenv.cfg before pyvenv.cfg, a line at
+// a time in universal newlines, split at its first "=", the key stripped of what Python's str.strip
+// strips and lowercased as str.lower does, the last include-system-site-packages winning; the system's
+// and the user's site-packages are on unless it is there and is not "true".
+func TestTheVenvConfig(t *testing.T) {
+	const key = "include-system-site-packages"
+	for body, off := range map[string]bool{
+		key + " = false\n":                            true,
+		"home = /usr/bin\n":                           false, // missing: on
+		"include-system-site-package = false\n":       false, // misspelled: on
+		key + " = false\n" + key + " = true\n":        false, // the last wins
+		key + " = true\n" + key + " = false\n":        true,
+		"INCLUDE-SYSTEM-SITE-PACKAGES = FALSE\n":      true,
+		key + " = TRUE\n":                             false,
+		"\x1f" + key + "\x1c =\x1d false \x1e\n":      true,  // Python's str.strip takes U+001C to U+001F too
+		"\ufeff" + key + " = false\n":                 false, // a BOM is part of the key
+		"\u0130nclude-system-site-packages = false\n": false, // Python lowers U+0130 to "i\u0307"
+		"include-system-site-pac\u212aages = false\n": true,  // and the Kelvin sign to "k"
+		"home = x\r" + key + " = false\r":             true,  // universal newlines
+		key + " = false\r" + key + " = true\r\n":      false,
+		key + " = false = true\n":                     true, // the value is "false = true": not "true"
+		key + " = true \t\n":                          false,
+	} {
+		w := newWorld(t)
+		write(t, filepath.Join(w.python, "pyvenv.cfg"), body, 0o644)
+		s, err := Make(w.python, w.code, Options{Private: w.private()})
+		if err == nil {
+			_ = s.Remove()
+		}
+		if (err == nil) != off || err != nil && !strings.Contains(err.Error(), "site-packages on") {
+			t.Errorf("%q: %v, want off %v", body, err, off)
+		}
+	}
+	// bin/pyvenv.cfg, where there is one, before pyvenv.cfg.
+	for bin, off := range map[string]bool{key + " = false\n": true, key + " = true\n": false} {
+		w := newWorld(t)
+		write(t, filepath.Join(w.python, "pyvenv.cfg"), map[bool]string{true: key + " = true\n", false: key + " = false\n"}[off], 0o644)
+		write(t, filepath.Join(w.python, "bin", "pyvenv.cfg"), bin, 0o644)
+		s, err := Make(w.python, w.code, Options{Private: w.private()})
+		if err == nil {
+			_ = s.Remove()
+		}
+		if (err == nil) != off {
+			t.Errorf("bin/pyvenv.cfg %q: %v, want off %v", bin, err, off)
+		}
+	}
+	w := newWorld(t)
+	write(t, filepath.Join(w.python, "pyvenv.cfg"), key+" = \xff\n", 0o644)
+	if s, err := Make(w.python, w.code, Options{Private: w.private()}); err == nil || !strings.Contains(err.Error(), "not UTF-8") {
+		if err == nil {
+			_ = s.Remove()
+		}
+		t.Errorf("not UTF-8: %v", err)
+	}
+}
+
 // The configured directories may be in a path the Worker must not read: the launchers let it read
 // them wherever they are.
 func TestTheConfiguredDirectoriesMayBeInAPrivatePath(t *testing.T) {
@@ -480,6 +557,55 @@ func TestTheSnapshotRefuses(t *testing.T) {
 		"the system's site-packages": {func(t *testing.T, w *world) {
 			write(t, filepath.Join(w.python, "pyvenv.cfg"), "home = /usr/bin\nInclude-System-Site-Packages = True\n", 0o644)
 		}, "include-system-site-packages"},
+		"no pyvenv.cfg": {func(t *testing.T, w *world) {
+			if err := os.Remove(filepath.Join(w.python, "pyvenv.cfg")); err != nil {
+				t.Fatal(err)
+			}
+		}, "no virtual environment"},
+		"a pyvenv.cfg that is a link": {func(t *testing.T, w *world) {
+			if err := os.Rename(filepath.Join(w.python, "pyvenv.cfg"), filepath.Join(w.dir, "pyvenv.cfg")); err != nil {
+				t.Fatal(err)
+			}
+			link(t, filepath.Join(w.dir, "pyvenv.cfg"), filepath.Join(w.python, "pyvenv.cfg"))
+		}, "its pyvenv.cfg is a link"},
+		"a .pth that is a link": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.dir, "elsewhere.pth"), "import os; os.system('x')\n", 0o644)
+			link(t, filepath.Join(w.dir, "elsewhere.pth"), filepath.Join(w.python, "lib/python3.12/site-packages/x.pth"))
+		}, "a .pth that is a link"},
+		"a .pth that is a link in the tree": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "share", "x.txt"), "import os; os.system('x')\n", 0o644)
+			link(t, "../../../share/x.txt", filepath.Join(w.python, "lib/python3.12/site-packages/x.pth"))
+		}, "a .pth that is a link"},
+		"sitecustomize.py": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/sitecustomize.py"), "import sys\n", 0o644)
+		}, "a sitecustomize module"},
+		"usercustomize.py": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/usercustomize.py"), "import sys\n", 0o644)
+		}, "a usercustomize module"},
+		"a sitecustomize package": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/sitecustomize/__init__.py"), "import sys\n", 0o644)
+		}, "a sitecustomize module"},
+		"a sitecustomize extension": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/sitecustomize.cpython-312-darwin.so"), "elf", 0o755)
+		}, "a sitecustomize module"},
+		"lib, a link out": {func(t *testing.T, w *world) {
+			moveOut(t, w, "lib")
+		}, "a link out of the environment"},
+		"lib/python3.12, a link out": {func(t *testing.T, w *world) {
+			moveOut(t, w, "lib/python3.12")
+		}, "a link out of the environment"},
+		"site-packages, a link out": {func(t *testing.T, w *world) {
+			moveOut(t, w, "lib/python3.12/site-packages")
+		}, "a link out of the environment"},
+		"a .pth in lib64, a directory of its own": {func(t *testing.T, w *world) {
+			if err := os.Remove(filepath.Join(w.python, "lib64")); err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(w.python, "lib64/python3.12/site-packages/x.pth"), "import os; os.system('x')\n", 0o644)
+		}, "an import line agentd cannot judge"},
+		"a .pth in PyPy's site-packages": {func(t *testing.T, w *world) {
+			write(t, filepath.Join(w.python, "lib/pypy3.10/site-packages/x.pth"), "import os; os.system('x')\n", 0o644)
+		}, "an import line agentd cannot judge"},
 		"a .pth directory that holds the copy": {func(t *testing.T, w *world) {
 			write(t, filepath.Join(w.python, "lib/python3.12/site-packages/tmp.pth"), statedir.Root+"\n", 0o644)
 		}, "the copy being made"},

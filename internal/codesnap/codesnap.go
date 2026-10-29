@@ -124,7 +124,7 @@ func make1(dir, python, code string, o Options) (*Snapshot, error) {
 	if err := b.tree(realCode, "code", b.inCode, true); err != nil {
 		return nil, fmt.Errorf("worker.code %s: %w", code, err)
 	}
-	if err := systemSite(filepath.Join(dir, "python", "pyvenv.cfg")); err != nil {
+	if err := venvConfig(filepath.Join(dir, "python")); err != nil {
 		return nil, fmt.Errorf("worker.python %s: %w", python, err)
 	}
 	slices.SortFunc(b.entries, func(x, y entry) int { return strings.Compare(x.path, y.path) })
@@ -149,26 +149,75 @@ func make1(dir, python, code string, o Options) (*Snapshot, error) {
 	return s, nil
 }
 
-// systemSite refuses an environment whose pyvenv.cfg (the copy's, which the Worker runs with) lets in
-// the system's site-packages, and the user's with them, as Python's site.py reads it: they would be
-// imported live, and pinned by nothing.
-func systemSite(cfg string) error {
-	data, err := os.ReadFile(cfg)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if ok && strings.ToLower(strings.TrimSpace(key)) == "include-system-site-packages" &&
-			strings.ToLower(strings.TrimSpace(value)) == "true" {
-			return errors.New("its pyvenv.cfg sets include-system-site-packages = true: the system's and the user's " +
-				"site-packages would be imported live, past the copy; make the environment without " +
-				"--system-site-packages")
+// venvConfig refuses the environment at python (the copy, which the Worker runs) unless Python's site.py
+// (Lib/site.py's venv), reading its pyvenv.cfg as it does, keeps the system's and the user's
+// site-packages off: they would be imported live, past the copy. site.py reads bin/pyvenv.cfg if it is
+// a file, else pyvenv.cfg; without either Python is no virtual environment, and the user's
+// site-packages are on. It reads it as UTF-8 (a BOM is part of the first line), a line at a time
+// (universal newlines); at the first "=" of a line it strips and lowercases the key and strips the
+// value; the last include-system-site-packages wins, lowercased; and only "true" turns them on, which
+// they are without one.
+func venvConfig(python string) error {
+	var cfg string
+	for _, name := range []string{"bin/pyvenv.cfg", "pyvenv.cfg"} {
+		c := filepath.Join(python, name)
+		fi, err := os.Lstat(c)
+		if err != nil {
+			continue
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("its %s is a link: what Python reads there the copy does not pin", name)
+		}
+		if fi.Mode().IsRegular() {
+			cfg = c
+			break
 		}
 	}
+	if cfg == "" {
+		return errors.New("it has no pyvenv.cfg: it is no virtual environment, and Python would import the user's " +
+			"site-packages live, past the copy; make one with python -m venv")
+	}
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		return err
+	}
+	if !utf8.Valid(data) {
+		return errors.New("its pyvenv.cfg is not UTF-8, which Python reads it as")
+	}
+	system := "true"
+	for _, line := range universalLines.Split(string(data), -1) {
+		if key, value, ok := strings.Cut(line, "="); ok &&
+			pyLower(strings.TrimFunc(key, pyIsSpace)) == "include-system-site-packages" {
+			system = pyLower(strings.TrimFunc(value, pyIsSpace))
+		}
+	}
+	if system == "true" {
+		return errors.New("its pyvenv.cfg leaves the system's and the user's site-packages on (include-system-site-packages " +
+			"is true, or missing): they would be imported live, past the copy; make the environment without " +
+			"--system-site-packages")
+	}
 	return nil
+}
+
+// universalLines splits text at the line ends Python's text files read in universal newlines mode.
+var universalLines = regexp.MustCompile("\r\n|\r|\n")
+
+// pyIsSpace is Python's str.isspace, for a character: Go's unicode.IsSpace, and the information
+// separators U+001C to U+001F.
+func pyIsSpace(r rune) bool { return unicode.IsSpace(r) || r >= 0x1c && r <= 0x1f }
+
+// pyLower is s lowercased as Python's str.lower does, as far as a comparison with an ASCII string
+// tells: as Go's unicode.ToLower, but for U+0130, which Python lowers to two characters, "i\u0307".
+func pyLower(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\u0130' {
+			b.WriteString("i\u0307")
+			continue
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
 }
 
 type entry struct {
@@ -320,10 +369,15 @@ func (b *builder) tree(src, dst string, sel selection, configured bool) error {
 			return err
 		}
 		t := d.Type()
+		out := filepath.ToSlash(filepath.Join(dst, rel))
+		if dst == "python" {
+			if err := siteEntry(out, t); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+		}
 		if t.IsDir() || !take { // directories are made for what goes in them
 			return nil
 		}
-		out := filepath.ToSlash(filepath.Join(dst, rel))
 		if err := plain(out); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
@@ -359,6 +413,9 @@ func (b *builder) link(src, path, out string) error {
 		if target, err = filepath.Rel(filepath.Dir(path), resolved); err != nil {
 			return err
 		}
+	} else if importRoot(out) {
+		return fmt.Errorf("%s: a link out of the environment, to %s: Python would import all of its packages through it "+
+			"live, past the copy; make the environment with directories of its own", path, resolved)
 	} else {
 		target = resolved
 	}
@@ -461,12 +518,51 @@ func copyFile(src, dst string) (int64, string, bool, error) {
 	return n, hex.EncodeToString(h.Sum(nil)), exec, err
 }
 
-// isPth reports whether out is a .pth file in the environment's site-packages, which Python reads
-// at its start.
+// isPth reports whether out is a .pth file in one of the environment's site-packages, which Python
+// reads at its start.
 func isPth(out string) bool {
+	name, ok := sitePackages(out)
+	return ok && strings.HasSuffix(name, ".pth")
+}
+
+// sitePackages reports whether out, a path in the copy, is in one of the environment's site-packages
+// directories, python/lib*/*/site-packages (lib, or lib64 as a directory of its own; python3.X, or
+// PyPy's pypy3.X), and its name there.
+func sitePackages(out string) (string, bool) {
 	parts := strings.Split(out, "/")
-	return len(parts) == 5 && parts[0] == "python" && parts[1] == "lib" && strings.HasPrefix(parts[2], "python") &&
-		parts[3] == "site-packages" && strings.HasSuffix(parts[4], ".pth")
+	if len(parts) == 5 && parts[0] == "python" && strings.HasPrefix(parts[1], "lib") && parts[3] == "site-packages" {
+		return parts[4], true
+	}
+	return "", false
+}
+
+// importRoot reports whether out is one of the environment's directories its packages are imported
+// from: python/lib*, python/lib*/* or python/lib*/*/site-packages.
+func importRoot(out string) bool {
+	parts := strings.Split(out, "/")
+	if len(parts) < 2 || parts[0] != "python" || !strings.HasPrefix(parts[1], "lib") {
+		return false
+	}
+	return len(parts) <= 3 || len(parts) == 4 && parts[3] == "site-packages"
+}
+
+// siteEntry refuses, in one of the environment's site-packages, what Python's site.py would run, or
+// read, past the copy: a sitecustomize or usercustomize module, which it imports at every start (agentd
+// cannot judge what one does without running it, as with a .pth's import lines), and a .pth that is a
+// link, whose content would be what it leads to.
+func siteEntry(out string, t fs.FileMode) error {
+	name, ok := sitePackages(out)
+	if !ok {
+		return nil
+	}
+	if stem, _, _ := strings.Cut(name, "."); stem == "sitecustomize" || stem == "usercustomize" {
+		return fmt.Errorf("a %s module in site-packages, which Python imports at its start, and which agentd cannot "+
+			"judge without running it: remove it", stem)
+	}
+	if t&fs.ModeSymlink != 0 && strings.HasSuffix(name, ".pth") {
+		return errors.New("a .pth that is a link: Python would read what it leads to, which the copy does not pin")
+	}
+	return nil
 }
 
 // writePth writes the copy of the .pth at src, as pth makes it, to dst.
@@ -509,6 +605,9 @@ func (b *builder) writePth(src, dst string) (int64, string, bool, error) {
 var pthImports = []string{
 	"import _virtualenv",
 	"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; " +
+		"enabled and __import__('_distutils_hack').add_shim();",
+	// setuptools' before 60, whose default was the standard library's distutils
+	"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'stdlib') == 'local'; " +
 		"enabled and __import__('_distutils_hack').add_shim();",
 }
 
@@ -553,17 +652,17 @@ func (b *builder) pth(src string, data []byte) ([]byte, error) {
 	for sc.Scan() {
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		switch {
-		case strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "":
+		case strings.HasPrefix(line, "#") || strings.TrimFunc(line, pyIsSpace) == "":
 			out.WriteString(line + "\n")
 			continue
 		case strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "import\t"):
-			if trimmed := strings.TrimRightFunc(line, unicode.IsSpace); !slices.Contains(pthImports, trimmed) {
-				return nil, refusedImport(trimmed)
+			if trimmed := strings.TrimRightFunc(line, pyIsSpace); !slices.Contains(pthImports, trimmed) {
+				return nil, refusedImport(filepath.Base(src), trimmed)
 			}
 			out.WriteString(line + "\n")
 			continue
 		}
-		dir := strings.TrimRightFunc(line, unicode.IsSpace) // as Python's str.rstrip
+		dir := strings.TrimRightFunc(line, pyIsSpace) // as Python's str.rstrip
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(site, dir)
 		}
@@ -613,9 +712,13 @@ func (b *builder) leaveOut(path string) {
 	}
 }
 
-// refusedImport is the refusal of a .pth's import line, naming the build backend that writes it where
-// it is one agentd knows.
-func refusedImport(line string) error {
+// refusedImport is the refusal of an import line of the .pth called name, naming the build backend that
+// writes it where it is one agentd knows; a *-nspkg.pth is setuptools' own, for a namespace package.
+func refusedImport(name, line string) error {
+	if strings.HasSuffix(name, "-nspkg.pth") {
+		return fmt.Errorf("%s, setuptools' .pth for a namespace package of an old wheel, has an import line agentd cannot "+
+			"judge without running it (%.80q): install the package again from a newer wheel, or remove the .pth", name, line)
+	}
 	what := "an import line agentd cannot judge without running it"
 	for _, h := range importHooks {
 		if strings.Contains(line, h.mark) {
