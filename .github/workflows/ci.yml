@@ -182,6 +182,34 @@ jobs:
           # Fails with "loopback: Failed RTM_NEWADDR" if the profile did not take.
           bwrap --unshare-all --ro-bind / / true
 
+      # A trial for M5 C3a, not for merging: can this runner start systemd --user scopes with
+      # memory and task limits, and does systemd tell an OOM kill apart?
+      - name: Trial, a systemd user manager for systemd-run --user scopes
+        if: env.AGENTOS_SANDBOX == 'bwrap'
+        run: |
+          uid=$(id -u)
+          loginctl show-user "$USER" -p Linger || true
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 200); do [[ -S /run/user/$uid/systemd/private ]] && break; sleep 0.05; done
+          ls -la "/run/user/$uid" "/run/user/$uid/systemd"
+          export XDG_RUNTIME_DIR=/run/user/$uid
+          systemctl --user is-system-running || true
+          systemd-run --version | head -1
+          uname -r
+          cat "/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/cgroup.controllers"
+          echo "== limits read back from inside a scope"
+          systemd-run --user --scope --quiet --collect -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=16 \
+            sh -c 'd=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); cat /proc/self/cgroup "$d/memory.max" "$d/memory.swap.max" "$d/pids.max"'
+          echo "== an OOM kill in a named scope, then its Result"
+          systemd-run --user --scope --quiet --unit=agentos-oomtrial -p MemoryMax=32M -p MemorySwapMax=0 \
+            /usr/bin/python3 -c 'x = bytearray(128 << 20)' || echo "exit $?"
+          systemctl --user show agentos-oomtrial.scope -p Result -p ActiveState -p LoadState
+          systemctl --user reset-failed agentos-oomtrial.scope || true
+          echo "== 20 scopes"
+          time (for _ in $(seq 20); do
+            systemd-run --user --scope --quiet --collect -p MemoryMax=512M -p MemorySwapMax=0 -p TasksMax=128 true
+          done)
+
       - run: make build
       - run: uv sync --locked --group dev
 
