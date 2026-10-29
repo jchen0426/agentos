@@ -163,6 +163,7 @@ func (l *listener) Accept() (net.Conn, error) {
 	return &conn{
 		Conn: c, id: l.nextID.Add(1), log: l.s.log, free: func() { <-l.s.conns },
 		closed: make(chan struct{}), changed: make(chan struct{}), turn: make(chan struct{}, 1),
+		tally: l.s.tally.Load(), // the generation of agentd's Worker it comes from: the latest to start
 	}, nil
 }
 
@@ -181,6 +182,7 @@ type conn struct {
 	once   sync.Once
 	closed chan struct{}
 	turn   chan struct{} // the turn to take a response from Temporal for this connection
+	tally  *Tally        // what its calls count into; nil for none
 
 	mu      sync.Mutex
 	flow    flow          // what of its responses the Worker has left unread

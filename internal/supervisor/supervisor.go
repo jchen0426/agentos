@@ -52,15 +52,24 @@ type Timing struct {
 	TermGrace   time.Duration // between SIGTERM and SIGKILL: 1 s
 	RecordEvery time.Duration // at most one record of an exit this often: 1 min
 	Drain       time.Duration // for the output's end, once the process group is gone: 5 s
+	// Liveness (Options.NewTally): a generation is stopped and started again once it has had no poll
+	// open for QuietFor, or has left a task it was handed unanswered for HoldFor, as the supervisor
+	// finds every CheckEvery. The first is checked once it is ready (ReadyWithin covers it till then),
+	// the rest from their start.
+	QuietFor   time.Duration // 60 s
+	HoldFor    time.Duration // 60 s
+	CheckEvery time.Duration // 5 s
 }
 
-func (t Timing) withDefaults() Timing {
+// WithDefaults is t with each field that is zero (or less) at its default.
+func (t Timing) WithDefaults() Timing {
 	for _, f := range []struct {
 		v   *time.Duration
 		def time.Duration
 	}{{&t.ReadyWithin, 60 * time.Second}, {&t.BackoffMin, time.Second}, {&t.BackoffMax, 60 * time.Second},
 		{&t.ResetAfter, 60 * time.Second}, {&t.StopGrace, 5 * time.Second}, {&t.TermGrace, time.Second},
-		{&t.RecordEvery, time.Minute}, {&t.Drain, 5 * time.Second}} {
+		{&t.RecordEvery, time.Minute}, {&t.Drain, 5 * time.Second}, {&t.QuietFor, 60 * time.Second},
+		{&t.HoldFor, 60 * time.Second}, {&t.CheckEvery, 5 * time.Second}} {
 		if *f.v <= 0 {
 			*f.v = f.def
 		}
@@ -99,8 +108,21 @@ type Options struct {
 	Record func(audit.Event)
 	// Hold is for tests only (agentd's fault script): while it reports true, no generation after the
 	// first starts, though the delay before it is over: a window with no Worker running.
-	Hold   func() bool
+	Hold func() bool
+	// NewTally, if set, begins what agentd's Runtime proxy counts of a generation's calls (a
+	// runtimeproxy.Tally): the supervisor calls it just before each generation starts, and checks the
+	// generation's liveness by it (Timing.QuietFor, HoldFor). Unset, nothing is checked.
+	NewTally func() Tally
+	// Code is the root of the code the Worker runs (agentd's snapshot of it), logged with each start.
+	Code   string
 	Timing Timing
+}
+
+// Tally is what the Runtime proxy saw of one generation's calls: the polls it has open, since when it
+// has had none (or since the tally began), and since when a task handed out to it has waited for its
+// answer (zero for none).
+type Tally interface {
+	Liveness() (polls int, quietSince, heldSince time.Time)
 }
 
 // Supervisor runs the Worker, a generation after another. Make one with New, and Start it once.
@@ -121,7 +143,9 @@ type Supervisor struct {
 	gen     int
 	pid     int // the running generation's launcher; 0 between generations
 
-	beforeStart func(n int) // tests: runs just before generation n's launcher is started
+	beforeStart func(n int)           // tests: runs just before generation n's launcher is started
+	startCmd    func(*exec.Cmd) error // starts a launcher: (*exec.Cmd).Start, but in tests
+	terminating func()                // tests: runs as a generation's stop begins
 
 	outMu     sync.Mutex
 	dropped   int         // lines not logged since the last one logged
@@ -135,8 +159,9 @@ func New(o Options) *Supervisor {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Supervisor{o: o, t: o.Timing.withDefaults(), log: log, lines: rate.NewLimiter(linesPerSecond, linesPerSecond),
-		stop: make(chan struct{}), done: make(chan struct{}), ready: make(chan struct{}), failed: make(chan error, 1)}
+	return &Supervisor{o: o, t: o.Timing.WithDefaults(), log: log, lines: rate.NewLimiter(linesPerSecond, linesPerSecond),
+		stop: make(chan struct{}), done: make(chan struct{}), ready: make(chan struct{}), failed: make(chan error, 1),
+		startCmd: (*exec.Cmd).Start}
 }
 
 // Start starts the first generation, and the rest as each exits, until Stop.
@@ -202,6 +227,7 @@ type generation struct {
 	exited     chan struct{} // closed once Wait has returned: ended is set then
 	ended      time.Time
 	tail       tail
+	tally      Tally // what the Runtime proxy counts of its calls; nil for no checks
 }
 
 func (s *Supervisor) loop() {
@@ -245,6 +271,25 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 		defer t.Stop()
 		deadline = t.C
 	}
+	// The liveness checks: the first generation's from its readiness, the others' from their start. The
+	// first's quiet counts from its readiness at the earliest: it may have polled nothing before.
+	var check <-chan time.Time
+	var ticker *time.Ticker
+	var quietFrom time.Time
+	checking := func() {
+		if g.tally != nil && ticker == nil {
+			ticker = time.NewTicker(s.t.CheckEvery)
+			check = ticker.C
+		}
+	}
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	if !first {
+		checking()
+	}
 	ready := g.ready
 	sawReady := func() {
 		ready = nil
@@ -252,12 +297,34 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 		if first {
 			close(s.ready)
 			deadline = nil
+			quietFrom = time.Now()
+			checking()
 		}
 	}
 	for {
 		select {
 		case <-ready:
 			sawReady()
+		case now := <-check:
+			rule, d := s.unresponsive(g, now, quietFrom)
+			if rule == "" {
+				continue
+			}
+			s.log.Error("the Worker is not serving", "generation", g.n, "pid", g.pid, "rule", rule,
+				"for", d.Round(time.Millisecond).String())
+			s.terminate(g)
+			s.cleanup(g)
+			ran := g.ended.Sub(g.started)
+			e := exit{generation: g.n, pid: g.pid, ran: ran, ready: closed(g.ready), at: g.ended, unresponsive: rule, unresponsiveFor: d}
+			e.code, e.signal = exitStatus(g.cmd.ProcessState)
+			stopping := closed(s.stop) // a Stop came meanwhile: no generation follows
+			if !stopping {
+				*backoff = s.next(*backoff, ran)
+				e.restartIn = *backoff
+			}
+			s.logExit(g, e)
+			rec.exit(e)
+			return stopping
 		case <-deadline:
 			s.terminate(g)
 			s.cleanup(g)
@@ -296,6 +363,23 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			rec.fire()
 		}
 	}
+}
+
+// unresponsive is the liveness rule the generation breaks at now, if any, and how long it has: a
+// task it was handed left unanswered for HoldFor (not_answering, which goes first when both hold),
+// or no poll open for QuietFor (not_polling), its quiet counted from quietFrom at the earliest.
+func (s *Supervisor) unresponsive(g *generation, now, quietFrom time.Time) (rule string, d time.Duration) {
+	polls, quietSince, heldSince := g.tally.Liveness()
+	if !heldSince.IsZero() && now.Sub(heldSince) >= s.t.HoldFor {
+		return "not_answering", now.Sub(heldSince)
+	}
+	if quietSince.Before(quietFrom) {
+		quietSince = quietFrom
+	}
+	if polls == 0 && now.Sub(quietSince) >= s.t.QuietFor {
+		return "not_polling", now.Sub(quietSince)
+	}
+	return "", 0
 }
 
 // pause waits d before the next generation, and on while the hold lasts (Options.Hold); it reports
@@ -399,7 +483,10 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 			started <- errStopped
 			return
 		}
-		err := cmd.Start()
+		if s.o.NewTally != nil { // its connections count from here on
+			g.tally = s.o.NewTally()
+		}
+		err := s.startCmd(cmd)
 		s.mu.Unlock()
 		if err != nil {
 			started <- err
@@ -436,7 +523,11 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 	// cmd/agentd's workerLaunch, whose test pins the keys), inherits nothing else of its own, and never
 	// hands a Worker a secret. A secret here would be one the Worker has, which is the bug to fix, not
 	// the log.
-	s.log.Info("worker started", "generation", n, "pid", g.pid, "argv", s.o.Argv, "env", env)
+	attrs := []any{"generation", n, "pid", g.pid, "argv", s.o.Argv, "env", env}
+	if s.o.Code != "" {
+		attrs = append(attrs, "code_sha256", s.o.Code)
+	}
+	s.log.Info("worker started", attrs...)
 	go s.read(g)
 	return g, nil
 }
@@ -459,6 +550,9 @@ func (s *Supervisor) discard(g *generation) {
 func (s *Supervisor) terminate(g *generation) {
 	if closed(g.exited) {
 		return
+	}
+	if s.terminating != nil {
+		s.terminating()
 	}
 	g.closeStopper()
 	if g.exitsWithin(s.t.StopGrace) {
@@ -539,6 +633,9 @@ func (s *Supervisor) logExit(g *generation, e exit) {
 		attrs = append(attrs, "restart_in", e.restartIn.String())
 	} else {
 		attrs = append(attrs, "restart", false)
+	}
+	if e.unresponsive != "" {
+		attrs = append(attrs, "unresponsive", e.unresponsive)
 	}
 	s.log.Warn("worker exited", append(attrs, "output", g.tail.lines())...)
 }

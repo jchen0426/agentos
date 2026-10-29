@@ -38,6 +38,7 @@ import (
 	agentosv1 "github.com/jchen0426/agentos/gen/go/agentos/v1"
 	"github.com/jchen0426/agentos/internal/audit"
 	"github.com/jchen0426/agentos/internal/budget"
+	"github.com/jchen0426/agentos/internal/codesnap"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/control"
 	"github.com/jchen0426/agentos/internal/faults"
@@ -133,6 +134,29 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		return err
 	}
 	statedir.Sweep(supervisor.StateKind)
+	statedir.Sweep(codesnap.Kind)
+	// The code the Worker runs, pinned: a copy, made now. The SDK's sandbox imports workflow modules
+	// afresh at every task, so a Worker running on the live directories would take an edit to them at
+	// its next one; every generation of this agentd's runs from the copy. The copy holds nothing the
+	// Worker could not read before: nothing its launcher hides from it, and none of what agentd keeps
+	// from it and from the tools, nor the deny list. Without a launcher it reads everything anyway.
+	var snap *codesnap.Snapshot
+	if !noWorker {
+		began := time.Now()
+		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, snapOptions(runtime.GOOS, cfg)); err != nil {
+			return fmt.Errorf("pin the Worker's code: %w", err)
+		}
+		for _, dir := range snap.LeftOut {
+			workerLog.Info("the Worker's sandbox hides a directory a .pth names, or one in it: the copy of its code leaves it out", "dir", dir)
+		}
+		defer func() {
+			if err := snap.Remove(); err != nil {
+				workerLog.Warn("could not remove the copy of the Worker's code; the next agentd tries again", "dir", snap.Dir, "error", err)
+			}
+		}()
+		workerLog.Info("pinned the Worker's code", "code_sha256", snap.Root, "files", snap.Files, "bytes", snap.Bytes,
+			"dir", snap.Dir, "took", time.Since(began).Round(time.Millisecond).String())
+	}
 	pol, err := policy.Load(cfg.PolicyFile)
 	if err != nil {
 		return err
@@ -220,7 +244,13 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	start["retention_seconds"] = int64(retention / time.Second)
 	start["no_worker"] = noWorker
 	if !noWorker {
-		start["worker"] = workerRecord(cfg)
+		// The manifest of the copy, in the ledger, at the address agentd.started records as code_sha256.
+		if ref, err := led.PutBlob(ctx, snap.Manifest); err != nil {
+			return fmt.Errorf("store the manifest of the Worker's code: %w", err)
+		} else if ref != "sha256:"+snap.Root {
+			return fmt.Errorf("the manifest of the Worker's code is %s, not sha256:%s", ref, snap.Root)
+		}
+		start["worker"] = workerRecord(cfg, snap, supervisor.Timing{}.WithDefaults())
 	}
 	// The chain its anchor workflows are named by: its first record's. A new ledger's first record is
 	// this one, which cannot name its own sha256.
@@ -412,20 +442,6 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	if err != nil {
 		return fmt.Errorf("runtime socket: %w", err)
 	}
-	var sup *supervisor.Supervisor
-	if !noWorker {
-		o, err := workerLaunch(runtime.GOOS, cfg, runtimeLn.Addr())
-		if err != nil {
-			return err
-		}
-		if len(cfg.Worker.Sandbox) == 0 {
-			workerLog.Warn("THE WORKER RUNS WITHOUT A SANDBOX (--insecure-dev): development only")
-		}
-		// Its exits' records go through their own queue: Add never waits for the ledger.
-		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, exits.Add
-		o.Hold = script.HoldWorker // the fault script's, for tests: none without one
-		sup = supervisor.New(o)
-	}
 	runtimeSrv := runtimeproxy.NewServer(backend, runtimeproxy.Rules{
 		Namespace:     cfg.Temporal.Namespace,
 		WorkflowQueue: cfg.TaskQueues.Workflows,
@@ -439,6 +455,22 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	// each kind, about one a second beyond those, and a count of the rest. Not on the Worker's
 	// request: the queue writes them.
 	runtimeSrv.OnRefused(func(r runtimeproxy.Refused) { refusals.Add(refusalRecord(r)) })
+	var sup *supervisor.Supervisor
+	if !noWorker {
+		o, err := workerLaunch(runtime.GOOS, cfg, snap, runtimeLn.Addr())
+		if err != nil {
+			return err
+		}
+		if len(cfg.Worker.Sandbox) == 0 {
+			workerLog.Warn("THE WORKER RUNS WITHOUT A SANDBOX (--insecure-dev): development only")
+		}
+		// Its exits' records go through their own queue: Add never waits for the ledger.
+		o.PIDFile, o.Log, o.Record = filepath.Join(cfg.DataDir, "worker.pid"), workerLog, exits.Add
+		o.Hold = script.HoldWorker // the fault script's, for tests: none without one
+		// Its liveness, by what the Runtime proxy sees of each generation's calls.
+		o.NewTally = func() supervisor.Tally { return runtimeSrv.NewTally() }
+		sup = supervisor.New(o)
+	}
 
 	// Control socket: agentctl only.
 	controlLn, err := listen("unix://" + cfg.ControlSocket)

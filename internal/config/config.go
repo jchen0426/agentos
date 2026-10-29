@@ -375,6 +375,26 @@ func (c *Config) private() []named {
 	return paths
 }
 
+// interpreterOutsideCode refuses an environment whose bin/python leads into the code directory, but
+// for the environment's own: agentd runs a copy of the code directory, with its *.py and *.so files
+// only, so the copy's bin/python would lead to the live interpreter, which the sandbox no longer opens.
+func interpreterOutsideCode(w Worker) error {
+	python := filepath.Join(w.Python, "bin", "python")
+	real, err := filepath.EvalSymlinks(python)
+	if err != nil {
+		return fmt.Errorf("worker.python: %s: %w", python, err)
+	}
+	in := func(dir string) bool {
+		r, err := filepath.EvalSymlinks(dir)
+		return within(real, dir) || err == nil && within(real, r)
+	}
+	if in(w.Code) && !in(w.Python) {
+		return fmt.Errorf("worker.python: %s leads to %s, in the code directory, of which agentd's Worker runs a copy "+
+			"of the *.py and *.so files only: give the Worker a Python environment whose interpreter is elsewhere", python, real)
+	}
+	return nil
+}
+
 // outsideHome refuses, for the macOS sandbox, a Python environment whose bin/python leads into the
 // home directory outside the Python environment and the code directory: the sandbox cannot read it,
 // and the Worker would fail only once its launcher ran. uv's own Pythons live there.
@@ -448,6 +468,9 @@ func (c *Config) CheckWorker(goos string, sandboxed bool) error {
 	}
 	if fi, err := os.Stat(filepath.Join(w.Python, "bin", "python")); err != nil || fi.IsDir() {
 		return fmt.Errorf("worker.python: %s/bin/python does not run the Worker: %v", w.Python, err)
+	}
+	if err := interpreterOutsideCode(w); err != nil {
+		return err
 	}
 	if sandboxed && goos == "darwin" {
 		if err := outsideHome(w); err != nil {

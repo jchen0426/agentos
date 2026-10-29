@@ -108,7 +108,8 @@ bin/agentd --config config/dev/agentd.yaml
 ```
 
 agentd starts the Worker itself, once its Runtime entry serves, in the sandbox its config's
-`worker` section names (below). The dev configs run it under `sandbox/macos/run-worker.sh`, with
+`worker` section names (below), from a copy of its code made when agentd starts: an edit to `python`
+takes effect when you restart agentd. The dev configs run it under `sandbox/macos/run-worker.sh`, with
 `.venv` as its Python environment and `python` as its code directory: that needs `npm ci` in
 `sandbox/macos`, and a Python outside the home directory, which the sandbox cannot read
 (`.venv/bin/python` must lead there: python.org's or Homebrew's, not one uv downloaded into the home
@@ -446,8 +447,13 @@ bin/agentctl budget extend <run-id> --usd 2.50
 agentd starts the Worker once its Runtime entry serves, and starts it again whenever it exits,
 however it exits: after 1 s, then twice as long each time, up to 60 s, and from 1 s again after a
 Worker that was up a minute. It never gives up, so that the Control socket keeps working and you can
-cancel the run that makes it crash. It has no liveness probe: a Worker that hangs, or that someone
-stopped (`kill -STOP`, as T1 does), is left as it is. The first Worker must say it is ready within
+cancel the run that makes it crash. agentd also watches each Worker's calls at its Runtime entry: one
+that has had no poll open for 60 s, or has left a workflow task it was handed unanswered for 60 s, is
+not serving, and agentd stops it and starts another, as for an exit (its log says which rule, and the
+`worker.exited` record has `unresponsive`). A Worker that hangs, or that someone stopped (`kill -STOP`,
+as T1 does), goes that way, once its open polls have run out (a long poll lasts about a minute). The
+first Worker is checked from its readiness on, the others from their start; a Worker run by hand
+(`--no-worker`) is not checked. The first Worker must say it is ready within
 60 s, before agentd says it is; otherwise agentd stops, and its error quotes the Worker's last lines.
 On SIGTERM or Ctrl-C agentd stops the Worker first, before it closes the Runtime entry: no more
 restarts, and the Worker is asked to stop through its stdin, a pipe whose write end only agentd holds
@@ -466,7 +472,36 @@ generation, pid, exit code or signal, how long it ran, whether it was ready, the
 within a minute of the last record is held, and the next record, when the minute is up or agentd
 stops, describes the latest and counts the others (`unrecorded`). A `dropped` in one counts earlier
 `worker.exited` records the audit log lost. `audit verify` and `runs explain` read past these records;
-`agentd.started` names the Worker's launcher, code directory, workflows and limits (none yet).
+`agentd.started` names the Worker's launcher, Python environment, code directory, workflows and limits
+(none yet), the copy of its code it runs (below), and the liveness thresholds (`liveness`).
+
+The Worker runs a copy of its code that agentd makes when it starts: the Python environment without
+its bytecode, and the `*.py` and `*.so` files (none whose name begins with a dot) of the code directory
+and of each directory a `.pth` names outside both (no data: a package that reads its own files belongs
+in the environment), read-only, in `/tmp/agentos-code.<agentd's pid>.*`, which agentd removes when it
+stops (the next agentd sweeps one a killed agentd left). Every generation runs the copy, so an edit to
+what it holds takes effect when agentd starts again, not in a running Worker: the Temporal SDK's
+sandbox imports workflow modules afresh at every workflow task, and would take an edit to the live code
+directory at the next one. What the copy does not hold stays live: the standard library, and what a
+link leads to outside the copy. A link is copied as a link, which the sandbox judges as before, so a
+module linked into the code directory (or a flit `--symlink` install) is imported from where it leads.
+
+The copy holds nothing the Worker could not read before. A directory a `.pth` names outside both goes
+in only where the Worker's sandbox lets it read it (on macOS outside the home directories and the
+shared temporary directories, on Linux in `/usr`); where it does not, the copy leaves the `.pth`'s line
+out, and agentd's log names the directory: the sandboxed Worker imported nothing from it (macOS's
+sandbox lets it look the directory up, not list or read it; Linux's has none). Without a sandbox the
+Worker reads everything anyway. agentd refuses a copy that would hold anything the Worker may not read
+(its data, its sockets, the Temporal client's files, a mirror, the deny list); an environment whose
+`pyvenv.cfg` lets in the system's site-packages (`include-system-site-packages = true`), imported live;
+a `.pth` with an import line but virtualenv's and setuptools' own, as an editable install by import
+hook writes (setuptools' for most layouts, hatchling's `dev-mode-exact`, meson-python's,
+scikit-build-core's): install the package as a wheel, or editable by path (hatchling's default,
+setuptools' `editable_mode=compat`); and an interpreter in the code directory, of which the copy holds
+only the `*.py` and `*.so` files. `agentd.started` records the copy as `code_sha256`, the sha256
+of its manifest (each file's path, size and sha256, or a link's target; the ledger keeps it as the blob
+of that address), with `code_files`, `code_bytes`, the `distributions` in the environment and the
+`interpreter`; the log of each start names `code_sha256` too.
 
 ```yaml
 worker:

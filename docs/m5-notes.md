@@ -2005,3 +2005,291 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
   | macOS，srt | 59 | 3 | 42 | 41 | 0 | 1 |
 
   跑完没有留下 Worker、agentd 或状态目录。
+
+## C2c：Worker 的活性和钉住的代码（2026-10-29）
+
+用户按推荐批准了设计（“按推荐批准”）：卡住 60 秒的 Worker 重启；阈值是常量，记进 agentd.started；代码用快照钉住；快照装整个虚拟环境，不含字节码；`.pth` 指向 `python`、`code` 以外的目录也钉住。协调者定的两处，没有异议：沿用 `worker.exited`，加 `unresponsive`；`--no-worker` 时不查活性。设计文档的改动由协调者在合并后改。
+
+### 做了什么
+
+- **活性，在 Runtime 代理那里判断**：
+  - 每一代一份 tally（`internal/runtimeproxy/tally.go`）：supervisor 在 `cmd.Start` 之前取一份新的，代理此后接受的连接都记进它。记的是：规则放过、还开着的 poll 数；最后一个 poll 结束的时间（没有 poll 时从这份 tally 开始算）；自 Worker 上一次回答以来，第一个发出去的任务的时间。
+  - “发出去”是 poll 的回应带着非空的 task_token（字段 1，在 `backendStream.RecvMsg` 里用 protowire 读）。“回答”是 RespondWorkflowTaskCompleted、Failed 或 RespondQueryTaskCompleted，规则放过也好、拒绝也好，都算。
+  - supervisor 每 5 秒查一次：第一代从 "worker ready" 起查（之前由 ReadyWithin 管），后面的代从启动起查。不在 poll：没有开着的 poll，且最后一个结束已满 60 秒（`not_polling`）；不回答：发出去的任务等了 60 秒以上（`not_answering`）。
+  - 违反时：日志打 "the Worker is not serving"（代数、pid、哪条规则、多久），照常 terminate，写一条 `worker.exited`，带 `unresponsive` 和 `unresponsive_ms`（走原来每分钟一条的限流），按原来的间隔重启。"worker exited" 那行日志也带 `unresponsive`。
+  - 常量放在 `Timing` 里（QuietFor 60 秒、HoldFor 60 秒、CheckEvery 5 秒），记进 `agentd.started.worker.liveness {quiet_ms, hold_ms}`。`--no-worker` 时没有 supervisor，什么都不查。
+- **钉住的代码，用启动时的快照**（`internal/codesnap`）：
+  - 为什么：SDK 的沙箱每个工作流任务都用新的 importer 建工作流实例，`max_cached_workflows=0` 又让每个任务都是新实例，所以工作流模块每个任务都从磁盘重读一遍，改动在运行中那一代的下一个任务就生效了。只核对哈希钉不住，只有副本钉得住。
+  - 何时、何处：拿到锁、清扫之后，写 agentd.started 之前；`/tmp/agentos-code.<pid>.*`（statedir），文件 0444（可执行的 0555），supervisor 停了以后删掉，下一个 agentd 启动时清扫被 kill 的 agentd 留下的。
+  - 拷什么：
+    - `python/`：整个虚拟环境，去掉 `__pycache__` 和 `*.pyc`、`*.pyo`；
+    - `code/`：`code` 下的 `*.py`、`*.so`，跳过点目录、`__pycache__` 和其中的虚拟环境（有 `pyvenv.cfg` 的目录）；
+    - `.pth` 指向两者以外的目录：Worker 的沙箱让它读的，按 code 目录的规则拷进 `python/pinned/<i>/`（只拷 `*.py`、`*.so`，跳过点文件、点目录、`__pycache__` 和其中的虚拟环境；第二轮之前是整个拷，修复轮之前不管沙箱让不让读，见下）；沙箱不让读的，连同 `.pth` 里那一行都不进副本，日志里记一行。`.pth` 里的路径行改成相对 site-packages 的路径。
+  - 链接一律拷成链接：指向自己那棵树里面的（Linux 虚拟环境的 `lib64 -> lib`、`bin/python3 -> python`）改成相对的；指出树外的（`bin/python` 指向解释器），指向原来的绝对路径。
+  - 不收（拒绝启动）：`.pth` 里 virtualenv 和 setuptools 自己那两行以外的 import 行（import hook 方式的 editable 安装就写这样的行）；`pyvenv.cfg` 里的 `include-system-site-packages = true`；文件、目录、链接以外的东西；超过 1 GiB 或 10 万个文件；名字里有控制字符或格式字符的。APFS 上用 clonefile。
+  - 哈希：每个文件一行（路径、种类、可执行位、大小、sha256 或链接目标），排好序就是 manifest；根 `code_sha256` 是 manifest 的 sha256。字节码和时间不在里面。
+  - 启动：给启动脚本的是快照的两个目录，跑 `<snap>/python/bin/python`，`Dir` 是 `<snap>/code`。启动脚本不用改，原来的目录不再进沙箱。CheckWorker 照旧查配置里的目录。
+  - 记录：`agentd.started.worker` 加了 `code_sha256`、`code_files`、`code_bytes`、`distributions`（site-packages 里每个 dist-info 的 METADATA 的 name==version）、`interpreter`；manifest 作为账本 blob 存，地址就是 `code_sha256`；"worker started" 那行日志带着根。
+  - 出错：快照的任何错误都让 agentd 在监听之前拒绝启动。快照里缺模块，会表现为第一个 Worker 的 ImportError。
+
+### 实现时定的
+
+- `.pth` 里指向 `python` 或 `code` 里面的路径行也改写，指到副本里对应的地方。设计只说了两者以外的目录，但测试里 editable 安装的 `.pth` 写的是 `<repo>/python`，在 `code`（仓库根）里面：不改写，副本就会去 import 原来的代码。指向不存在目录的行删掉：Python 本来也跳过它，留着的话，以后那里出现目录就会被 import 进来。
+- `distributions` 只读 site-packages 顶层的 dist-info，不读打包在别的包里的。
+- `Timing.WithDefaults` 导出了，agentd.started 要记阈值。Runtime 代理挪到 supervisor 之前创建，`NewTally` 要用它。
+- `workerPrivate(cfg)`（tools 不能读的，加上 deny list）同时给启动脚本的 `AGENTOS_SANDBOX_DENY_READ` 和快照用，两边不会对不上。
+
+### 要落实的几点
+
+- **连接能不能算到它来自的那一代**：查过了，可以。代理的 listener 在 accept 时把当时最新的 tally 放进 conn（`limits.go` 的 Accept）；这个连接上的每个调用（`checkRequest`、`backendStream.RecvMsg`）都记进 `conn.tally`。supervisor 在 `cmd.Start` 之前取新的 tally，所以新一代的连接都在它之后被 accept。`TestAConnectionCountsIntoTheTallyBeforeIt` 钉着：新 tally 之前的连接记进旧的，之后的记进新的。
+  - 剩余风险：残留的 Worker 之后才连上来，会算成当前这一代。一个还在 poll 的残留会掩护一个死掉的当前代（poll 数不为 0）；一个拿了任务又不回答的残留，会让当前代被判成 `not_answering`。在新 tally 和 `cmd.Start` 之间连上来的旧连接也一样。
+- **快照的复制成本**：
+  - macOS（APFS，clonefile，连哈希）：每个 agentd 启动中位数 0.75 秒，最长 1.6 秒（2362 个文件，117 MiB）；`test_worker_supervision.py` 加 T1、T12 一共复制 31 次，24–25 秒。
+  - Linux VM（ext4，没有 clonefile）：第一次 2.2 秒（冷缓存），之后 0.2–0.3 秒（2857 个文件，89 MiB）。
+  - 整套大约 38 次 `worker=True` 的 agentd 启动：Linux 多 10–15 秒，macOS 多半分钟左右。新的黑盒测试每个环境多约 3.6 分钟（不在 poll 那个约 130 秒，不回答那个约 77 秒，钉住代码那个约 10–20 秒），比设计估计的 5 分钟少，没有更糟。
+  - 所以没有把空闲 SIGSTOP 那个测试改成只在 nightly 跑：Linux 的 nightly 大约从 29 分钟到 33 分钟，上限 40；PR 运行没有 verify，更快。要是 CI 显示紧，按 `GITHUB_EVENT_NAME` 跳过它只要一行。
+- **C2b 记的 C3 那条**：T9 的探测是从 Worker fork 出来的，C3 以后再说，现在不用做。
+
+### 安全审查的两条中等（已修）
+
+- **指出树外的链接**：原来按它指向的文件拷贝。虚拟环境或 code 里一个指向 `~/.ssh/id_rsa`、账本或镜像文件的链接，原来 Worker 读不到（Seatbelt 按真实路径判断；bwrap 不挂载目标），拷进快照以后就能读了。现在一律拷成链接，指向原来的地方，由沙箱照旧判断。没有因此坏掉什么：macOS 的 uv 虚拟环境里只有 `bin/python*` 是链接，Linux 的还有 `lib64 -> lib`，都在树里。
+- **两者以外的 `.pth` 目录整个拷贝**：现在 `codesnap.Make` 收到 Worker 不能读的路径（`workerPrivate`：数据目录、两个 socket 的目录、TLS 证书和私钥、镜像，加 deny list），并且：
+  - 一棵树装着其中任何一个，就拒绝；
+  - `.pth` 的目录（EvalSymlinks 之后）在其中任何一个里面，就拒绝；
+  - 读到的每个路径都在其中任何一个里面，就拒绝。只有 `python` 和 `code` 本身例外：启动脚本不管它们在哪都让 Worker 读（srt 的 allowRead 对里面的东西优先），测试自己的 code 目录就在 deny list 里的 `stack.tmp` 下面。
+- **快照拷的东西，只有 Worker 原来能读的**（修复轮之前有个例外，`.pth` 目录，现在没有了）：
+  - `python` 和 `code` 里的东西，两种沙箱本来就让它读；
+  - 链接不拷它指向的东西；
+  - `python`、`code` 以外的 `.pth` 目录：只拷沙箱让 Worker 读的（`workerVisible`，照着两个启动脚本），按 code 目录的规则；agentd 不让 Worker 读的路径，在里面的、装着它的，一概拒绝。不加沙箱时 Worker 本来什么都能读。
+- **修复轮的决定：`.pth` 目录只钉沙箱让 Worker 读的**（替换第二轮“协调者定的：`.pth` 目录按 code 目录的规则拷，不加 `$HOME`，也不再整个拷”那一条）。
+  - 协调者第一次的判断错了，错在理由：它说一个 `.pth` 写着那个目录，就是 Worker 要 import 它，所以钉进去是“照 `.pth` 的意思办”。可沙箱不让读的目录，Worker 原来一个模块也 import 不到，钉进副本是纯粹的放宽。
+  - 协调者这次给的理由是：对这些目录，site.py 的 `os.path.exists` 为假。我在启动脚本的 srt 下试过（同样的 denyRead），这只对 bwrap 成立（沙箱里根本没有那个目录）。srt 下，被拒读的目录 `exists` 为真（Seatbelt 让 stat 目录），那一行照样上了 `sys.path`；但目录列不出、文件读不了（PermissionError），文件的 `exists` 为假，照样什么都 import 不到。结论不变。
+  - 做法：agentd 把一个判断函数传给 `codesnap.Make`（`Options.Visible`，`cmd/agentd/worker.go` 的 `workerVisible`），照着启动脚本：
+    - 不加沙箱：全都能读；
+    - macOS（srt）：两个家目录（`$HOME` 和用户数据库里的）、`/tmp`、`/private/tmp`、`/var/tmp`、`/private/var/tmp`、`/var/folders`、`/private/var/folders` 里面的都不能读，按原路径和真实路径比，不分大小写；
+    - Linux（bwrap）：只有 `/usr` 里面的。
+    - Go 的列表旁边注明了照的是启动脚本哪几行，两个启动脚本里也加了指回来的注释。
+  - 沙箱不让读的 `.pth` 目录：`.pth` 里那一行去掉，每个目录在日志里记一行（`the Worker's sandbox hides a directory a .pth names, or one in it: ...`）。让读的，按 code 目录的规则钉，私有路径照旧拒绝。
+  - 两处新的拒绝：`.pth` 目录装着快照自己的目录；code 的规则不收点文件（以前只跳过点目录）。
+  - 比协调者说的多做了三处，都只会少钉，不会多钉：
+    - 让读的 `.pth` 目录里面，沙箱不让读的子目录也跳过，也记日志：判断函数逐个路径查，不只查顶层。比如 `.pth` 写着 `/`，srt 下 `/` 本身能读，`/Users/<me>` 不能。
+    - macOS 还按数据卷的名字比（`/System/Volumes/Data/Users/...`、`/System/Volumes/Data/private/tmp`）。`/Users` 和 `/private` 是到 `/System/Volumes/Data` 的 firmlink，EvalSymlinks 解不开，Seatbelt 却认得：同一个 probe 下这些名字一样是 PermissionError，大小写变了也是。不加的话，一个 `.pth` 写 `/System/Volumes/Data/Users/<me>/x`，判断函数会说能读，钉进去又是放宽。
+    - Linux 除了要真实路径在 `/usr` 里，还要原路径的第一段是 `/usr`、`/bin`、`/sbin`、`/lib` 或 `/lib64`：沙箱自己的 root 里只有这些。`/opt/link -> /usr/share/x` 的真实路径在 `/usr` 里，可沙箱里根本没有 `/opt`，只按真实路径判断就会钉进去。
+  - 说法改成：副本里没有 Worker 原来读不到的东西；不加沙箱时，Worker 本来什么都能读。包的注释、README、这里都这么写。
+  - 黑盒测试：钉住代码那个测试把 `python/agentos_worker`、`python/agentos` 拷进测试自己的 code 目录。none 下副本里有 `python/pinned`；srt 和 bwrap 下没有，agentd 的日志记着仓库的 `python`。
+  - 原来那条决定里还对的部分照旧：让读的 `.pth` 目录按 code 目录的规则拷，不整个拷（数据、`.env` 都不进副本）；同一个 `<repo>/python`，不管经由 code 还是经由 `.pth` 到达，拷法都一样。
+
+### 测试
+
+- **Go**：
+  - tally：空的 poll 回应不算发出任务；被拒的回答照样清掉等待；被拒的 poll 不算；新 tally 之前的连接不算进它；空的 task_token 不算发出任务；
+  - supervisor（假 tally，300 毫秒的阈值）：两条规则各自重启、打日志、写记录；开着 poll、两倍阈值没有新调用也不重启；第一代就绪之前不查；后面一代从不 poll 会被重启，不进 Failed；检查期间 Stop，什么都不起；`TestTheDefaults`、`TestTheExitRecord` 加了新字段；
+  - codesnap：拷了哪些文件、`.pth` 的改写、各种拒绝；同样的代码两次快照根相同，改一个字节根就变，pyc 不影响；上限；清扫；树外链接仍是链接、它指向的内容哪个文件里都没有；`.pth` 指向数据目录、deny list 里的路径、装着数据目录的目录，都拒绝；`code` 装着数据目录，拒绝；配置的目录在私有路径下面，照收；
+  - cmd/agentd：`TestWorkerLaunch`（快照的路径）、`TestWorkerRecord`（新字段）、`TestWorkerPrivate`。
+- **黑盒**（三种环境都跑）：
+  - 空闲时 SIGSTOP：`not_polling` 在冻结后 60 秒以上、185 秒以内出现，然后是第二代、记录、一次成功的运行；
+  - T1 那样冻结、不杀：`not_answering` 在任务发出后 60 秒以上、95 秒以内出现，运行成功，只有一次模型调用、一次 WorkflowTaskTimedOut；
+  - 钉住的代码：同一代改了文件还是 v1，杀掉以后第二代还是 v1；manifest blob 里有 v1 的 sha256；重启 agentd 换了新的根，变成 v2；agentd 停了快照就没了（在下一个 agentd 能清扫之前就核对）；kill -9 之后下一个 agentd 清扫掉；
+  - 拒绝：code 装着 deny list 里的路径，agentd 不启动；
+  - `test_worker_supervision.py` 的 `worker` 字典改成逐项核对。
+
+### 改坏检查
+
+- **Go 34 处**：33 处抓到，1 处等价。
+  - tally 7 处：被拒的回答不算；被拒的 poll 算；每个 poll 回应都算发出；空 token 算发出；连接用最新的 tally；等待算最后一个任务的；poll 结束不记安静时间。
+  - supervisor 8 处：第一代就绪前就查；开着的 poll 不算；不回答从不触发；不回应时停掉整个 supervisor；不写记录；记录不说原因；不取 tally；Stop 被检查吞掉。
+  - codesnap 11 处：拷字节码；`.pth` 不改写；树里的链接指回原来的树；收 import hook；没有上限；文件可写；收点目录；收嵌套的虚拟环境；根不含内容；拒绝后快照留着；树外的 `.pth` 目录不钉。
+  - 安全修复 5 处：树外链接拷成它指向的内容；`.pth` 目录当成配置的目录放过；配置的目录不放过；deny list 不算私有；每个读到的路径都查。前四处抓到；最后一处是等价的改坏：树的根已经查过“装着”和“在里面”，逐个路径的检查是给以后的代码路径留的保险，协调者要的就是这个。
+  - cmd/agentd 3 处：启动原来的目录；记录里没有根；记录里没有活性阈值。
+- **黑盒 6 处**，none 下，都抓到：
+  - manifest 不进账本；
+  - agentd 停了快照留着（第一次没抓到：之前的检查放在 `restart_agentd()` 之后，下一个 agentd 的清扫把它删了。改成停了就查）；
+  - 不清扫快照；
+  - Worker 跑原来的代码；
+  - 快照不收私有路径；
+  - supervisor 拿不到 tally。
+
+### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。ruff 只报原来就有的三处。
+- macOS，`--verify-after-each`，两种环境同时跑：`test_worker_supervision.py`、T1 的两个文件、T12。三种完整套件、bwrap 全套由你跑。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） |
+  |---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 55 | 3 | 55 | 48 | 0 | 7 |
+  | macOS，srt | 58 | 0 | 56 | 48 | 0 | 8 |
+
+  跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+- Linux VM（bwrap，`~/agentos-venv-m5`）：两个活性测试，加 `--verify-after-each`，都过（约 131 秒、74 秒）；钉住代码、第一个测试、kill -9 那个也都过。
+
+### 剩余风险
+
+- 残留的 Worker 之后才连上来，会算成当前这一代（见上）。
+- 标准库不在副本里，在两个目录以外。
+- 链接指向的树外的东西不钉：manifest 只记链接的目标。
+- 规则按“自上一次回答以来第一个发出去的任务”算：一个 Worker 回答别的任务、只卡在一个任务上，算活着；那个任务由 Temporal 的工作流任务超时交给别人。
+- 空闲时被冻结的 Worker，要等它开着的长 poll 自己结束（一分钟左右）以后，再过 60 秒才判出来：1–2 分钟，不是 60 秒。
+- 根只盖副本，不盖解释器（`interpreter` 记了它在哪）。
+- 每次 agentd 启动多一个约 375 KB 的 manifest blob；代码不变时地址相同，只存一次。
+- 文件是只读的，但不加沙箱的 Worker 和 agentd 是同一个用户，可以改回来；两种沙箱都不让它写副本。
+- （修复轮之前）`python`、`code` 以外的 `.pth` 目录，沙箱原来不让读的也钉进了副本：修复轮改了，见“修复轮的决定”。修复轮之后的剩余风险见下一节。
+- 这样的目录里，运行时要读数据文件的包，在 Worker 里会失败：数据文件不进副本。它该装进虚拟环境，和 code 目录一样。
+
+### 修复轮（两份审查之后，39e71ea 之上）
+
+协调者在 39e71ea 上跑的三种完整套件都过了：none 304 过、32 跳过，37 分钟；srt 331 过、5 跳过，42 分钟；bwrap 318 过、18 跳过，33 分钟。这一轮修两份审查的三条中等，和几条便宜的低：
+
+- **中等 1，只钉沙箱让 Worker 读的**：见上面“修复轮的决定”。
+- **中等 2，`include-system-site-packages = true`**：查副本里的 `pyvenv.cfg`（Worker 用的就是它），键和值去掉空白、不分大小写，为真就拒绝启动：系统的和用户的 site-packages 会被现场 import，什么都钉不住。
+- **中等 3，`.pth` 的 import 行**：只放过两行，去掉行尾空白以后逐字相同：`import _virtualenv`，和 setuptools 的 distutils-precedence 那一行。别的一律拒绝；认得出的说出是哪个后端（setuptools 的 `__editable__`、hatchling 的 `_editable_impl_`（dev-mode-exact）、editables、meson-python、scikit-build-core），并建议装成 wheel，或者按路径的 editable 安装（hatchling 默认的，setuptools 的 `editable_mode=compat`）。不跑 Python。
+- **低 4，按 fd 拷**：源文件用 `O_NOFOLLOW|O_NONBLOCK` 打开，fstat 要是普通文件；目标用 `O_EXCL` 新建；macOS 上从源的 fd 克隆（`fclonefileat`），再用 `O_NOFOLLOW` 打开克隆，也要是普通文件；哈希从 fd 读，权限用 fchmod 设，不再按路径 chmod。`O_NONBLOCK` 是我加的：一个文件换成了 FIFO，没有它 open 会一直阻塞，agentd 就起不来（`TestCopyFile` 要求 5 秒内拒绝）。遍历中途目录被换成链接，仍是剩余风险。
+- **低 5，记录的卫生**：`distributions` 只留 PEP 508 的名字（最长 100 个字符）和 PEP 440 的版本（最长 64 个字符），最多 1000 个。manifest 的路径、链接的目标和解释器，有 Unicode 控制字符或格式字符（Cc、Cf：换行、制表、双向覆盖等）的，或者不是 UTF-8 的，拒绝。
+- **低 6，配置成链接的根**：`python`、`code` 按真实路径遍历，`.pth` 的行也和它们的真实路径比。
+- **低 7，`.pth` 的分隔符**：Python 的 `str.splitlines` 认、Go 的 scanner 不认的分隔符（不跟 `\n` 的 `\r`、`\f`、`\v`、`\x1c`–`\x1e`、`\x85`、U+2028、U+2029），有就拒绝；`\r\n` 照旧是行尾。不是 UTF-8 的 `.pth` 也拒绝。
+- **低 8，解释器在 code 里**：CheckWorker 拒绝 `bin/python` 指到 code 目录里（又不在 python 里）的环境，不管平台、加不加沙箱。C2a 的用例 “a Python leading into the code directory” 现在期待这个拒绝，另加了 Linux 和不加沙箱的两个。
+- **低 9，第一代的安静时间**：not_polling 从 max(quietSince, 就绪的时刻) 算起。
+- **低 10，两个活下来的改坏**：两条规则同时成立时报 not_answering（`TestBothRulesHold`）；每一代的 tally 在它的启动脚本启动之前取（`TestTheTallyComesBeforeTheStart`）。
+- **低 11，杀到一半来了 Stop**：那条记录不带 `restart_in_ms`，也不再起下一代。
+- **低 12，措辞**：README 的 “never in a running Worker” 改成只对副本里有的东西成立：标准库、链接指向的副本外的东西，照旧是活的。README 也写明了副本里没有 Worker 原来读不到的东西，以及 agentd 拒绝什么。
+
+#### 我定的几处
+
+- **解释器只拒绝在 code 里的，不拒绝在 python 里的**（协调者说的是“在 python 或 code 里”）。python 整个拷进副本，`bin/python` 指到 python 自己里面的（`--copies` 建的环境，或 code 里的虚拟环境，像 `home/code/venv`）是树内的链接，会改成相对的，副本里自己就有解释器，跑得起来。只有指到 code 里、又不在 python 里的，才会指回原来的目录：副本的 code 只有 `*.py` 和 `*.so`，沙箱也不再打开原来的 code。C2a 的用例 “macOS, a Python in the code directory”（环境就在 code 里）照旧通过，改坏检查 E2 钉着。
+- **`bin/python*` 不再特殊处理**：树内的链接一律改成相对的，指出树外的一律用绝对路径；原来的特例多余了。
+- **测试用的启动钩子就是启动本身**：原来打算在 `cmd.Start` 之后调一个钩子，可是把 NewTally 挪到 Start 和钩子之间，这个改坏就抓不到。现在钩子就是启动（`startCmd`，默认 `(*exec.Cmd).Start`），NewTally 挪到它后面就被抓到。
+- **每个家目录的 `.agentos` 也藏**（单独一个提交）：启动脚本按原路径和真实路径拒读 `~/.agentos`，它的真实路径可能在家目录外面；不管 agentd 配置的数据目录是哪个，判断函数都照着做。
+- “修复轮的决定”里比协调者说的多做的三处：子目录逐个查，数据卷的名字，Linux 的第一段。
+
+#### 剩余风险（修复轮之后）
+
+- 残留的连接会算进当前这一代的 tally：macOS 上任何本机进程都连得上那个端口，Linux 上任何同 uid 的进程都连得上那个 socket。开着的 poll 能掩护 not_polling；被拒的 Respond* 照样清掉 heldSince；拿了任务又一直不答的，会让当前代被反复重启。真正的办法是每一代一个凭据，以后做。
+- 经由树外链接的代码是活的：flit 的 `--symlink`，或者 code 里一个链接过去的模块（PIN-3）。
+- 链接的目标按字面解析，不像内核那样逐段解析（L4）；只影响钉住，不影响沙箱怎么判断。
+- `.pth` 里指向 zip 或 egg 的行去掉了；python 或 code 里有 deny_read 列着的文件，拒绝启动。
+- 任何回答都清掉 heldSince（LIV-2）：卡在一个任务上、却回答了别的任务的 Worker，要等 Temporal 重新派发那个任务（约 10 秒后）才被抓到。
+- 一个丢了的旧式 query 发放，会让一个空闲、健康的 Worker 在 60 秒后被重启（LIV-3）；agentd 自己从不 query。
+- 毒任务让 Worker 每 65–70 秒被杀一次，1 秒后重启，每分钟一条记录；Control 仍然可以取消那个运行（LIV-4）。
+- 副本里没有字节码（LIV-6）：见下面的测量。
+- 遍历时目录被换成链接的竞争：WalkDir 会进到链接指向的地方，那里的文件（私有路径的检查按名字，挡不住；沙箱也许不让读）就进了副本。要在 agentd 启动的那一刻写得了 python 或 code 才做得到。
+
+#### 测量：每一代从启动到就绪（LIV-6）
+
+“worker ready” 那行日志的 `after`（从启动脚本启动到 Worker 说就绪）。C2c 之前用 d88318c（C2b 合并后的 main）编出来的 agentd，Worker 跑原来的目录；之后用 6fd3015 的，Worker 跑副本。两个测试（第一个测试，和重启 4 次的那个），前后交替各跑两遍，别的什么都没跑；每格 4 个第一代、8 个后面的代，取中位数。
+
+| 环境 | 第一代，之前 | 第一代，之后 | 后面的代，之前 | 后面的代，之后 | 拷贝本身（之后） |
+|---|---|---|---|---|---|
+| macOS，srt | 0.47 秒 | 1.87 秒 | 0.46 秒 | 0.86 秒 | 0.76 秒 |
+| Linux VM，bwrap | 0.50 秒 | 0.76 秒 | 0.54 秒 | 0.77 秒 | 0.41 秒 |
+
+- srt 下第一代多 1.4 秒，后面每代多 0.4 秒；VM 里每代多 0.26 秒。后面的代多出来的是编译：副本里没有字节码，沙箱里的 Worker 又写不了（`PYTHONDONTWRITEBYTECODE=1`，副本只读），每一代都从源码编译它 import 的模块。macOS 第一代另外多的约 1 秒，我猜是克隆出来的新文件第一次读（页缓存是冷的），也许还有新路径上 `.so` 第一次加载时的签名检查；没有验证。
+- 不加沙箱时（上面那次跑的日志，之后）：第一代 1.44 秒，后面的代 0.24 秒。第一代把字节码写进了副本（副本的目录对同一个用户是可写的），后面的代就用上了。
+- 协调者看到的完整套件比 C2b 慢 5–6 分钟（估计是 4 分钟）：套件里用 agentd 自己的 Worker 的测试，这四个文件里每个环境大约 29 次第一代、10 次后面的代、31 次拷贝；整个套件多几次。按上面的数，srt 下约 29×1.4 + 10×0.4 ≈ 45 秒，加上拷贝约 25 秒；原来的估计里只算了拷贝和新测试（约 3.6 分钟）。多出来的一分钟左右大致是这个，剩下的是一次和一次之间的波动。
+- 要消掉它，可以在做快照时编好字节码（`compileall --invalidation-mode checked-hash`，哈希进 manifest）。可这要在沙箱外跑 Worker 的解释器；不加 `-I -S` 的话，它还会处理 `.pth` 的 import 行。这轮没做。
+
+#### 改坏检查
+
+- **Go 39 处，都抓到**（两处第一次没编译过：改坏本身留下了没用的 import 和变量，改了改坏再跑，都抓到）。
+  - 只钉沙箱让读的 13 处：沙箱不让读的 `.pth` 目录照钉；让读的目录里不让读的子目录照钉；macOS 不比路径的真实路径；不比被藏目录的真实路径；分大小写；不藏用户数据库里的家目录；不藏 `/var/tmp`；不按数据卷的名字藏；不藏 `.agentos`；Linux 不看原路径的第一段；Linux 不看真实路径；不认识的平台全让读；不加沙箱也判断。
+  - 拒绝 2 处：装着快照的 `.pth` 目录照收；点文件照收。
+  - `include-system-site-packages` 2 处：不查；分大小写。
+  - import 行 3 处：什么 import 行都收；行尾空白算数；不说后端。
+  - 按 fd 拷 4 处：跟着链接；FIFO 阻塞着打开；不要求普通文件；覆盖已有的文件。
+  - 记录 4 处：什么名字和版本都记；不设上限；控制字符放过；解释器不查。
+  - 链接的根 2 处：遍历给的路径；`.pth` 的行和给的路径比。
+  - 分隔符 3 处：不查；`\r\n` 也拒绝；U+2028 放过。
+  - 解释器 2 处：code 里的照收；环境自己里面的也拒绝。
+  - supervisor 4 处：第一代的安静从启动算；先报 not_polling；tally 在启动之后取；Stop 时的记录带 `restart_in_ms`。
+  - 没跑的三处是测试里等价的：按路径 chmod、不再检查克隆、从源文件哈希。它们只在拷的同时有人换文件时才不一样，测试造不出那个时机。
+- **黑盒 2 处**，srt 下钉住代码那个测试，用 agentd 的两个改坏版本（`AGENTOS_BIN` 指过去）：agentd 不传判断函数（副本里有 `python/pinned/0`）；不记那行日志。都抓到。
+
+#### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。改到的四个包（codesnap、config、supervisor、cmd/agentd）的测试交叉编译成 Linux 的，在 VM 里跑也都过（VM 里没有 Go）。
+- macOS，`--verify-after-each`，两种环境同时跑：`test_worker_supervision.py`、T1 的两个文件、T12。第一次开跑时 `bin/` 还是改日志措辞之前编的，发现以后停掉、重编、重跑；下表是重跑的，用的是 800fc7f 的 agentd。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） | 用时 |
+  |---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 55 | 3 | 55 | 48 | 0 | 7 | 13 分 41 秒 |
+  | macOS，srt | 58 | 0 | 56 | 48 | 0 | 8 | 15 分 3 秒 |
+
+  跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+- Linux VM（bwrap，`~/agentos-venv-m5`）：钉住代码那个测试，带 `--verify-after-each`，过了；agentd 的日志记着仓库的 `python` 被去掉了，副本里没有 `python/pinned`。
+- 6fd3015（`.agentos` 那个提交）之后重编，钉住代码那个测试和拒绝启动的那组，带 `--verify-after-each`，在三种环境下又各跑了一遍：none 5 过、1 跳过；srt 6 过；bwrap 6 过。起了 agentd、又不是照设计拒绝启动的栈，verify 都以 0 退出。测量用的“之后”也是这个版本。
+
+### 第三轮（a9fb46a 之上）
+
+协调者在 a9fb46a 上跑的三种完整套件都过了，verify 没有失败：none 304 过、32 跳过，37 分 5 秒，179 个栈；srt 331 过、5 跳过，41 分 42 秒，187 个栈；bwrap 318 过、18 跳过，33 分 7 秒，186 个栈。对 a9fb46a 的两份复审（对抗性审查、安全审查）都没有中等及以上的发现。这一轮修几条便宜的低：
+
+- **R3-1，照 site.py 读 pyvenv.cfg**（`Lib/site.py` 的 `venv()`）：
+  - `bin/pyvenv.cfg` 是文件就读它，否则读 `pyvenv.cfg`；`system_site` 起始为 "true"。
+  - 每个带 "=" 的行在第一个 "=" 处切开，键 strip 后小写，值 strip；最后一个 include-system-site-packages 算数，再小写；只有 "true" 打开系统的和用户的 site-packages。
+  - 按 UTF-8 读，不去 BOM：site.py 用的是 utf-8，不是 utf-8-sig，BOM 成了第一个键的一部分。按 universal newlines 分行（`\r`、`\n`、`\r\n`）。
+  - strip 和 lower 照 Python 的做：Python 的 `str.strip` 比 Go 的 `TrimSpace` 多去 U+001C–U+001F；Python 把 U+0130 小写成两个字符 "i̇"，Go 是 "i"。我用 Python 和 Go 把整个 Unicode 对过一遍，差别只有这两处（开尔文符号 U+212A 两边都小写成 "k"）。
+  - 生效的值是 "true" 就拒绝，键缺了或拼错了也算；完全没有 pyvenv.cfg 也拒绝：不是虚拟环境，用户的 site-packages 是开着的。Go 测试里只写 `home = ...` 的 fixture 改了。
+- **R3-2，查 site.py 读的东西，不看路径的样子**：
+  - 拒绝 site-packages 里是链接的 `*.pth`，指向树里树外都拒绝：Python 会把它指向的文件当 .pth 读，那个文件没被当 .pth 查过。
+  - 拒绝 `lib*`、`lib*/*`、`lib*/*/site-packages` 是指出环境的链接：那样整个环境都是活的。
+  - 拒绝 site-packages 里的 sitecustomize 和 usercustomize，不管是 .py、包目录还是扩展模块，按名字第一个点之前的部分判断。
+  - `python/lib*/*/site-packages` 下的每个 `*.pth` 都查：lib64 作为独立目录的、PyPy 的 `lib/pypy3.X` 都算。
+- **R3-3，允许名单**：加了 setuptools 60 之前的 distutils-precedence 那一行（默认值是 'stdlib'）。`*-nspkg.pth` 单独一条拒绝信息：这是旧 wheel 里 setuptools 给命名空间包写的 .pth，建议从新一点的 wheel 重装，或者删掉它，不给 editable 安装的建议。
+- **R3-4，改坏 M18**：`codesnap.Options` 在 `snapOptions` 里构造，`TestSnapOptions` 查它。`Visible: nil` 现在 Go 测试就抓得到，不只靠黑盒测试。
+- **R3-5，`TestAStopDuringACheckStartsNothing` 不再 flaky**：原来要在 "not serving" 那行日志之后 300 毫秒的 StopGrace 之内调 Stop，负载高的机器赶不上。现在 terminate 开头有个测试钩子 `terminating`（生产代码里是 nil），在停止开始时调 Stop，等它关掉 stop 通道再往下走。四个 CPU 打满时连跑 10 次都过。
+- **L-a，/lib64**：只在 `/usr/lib64` 存在时才把 `/lib64` 算进去，和启动脚本一样（`bwrapShown`，测试时用自己的 root）。
+- **R3-6 查过，不适用**：这是协调者查的。darwin 上 Go 1.26 的 `user.Current` 在 CGO_ENABLED=0 时也读用户数据库；把 HOME 设到别处，两种构建打印的都是 /Users/joechen。
+
+#### 我定的几处
+
+- `pyvenv.cfg`（两个位置任一个）是链接就拒绝：site.py 会跟着链接读，读到的东西副本钉不住。这比 site.py 严，出错时是关着的。
+- `.pth` 的行也照 Python 的空白定义 strip（空行判断、import 行的行尾、路径行的 rstrip），和 pyvenv.cfg 一致。
+- sitecustomize 按模块名判断，不只看 `sitecustomize.py`：包目录、扩展模块（`sitecustomize.cpython-312-darwin.so`）一样会被 `import sitecustomize` 导入。
+
+#### 剩余风险（新增）
+
+- L-b：`.pth` 写着私有路径里面的目录时，整个启动被拒绝，而不是去掉那一行。这样出错时是关着的，保留。
+
+#### 改坏检查
+
+- Go 23 处，都抓到：
+  - pyvenv.cfg 10 处：先读 `pyvenv.cfg`；缺键当成关；没有 pyvenv.cfg 照收；第一个算数；用 Go 的 TrimSpace；去 BOM；用 Go 的 ToLower；只按 `\n` 分行；链接当没有；不是 UTF-8 照收。
+  - site.py 读的东西 6 处：.pth 链接照收；sitecustomize 照收；只认 `sitecustomize.py`；lib 的链接出去照收；只把 site-packages 当根；只查 `lib/python*` 下的 .pth。
+  - 允许名单 2 处：拒绝旧的 setuptools 行；nspkg 给 editable 的建议。
+  - agentd 2 处：Visible 为 nil；没有私有路径。
+  - /lib64 2 处：总是算；从不算。
+  - 去掉 flaky 以后，那个测试钉的改坏（Stop 时的记录带 `restart_in_ms`）照样抓到。
+
+#### 跑过的
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build`、`make build-linux` 都通过。改到的三个包（codesnap、supervisor、cmd/agentd）的测试交叉编译后在 VM 里跑，也都过。
+- macOS，`--verify-after-each`，两种环境同时跑：`test_worker_supervision.py`、T1 的两个文件、T12。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（agentd 照设计不启动） | 用时 |
+  |---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 55 | 3 | 55 | 48 | 0 | 7 | 13 分 50 秒 |
+  | macOS，srt | 58 | 0 | 56 | 48 | 0 | 8 | 14 分 55 秒 |
+
+  跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+- Linux VM（bwrap，`~/agentos-venv-m5`）：钉住代码的测试和拒绝启动的那组，带 `--verify-after-each`：6 过；6 个栈，1 个 verify 以 0 退出，0 个失败，5 个照设计拒绝启动没验。
+
+### 最后的复审和协调者的运行（e3fce88）
+
+- **两份增量复审**都没有中等及以上的发现。
+  - 安全审查确认两点：这一轮没有放宽 Worker 能读的东西，也没有削弱上一轮的检查；`terminating` 钩子不导出、不在 Options 里，生产代码里一直是 nil。
+  - 对抗性审查确认 R3-1 到 R3-5 都关上了，去掉 flaky 的那个测试仍然是真的测试。它改坏 15 处，抓到 14 处，没抓到的那处是把钩子本身去掉，而钩子只是让测试不再抖。
+- **对抗性审查又找到两条低**，协调者定为不修，记进剩余风险：
+  - R4-1：`.pth` 指向的目录里（code 副本的子目录，或 `python/pinned/N`）有 sitecustomize/usercustomize 时，它照样被拷进副本，每次启动都会被导入。它本身是钉住的（拷了，也算进了根），但和副本里任何一个模块一样，运行时可以自己去碰没钉住的路径。
+  - R4-2：import 根的链接按字面路径判断在不在树里。两跳的链（`python/lib -> sub`，`python/sub -> /outside/lib`）能让副本的 `lib` 指到树外，整个 lib 树就又是活的。要特意摆出这样的布局才会发生。
+  - 不修的理由：
+    - 两条都要特意摆出来的布局，标准的安装工具做不出来；
+    - 读什么仍由沙箱判断，所以都不放宽 Worker 能读的东西，只是代码钉不住；
+    - 它们和“副本里的代码运行时自己伸出去”是同一类剩余风险。
+  - 每一轮复审都还能再找出一两条更偏的低，到这里收住。
+- **协调者在 e3fce88 上的运行**：三种环境各跑一遍所有用 agentd 自己的 Worker 的测试，带 `--verify-after-each`。这些测试是 `test_worker_supervision.py`、T1 的两个文件、T9、`test_agentd_restart.py`、T12、`test_harness.py` 和 `test_sandbox.py`。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（照设计不启动） | 用时 |
+  |---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 61 | 28 | 60 | 53 | 0 | 7 | 14 分 12 秒 |
+  | macOS，srt | 86 | 3 | 67 | 59 | 0 | 8 | 16 分 13 秒 |
+  | Linux VM，bwrap | 74 | 15 | 66 | 58 | 0 | 8 | 12 分 37 秒 |
+
+  - 跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+  - 完整套件在 a9fb46a 上跑过（见第三轮开头）；e3fce88 之后的完整套件交给 CI。

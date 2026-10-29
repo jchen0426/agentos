@@ -137,7 +137,8 @@ node -e '
   }
   // The shared temporary directories hold the state of every launch, this one included:
   // allowRead wins for what is inside, so the Worker reads its own private directory there and
-  // nothing else.
+  // nothing else. agentd mirrors denied and both (the deny list aside) in workerVisible
+  // (cmd/agentd/worker.go), to copy only what the Worker can read: change them together.
   const denied = ["/private/tmp", "/private/var/tmp", "/private/var/folders", ...homes,
     ...homes.map(h => path.join(h, ".agentos")), ...listed];
   const both = paths => [...new Set(paths.flatMap(p => [p, real(p)]))];

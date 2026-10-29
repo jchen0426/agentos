@@ -18,6 +18,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mwitkow/grpc-proxy/proxy"
@@ -68,6 +69,7 @@ type Server struct {
 	forward  *semaphore.Weighted // bytes of requests Temporal has not answered yet
 	takes    chan struct{}       // a place per response being taken from Temporal
 	refusals refusalLog
+	tally    atomic.Pointer[Tally] // what connections accepted from now on count into (NewTally)
 }
 
 // NewServer returns a proxy that forwards permitted calls to backend, within DefaultLimits.
@@ -114,6 +116,7 @@ func (s *Server) Stop() { s.srv.Stop() }
 type call struct {
 	c        *conn
 	answered func() // gives back the request's share of Limits.ForwardBytes
+	poll     bool   // a poll for a workflow task, whose response may hand one out (Tally)
 }
 
 type callKey struct{}
@@ -183,6 +186,9 @@ func (s *Server) checkRequest(srv any, ss grpc.ServerStream, info *grpc.StreamSe
 		return err
 	}
 	raw := first.ProtoReflect().GetUnknown()
+	if answers[method] { // the Worker answered, whatever agentd makes of the answer
+		c.tally.answered()
+	}
 	if !largeRequests[method] && len(raw) > s.limits.MaxShortRequest {
 		err := tooLarge(fmt.Sprintf("%d vs. %d", len(raw), s.limits.MaxShortRequest))
 		refused(method+" size", errors.New(status.Convert(err).Message()))
@@ -212,7 +218,11 @@ func (s *Server) checkRequest(srv any, ss grpc.ServerStream, info *grpc.StreamSe
 	var answeredOnce sync.Once
 	answered := func() { answeredOnce.Do(func() { s.forward.Release(share) }) }
 	defer answered()
-	cl := &call{c: c, answered: answered}
+	if method == pollMethod {
+		c.tally.pollStarted()
+		defer c.tally.pollEnded()
+	}
+	cl := &call{c: c, answered: answered, poll: method == pollMethod}
 	return handler(srv, &serverStream{ServerStream: ss, ctx: context.WithValue(ctx, callKey{}, cl),
 		first: first, c: c, slow: s.limits.SlowWorker, done: done})
 }
@@ -311,6 +321,9 @@ func (b *backendStream) RecvMsg(m any) error {
 	}
 	if err := b.ClientStream.RecvMsg(m); err != nil {
 		return err
+	}
+	if e, ok := m.(*emptypb.Empty); ok && b.call.poll && handsOut(e.ProtoReflect().GetUnknown()) {
+		b.call.c.tally.handedOut()
 	}
 	b.call.c.queue(responseSize(m))
 	return nil
