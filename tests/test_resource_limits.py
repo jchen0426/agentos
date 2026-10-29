@@ -306,7 +306,7 @@ def test_a_launcher_that_does_not_source_limits_sh_is_refused(stack: Stack, laun
                r"[0-9a-f]{16}-" + launcher + r"-1\.scope: its launcher does not source sandbox/linux/limits\.sh, or a wrapper runs the "
                r"launcher without exec")
     if launcher == "worker":
-        assert re.search("the Worker's launcher did not run it in its systemd user scope, which holds its limits, and agentd stopped it: "
+        assert re.search("the Worker's launcher did not run it in a systemd user scope that holds its limits, and agentd stopped it: "
                          + outside, stopped["error"]), stopped
     else:  # the self-check's: a call whose server failed, the log says why
         assert stopped["error"].startswith("the git tool server does not work: the git tool server failed on"), stopped

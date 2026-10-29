@@ -1651,7 +1651,7 @@ func TestAWorkerOutsideItsScope(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("the supervisor did not fail")
 			}
-			if !strings.Contains(err.Error(), "the Worker's launcher did not run it in its systemd user scope, which holds its limits, "+
+			if !strings.Contains(err.Error(), "the Worker's launcher did not run it in a systemd user scope that holds its limits, "+
 				"and agentd stopped it") || !strings.Contains(err.Error(), fmt.Sprintf("not in its scope agentos-test-worker-%d.scope", outside)) {
 				t.Errorf("%v", err)
 			}
@@ -1703,7 +1703,7 @@ func TestAWorkerThatExitsAsItSaysItIsReady(t *testing.T) {
 	if ev, _ := r.all(); len(ev) != 1 || ev[0].Payload.(map[string]any)["generation"] != 1 {
 		t.Errorf("records %v", ev)
 	}
-	if out := logged.entries("the Worker's launcher did not run it in its systemd user scope, which holds its limits: agentd " +
+	if out := logged.entries("the Worker's launcher did not run it in a systemd user scope that holds its limits: agentd " +
 		"stopped it, and starts no other"); len(out) != 0 {
 		t.Errorf("logged %v", out)
 	}

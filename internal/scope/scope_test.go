@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -359,6 +361,35 @@ func TestInScope(t *testing.T) {
 		err := withProc(New("/run/user/501", nil, nil), c.files).On("worker", workerLimits).InScope(42, unit)
 		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {
 			t.Errorf("%s: %v, want %q", name, err, c.refusal)
+		}
+	}
+	// " (deleted)" is the kernel's mark only where no cgroup has that path: a cgroup so named, which a
+	// launcher with a delegated subtree can make and move into, is that cgroup, not the scope.
+	named := map[string]string{"/proc/42/cgroup": "0::" + path + " (deleted)\n", dir + " (deleted)/cgroup.procs": "42\n"}
+	if err := withProc(New("/run/user/501", nil, nil), named).On("worker", workerLimits).InScope(42, unit); err == nil ||
+		!strings.Contains(err.Error(), "is in the cgroup "+path+" (deleted), not in its scope "+unit+": its launcher does not source") {
+		t.Errorf("a cgroup named as the kernel marks a removed one: %v", err)
+	}
+	// kernfs answers ENODEV to an open or a read that races a cgroup's removal: gone, as ENOENT is.
+	for name, c := range map[string]struct {
+		files map[string]string
+		errs  map[string]error
+	}{
+		"cgroup.procs ENODEV":                 {with("0::"+path+"\n", nil), map[string]error{dir + "/cgroup.procs": syscall.ENODEV}},
+		"a limit ENODEV, cgroup.procs ENOENT": {with("0::"+path+"\n", held, "cgroup.procs", ""), map[string]error{dir + "/memory.swap.max": syscall.ENODEV}},
+		"the mark, its path ENODEV": {with("0::"+path+" (deleted)\n", nil),
+			map[string]error{dir + " (deleted)/cgroup.procs": syscall.ENODEV}},
+	} {
+		s := withProc(New("/run/user/501", nil, nil), c.files)
+		read := s.readFile
+		s.readFile = func(path string) ([]byte, error) {
+			if err, ok := c.errs[path]; ok {
+				return nil, &fs.PathError{Op: "read", Path: path, Err: err}
+			}
+			return read(path)
+		}
+		if err := s.On("worker", workerLimits).InScope(42, unit); err != nil {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 	// A scope that ends while its limits are read: its directory goes, files and all, after the first.

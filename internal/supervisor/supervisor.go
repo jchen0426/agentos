@@ -364,9 +364,9 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 				}
 				s.terminate(g)
 				s.cleanup(g)
-				s.log.Error("the Worker's launcher did not run it in its systemd user scope, which holds its limits: agentd "+
+				s.log.Error("the Worker's launcher did not run it in a systemd user scope that holds its limits: agentd "+
 					"stopped it, and starts no other", "generation", g.n, "pid", g.pid, "error", err)
-				s.failed <- fmt.Errorf("the Worker's launcher did not run it in its systemd user scope, which holds its limits, and "+
+				s.failed <- fmt.Errorf("the Worker's launcher did not run it in a systemd user scope that holds its limits, and "+
 					"agentd stopped it: %w", err)
 				return true
 			}

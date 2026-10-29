@@ -226,8 +226,9 @@ func (t *Set) OOMKilled(unit string) (bool, error) {
 // runs its sandbox in no scope and with no limits, while agentd.started says they hold; one that makes
 // a scope of that name with other limits holds those. A scope that has ended holds nothing any more,
 // and is no error: its directory is gone (a cgroup with a live process in it cannot be removed), and
-// a process of it not reaped yet reads "<path> (deleted)". nil when the limits are off, or the run has
-// no scope.
+// a process of it not reaped yet reads "<path> (deleted)". That mark is the kernel's only where no
+// cgroup has that path: a launcher with a delegated subtree can make a cgroup so named, and move into
+// it. nil when the limits are off, or the run has no scope.
 func (t *Set) InScope(pid int, unit string) error {
 	if t.scopes == nil || unit == "" {
 		return nil
@@ -240,7 +241,9 @@ func (t *Set) InScope(pid int, unit string) error {
 	if err != nil {
 		return fmt.Errorf("the process agentd started for the %s (pid %d): %w", t.kind, pid, err)
 	}
-	cgroup = strings.TrimSuffix(cgroup, " (deleted)")
+	if ended, ok := strings.CutSuffix(cgroup, " (deleted)"); ok && t.gone("/sys/fs/cgroup"+cgroup) {
+		cgroup = ended
+	}
 	if !strings.HasSuffix(cgroup, "/"+unit) {
 		return fmt.Errorf("the process agentd started for the %s (pid %d) is in the cgroup %s, not in its scope %s: its launcher "+
 			"does not source sandbox/linux/limits.sh, or a wrapper runs the launcher without exec", t.kind, pid, cgroup, unit)
@@ -253,10 +256,18 @@ func (t *Set) InScope(pid int, unit string) error {
 		}
 	}
 	// After its limits: a directory gone by now has ended, meanwhile perhaps, and lacks no limit.
-	if _, err := t.scopes.readFile(dir + "/cgroup.procs"); errors.Is(err, fs.ErrNotExist) {
+	if t.gone(dir) {
 		return nil
 	}
 	return t.held("the scope "+unit, got)
+}
+
+// gone reports whether the cgroup whose directory is dir has been removed, by its cgroup.procs: a read
+// that finds no such file, or one that kernfs answers ENODEV, as it does an open or a read racing the
+// removal (kernfs_get_active fails), which errors.Is(err, fs.ErrNotExist) does not count.
+func (t *Set) gone(dir string) bool {
+	_, err := t.scopes.readFile(dir + "/cgroup.procs")
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENODEV)
 }
 
 // unified is a process's cgroup on cgroup v2, from the lines of its /proc/<pid>/cgroup: the path of its
