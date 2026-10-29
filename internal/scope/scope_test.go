@@ -204,7 +204,7 @@ func TestProbe(t *testing.T) {
 		}, is: ErrNoManager, message: []string{"Failed to connect to bus: Connection refused", "loginctl enable-linger"}},
 		"a scope it cannot start": {dir: dir, probe: func(string, []string) (string, error) {
 			return "", errors.New("systemd-run: exit status 1: Failed to start transient scope unit: Access denied")
-		}, message: []string{"could not start a systemd user scope", "Access denied"}},
+		}, message: []string{"could not start a systemd user scope", "systemd 253 or later", "Access denied"}},
 		"no memory controller": {dir: dir, probe: report(good, "memory.max missing", "memory.swap.max missing", "pids.max 512"), is: ErrNotHeld,
 			message: []string{"has no memory.max", "delegated", "cgroup.controllers", "--insecure-dev"}},
 		"no swap limit": {dir: dir, probe: report(good, "memory.max 1073741824", "memory.swap.max missing", "pids.max 512"), is: ErrNotHeld,

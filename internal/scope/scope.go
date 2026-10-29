@@ -235,7 +235,8 @@ func (s *Scopes) Probe(ctx context.Context, sets ...*Set) error {
 		case err != nil && strings.Contains(err.Error(), "Failed to connect to bus"):
 			return s.noManager(err.Error())
 		case err != nil:
-			return fmt.Errorf("agentd could not start a systemd user scope to check that it holds the %s limits: %w", t.kind, err)
+			return fmt.Errorf("agentd could not start a systemd user scope to check that it holds the %s limits (it needs "+
+				"systemd 253 or later, for OOMPolicy= on a scope): %w", t.kind, err)
 		}
 		if err := t.heldIn(unit, out); err != nil {
 			return fmt.Errorf("%w: %w; systemd delegates the memory and pids controllers to user@<uid>.service by default "+

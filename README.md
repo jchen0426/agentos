@@ -57,9 +57,9 @@ Go 1.26, Python 3.12 with [uv](https://docs.astral.sh/uv/), the Temporal CLI
 (`brew install temporal`), git 2.41 or later (the git tool server reads attributes from the
 empty tree, `GIT_ATTR_SOURCE`). For the macOS sandbox: Node 22 (`npm ci` in
 `sandbox/macos`). For the Linux sandbox: bubblewrap 0.8 or later and socat, or the Lima VM
-(`brew install lima`, then `make vm`); and for its resource limits a systemd user manager, on cgroup
-v2, with the memory and pids controllers delegated to it, as systemd does by default (see "Resource
-limits" below). A login session starts one; to keep one without a session, `sudo loginctl
+(`brew install lima`, then `make vm`); and for its resource limits a systemd user manager, systemd
+253 or later (Ubuntu 24.04 has 255), on cgroup v2, with the memory and pids controllers delegated to
+it, as systemd does by default (see "Resource limits" below). A login session starts one; to keep one without a session, `sudo loginctl
 enable-linger <user>`. Mirrors must belong to the user agentd runs as: git
 runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
 mirror that holds its data directory, either socket's directory, the Temporal client certificate
