@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import SANDBOX, TERMINAL, TOOL_LAUNCHER, Stack, descendants, command_of, wait_for
+from tests.harness import SANDBOX, TERMINAL, TOOL_LAUNCHER, WORKER_LAUNCHER, Stack, command_of, descendants, wait_for
 from tests.limits_workflows import MARK
 from tests.test_t12_explain import end_event, points, record_seq, report_agrees
 
@@ -131,9 +131,9 @@ def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> 
 
 
 def test_a_worker_over_its_memory_limit_is_killed_recorded_and_started_again(stack: Stack) -> None:
-    """A Worker that holds more than its memory limit: the kernel kills it, systemd stops its scope, and
-    agentd, told so by systemd, logs it with the limit, records it (oom_kill) and starts the next
-    generation, which carries the run on to its end. The failed scope is cleared."""
+    """A Worker that holds more than its memory limit: the kernel's out-of-memory killer kills it, systemd
+    stops its scope, and agentd, told so by systemd, logs it with the limit, records it (oom_kill) and
+    starts the next generation, which carries the run on to its end. The failed scope is cleared."""
     stack.start_agentd(worker=True, workflows=WORKFLOWS, extra=limited(stack, WORKFLOWS, worker={"memory": "192MiB"}))
     w = stack.worker()
     pid = w.wait_ready(1)
@@ -144,7 +144,7 @@ def test_a_worker_over_its_memory_limit_is_killed_recorded_and_started_again(sta
     wait_for(lambda: exit_records(stack), "the Worker's exit's record", timeout=90)
     [record] = exit_records(stack)
     assert record["generation"] == 1 and record["oom_kill"] is True and record["ready"] is True, record
-    [over] = w.log("the Worker went over its memory limit, and the kernel killed it")
+    [over] = w.log("the kernel's out-of-memory killer killed the Worker")
     assert over["generation"] == 1 and over["memory_limit"] == "192MiB" and over["scope"] == f"agentos-{token}-worker-1.scope", over
     [exited] = w.log("worker exited")
     assert exited["oom_kill"] is True and exited["restart_in"] == "1s", exited
@@ -203,18 +203,21 @@ def costly_commit(mirror: Path) -> str:
     return new
 
 
-def test_a_git_tool_call_over_its_memory_limit_is_refused_once(stack: Stack) -> None:
-    """A commit too large to diff within the git tool calls' memory limit: the kernel kills git, systemd
-    the rest of the call's scope; agentd, told so by systemd, refuses the call for good, naming the
-    limit, as it does one past the CPU time limit: one attempt, a tool's error (no error_cause, which
-    would say the server failed), which runs explain and the report quote. The failed scope is cleared.
-    agentd's own calls at start fit within the limit."""
+def test_a_git_tool_call_killed_for_memory_twice_is_refused_in_one_attempt(stack: Stack) -> None:
+    """A commit too large to diff within the git tool calls' memory limit: the kernel's out-of-memory
+    killer kills git, and systemd the rest of the call's scope. systemd does not say whether the call
+    went over its own limit or memory ran out higher up, so agentd runs the call once more, in a new
+    scope, which is killed too; then it refuses the call for good, as it does one past the CPU time
+    limit, saying both: one gateway attempt, a tool's error (no error_cause, which would say the server
+    failed), which runs explain and the report quote. The failed scopes are cleared. agentd's own calls
+    at start fit within the limit."""
     stack.start_agentd(extra={"git_tools": {"sandbox": [str(TOOL_LAUNCHER[SANDBOX])], "limits": {"memory": "64MiB"}}})
     stack.start_worker()
     stack.commit = costly_commit(stack.tmp / "mirror")
     run = stack.start_run()
     assert stack.wait_state(run, TERMINAL, timeout=120)["state"] == "SUCCEEDED"  # reported, as every end path is
-    refusal = "tool git.show_diff: the commit is too large for the git tool server to read within its memory limit of 64MiB"
+    refusal = ("tool git.show_diff: the kernel's out-of-memory killer killed the git tool server in both attempts at the call, "
+               "under a memory limit of 64MiB: the commit is too large to read within it, or the host ran out of memory")
     calls = [json.loads(r["payload"]) for r in stack.ledger("SELECT payload FROM audit_log WHERE workflow_id = ? AND type = 'call'",
                                                              run["run_id"])]
     diffs = [c for c in calls if c["name"] == "git.show_diff"]
@@ -222,15 +225,19 @@ def test_a_git_tool_call_over_its_memory_limit_is_refused_once(stack: Stack) -> 
     [diff] = diffs
     assert (diff["attempt"], diff["status"], diff["error_type"]) == (1, "error", "ToolFailed"), diff
     assert diff["error"] == refusal + " (type: ToolFailed, retryable: false)" and "error_cause" not in diff, diff
-    [killed] = [e for e in stack.agentd_log() if e.get("msg") == "the git tool call went over its memory limit, and the kernel killed it: refused"]
-    assert killed["tool"] == "show_diff" and killed["memory_limit"] == "64MiB", killed
-    token = re.fullmatch(r"agentos-([0-9a-f]{16})-tool-\d+\.scope", killed["scope"]).group(1)
-    assert failed_units(token) == []
+    killed = [e for e in stack.agentd_log() if e.get("msg") == "the kernel's out-of-memory killer killed the git tool server"
+              and e.get("tool") == "show_diff"]
+    assert len(killed) == 2 and all(k["memory_limit"] == "64MiB" for k in killed), killed
+    first, second = (re.fullmatch(r"agentos-([0-9a-f]{16})-tool-(\d+)\.scope", k["scope"]).groups() for k in killed)
+    assert first[0] == second[0] and int(second[1]) == int(first[1]) + 1, killed  # two scopes, one after the other
+    assert any(e.get("msg", "").startswith("the git tool call runs once more, in a new scope") for e in stack.agentd_log())
+    assert failed_units(first[0]) == []
     e = stack.explain(run)
     points(e, "step_failed", "tool_error", "fetch_diff", "1:git.show_diff", 1,
            seq=record_seq(stack, run, "1:git.show_diff", 1, "error"), event=end_event(stack, run, "1:git.show_diff"),
-           says=("memory limit of 64MiB",))
-    assert "within its memory limit of 64MiB" in report_agrees(stack, run, e)
+           says=("out-of-memory killer killed the git tool server in both attempts", "memory limit of 64MiB",
+                 "or the host ran out of memory"))
+    assert "in both attempts at the call, under a memory limit of 64MiB" in report_agrees(stack, run, e)
 
 
 # A systemd-run in front of the real one that starts the launcher's scope otherwise than it asked, as a
@@ -239,7 +246,8 @@ def test_a_git_tool_call_over_its_memory_limit_is_refused_once(stack: Stack) -> 
 SCOPES_OTHERWISE = {
     "another unit": ("s/^--unit=\\(.*\\)\\.scope$/--unit=\\1-other.scope/", "not in its scope"),
     "more memory": ("s/^--property=MemoryMax=.*/--property=MemoryMax=134217728/", "its scope's memory.max is 134217728, not 67108864"),
-    "swap": ("s/^--property=MemorySwapMax=0$/--property=MemorySwapMax=infinity/", "its scope's memory.swap.max is max, not 0"),
+    "swap": ("s/^--property=MemorySwapMax=0$/--property=MemorySwapMax=infinity/",
+             "its scope's memory.swap.max is max, not 0: systemd could not set it"),
     "more tasks": ("s/^--property=TasksMax=.*/--property=TasksMax=64/", "its scope's pids.max is 64, not 32"),
     "as asked": ("", ""),
 }
@@ -265,6 +273,66 @@ def test_the_launchers_check_their_scope(tmp_path: Path, scope: str) -> None:
         assert (r.returncode, r.stdout) == (0, "inside\n"), r.stderr
     else:
         assert r.returncode == 1 and "inside" not in r.stdout and refusal in r.stderr, (r.stdout, r.stderr)
+
+
+def unscoped(original: Path, copy: Path) -> Path:
+    """copy: original without the line that sources limits.sh."""
+    lines = original.read_text().splitlines(keepends=True)
+    kept = [line for line in lines if "limits.sh\"" not in line]
+    assert len(kept) == len(lines) - 1, "the launcher sources limits.sh in one line"
+    copy.write_text("".join(kept))
+    copy.chmod(0o755)
+    return copy
+
+
+@pytest.mark.audit_verify(skip="agentd refuses to start by design: a launcher runs its sandbox in no scope")
+@pytest.mark.parametrize("launcher", ["worker", "tool"])
+def test_a_launcher_that_does_not_source_limits_sh_is_refused(stack: Stack, launcher: str) -> None:
+    """A launcher that does not source limits.sh (an older copy of run-*.sh, one of its own) runs the
+    sandbox in no scope, with no limits: agentd finds its launcher outside the run's scope once the
+    Worker says it is ready, or a tool call's server answers (its self-check at start), and refuses to
+    start, saying why."""
+    original = {"worker": WORKER_LAUNCHER, "tool": TOOL_LAUNCHER}[launcher][SANDBOX]
+    copy = unscoped(original, stack.tmp / original.name)
+    extra = limited(stack)
+    extra["worker" if launcher == "worker" else "git_tools"]["sandbox"] = [str(copy)]
+    with pytest.raises(AssertionError):
+        stack.start_agentd(worker=True, extra=extra)
+    assert stack.agentd is not None and stack.agentd.popen.wait(timeout=60) == 1
+    log = stack.agentd_log()
+    [stopped] = [e for e in log if e.get("msg") == "agentd stopped"]
+    assert not any(e.get("msg") == "agentd ready" for e in log), log
+    outside = r"is in the cgroup /\S+, not in its scope agentos-[0-9a-f]{16}-" + launcher + r"-1\.scope: a launcher that does not source sandbox/linux/limits\.sh"
+    if launcher == "worker":
+        assert re.search("the Worker's launcher did not run it in its systemd user scope, which holds its limits, and agentd stopped it: "
+                         "the worker's launcher \\(pid \\d+\\) " + outside, stopped["error"]), stopped
+    else:  # the self-check's: a call whose server failed, the log says why
+        assert stopped["error"].startswith("the git tool server does not work: the git tool server failed on"), stopped
+        assert any(e.get("msg") == "the git tool server failed" and re.search(outside, e.get("error", "")) for e in log), log
+
+
+@pytest.mark.audit_verify(skip="agentd stops by design: its Worker's launcher runs it in no scope")
+def test_a_later_worker_out_of_its_scope_stops_agentd(stack: Stack) -> None:
+    """The Worker's launcher that runs the first generation in its scope, and the next in none (a launcher
+    changed under a running agentd): agentd, ready by then, stops that generation once it says it is
+    ready, starts no other, and stops, saying why."""
+    copy = unscoped(WORKER_LAUNCHER[SANDBOX], stack.tmp / "run-worker-unscoped.sh")
+    marker = stack.tmp / "first-launched"
+    wrapper = stack.tmp / "run-worker.sh"
+    wrapper.write_text(f"#!/bin/sh\nif [ -e {shlex.quote(str(marker))} ]; then exec {shlex.quote(str(copy))} \"$@\"; fi\n"
+                       f"touch {shlex.quote(str(marker))}\nexec {shlex.quote(str(WORKER_LAUNCHER[SANDBOX]))} \"$@\"\n")
+    wrapper.chmod(0o755)
+    extra = limited(stack)
+    extra["worker"]["sandbox"] = [str(wrapper)]
+    stack.start_agentd(worker=True, extra=extra)
+    w = stack.worker()
+    os.kill(w.wait_ready(1), signal.SIGKILL)
+    assert stack.agentd is not None and stack.agentd.popen.wait(timeout=90) == 1
+    log = stack.agentd_log()
+    [stopped] = [e for e in log if e.get("msg") == "agentd stopped"]
+    assert re.search(r"agentd stopped it: the worker's launcher \(pid \d+\) is in the cgroup /\S+, not in its scope "
+                     r"agentos-[0-9a-f]{16}-worker-2\.scope", stopped["error"]), stopped
+    assert len(w.log("worker started")) == 2 and len(w.log("worker ready")) == 1, w.log()
 
 
 @pytest.mark.audit_verify(skip="agentd refuses to start by design: there is no user manager")
@@ -295,7 +363,7 @@ def test_insecure_dev_turns_the_limits_off(stack: Stack, monkeypatch: pytest.Mon
     assert warned["level"] == "WARN", warned
     started = last_start(stack)
     assert started["insecure_dev"] is True, started
-    assert started["worker"]["limits"]["enforcement"] == "off" and started["git_tools_limits"]["enforcement"] == "off", started
+    assert started["worker"]["limits"] == {"enforcement": "off"} and started["git_tools_limits"] == {"enforcement": "off"}, started
     w = stack.worker()
     pid = w.wait_ready(1)
     assert "agentos-" not in cgroup_of(pid), cgroup_of(pid)

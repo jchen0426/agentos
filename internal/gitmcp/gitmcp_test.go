@@ -1084,8 +1084,9 @@ func TestTheServerRunsInASessionOfItsOwn(t *testing.T) {
 
 // fakeServer serves every tool on stdio with one answer: "many values" (an answer of
 // hundreds of thousands of tiny values, under the reply limit), "long refusal" (a refusal
-// that names the mirror and runs on), or "failure" (a protocol error). It says something on
-// stderr first, as git would.
+// that names the mirror and runs on), "answer" (an empty list of files, and an exit as it should
+// be), "answer, exit 3" (that answer, and then exit status 3), or "failure" (a protocol error).
+// It says something on stderr first, as git would.
 func fakeServer(answer string) {
 	mirror := ""
 	for i, a := range os.Args {
@@ -1102,12 +1103,17 @@ func fakeServer(answer string) {
 				return result("x"), map[string]any{"files": make([]any, 300_000)}, nil
 			case "long refusal":
 				return nil, nil, errors.New("in " + mirror + ": " + strings.Repeat("x", 100_000))
+			case "answer", "answer, exit 3":
+				return result("none"), map[string]any{"files": []any{}}, nil
 			}
 			return nil, nil, unavailable(errors.New("it broke"))
 		})
 	}
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+	}
+	if answer == "answer, exit 3" {
+		os.Exit(3)
 	}
 }
 
@@ -1176,12 +1182,15 @@ func TestCallAgainstALyingServer(t *testing.T) {
 }
 
 // limits are a call's resource limits as a test sets them: each call's scope is named after its
-// number, and the kernel killed every call's server if killed says so (OOMKilled answers err, if set).
+// number; the kernel's out-of-memory killer killed the calls killed names (by number), and OOMKilled
+// answers err for every call, if set; the launcher is not in its scope if outside says so.
 type limits struct {
-	mu     sync.Mutex
-	killed bool
-	err    error
-	asked  []string // the scopes OOMKilled was asked about
+	mu      sync.Mutex
+	killed  map[int64]bool
+	err     error
+	outside bool
+	asked   []string // the scopes OOMKilled was asked about
+	checked []string // the scopes InScope was asked about
 }
 
 func (l *limits) Env(n int64) (string, []string) {
@@ -1189,84 +1198,156 @@ func (l *limits) Env(n int64) (string, []string) {
 	return unit, []string{"AGENTOS_LIMIT_UNIT=" + unit, "AGENTOS_LIMIT_MEMORY=67108864"}
 }
 
+func (l *limits) InScope(pid int, unit string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.checked = append(l.checked, unit)
+	if l.outside {
+		return fmt.Errorf("the tool's launcher (pid %d) is in the cgroup /elsewhere, not in its scope %s", pid, unit)
+	}
+	return nil
+}
+
 func (l *limits) OOMKilled(unit string) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.asked = append(l.asked, unit)
-	return l.killed && l.err == nil, l.err
+	var n int64
+	fmt.Sscanf(unit, "agentos-test-tool-%d.scope", &n)
+	return l.killed[n] && l.err == nil, l.err
 }
 
 func (l *limits) Memory() string { return "64MiB" }
 
-// On Linux each call runs in a systemd user scope of its own (M5 C3a): its launcher gets the limits,
-// its scope's name among them, a new one for each call, whichever client of the same makes it. A call
-// whose server failed is asked about once the server has exited: one the kernel killed at its memory
-// limit is refused, naming the limit, the same way every time, and logged so; any other failure stays
-// one, to be tried again. A call whose server answered, or refused, is not asked about.
-func TestACallOverItsMemory(t *testing.T) {
+func (l *limits) scopes() ([]string, []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.asked), slices.Clone(l.checked)
+}
+
+// limitedClient is a client whose server is this test binary, answering as answer says (fakeServer),
+// but its first call's as first says, if it says; with limits l. Its launcher writes down each call's
+// scope and memory limit, a line each, to units.
+func limitedClient(t *testing.T, answer, first, units string, l *limits, log *logs) *Client {
+	t.Helper()
 	bin, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	units := filepath.Join(t.TempDir(), "units")
-	client := func(answer string, l *limits, log *logs) *Client { // <answer> <units> <mirror> -- <server> ...
-		launcher := []string{"/bin/sh", "-c", `answer=$1; printf '%s %s\n' "$AGENTOS_LIMIT_UNIT" "$AGENTOS_LIMIT_MEMORY" >>"$2"; shift 4; ` +
-			fakeServerEnv + `=$answer exec "$@"`, "sh", answer, units}
-		c, err := NewClient(Options{Server: bin, Sandbox: launcher, Timeout: 30 * time.Second, Limits: l,
-			Log: slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelInfo}))})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return c
+	// <answer> <first> <units> <mirror> -- <server> ...
+	launcher := []string{"/bin/sh", "-c", `answer=$1; printf '%s %s\n' "$AGENTOS_LIMIT_UNIT" "$AGENTOS_LIMIT_MEMORY" >>"$3"; ` +
+		`case $AGENTOS_LIMIT_UNIT in *-1.scope) [ -n "$2" ] && answer=$2;; esac; shift 5; ` + fakeServerEnv + `=$answer exec "$@"`,
+		"sh", answer, first, units}
+	c, err := NewClient(Options{Server: bin, Sandbox: launcher, Timeout: 30 * time.Second, Limits: l,
+		Log: slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelInfo}))})
+	if err != nil {
+		t.Fatal(err)
 	}
+	return c
+}
+
+// On Linux each call runs in a systemd user scope of its own (M5 C3a): its launcher gets the limits, its
+// scope's name among them, a new one for each call, whichever client of the same makes it. A call whose
+// server failed is asked about once the server has exited: one the kernel's out-of-memory killer killed
+// is run once more, in a new scope, which systemd does not tell from memory running out higher up;
+// killed again, it is refused, the same way every time, saying both; answered, that answer, logged; failed
+// otherwise, that failure. A call whose server answered, or refused, and whose launcher then exited as it
+// should, is not asked about; one whose launcher exited otherwise is, and its answer stands.
+func TestACallOverItsMemory(t *testing.T) {
 	mirror := t.TempDir()
-	var log logs
-	killed := &limits{killed: true}
-	err = client("failure", killed, &log).Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
-	if !IsToolError(err) || IsServerFailure(err) || err.Error() != "the commit is too large for the git tool server to read within its memory limit of 64MiB" {
-		t.Errorf("a server the kernel killed: %v", err)
-	}
-	if !strings.Contains(log.String(), "the git tool call went over its memory limit, and the kernel killed it: refused") ||
-		!strings.Contains(log.String(), "memory_limit=64MiB") || !strings.Contains(log.String(), "the fake server's own words") {
-		t.Errorf("its log: %s", log.String())
+	units := filepath.Join(t.TempDir(), "units")
+	scopes := func(n ...int) []string {
+		var out []string
+		for _, i := range n {
+			out = append(out, fmt.Sprintf("agentos-test-tool-%d.scope", i))
+		}
+		return out
 	}
 	for name, c := range map[string]struct {
-		answer string
-		l      *limits
-		why    string // in the log
+		answer, first string
+		killed        map[int64]bool
+		err           error
+		asked         []string // the scopes systemd was asked about
+		refused       string   // the call's refusal; "" for none
+		failed, ok    bool     // or the call failed (a ServerFailure); or it answered
+		log           []string // in the log
 	}{
-		"another failure":     {"failure", &limits{}, "it broke"},
-		"systemd cannot tell": {"failure", &limits{killed: true, err: errors.New("systemctl: exit status 1")}, "systemd could not say"},
+		"killed twice": {answer: "failure", killed: map[int64]bool{1: true, 2: true}, asked: scopes(1, 2),
+			refused: "the kernel's out-of-memory killer killed the git tool server in both attempts at the call, under a memory limit " +
+				"of 64MiB: the commit is too large to read within it, or the host ran out of memory",
+			log: []string{"the kernel's out-of-memory killer killed the git tool server", "runs once more, in a new scope",
+				"memory_limit=64MiB", "scope=agentos-test-tool-2.scope", "the fake server's own words"}},
+		"killed, then answered": {answer: "answer", first: "failure", killed: map[int64]bool{1: true}, asked: scopes(1), ok: true,
+			log: []string{"runs once more, in a new scope", "the git tool call's second attempt answered"}},
+		"killed, then failed": {answer: "failure", killed: map[int64]bool{1: true}, asked: scopes(1, 2), failed: true,
+			log: []string{"runs once more, in a new scope", "the git tool server failed"}},
+		"failed": {answer: "failure", asked: scopes(1), failed: true, log: []string{"it broke"}},
+		"systemd cannot tell": {answer: "failure", killed: map[int64]bool{1: true}, err: errors.New("systemctl: exit status 1"),
+			asked: scopes(1), failed: true, log: []string{"could not ask systemd how the git tool call's scope ended", "it broke"}},
+		"answered":                        {answer: "answer", ok: true},
+		"refused":                         {answer: "long refusal", refused: "in <mirror>: xxx"},
+		"answered, then exited otherwise": {answer: "answer, exit 3", asked: scopes(1), ok: true},
+		"answered, then killed": {answer: "answer, exit 3", killed: map[int64]bool{1: true}, asked: scopes(1), ok: true,
+			log: []string{"killed what was left of the git tool call after its server answered: the answer stands"}},
 	} {
 		var log logs
-		err := client(c.answer, c.l, &log).Call(context.Background(), mirror, "resolve_commit", ResolveCommitIn{}, &ResolveCommitOut{})
-		if !IsServerFailure(err) || !strings.Contains(log.String(), c.why) || len(c.l.asked) != 1 {
-			t.Errorf("%s: %v, asked %q; %s", name, err, c.l.asked, log.String())
+		l := &limits{killed: c.killed, err: c.err}
+		_ = os.Remove(units)
+		err := limitedClient(t, c.answer, c.first, units, l, &log).Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{})
+		switch {
+		case c.refused != "" && (!IsToolError(err) || !strings.HasPrefix(err.Error(), c.refused)):
+			t.Errorf("%s: %v, want the refusal %q", name, err, c.refused)
+		case c.failed && !IsServerFailure(err), c.ok && err != nil:
+			t.Errorf("%s: %v", name, err)
+		}
+		if asked, _ := l.scopes(); !slices.Equal(asked, c.asked) {
+			t.Errorf("%s: asked about %q, want %q", name, asked, c.asked)
+		}
+		for _, m := range c.log {
+			if !strings.Contains(log.String(), m) {
+				t.Errorf("%s: the log has no %q: %s", name, m, log.String())
+			}
 		}
 	}
-	// Not asked: its server answered, or refused.
-	answered := &limits{killed: true}
-	c := client("long refusal", answered, &log)
-	if err := c.Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{}); !IsToolError(err) || strings.Contains(err.Error(), "memory") {
-		t.Errorf("a refusal: %v", err)
-	}
-	if err := client("many values", answered, &log).Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{}); err == nil ||
-		IsToolError(err) || IsServerFailure(err) {
-		t.Errorf("an answer it cannot take: %v", err)
-	}
-	if len(answered.asked) != 0 {
-		t.Errorf("asked about %q", answered.asked)
-	}
 	// Each call its own scope, whichever client of the same makes it.
-	_ = c.WithOwnSlots(1).Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
-	_ = c.Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
+	var log logs
+	c := limitedClient(t, "answer", "", units, &limits{}, &log)
+	_ = os.Remove(units)
+	_ = c.Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{})
+	_ = c.WithOwnSlots(1).Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{})
+	_ = c.Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{})
 	b, err := os.ReadFile(units)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if want := []string{"agentos-test-tool-2.scope 67108864", "agentos-test-tool-3.scope 67108864"}; !slices.Equal(lines[len(lines)-2:], want) {
+	if lines, want := strings.Split(strings.TrimSpace(string(b)), "\n"), []string{"agentos-test-tool-1.scope 67108864",
+		"agentos-test-tool-2.scope 67108864", "agentos-test-tool-3.scope 67108864"}; !slices.Equal(lines, want) {
 		t.Errorf("the launchers got %q", lines)
+	}
+}
+
+// Once the server answers the handshake, the client checks that the call's launcher is in its scope: one
+// that does not source limits.sh runs the server with no limits. The call fails then, as a server that
+// fails, and the log says why; agentd's SelfCheck refuses to start on it.
+func TestACallOutsideItsScope(t *testing.T) {
+	var log logs
+	l := &limits{outside: true}
+	err := limitedClient(t, "answer", "", filepath.Join(t.TempDir(), "units"), l, &log).Call(context.Background(), t.TempDir(),
+		"read_files", ReadFilesIn{}, &ReadFilesOut{})
+	if !IsServerFailure(err) {
+		t.Errorf("%v", err)
+	}
+	if !strings.Contains(log.String(), "the git tool server failed") || !strings.Contains(log.String(), "not in its scope agentos-test-tool-1.scope") {
+		t.Errorf("the log: %s", log.String())
+	}
+	if _, checked := l.scopes(); !slices.Equal(checked, []string{"agentos-test-tool-1.scope"}) {
+		t.Errorf("checked %q", checked)
+	}
+	// In its scope, the call goes on.
+	l = &limits{}
+	if err := limitedClient(t, "answer", "", filepath.Join(t.TempDir(), "units"), l, &log).Call(context.Background(), t.TempDir(),
+		"read_files", ReadFilesIn{}, &ReadFilesOut{}); err != nil {
+		t.Errorf("in its scope: %v", err)
 	}
 }
 

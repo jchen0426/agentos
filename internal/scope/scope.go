@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -56,32 +57,52 @@ func Exec(ctx context.Context, env []string, argv ...string) ([]byte, error) {
 }
 
 // RuntimeDir is where agentd finds the user manager: its own XDG_RUNTIME_DIR, an absolute path, else
-// /run/user/<uid>, where systemd-logind makes it.
+// /run/user/<uid>, where systemd-logind makes it. An XDG_RUNTIME_DIR another uid owns is not agentd's
+// (su without a login keeps the caller's): it is passed over for /run/user/<uid>.
 func RuntimeDir() string {
-	if d := os.Getenv("XDG_RUNTIME_DIR"); filepath.IsAbs(d) {
+	d := os.Getenv("XDG_RUNTIME_DIR")
+	if fi, err := os.Stat(d); filepath.IsAbs(d) && (err != nil || ownedByMe(fi)) {
 		return d
 	}
 	return fmt.Sprintf("/run/user/%d", os.Getuid())
+}
+
+// ownedByMe reports whether this process's uid owns the file.
+func ownedByMe(fi fs.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
 }
 
 // Scopes are the scopes of one agentd start. Each is named agentos-<token>-<kind>-<n>.scope, with a
 // token of the start's own: no name is one systemd still keeps from another agentd (a failed scope
 // nobody cleared stays until reset-failed, and systemd refuses a second unit of the same name).
 type Scopes struct {
-	dir   string // XDG_RUNTIME_DIR, which systemctl and systemd-run find the user manager by
-	token string
-	run   Runner
+	dir      string // XDG_RUNTIME_DIR, which systemctl and systemd-run find the user manager by
+	token    string
+	run      Runner
+	readFile func(string) ([]byte, error) // reads /proc's files
 }
 
-// New makes the scopes of an agentd start, whose user manager listens in dir, asked through run.
-func New(dir string, run Runner) *Scopes {
+// New makes the scopes of an agentd start, whose user manager listens in dir, asked through run; read
+// reads /proc's files (the kernel's command line, a launcher's cgroup): os.ReadFile, but in tests.
+func New(dir string, run Runner, read func(string) ([]byte, error)) *Scopes {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b) // never fails (crypto/rand)
-	return &Scopes{dir: dir, token: hex.EncodeToString(b), run: run}
+	return &Scopes{dir: dir, token: hex.EncodeToString(b), run: run, readFile: read}
 }
 
 // Names is the pattern of the names of the start's scopes, for its log.
 func (s *Scopes) Names() string { return "agentos-" + s.token + "-*.scope" }
+
+// ResetFailed clears what systemd keeps of the start's scopes that ended failed, all at once: those
+// OOMKilled had no word of in time. agentd calls it as it stops, once none of them runs. Its error
+// says systemctl failed; a pattern that matches nothing is no error.
+func (s *Scopes) ResetFailed() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := s.run(ctx, s.env(), "systemctl", "--user", "reset-failed", "--", "agentos-"+s.token+"-*")
+	return err
+}
 
 // env is the environment of systemctl and systemd-run: where the user manager listens, and nothing of
 // agentd's own but PATH. Not DBUS_SESSION_BUS_ADDRESS, as the launchers get none: systemd-run falls
@@ -168,7 +189,11 @@ func (t *Set) OOMKilled(unit string) (bool, error) {
 		case "active", "activating", "deactivating", "reloading", "refreshing":
 			select {
 			case <-ctx.Done():
-				// Still running something, or stopping it: the Result may be the kill's already.
+				// Still running something, or stopping it: the Result may be the kill's already. Clear the
+				// scope all the same, should it be failed by now (or not: Scopes.ResetFailed, at the end).
+				reset, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_, _ = s.run(reset, s.env(), "systemctl", "--user", "reset-failed", "--", unit)
 				return p["Result"] == "oom-kill", nil
 			case <-time.After(settleEvery):
 			}
@@ -178,6 +203,73 @@ func (t *Set) OOMKilled(unit string) (bool, error) {
 		}
 		return p["Result"] == "oom-kill", nil
 	}
+}
+
+// InScope checks that process pid, the launcher of one of the set's runs, is in unit, the run's scope,
+// as limits.sh puts it there. A launcher that does not source limits.sh (an older copy of run-*.sh, one
+// of its own, a wrapper that drops AGENTOS_LIMIT_*) runs its sandbox in no scope and with no limits,
+// while agentd.started says they hold. nil when the limits are off, or the run has no scope.
+func (t *Set) InScope(pid int, unit string) error {
+	if t.scopes == nil || unit == "" {
+		return nil
+	}
+	b, err := t.scopes.readFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return fmt.Errorf("cannot tell the cgroup of the %s's launcher (pid %d): %w", t.kind, pid, err)
+	}
+	cgroup, err := unified(strings.Split(strings.TrimSpace(string(b)), "\n"))
+	switch {
+	case err != nil:
+		return fmt.Errorf("the %s's launcher (pid %d): %w", t.kind, pid, err)
+	case !strings.HasSuffix(cgroup, "/"+unit):
+		return fmt.Errorf("the %s's launcher (pid %d) is in the cgroup %s, not in its scope %s: a launcher that does not source "+
+			"sandbox/linux/limits.sh runs the sandbox with no limits", t.kind, pid, cgroup, unit)
+	}
+	return nil
+}
+
+// unified is a process's cgroup on cgroup v2, from the lines of its /proc/<pid>/cgroup: the path of its
+// 0:: line, which there must be. A cgroup v1 hierarchy that holds the memory or the pids controller
+// takes them from v2, and the limits would not hold: refused. Other v1 hierarchies are no matter (some
+// VPNs mount net_cls beside v2).
+func unified(lines []string) (string, error) {
+	path, found := "", 0
+	for _, line := range lines {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			path, found = p, found+1
+			continue
+		}
+		if f := strings.SplitN(line, ":", 3); len(f) == 3 {
+			for c := range strings.SplitSeq(f[1], ",") {
+				if c == "memory" || c == "pids" {
+					return "", fmt.Errorf("a cgroup v1 hierarchy holds the %s controller (%q), which the limits need on cgroup v2", c, line)
+				}
+			}
+		}
+	}
+	if found != 1 || !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("not in one cgroup of cgroup v2 (the unified hierarchy): %q", lines)
+	}
+	return path, nil
+}
+
+// kernelCharges refuses a kernel command line that keeps kernel memory, or sockets' buffers, from the
+// cgroups' memory (cgroup.memory=nokmem, nosocket): the limits would not hold the memory charged to no
+// process, which is what they are for.
+func kernelCharges(cmdline string) error {
+	for _, arg := range strings.Fields(cmdline) {
+		v, ok := strings.CutPrefix(arg, "cgroup.memory=")
+		if !ok {
+			continue
+		}
+		for opt := range strings.SplitSeq(v, ",") {
+			if opt == "nokmem" || opt == "nosocket" {
+				return fmt.Errorf("the kernel's command line has cgroup.memory=%s: the cgroups' memory leaves out the kernel's (page "+
+					"tables, pipe and socket buffers), and the limits would not hold it", v)
+			}
+		}
+	}
+	return nil
 }
 
 // properties are systemctl show's Name=value lines.
@@ -220,6 +312,13 @@ func (s *Scopes) Probe(ctx context.Context, sets ...*Set) error {
 		}
 		return s.noManager(fmt.Sprintf("its socket %s is not there (%s)", private, why))
 	}
+	cmdline, err := s.readFile("/proc/cmdline")
+	if err != nil {
+		return fmt.Errorf("%w: cannot read the kernel's command line: %w", ErrNotHeld, err)
+	}
+	if err := kernelCharges(string(cmdline)); err != nil {
+		return fmt.Errorf("%w: %w%s", ErrNotHeld, err, orInsecureDev)
+	}
 	for _, t := range sets {
 		if t.scopes != s {
 			continue // off, or another start's
@@ -234,18 +333,21 @@ func (s *Scopes) Probe(ctx context.Context, sets ...*Set) error {
 		switch {
 		case err != nil && strings.Contains(err.Error(), "Failed to connect to bus"):
 			return s.noManager(err.Error())
-		case err != nil:
+		case err != nil && strings.Contains(err.Error(), "OOMPolicy"):
 			return fmt.Errorf("agentd could not start a systemd user scope to check that it holds the %s limits (it needs "+
 				"systemd 253 or later, for OOMPolicy= on a scope): %w", t.kind, err)
+		case err != nil:
+			return fmt.Errorf("agentd could not start a systemd user scope to check that it holds the %s limits: %w", t.kind, err)
 		}
 		if err := t.heldIn(unit, out); err != nil {
-			return fmt.Errorf("%w: %w; systemd delegates the memory and pids controllers to user@<uid>.service by default "+
-				"(Delegate=): /sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers lists those it has; "+
-				"or start agentd with --insecure-dev, which turns the limits off (development only)", ErrNotHeld, err, os.Getuid(), os.Getuid())
+			return fmt.Errorf("%w: %w%s", ErrNotHeld, err, orInsecureDev)
 		}
 	}
 	return nil
 }
+
+// orInsecureDev ends the refusals of limits that do not hold.
+const orInsecureDev = "; or start agentd with --insecure-dev, which turns the limits off (development only)"
 
 // noManager is ErrNoManager, with why and how to start one.
 func (s *Scopes) noManager(why string) error {
@@ -259,7 +361,7 @@ func (s *Scopes) noManager(why string) error {
 		"with --insecure-dev, which turns the limits off (development only)", ErrNoManager, os.Getuid(), s.dir, why, name)
 }
 
-// heldIn checks a probe's report of unit: one cgroup, the unit's, and each limit as t asks.
+// heldIn checks a probe's report of unit: its cgroup on v2, the unit's, and each limit as t asks.
 func (t *Set) heldIn(unit string, out []byte) error {
 	var cgroups []string
 	got := map[string]string{}
@@ -271,17 +373,22 @@ func (t *Set) heldIn(unit string, out []byte) error {
 			got[k] = v
 		}
 	}
-	if len(cgroups) != 1 || !strings.HasPrefix(cgroups[0], "0::/") {
-		return fmt.Errorf("the probe scope's process is in the cgroups %q, not in one of cgroup v2's (the unified hierarchy)", cgroups)
+	cgroup, err := unified(cgroups)
+	if err != nil {
+		return fmt.Errorf("the probe scope's process: %w", err)
 	}
-	if !strings.HasSuffix(cgroups[0], "/"+unit) {
-		return fmt.Errorf("the probe's process is in the cgroup %s, not in its scope's (%s)", strings.TrimPrefix(cgroups[0], "0::"), unit)
+	if !strings.HasSuffix(cgroup, "/"+unit) {
+		return fmt.Errorf("the probe's process is in the cgroup %s, not in its scope's (%s)", cgroup, unit)
 	}
 	for _, f := range []struct{ file, want string }{{"memory.max", strconv.FormatInt(t.limits.Memory, 10)}, {"memory.swap.max", "0"},
 		{"pids.max", strconv.FormatInt(t.limits.Tasks, 10)}} {
 		switch v, ok := got[f.file]; {
 		case !ok || v == "missing":
-			return fmt.Errorf("the probe scope has no %s (is that controller delegated to the user manager?)", f.file)
+			return fmt.Errorf("the probe scope has no %s: is that controller delegated to the user manager? systemd delegates "+
+				"memory and pids to user@<uid>.service by default (Delegate=), and "+
+				"/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers lists those it has", f.file, os.Getuid(), os.Getuid())
+		case v == "max":
+			return fmt.Errorf("the probe scope's %s is max, not %s: systemd could not set it (journalctl --user says why)", f.file, f.want)
 		case v != f.want:
 			return fmt.Errorf("the probe scope's %s is %s, not %s", f.file, v, f.want)
 		}

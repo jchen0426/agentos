@@ -11,7 +11,7 @@
 # The sandbox has no /sys and cannot reach the user manager: what runs in it cannot raise them.
 #
 # agentd gives the launcher, in the environment it makes for it:
-#   AGENTOS_LIMIT_MEMORY  bytes, a whole number of pages
+#   AGENTOS_LIMIT_MEMORY  bytes, a whole number of pages (up to 19 digits, as agentd's int64 holds)
 #   AGENTOS_LIMIT_TASKS   processes and threads
 #   AGENTOS_LIMIT_UNIT    the scope's name, agentos-<agentd's token>-<worker|tool>-<n>.scope
 #   XDG_RUNTIME_DIR       where the user manager listens (systemd/private)
@@ -35,7 +35,7 @@ if [[ ${AGENTOS_LIMITS+set} ]]; then
   [[ -z ${AGENTOS_LIMIT_MEMORY-}${AGENTOS_LIMIT_TASKS-}${AGENTOS_LIMIT_UNIT-} ]] ||
     limits_fail "AGENTOS_LIMITS=off, and limits too: one or the other"
 else
-  [[ ${AGENTOS_LIMIT_MEMORY-} =~ ^[1-9][0-9]{0,17}$ ]] ||
+  [[ ${AGENTOS_LIMIT_MEMORY-} =~ ^[1-9][0-9]{0,18}$ ]] ||
     limits_fail "AGENTOS_LIMIT_MEMORY=${AGENTOS_LIMIT_MEMORY-} is not a number of bytes: agentd gives the launcher its limits" \
       "(or AGENTOS_LIMITS=off, its --insecure-dev)"
   [[ ${AGENTOS_LIMIT_TASKS-} =~ ^[1-9][0-9]{0,17}$ ]] ||
@@ -53,17 +53,29 @@ else
       --property=MemoryMax="$AGENTOS_LIMIT_MEMORY" --property=MemorySwapMax=0 \
       --property=TasksMax="$AGENTOS_LIMIT_TASKS" --property=OOMPolicy=stop -- "$0" "$@"
   fi
-  # In its scope: its cgroup is the scope's, on cgroup v2 alone, and holds the limits asked.
+  # In its scope: its cgroup is the scope's, on cgroup v2, and holds the limits asked. A cgroup v1
+  # hierarchy that holds the memory or the pids controller would take it from v2; another (a VPN's
+  # net_cls) is no matter.
   mapfile -t limits_cgroups </proc/self/cgroup
-  [[ ${#limits_cgroups[@]} -eq 1 && ${limits_cgroups[0]} == 0::/* ]] ||
-    limits_fail "not on cgroup v2 alone: /proc/self/cgroup is ${limits_cgroups[*]}"
-  limits_cgroup=${limits_cgroups[0]#0::}
+  limits_cgroup=
+  for limits_line in "${limits_cgroups[@]}"; do
+    if [[ $limits_line == 0::* ]]; then
+      [[ -z $limits_cgroup ]] || limits_fail "two cgroup v2 lines in /proc/self/cgroup: ${limits_cgroups[*]}"
+      limits_cgroup=${limits_line#0::}
+    elif IFS=: read -r _ limits_controllers _ <<<"$limits_line" &&
+      [[ ,$limits_controllers, == *,memory,* || ,$limits_controllers, == *,pids,* ]]; then
+      limits_fail "a cgroup v1 hierarchy holds memory or pids ($limits_line): the limits need them on cgroup v2"
+    fi
+  done
+  [[ $limits_cgroup == /* ]] || limits_fail "not on cgroup v2: /proc/self/cgroup is ${limits_cgroups[*]}"
   [[ $limits_cgroup == */"$AGENTOS_LIMIT_UNIT" ]] ||
     limits_fail "not in its scope $AGENTOS_LIMIT_UNIT: its cgroup is $limits_cgroup"
   limits_check() { # <file> <value asked>
     local got
     { read -r got <"/sys/fs/cgroup$limits_cgroup/$1"; } 2>/dev/null ||
       limits_fail "its scope has no $1 (is that controller delegated to the user manager?)"
+    [[ $got != max || $2 == max ]] ||
+      limits_fail "its scope's $1 is max, not $2: systemd could not set it (journalctl --user says why)"
     [[ $got == "$2" ]] || limits_fail "its scope's $1 is $got, not $2"
   }
   limits_check memory.max "$AGENTOS_LIMIT_MEMORY"

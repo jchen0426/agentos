@@ -59,9 +59,9 @@ empty tree, `GIT_ATTR_SOURCE`). For the macOS sandbox: Node 22 (`npm ci` in
 `sandbox/macos`). For the Linux sandbox: bubblewrap 0.8 or later and socat, or the Lima VM
 (`brew install lima`, then `make vm`); and for its resource limits a systemd user manager, systemd
 253 or later (Ubuntu 24.04 has 255), on cgroup v2, with the memory and pids controllers delegated to
-it, as systemd does by default (see "Resource limits" below). A login session starts one; to keep one without a session, `sudo loginctl
-enable-linger <user>`. Mirrors must belong to the user agentd runs as: git
-runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
+it, as systemd does by default (see "Resource limits" below). A login session starts one; to keep
+one without a session, `sudo loginctl enable-linger <user>`. Mirrors must belong to the user agentd
+runs as: git runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
 mirror that holds its data directory, either socket's directory, the Temporal client certificate
 or key, or another repo's mirror: on Linux the git tool server's sandbox mounts all of the call's
 mirror.
@@ -568,21 +568,32 @@ calls keep `run-tool.sh`'s per-process limits too (4 GiB of address space, 30 s 
 The launcher starts the scope itself (`sandbox/linux/limits.sh`), named
 `agentos-<a token of agentd's start>-worker-<generation>.scope` or `-tool-<n>.scope`, and checks that
 its cgroup holds the limits before it starts bwrap; the sandbox sees neither `/sys` nor the user
-manager, so nothing in it can raise them. Each costs about 5 ms.
+manager, so nothing in it can raise them. Each costs about 5 ms. agentd checks too, once a Worker says
+it is ready and once a tool call's server answers, that the launcher is in the run's scope: a launcher
+that does not source `limits.sh` (an older copy, one of your own) is refused. The Worker gets
+`TOKIO_WORKER_THREADS=4` and the git tool server `GOMAXPROCS=4`: both runtimes start a thread for each
+CPU, which the task limit counts.
 
 As agentd starts, it runs a probe scope of each set of limits and reads them back, and refuses to start
 when they do not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`, else
 `/run/user/<uid>`), or the limits do not take (the controllers are not delegated to it:
 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/cgroup.controllers` lists those it
-has). Past its memory limit the kernel kills a process of the scope, and systemd stops the rest; agentd
-asks systemd how the scope ended. A Worker the kernel killed so is logged ("the Worker went over its
-memory limit"), with the limit, and its `worker.exited` has `oom_kill: true`; agentd starts it again,
-as after any exit. A git tool call is refused, naming the limit, and not tried again: the same commit
-goes over it every time, as over the CPU time limit. A scope the kernel ended stays, failed, until agentd
-clears it (`reset-failed`); one an agentd that stopped first left shows in `systemctl --user --failed`,
-harmless (`systemctl --user reset-failed 'agentos-*'` clears it). There is no limit on the Worker's CPU:
-a subverted Worker can keep the CPUs busy, and slow the machine, but not use up its memory or its
-processes. The limits are your user manager's: a process of yours outside the sandbox could change them.
+has). Past its memory limit the kernel's out-of-memory killer kills a process of the scope, and systemd
+stops the rest; agentd asks systemd how the scope ended. systemd says only that the killer struck: past
+the scope's own limit as a rule, but memory running out higher up (a slice's limit, the machine's
+memory, systemd-oomd) reads the same. A Worker so killed is logged ("the kernel's out-of-memory killer
+killed the Worker"), with its limit, and its `worker.exited` has `oom_kill: true`; agentd starts it
+again, as after any exit. A git tool call so killed is run once more, in a new scope; killed again, it
+is refused, and not tried again, saying so and naming the limit: the commit is too large to read within
+it (the same commit goes over it every time, as over the CPU time limit), or the machine ran out of
+memory. A scope the kernel ended stays, failed, until agentd clears it (`reset-failed`), as it learns
+how the scope ended, and for its whole start as it stops; one a killed agentd left shows in `systemctl
+--user --failed`, harmless (`systemctl --user reset-failed 'agentos-*'` clears it). Without lingering,
+logind stops your user manager when your last session ends, and with it the Worker and every git tool
+call in their scopes, and the launchers refuse until you log in again: agentd warns at start (`sudo
+loginctl enable-linger <user>` keeps the manager). There is no limit on the Worker's CPU: a subverted
+Worker can keep the CPUs busy, and slow the machine, but not use up its memory or its processes. The
+limits are your user manager's: a process of yours outside the sandbox could change them.
 
 `--insecure-dev` turns the limits off, and agentd says so at every start: the launchers then get
 `AGENTOS_LIMITS=off`. A Linux launcher run by hand (a Worker of your own, with `--no-worker`) needs
@@ -590,8 +601,8 @@ either that or the limits, as agentd gives them: `AGENTOS_LIMIT_MEMORY` (bytes),
 `AGENTOS_LIMIT_TASKS`, `AGENTOS_LIMIT_UNIT` (a scope name of your choosing, `agentos-<x>.scope`) and
 `XDG_RUNTIME_DIR`; it refuses to run without them. macOS's sandbox sets none of these limits, and agentd
 refuses a configuration that names any there. `agentd.started` records both sets, as `worker.limits`
-and `git_tools_limits`: `memory_bytes`, `tasks`, `swap_bytes` (0), and `enforcement`, which is
-`systemd_user_scope`, `off` (`--insecure-dev`) or `none` (macOS).
+and `git_tools_limits`: where they hold, `memory_bytes`, `tasks`, `swap_bytes` (0) and `enforcement:
+systemd_user_scope`; elsewhere `enforcement` alone, `off` (`--insecure-dev`) or `none` (macOS).
 
 ## Tests
 

@@ -67,7 +67,7 @@ func TestTheLaunchersTakeWhatEnvGives(t *testing.T) {
 		return stdout.String(), stderr.String(), err == nil, args
 	}
 
-	s := New(manager, nil)
+	s := New(manager, nil, nil)
 	unit, env := s.On("tool", Limits{Memory: 64 << 20, Tasks: 32}).Env(7)
 	stdout, stderr, ok, args := launch(env)
 	if want := []string{"--user", "--scope", "--quiet", "--unit=" + unit, "--property=MemoryMax=67108864", "--property=MemorySwapMax=0",
@@ -79,6 +79,12 @@ func TestTheLaunchersTakeWhatEnvGives(t *testing.T) {
 	}
 	if runtime.GOOS == "linux" && !strings.Contains(stderr, "not in its scope "+unit) {
 		t.Errorf("outside its scope: %s", stderr)
+	}
+
+	// As much memory as agentd's configuration may ask (999999999GiB, 19 digits).
+	_, most := s.On("tool", Limits{Memory: 999999999 << 30, Tasks: 32}).Env(8)
+	if _, _, _, args := launch(most); len(args) < 5 || args[4] != "--property=MemoryMax=1073741822926258176" {
+		t.Errorf("the most memory: systemd-run %q", args)
 	}
 
 	_, off := Off("tool", Limits{Memory: 64 << 20, Tasks: 32}).Env(7)
@@ -104,6 +110,7 @@ func TestTheLaunchersTakeWhatEnvGives(t *testing.T) {
 		"limits empty":            {[]string{"AGENTOS_LIMITS="}, "AGENTOS_LIMITS=: only off turns the limits off"},
 		"off, and limits":         {append(slices.Clone(env), OffEnv), "AGENTOS_LIMITS=off, and limits too"},
 		"memory in GiB":           {without("AGENTOS_LIMIT_MEMORY", "AGENTOS_LIMIT_MEMORY=1GiB"), "is not a number of bytes"},
+		"memory of 20 digits":     {without("AGENTOS_LIMIT_MEMORY", "AGENTOS_LIMIT_MEMORY=10000000000000000000"), "is not a number of bytes"},
 		"no memory":               {without("AGENTOS_LIMIT_MEMORY"), "is not a number of bytes"},
 		"no tasks":                {without("AGENTOS_LIMIT_TASKS", "AGENTOS_LIMIT_TASKS=0"), "is not a number of tasks"},
 		"a path for a unit":       {without("AGENTOS_LIMIT_UNIT", "AGENTOS_LIMIT_UNIT=../x.scope"), "is not the name of a scope"},

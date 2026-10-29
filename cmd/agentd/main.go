@@ -121,11 +121,12 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	}
 	// And the resource limits of the Worker and of each git tool call (M5 C3a): on Linux a probe scope
 	// of each shows now that the user manager holds them, or agentd refuses to start, saying why.
-	limits, err := resourceLimits(ctx, runtime.GOOS, cfg, insecureDev, noWorker, scope.Exec)
+	limits, err := resourceLimits(ctx, runtime.GOOS, cfg, insecureDev, noWorker, scope.Exec, os.ReadFile)
 	if err != nil {
 		return err
 	}
 	limits.say(cfg, log)
+	defer limits.clear(log) // after everything else of this start: the failed scopes it left go
 	if err := mkdirPrivate(cfg.DataDir); err != nil {
 		return err
 	}
@@ -555,10 +556,17 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		"runtime", cfg.RuntimeListen, "control", cfg.ControlSocket, "temporal", cfg.Temporal.Address,
 		"gateway_queue", cfg.TaskQueues.Gateway, "workflow_queue", cfg.TaskQueues.Workflows, "worker", theWorker)
 
+	// A later generation's launcher that did not run it in its scope stops the supervisor, and agentd.
+	var failed <-chan error
+	if sup != nil {
+		failed = sup.Failed()
+	}
 	select {
 	case <-ctx.Done():
 		return shutdown()
 	case err := <-errs:
+		return err
+	case err := <-failed:
 		return err
 	}
 }

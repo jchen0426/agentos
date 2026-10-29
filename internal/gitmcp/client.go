@@ -55,9 +55,10 @@ type Options struct {
 	Parallel int           // servers running at once; 4 when 0
 	Log      *slog.Logger  // gets the server's stderr when a call fails or is refused; the error does not carry it
 	// Limits, if set, hold each call to its resource limits (Linux, M5 C3a): the launcher gets what
-	// Limits.Env gives it, and runs the call in a systemd user scope of its own. A call whose server
-	// failed because the kernel killed it at its memory limit is refused (a ToolError), as one past the
-	// CPU time limit is: the same call goes over it every time.
+	// Limits.Env gives it, and runs the call in a systemd user scope of its own, which the client checks
+	// the launcher is in once the server answers. A call whose server the kernel's out-of-memory killer
+	// killed is run once more; killed again, it is refused (a ToolError), as one past the CPU time limit
+	// is: the same call goes over it every time.
 	Limits Limits
 }
 
@@ -66,8 +67,10 @@ type Limits interface {
 	// Env is what call n's launcher gets: the name of its scope ("" for none), and the variables that
 	// say what holds it, or that the limits are off.
 	Env(n int64) (unit string, env []string)
-	// OOMKilled reports, once what ran in unit has exited, whether the kernel killed it at its memory
-	// limit; its error says it could not be told.
+	// InScope checks that the launcher, process pid, is in unit; nil for no scope.
+	InScope(pid int, unit string) error
+	// OOMKilled reports, once what ran in unit has exited, whether the kernel's out-of-memory killer
+	// killed it; its error says it could not be told.
 	OOMKilled(unit string) (bool, error)
 	// Memory is the memory limit, as a refusal names it.
 	Memory() string
@@ -239,7 +242,7 @@ func checked(f File, p string) (File, error) {
 // Call runs tool on the mirror and decodes its structured result into out. A call that runs
 // past the timeout fails, to be retried: the launcher's CPU time limit is what refuses a
 // commit too costly to diff, the same way every time, while a call can be slow because the
-// machine is. So is its memory limit, on Linux (Options.Limits), for a commit too large.
+// machine is. So does its memory limit, on Linux (Options.Limits), for a commit too large.
 func (c *Client) Call(ctx context.Context, mirror, tool string, args, out any) error {
 	release, err := c.slot(ctx)
 	if err != nil {
@@ -282,15 +285,44 @@ func (c *Client) slot(ctx context.Context) (func(), error) {
 	}
 }
 
-// call is Call in a slot already taken.
-func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) (err error) {
+// call is Call in a slot already taken. A call whose server the kernel's out-of-memory killer killed is
+// run once more, in a scope of its own, with a timeout of its own (Options.Limits): systemd's oom-kill
+// does not tell the call's own memory limit from memory running out higher up (a slice's limit, the
+// host's memory, systemd-oomd). Killed again, it is refused, as a call past the CPU time limit is
+// (cpuLimitError): the commit is too large to read within the limit, or the host is short of memory. A
+// second attempt that answers, or fails otherwise, ends the call as it ended.
+func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) error {
+	killed, err := c.attempt(ctx, mirror, tool, args, out)
+	if !killed || !IsServerFailure(err) {
+		return err
+	}
+	c.warn("the git tool call runs once more, in a new scope, after the kernel's out-of-memory killer killed its server",
+		"tool", tool, "memory_limit", c.limits.Memory())
+	killed, err = c.attempt(ctx, mirror, tool, args, out)
+	switch {
+	case killed && IsServerFailure(err):
+		return &ToolError{Msg: "the kernel's out-of-memory killer killed the git tool server in both attempts at the call, under a " +
+			"memory limit of " + c.limits.Memory() + ": the commit is too large to read within it, or the host ran out of memory"}
+	case err == nil:
+		c.warn("the git tool call's second attempt answered, after the kernel's out-of-memory killer killed the first",
+			"tool", tool, "memory_limit", c.limits.Memory())
+	}
+	return err
+}
+
+// attempt runs the server once, in a scope of its own if the calls have limits, and calls tool on it.
+// killed says that the kernel's out-of-memory killer killed what ran in the scope, as systemd says once
+// the launcher has exited: asked when the call failed, or when the launcher exited otherwise than as it
+// should after an answer (which stands); asking also clears a failed scope. A launcher that exits as it
+// should costs no systemctl.
+func (c *Client) attempt(ctx context.Context, mirror, tool string, args, out any) (killed bool, err error) {
 	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	// A directory of this call's own, removed afterwards however the server ends: the
 	// launcher keeps its state there, and an unsandboxed server its temporary files.
 	state, err := statedir.Make(stateKind)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer statedir.Remove(state)
 	argv := []string{c.server, "--mirror", mirror}
@@ -320,42 +352,37 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) (
 	cmd.Stderr = stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return false, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := cmd.Start(); err != nil {
 		c.logFailure(tool, fmt.Errorf("start: %w", err), stderr.String())
-		return failedOn(tool)
+		return false, failedOn(tool)
 	}
-	// What went wrong is logged with the server's stderr, which is whole once it has exited. Whether the
-	// kernel killed a server that failed at the call's memory limit, systemd says once it has exited: such
-	// a call is refused, since it goes over the limit every time, as over the CPU time limit (cpuLimitError).
+	// What went wrong is logged with the server's stderr, which is whole once it has exited.
 	var failure error
 	var refused *ToolError
 	defer func() {
-		_ = cmd.Wait()
+		waitErr := cmd.Wait()
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // anything of the group still running
 		msg := stderr.String()
-		if failure != nil && unit != "" {
-			switch killed, oerr := c.limits.OOMKilled(unit); {
-			case oerr != nil:
-				c.logFailure(tool, fmt.Errorf("%w; and systemd could not say whether the call went over its memory limit: %w",
-					failure, oerr), msg)
-				return
-			case killed:
-				err = &ToolError{Msg: "the commit is too large for the git tool server to read within its memory limit of " +
-					c.limits.Memory()}
-				if c.log != nil {
-					c.log.Warn("the git tool call went over its memory limit, and the kernel killed it: refused", "tool", tool,
-						"memory_limit", c.limits.Memory(), "scope", unit, "error", failure, "stderr", msg)
-				}
-				return
+		if unit != "" && (failure != nil || waitErr != nil) {
+			k, oerr := c.limits.OOMKilled(unit)
+			if oerr != nil {
+				c.warn("could not ask systemd how the git tool call's scope ended", "tool", tool, "scope", unit, "error", oerr)
 			}
+			killed = k && oerr == nil
 		}
 		switch {
+		case killed && failure != nil:
+			c.warn("the kernel's out-of-memory killer killed the git tool server", "tool", tool, "memory_limit", c.limits.Memory(),
+				"scope", unit, "error", failure, "stderr", msg)
+		case killed:
+			c.warn("the kernel's out-of-memory killer killed what was left of the git tool call after its server answered: the "+
+				"answer stands", "tool", tool, "memory_limit", c.limits.Memory(), "scope", unit, "stderr", msg)
 		case failure != nil:
 			c.logFailure(tool, failure, msg)
 		case refused != nil && msg != "" && c.log != nil:
@@ -367,33 +394,48 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) (
 	session, err := client.Connect(callCtx, &mcp.IOTransport{Reader: stdout, Writer: stdin, MaxLineLength: maxReply}, nil)
 	if err != nil {
 		failure = fmt.Errorf("connect: %w", err)
-		return failedOn(tool)
+		return false, failedOn(tool)
 	}
 	defer session.Close()
+	// The server answers: its launcher has gone past limits.sh, if it sources it. One that does not runs
+	// the server in no scope and with no limits.
+	if c.limits != nil {
+		if err := c.limits.InScope(cmd.Process.Pid, unit); err != nil {
+			failure = err
+			return false, failedOn(tool)
+		}
+	}
 	faults.StallInTool(callCtx) // a test's hold, with the server up (agentd's --fault-script)
 	res, err := session.CallTool(callCtx, &mcp.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		failure = err
-		return failedOn(tool)
+		return false, failedOn(tool)
 	}
 	if res.IsError {
 		refused = refusal(mirror, res)
-		return refused
+		return false, refused
 	}
 	switch n, ok := values(res.StructuredContent, maxValues); {
 	case !ok:
-		return fmt.Errorf("git tool %s: an answer agentd cannot count the values of", tool)
+		return false, fmt.Errorf("git tool %s: an answer agentd cannot count the values of", tool)
 	case n > maxValues:
-		return fmt.Errorf("git tool %s: an answer of more than %d values", tool, maxValues)
+		return false, fmt.Errorf("git tool %s: an answer of more than %d values", tool, maxValues)
 	}
 	b, err := json.Marshal(res.StructuredContent)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("git tool %s: unexpected result: %w", tool, err)
+		return false, fmt.Errorf("git tool %s: unexpected result: %w", tool, err)
 	}
-	return nil
+	return false, nil
+}
+
+// warn logs at Warn, if the client has a log.
+func (c *Client) warn(msg string, attrs ...any) {
+	if c.log != nil {
+		c.log.Warn(msg, attrs...)
+	}
 }
 
 // SelfCheck calls every tool through the launcher, on a repository of its own: agentd runs it
@@ -479,8 +521,8 @@ func blobID(b []byte) string {
 }
 
 // ServerFailure is the error of a call whose server failed: it did not start, stopped, timed out, or
-// answered nothing agentd could read; but for one the kernel killed at the call's memory limit, which
-// is refused (a ToolError). Wrapped (%w) by whatever reads through the server, it stays one
+// answered nothing agentd could read; but for one the kernel's out-of-memory killer killed in two
+// attempts, which is refused (a ToolError). Wrapped (%w) by whatever reads through the server, it stays one
 // (IsServerFailure): the gateway records it as such, and agentctl runs explain tells it by that.
 type ServerFailure struct{ Tool string }
 

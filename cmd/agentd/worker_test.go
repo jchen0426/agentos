@@ -53,7 +53,7 @@ func TestWorkerLaunch(t *testing.T) {
 		t.Errorf("macOS: limits %v", o.Limits)
 	}
 	cfg.RuntimeListen = "unix:///run/agentos/runtime/runtime.sock"
-	limits := scope.New("/run/user/501", nil).On("worker", scope.Limits{Memory: 1 << 30, Tasks: 512})
+	limits := scope.New("/run/user/501", nil, nil).On("worker", scope.Limits{Memory: 1 << 30, Tasks: 512})
 	o, err = workerLaunch("linux", cfg, snap, &net.UnixAddr{Name: "/run/agentos/runtime/runtime.sock", Net: "unix"}, limits)
 	if want := slices.Concat([]string{"/opt/agentos/run-worker.sh", "/run/agentos/runtime/runtime.sock", snap.Python, snap.Code, "--"},
 		worker, []string{"--endpoint", "127.0.0.1:7233"}, args); err != nil || !slices.Equal(o.Argv, want) || o.StateDirs || o.Lifeline ||
@@ -202,7 +202,9 @@ func TestWorkerRecord(t *testing.T) {
 	}
 	cfg = workerConfig()
 	cfg.Worker.Sandbox = nil
-	if r := workerRecord(cfg, snap, supervisor.Timing{}, enforcedOff); r["sandbox"] != "" || r["limits"].(map[string]any)["enforcement"] != "off" {
+	// With the limits off (or none), the record says only that.
+	if r := workerRecord(cfg, snap, supervisor.Timing{}, enforcedOff); r["sandbox"] != "" ||
+		!maps.Equal(r["limits"].(map[string]any), map[string]any{"enforcement": "off"}) {
 		t.Errorf("unsandboxed: %v", r)
 	}
 }

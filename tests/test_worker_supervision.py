@@ -86,13 +86,13 @@ def test_agentd_starts_its_worker_before_it_says_it_is_ready(stack: Stack) -> No
     started = last_start(stack)
     assert started["no_worker"] is False, started
     worker = started["worker"]
-    # Its limits, the defaults, and what holds them (M5 C3a): a scope of each generation's own under bwrap,
-    # off with --insecure-dev on Linux (none), and nothing on macOS.
-    holds = "systemd_user_scope" if SANDBOX == "bwrap" else "off" if is_linux() else "none"
+    # Its limits and what holds them (M5 C3a): under bwrap the defaults, in a scope of each generation's
+    # own; off with --insecure-dev on Linux (none), and none on macOS, without numbers.
+    limits = ({"memory_bytes": 1 << 30, "tasks": 512, "swap_bytes": 0, "enforcement": "systemd_user_scope"} if SANDBOX == "bwrap"
+              else {"enforcement": "off" if is_linux() else "none"})
     assert {k: worker.get(k) for k in ("sandbox", "python", "code", "workflows", "limits")} == {
         "sandbox": str(WORKER_LAUNCHER[SANDBOX]) if SANDBOX in WORKER_LAUNCHER else "",
-        "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS",
-        "limits": {"memory_bytes": 1 << 30, "tasks": 512, "swap_bytes": 0, "enforcement": holds}}, started
+        "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS", "limits": limits}, started
     # The copy of the code it runs (M5 C2c), which the start's log names too, and the liveness thresholds.
     assert re.fullmatch(r"[0-9a-f]{64}", worker["code_sha256"]) and launch["code_sha256"] == worker["code_sha256"], (worker, launch)
     assert worker["code_files"] > 1000 and worker["code_bytes"] > 50 << 20, worker
