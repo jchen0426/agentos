@@ -16,6 +16,7 @@ import (
 	"github.com/jchen0426/agentos/internal/codesnap"
 	"github.com/jchen0426/agentos/internal/config"
 	"github.com/jchen0426/agentos/internal/models"
+	"github.com/jchen0426/agentos/internal/scope"
 	"github.com/jchen0426/agentos/internal/supervisor"
 )
 
@@ -38,8 +39,9 @@ func checkWorker(goos string, cfg *config.Config, insecureDev bool) error {
 // directories are no part of it. The environment is agentd's own making, from scratch: what the
 // launchers need (agentd's own PATH, for node, bwrap and socat, and HOME, which the macOS launcher
 // denies), and what agentd keeps from the Worker. Nothing else of agentd's own environment, and no
-// secret: a Worker never gets one.
-func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runtime net.Addr) (supervisor.Options, error) {
+// secret: a Worker never gets one. limits are what the launcher gets of each generation's resource
+// limits (the supervisor adds them: Options.Limits); nil for none.
+func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runtime net.Addr, limits *scope.Set) (supervisor.Options, error) {
 	w := cfg.Worker
 	python := filepath.Join(snap.Python, "bin", "python")
 	// The Worker stops, gracefully, when its stdin ends: the supervisor's stop channel.
@@ -59,6 +61,9 @@ func workerLaunch(goos string, cfg *config.Config, snap *codesnap.Snapshot, runt
 	}
 	env = append(env, "LANG=C.UTF-8", "AGENTOS_SANDBOX_DENY_READ="+string(deny))
 	o := supervisor.Options{Env: env, Dir: snap.Code, Code: snap.Root}
+	if limits != nil { // a nil *scope.Set in the interface would not be nil
+		o.Limits = limits
+	}
 	command := []string{python, "-m", "agentos_worker"}
 	switch {
 	case len(w.Sandbox) == 0:
@@ -226,17 +231,17 @@ func inside(path, dir string) bool {
 }
 
 // workerRecord is the Worker in agentd.started: its launcher ("" for none), the directories it runs a
-// copy of, what it serves, and its limits, of which this agentd sets none; the copy (snap): its root,
-// which addresses the manifest's blob in the ledger, its size, the distributions in the environment and
-// the interpreter; and the liveness thresholds, t's.
-func workerRecord(cfg *config.Config, snap *codesnap.Snapshot, t supervisor.Timing) map[string]any {
+// copy of, what it serves, and its resource limits with what holds them (enforcement, limitsRecord); the
+// copy (snap): its root, which addresses the manifest's blob in the ledger, its size, the distributions
+// in the environment and the interpreter; and the liveness thresholds, t's.
+func workerRecord(cfg *config.Config, snap *codesnap.Snapshot, t supervisor.Timing, enforcement string) map[string]any {
 	w := cfg.Worker
 	sandbox := ""
 	if len(w.Sandbox) > 0 {
 		sandbox = w.Sandbox[0]
 	}
 	return map[string]any{"sandbox": sandbox, "python": w.Python, "code": w.Code, "workflows": w.Workflows,
-		"limits": map[string]any{}, "code_sha256": snap.Root, "code_files": snap.Files, "code_bytes": snap.Bytes,
+		"limits": limitsRecord(w.Limits, enforcement), "code_sha256": snap.Root, "code_files": snap.Files, "code_bytes": snap.Bytes,
 		"distributions": slices.Clone(snap.Distributions), "interpreter": snap.Interpreter,
 		"liveness": map[string]any{"quiet_ms": t.QuietFor.Milliseconds(), "hold_ms": t.HoldFor.Milliseconds()}}
 }

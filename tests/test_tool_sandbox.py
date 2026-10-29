@@ -25,7 +25,7 @@ import pytest
 
 from tests.conftest import _stack
 from tests.harness import (KEYCHAIN_ITEMS, LOGIN_KEYCHAIN, REPO, SANDBOX, TOOL_LAUNCHER, Stack, in_keychain,
-                           outside_root, remove_outside_root, user_temp_dir)
+                           launcher_limits, outside_root, remove_outside_root, user_temp_dir)
 
 pytestmark = pytest.mark.skipif(SANDBOX not in TOOL_LAUNCHER, reason="needs AGENTOS_SANDBOX=bwrap or srt")
 
@@ -106,10 +106,11 @@ def connect(url: str) -> None:
 
 
 def probe_env(state: str, deny: list[str]) -> dict:
-    """The environment agentd gives the launcher, plus a secret the server must not see."""
+    """The environment agentd gives the launcher, its limits on Linux among it, plus a secret the server
+    must not see."""
     return {"PATH": os.environ["PATH"], "HOME": state, "TMPDIR": state, "AGENTOS_TMPDIR": state, "LANG": "C.UTF-8",
             "AGENTOS_SANDBOX_STATE": state, "AGENTOS_SANDBOX_DENY_READ": json.dumps(deny),
-            "AGENTOS_TEST_CANARY": "a secret the tool server must not see"}
+            "AGENTOS_TEST_CANARY": "a secret the tool server must not see", **launcher_limits("tool")}
 
 
 def probe(mirror: Path, args: dict, deny: list[str], env: dict[str, str] | None = None) -> dict:

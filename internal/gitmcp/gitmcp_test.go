@@ -1175,6 +1175,101 @@ func TestCallAgainstALyingServer(t *testing.T) {
 	}
 }
 
+// limits are a call's resource limits as a test sets them: each call's scope is named after its
+// number, and the kernel killed every call's server if killed says so (OOMKilled answers err, if set).
+type limits struct {
+	mu     sync.Mutex
+	killed bool
+	err    error
+	asked  []string // the scopes OOMKilled was asked about
+}
+
+func (l *limits) Env(n int64) (string, []string) {
+	unit := fmt.Sprintf("agentos-test-tool-%d.scope", n)
+	return unit, []string{"AGENTOS_LIMIT_UNIT=" + unit, "AGENTOS_LIMIT_MEMORY=67108864"}
+}
+
+func (l *limits) OOMKilled(unit string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.asked = append(l.asked, unit)
+	return l.killed && l.err == nil, l.err
+}
+
+func (l *limits) Memory() string { return "64MiB" }
+
+// On Linux each call runs in a systemd user scope of its own (M5 C3a): its launcher gets the limits,
+// its scope's name among them, a new one for each call, whichever client of the same makes it. A call
+// whose server failed is asked about once the server has exited: one the kernel killed at its memory
+// limit is refused, naming the limit, the same way every time, and logged so; any other failure stays
+// one, to be tried again. A call whose server answered, or refused, is not asked about.
+func TestACallOverItsMemory(t *testing.T) {
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	units := filepath.Join(t.TempDir(), "units")
+	client := func(answer string, l *limits, log *logs) *Client { // <answer> <units> <mirror> -- <server> ...
+		launcher := []string{"/bin/sh", "-c", `answer=$1; printf '%s %s\n' "$AGENTOS_LIMIT_UNIT" "$AGENTOS_LIMIT_MEMORY" >>"$2"; shift 4; ` +
+			fakeServerEnv + `=$answer exec "$@"`, "sh", answer, units}
+		c, err := NewClient(Options{Server: bin, Sandbox: launcher, Timeout: 30 * time.Second, Limits: l,
+			Log: slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelInfo}))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	mirror := t.TempDir()
+	var log logs
+	killed := &limits{killed: true}
+	err = client("failure", killed, &log).Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
+	if !IsToolError(err) || IsServerFailure(err) || err.Error() != "the commit is too large for the git tool server to read within its memory limit of 64MiB" {
+		t.Errorf("a server the kernel killed: %v", err)
+	}
+	if !strings.Contains(log.String(), "the git tool call went over its memory limit, and the kernel killed it: refused") ||
+		!strings.Contains(log.String(), "memory_limit=64MiB") || !strings.Contains(log.String(), "the fake server's own words") {
+		t.Errorf("its log: %s", log.String())
+	}
+	for name, c := range map[string]struct {
+		answer string
+		l      *limits
+		why    string // in the log
+	}{
+		"another failure":     {"failure", &limits{}, "it broke"},
+		"systemd cannot tell": {"failure", &limits{killed: true, err: errors.New("systemctl: exit status 1")}, "systemd could not say"},
+	} {
+		var log logs
+		err := client(c.answer, c.l, &log).Call(context.Background(), mirror, "resolve_commit", ResolveCommitIn{}, &ResolveCommitOut{})
+		if !IsServerFailure(err) || !strings.Contains(log.String(), c.why) || len(c.l.asked) != 1 {
+			t.Errorf("%s: %v, asked %q; %s", name, err, c.l.asked, log.String())
+		}
+	}
+	// Not asked: its server answered, or refused.
+	answered := &limits{killed: true}
+	c := client("long refusal", answered, &log)
+	if err := c.Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{}); !IsToolError(err) || strings.Contains(err.Error(), "memory") {
+		t.Errorf("a refusal: %v", err)
+	}
+	if err := client("many values", answered, &log).Call(context.Background(), mirror, "read_files", ReadFilesIn{}, &ReadFilesOut{}); err == nil ||
+		IsToolError(err) || IsServerFailure(err) {
+		t.Errorf("an answer it cannot take: %v", err)
+	}
+	if len(answered.asked) != 0 {
+		t.Errorf("asked about %q", answered.asked)
+	}
+	// Each call its own scope, whichever client of the same makes it.
+	_ = c.WithOwnSlots(1).Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
+	_ = c.Call(context.Background(), mirror, "show_diff", ShowDiffIn{}, &ShowDiffOut{})
+	b, err := os.ReadFile(units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if want := []string{"agentos-test-tool-2.scope 67108864", "agentos-test-tool-3.scope 67108864"}; !slices.Equal(lines[len(lines)-2:], want) {
+		t.Errorf("the launchers got %q", lines)
+	}
+}
+
 // noCall fails the test if it is called.
 type noCall struct{ t *testing.T }
 

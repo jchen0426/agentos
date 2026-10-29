@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.harness import (REPO, SANDBOX, Stack, command_of, descendants, free_port, outside_root,
+from tests.harness import (REPO, SANDBOX, Stack, command_of, descendants, free_port, launcher_limits, outside_root,
                            remove_outside_root, wait_for)
 
 pytestmark = pytest.mark.skipif(SANDBOX == "none", reason="needs AGENTOS_SANDBOX=bwrap or srt")
@@ -168,12 +168,14 @@ def runtime_entry(stack: Stack) -> Path | int:
 
 
 def reach(launch: list[str], file: Path, way_out: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Runs REACH_PROBE in the sandbox. The interpreter itself, not a virtual environment's link
-    to it: the Python environment the launcher is given need not be one."""
+    """Runs REACH_PROBE in the sandbox, with env (this process's by default) and, on Linux, the Worker's
+    limits in a scope of its own. The interpreter itself, not a virtual environment's link to it: the
+    Python environment the launcher is given need not be one."""
     # In a session of its own, as agentd and the harness start a Worker: the macOS launcher refuses
     # to run a Worker that has a controlling terminal.
     return subprocess.run([*launch, os.path.realpath(sys.executable), "-I", "-c", REACH_PROBE, str(file), str(way_out)],
-                          capture_output=True, text=True, timeout=60, cwd=REPO, env=env, start_new_session=True)
+                          capture_output=True, text=True, timeout=60, cwd=REPO, start_new_session=True,
+                          env={**(os.environ if env is None else env), **launcher_limits("worker")})
 
 
 @contextlib.contextmanager
@@ -557,7 +559,7 @@ def test_worker_sandbox_can_create_no_files() -> None:
             runtime.bind(str(sock_dir / "runtime.sock"))
             r = subprocess.run([str(REPO / "sandbox/linux/run-worker.sh"), str(sock_dir / "runtime.sock"), sys.prefix,
                                 str(REPO), "--", sys.executable, "-I", "-c", WRITE_PROBE, json.dumps(writes)],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, env={**os.environ, **launcher_limits("worker")})
     finally:
         shutil.rmtree(sock_dir, ignore_errors=True)
         escaped = [p for p in writes.values() if os.path.exists(p)]

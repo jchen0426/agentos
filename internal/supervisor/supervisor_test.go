@@ -1452,6 +1452,8 @@ func TestTheExitRecord(t *testing.T) {
 		"the first, agentd stops": {generation: 1, pid: 44, code: 2, at: at},
 		"unresponsive": {generation: 2, pid: 45, signal: "killed", ran: 2 * time.Minute, ready: true, at: at, restartIn: time.Second,
 			unresponsive: "not_answering", unresponsiveFor: 61500 * time.Millisecond},
+		"over its memory": {generation: 6, pid: 46, signal: "terminated", ran: time.Minute, ready: true, at: at, restartIn: time.Second,
+			oomKill: true},
 	} {
 		ev := e.Event(7)
 		if ev.Type != ExitedType || ev.Actor != audit.Agentd || ev.WorkflowID != "" {
@@ -1486,5 +1488,115 @@ func TestTheExitRecord(t *testing.T) {
 			e.unresponsive != "" && (fields["unresponsive"] != e.unresponsive || fields["unresponsive_ms"] != json.Number("61500")) {
 			t.Errorf("%s: %s", name, b)
 		}
+		if o, ok := fields["oom_kill"]; e.oomKill != ok || ok && o != true {
+			t.Errorf("%s: %s", name, b)
+		}
+	}
+}
+
+// limits are the Worker's resource limits as a test sets them: each generation's scope is named after
+// it, and the kernel killed the generations killed names (OOMKilled answers err for every one, if set).
+type limits struct {
+	mu     sync.Mutex
+	killed map[int64]bool
+	err    error
+	asked  []string // the scopes OOMKilled was asked about
+}
+
+func (l *limits) Env(n int64) (string, []string) {
+	unit := fmt.Sprintf("agentos-test-worker-%d.scope", n)
+	return unit, []string{"AGENTOS_LIMIT_UNIT=" + unit, "AGENTOS_LIMIT_MEMORY=1073741824"}
+}
+
+func (l *limits) OOMKilled(unit string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.asked = append(l.asked, unit)
+	var n int64
+	fmt.Sscanf(unit, "agentos-test-worker-%d.scope", &n)
+	return l.killed[n], l.err
+}
+
+func (l *limits) Memory() string { return "1GiB" }
+
+func (l *limits) scopes() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.asked)
+}
+
+// Each generation's launcher gets its limits, its scope of its own named among them (M5 C3a). Once a
+// generation has exited without agentd's doing, the supervisor asks whether the kernel killed it at
+// its memory limit: one it did is logged so, naming the limit, and recorded so (oom_kill); it starts
+// again as any other. A generation agentd stopped is not asked about, nor is one without a scope.
+func TestAWorkerOverItsMemory(t *testing.T) {
+	l := &limits{killed: map[int64]bool{1: true}}
+	s, logged, r, file := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: 20 * time.Millisecond},
+		"AGENTOS_TEST_PLAN=report-re,report-re,report")
+	s.o.Limits = l
+	s.Start()
+	readied(t, s)
+	wait(t, "the third generation", 10*time.Second, func() bool { return len(logged.entries("worker ready")) == 3 })
+	s.Stop()
+	b, err := os.ReadFile(file + ".gen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var got struct{ Env []string }
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatal(err)
+		}
+		if unit := fmt.Sprintf("AGENTOS_LIMIT_UNIT=agentos-test-worker-%d.scope", i+1); !slices.Contains(got.Env, unit) ||
+			!slices.Contains(got.Env, "AGENTOS_LIMIT_MEMORY=1073741824") {
+			t.Errorf("generation %d's environment: %q, want %s", i+1, got.Env, unit)
+		}
+	}
+	if asked := l.scopes(); !slices.Equal(asked, []string{"agentos-test-worker-1.scope", "agentos-test-worker-2.scope"}) {
+		t.Errorf("asked about %q", asked)
+	}
+	over := logged.entries("the Worker went over its memory limit, and the kernel killed it")
+	if len(over) != 1 || over[0]["generation"] != 1.0 || over[0]["memory_limit"] != "1GiB" || over[0]["scope"] != "agentos-test-worker-1.scope" {
+		t.Errorf("logged %v", over)
+	}
+	exits := logged.entries("worker exited")
+	if len(exits) != 2 || exits[0]["oom_kill"] != true || exits[1]["oom_kill"] != nil || exits[0]["restart_in"] != "20ms" {
+		t.Errorf("exits %v", exits)
+	}
+	ev, _ := r.all()
+	if len(ev) != 2 || ev[0].Payload.(map[string]any)["oom_kill"] != true || ev[1].Payload.(map[string]any)["oom_kill"] != nil {
+		t.Errorf("records %v", ev)
+	}
+}
+
+// A first generation the kernel killed before it was ready fails agentd, saying so; and a generation
+// systemd cannot be asked about is recorded without oom_kill, the log saying why.
+func TestTheFirstWorkerOverItsMemory(t *testing.T) {
+	s, _, r, _ := worker(t, "exit", Timing{})
+	s.o.Limits = &limits{killed: map[int64]bool{1: true}}
+	s.Start()
+	select {
+	case err := <-s.Failed():
+		if !strings.Contains(err.Error(), "the Worker exited before it said it was ready (exit status 3, the kernel killed it at its memory limit of 1GiB)") {
+			t.Errorf("%v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first Worker did not fail")
+	}
+	if ev, _ := r.all(); len(ev) != 1 || ev[0].Payload.(map[string]any)["oom_kill"] != true {
+		t.Errorf("records %v", ev)
+	}
+
+	s, logged, r, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,ready")
+	s.o.Limits = &limits{killed: map[int64]bool{1: true}, err: errors.New("systemctl: exit status 1")}
+	s.Start()
+	readied(t, s)
+	wait(t, "the second generation", 10*time.Second, func() bool { return len(logged.entries("worker ready")) == 2 })
+	if w := logged.entries("could not ask systemd how the Worker's scope ended: its exit's record does not say whether it went over its memory limit"); len(w) != 1 ||
+		w[0]["error"] != "systemctl: exit status 1" || len(logged.entries("the Worker went over its memory limit, and the kernel killed it")) != 0 {
+		t.Errorf("logged %v", w)
+	}
+	if ev, _ := r.all(); len(ev) != 1 || ev[0].Payload.(map[string]any)["oom_kill"] != nil {
+		t.Errorf("records %v", ev)
 	}
 }

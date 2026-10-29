@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +37,8 @@ type Client struct {
 	timeout time.Duration
 	log     *slog.Logger
 	slots   chan struct{} // servers running at once
+	limits  Limits
+	calls   *atomic.Int64 // calls made, by every client WithOwnSlots made of this one too: each scope's number
 }
 
 // Options configure a Client.
@@ -51,6 +54,23 @@ type Options struct {
 	Timeout  time.Duration // per call, from the moment it has a slot
 	Parallel int           // servers running at once; 4 when 0
 	Log      *slog.Logger  // gets the server's stderr when a call fails or is refused; the error does not carry it
+	// Limits, if set, hold each call to its resource limits (Linux, M5 C3a): the launcher gets what
+	// Limits.Env gives it, and runs the call in a systemd user scope of its own. A call whose server
+	// failed because the kernel killed it at its memory limit is refused (a ToolError), as one past the
+	// CPU time limit is: the same call goes over it every time.
+	Limits Limits
+}
+
+// Limits are how a call's launcher holds it to the calls' resource limits: a *scope.Set.
+type Limits interface {
+	// Env is what call n's launcher gets: the name of its scope ("" for none), and the variables that
+	// say what holds it, or that the limits are off.
+	Env(n int64) (unit string, env []string)
+	// OOMKilled reports, once what ran in unit has exited, whether the kernel killed it at its memory
+	// limit; its error says it could not be told.
+	OOMKilled(unit string) (bool, error)
+	// Memory is the memory limit, as a refusal names it.
+	Memory() string
 }
 
 // maxReply bounds one message from the server: a diff at its limit, or one file read_files
@@ -91,7 +111,7 @@ func NewClient(o Options) (*Client, error) {
 		n = 4
 	}
 	return &Client{server: o.Server, sandbox: o.Sandbox, deny: string(deny), timeout: o.Timeout, log: o.Log,
-		slots: make(chan struct{}, n)}, nil
+		slots: make(chan struct{}, n), limits: o.Limits, calls: new(atomic.Int64)}, nil
 }
 
 // WithOwnSlots is a client like c whose calls take n slots of their own (4 when n is not
@@ -219,7 +239,7 @@ func checked(f File, p string) (File, error) {
 // Call runs tool on the mirror and decodes its structured result into out. A call that runs
 // past the timeout fails, to be retried: the launcher's CPU time limit is what refuses a
 // commit too costly to diff, the same way every time, while a call can be slow because the
-// machine is.
+// machine is. So is its memory limit, on Linux (Options.Limits), for a commit too large.
 func (c *Client) Call(ctx context.Context, mirror, tool string, args, out any) error {
 	release, err := c.slot(ctx)
 	if err != nil {
@@ -263,7 +283,7 @@ func (c *Client) slot(ctx context.Context) (func(), error) {
 }
 
 // call is Call in a slot already taken.
-func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) error {
+func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) (err error) {
 	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	// A directory of this call's own, removed afterwards however the server ends: the
@@ -282,6 +302,12 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 	// may see.
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + state, "TMPDIR=" + state, "AGENTOS_TMPDIR=" + state,
 		"LANG=C.UTF-8", "AGENTOS_SANDBOX_STATE=" + state, "AGENTOS_SANDBOX_DENY_READ=" + c.deny}
+	var unit string // the call's systemd user scope, if it has one
+	if c.limits != nil {
+		var limits []string
+		unit, limits = c.limits.Env(c.calls.Add(1))
+		cmd.Env = append(cmd.Env, limits...)
+	}
 	// The launcher and everything it starts form a process group, killed whole: on a timeout
 	// the server goes too, not just its launcher. (A process that starts a session of its own
 	// escapes this; on Linux bwrap's --die-with-parent still ends it.) The group is a session's
@@ -304,13 +330,32 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 		c.logFailure(tool, fmt.Errorf("start: %w", err), stderr.String())
 		return failedOn(tool)
 	}
-	// What went wrong is logged with the server's stderr, which is whole once it has exited.
+	// What went wrong is logged with the server's stderr, which is whole once it has exited. Whether the
+	// kernel killed a server that failed at the call's memory limit, systemd says once it has exited: such
+	// a call is refused, since it goes over the limit every time, as over the CPU time limit (cpuLimitError).
 	var failure error
 	var refused *ToolError
 	defer func() {
 		_ = cmd.Wait()
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // anything of the group still running
-		switch msg := stderr.String(); {
+		msg := stderr.String()
+		if failure != nil && unit != "" {
+			switch killed, oerr := c.limits.OOMKilled(unit); {
+			case oerr != nil:
+				c.logFailure(tool, fmt.Errorf("%w; and systemd could not say whether the call went over its memory limit: %w",
+					failure, oerr), msg)
+				return
+			case killed:
+				err = &ToolError{Msg: "the commit is too large for the git tool server to read within its memory limit of " +
+					c.limits.Memory()}
+				if c.log != nil {
+					c.log.Warn("the git tool call went over its memory limit, and the kernel killed it: refused", "tool", tool,
+						"memory_limit", c.limits.Memory(), "scope", unit, "error", failure, "stderr", msg)
+				}
+				return
+			}
+		}
+		switch {
 		case failure != nil:
 			c.logFailure(tool, failure, msg)
 		case refused != nil && msg != "" && c.log != nil:
@@ -434,8 +479,9 @@ func blobID(b []byte) string {
 }
 
 // ServerFailure is the error of a call whose server failed: it did not start, stopped, timed out, or
-// answered nothing agentd could read. Wrapped (%w) by whatever reads through the server, it stays
-// one (IsServerFailure): the gateway records it as such, and agentctl runs explain tells it by that.
+// answered nothing agentd could read; but for one the kernel killed at the call's memory limit, which
+// is refused (a ToolError). Wrapped (%w) by whatever reads through the server, it stays one
+// (IsServerFailure): the gateway records it as such, and agentctl runs explain tells it by that.
 type ServerFailure struct{ Tool string }
 
 func (e *ServerFailure) Error() string {

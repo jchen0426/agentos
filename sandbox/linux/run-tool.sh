@@ -14,17 +14,26 @@
 #   - per process: at most 4 GiB of address space (a small crafted repository can make git ask
 #     for a lot of memory), 30 s of CPU (a commit too costly to diff is refused the same way
 #     every time: git dies of SIGXCPU; 40 s is the hard limit, where Linux sends SIGKILL
-#     instead) and 64 MiB per file written.
+#     instead) and 64 MiB per file written;
+#   - for the call as a whole (limits.sh, sourced first): a systemd user scope of its own, a
+#     cgroup that holds all the memory its processes use, the kernel's for them and the private
+#     /tmp among it, with no swap, and its tasks, processes and threads together, as
+#     git_tools.limits says (512 MiB and 128 by default). Past the memory the kernel kills the
+#     call's largest process (git, as a rule) and systemd the rest; agentd refuses the call the
+#     same way every time, as it does one past the CPU time.
 #
-# Usage: run-tool.sh <mirror> -- <server> [args...]
+# Usage: run-tool.sh <mirror> -- <server> [args...], with the limits in the environment
+# (limits.sh says which), or AGENTOS_LIMITS=off.
 # Ubuntu 23.10+ also needs an AppArmor profile that grants bwrap user namespaces
-# (see vm/lima/agentos.yaml).
+# (see vm/lima/agentos.yaml). The limits need a systemd user manager: a login session, or lingering.
 set -euo pipefail
 
 if [[ $# -lt 3 || $2 != "--" ]]; then
   echo "usage: $0 <mirror> -- <server> [args...]" >&2
   exit 2
 fi
+# shellcheck source=limits.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/limits.sh" # in its scope from here on
 # Both are mounted at the paths they are named by, whatever symlinks those go through.
 mirror=$1
 shift 2

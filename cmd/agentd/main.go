@@ -54,6 +54,7 @@ import (
 	"github.com/jchen0426/agentos/internal/pricing"
 	"github.com/jchen0426/agentos/internal/runtimeproxy"
 	"github.com/jchen0426/agentos/internal/safetext"
+	"github.com/jchen0426/agentos/internal/scope"
 	"github.com/jchen0426/agentos/internal/secrets"
 	"github.com/jchen0426/agentos/internal/statedir"
 	"github.com/jchen0426/agentos/internal/supervisor"
@@ -118,6 +119,13 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 			return err
 		}
 	}
+	// And the resource limits of the Worker and of each git tool call (M5 C3a): on Linux a probe scope
+	// of each shows now that the user manager holds them, or agentd refuses to start, saying why.
+	limits, err := resourceLimits(ctx, runtime.GOOS, cfg, insecureDev, noWorker, scope.Exec)
+	if err != nil {
+		return err
+	}
+	limits.say(cfg, log)
 	if err := mkdirPrivate(cfg.DataDir); err != nil {
 		return err
 	}
@@ -240,7 +248,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	// until the next start.
 	incarnation := uuid.NewString()
 	startedAt := time.Now()
-	start := startRecord(configPath, cfg, pol, mods, prices, incarnation, faultScript, testTools, insecureDev)
+	start := startRecord(configPath, cfg, pol, mods, prices, incarnation, faultScript, testTools, insecureDev, limits.enforcement)
 	start["retention_seconds"] = int64(retention / time.Second)
 	start["no_worker"] = noWorker
 	if !noWorker {
@@ -250,7 +258,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 		} else if ref != "sha256:"+snap.Root {
 			return fmt.Errorf("the manifest of the Worker's code is %s, not sha256:%s", ref, snap.Root)
 		}
-		start["worker"] = workerRecord(cfg, snap, supervisor.Timing{}.WithDefaults())
+		start["worker"] = workerRecord(cfg, snap, supervisor.Timing{}.WithDefaults(), limits.enforcement)
 	}
 	// The chain its anchor workflows are named by: its first record's. A new ledger's first record is
 	// this one, which cannot name its own sha256.
@@ -356,7 +364,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 			}
 		}
 	}
-	git, err := gitServer(cfg, insecureDev, log)
+	git, err := gitServer(cfg, insecureDev, limits.tools, log)
 	if err != nil {
 		return err
 	}
@@ -457,7 +465,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	runtimeSrv.OnRefused(func(r runtimeproxy.Refused) { refusals.Add(refusalRecord(r)) })
 	var sup *supervisor.Supervisor
 	if !noWorker {
-		o, err := workerLaunch(runtime.GOOS, cfg, snap, runtimeLn.Addr())
+		o, err := workerLaunch(runtime.GOOS, cfg, snap, runtimeLn.Addr(), limits.worker)
 		if err != nil {
 			return err
 		}
@@ -598,9 +606,10 @@ func refusalRecord(r runtimeproxy.Refused) audit.Event {
 }
 
 // startRecord is the payload of agentd.started: this process, how it was started, and what it was
-// started with, each configuration file by the sha256 of the bytes it was loaded from.
+// started with, each configuration file by the sha256 of the bytes it was loaded from, and the git
+// tool calls' resource limits with what holds them (enforcement, limitsRecord).
 func startRecord(configPath string, cfg *config.Config, pol *policy.Policy, mods *models.Config, prices *pricing.Table,
-	incarnation, faultScript string, testTools, insecureDev bool) map[string]any {
+	incarnation, faultScript string, testTools, insecureDev bool, enforcement string) map[string]any {
 	sandbox := ""
 	if len(cfg.GitTools.Sandbox) > 0 {
 		sandbox = cfg.GitTools.Sandbox[0]
@@ -611,7 +620,7 @@ func startRecord(configPath string, cfg *config.Config, pol *policy.Policy, mods
 	file := func(path, sum string) map[string]string { return map[string]string{"path": path, "sha256": sum} }
 	p := map[string]any{
 		"pid": os.Getpid(), "incarnation": incarnation, "insecure_dev": insecureDev, "test_tools": testTools,
-		"fault_script": faultScript != "", "git_tools_sandbox": sandbox,
+		"fault_script": faultScript != "", "git_tools_sandbox": sandbox, "git_tools_limits": limitsRecord(cfg.GitTools.Limits, enforcement),
 		"config": map[string]any{
 			"agentd": file(configPath, cfg.SHA256), "policy": file(cfg.PolicyFile, pol.SHA256),
 			"models": file(cfg.ModelsFile, mods.SHA256), "prices": file(cfg.PricesFile, prices.SHA256),
@@ -731,8 +740,9 @@ func buildTools(cfg *config.Config, pol *policy.Policy, led *ledger.Ledger, tc c
 
 // gitServer is how agentd runs the read-only git MCP server. Its sandbox launcher is required:
 // the server reads repositories, which are untrusted. --insecure-dev lets a developer run it
-// without one, and every start says so.
-func gitServer(cfg *config.Config, insecureDev bool, log *slog.Logger) (*gitmcp.Client, error) {
+// without one, and every start says so. limits are what the launcher gets of each call's resource
+// limits: nil for none.
+func gitServer(cfg *config.Config, insecureDev bool, limits *scope.Set, log *slog.Logger) (*gitmcp.Client, error) {
 	g := cfg.GitTools
 	if g.Server == "" {
 		self, err := os.Executable()
@@ -755,8 +765,12 @@ func gitServer(cfg *config.Config, insecureDev bool, log *slog.Logger) (*gitmcp.
 		return nil, errors.New("git_tools.sandbox is required: the launcher in sandbox/macos or sandbox/linux " +
 			"(or start agentd with --insecure-dev, for development only)")
 	}
-	return gitmcp.NewClient(gitmcp.Options{Server: g.Server, Sandbox: g.Sandbox, DenyRead: toolDenyRead(cfg),
-		Timeout: g.Timeout, Log: log.With("component", "git-tools")})
+	o := gitmcp.Options{Server: g.Server, Sandbox: g.Sandbox, DenyRead: toolDenyRead(cfg), Timeout: g.Timeout,
+		Log: log.With("component", "git-tools")}
+	if limits != nil { // a nil *scope.Set in the interface would not be nil
+		o.Limits = limits
+	}
+	return gitmcp.NewClient(o)
 }
 
 // toolDenyRead is what the git tool server must not read, whatever its launcher allows:
