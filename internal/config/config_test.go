@@ -552,6 +552,7 @@ func TestLimits(t *testing.T) {
 	}
 	for body, refusal := range map[string]string{
 		"worker: {limits: {memory: 1073741824}}\n":    "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 536870912}}\n":     "write a whole number of MiB or GiB",
 		"worker: {limits: {memory: 1G}}\n":            "write a whole number of MiB or GiB",
 		"worker: {limits: {memory: 1.5GiB}}\n":        "write a whole number of MiB or GiB",
 		"worker: {limits: {memory: 0MiB}}\n":          "write a whole number of MiB or GiB",

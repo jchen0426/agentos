@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -11,8 +12,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jchen0426/agentos/internal/config"
+	"github.com/jchen0426/agentos/internal/gitmcp"
 	"github.com/jchen0426/agentos/internal/models"
 	"github.com/jchen0426/agentos/internal/policy"
 	"github.com/jchen0426/agentos/internal/pricing"
@@ -161,6 +164,51 @@ func TestStartRecordsTheToolLimits(t *testing.T) {
 		if l, ok := p["git_tools_limits"].(map[string]any); !ok || !maps.Equal(l, map[string]any{"memory_bytes": int64(64 << 20),
 			"tasks": int64(32), "swap_bytes": 0, "enforcement": enforcement}) {
 			t.Errorf("%s: %v", enforcement, p["git_tools_limits"])
+		}
+	}
+}
+
+// Each git tool call's launcher gets the calls' limits, a scope of its own named among them; or, with
+// them off, AGENTOS_LIMITS=off; or, where nothing holds them, none of it.
+func TestTheGitToolCallsGetTheirLimits(t *testing.T) {
+	dir := t.TempDir()
+	server, launcher := filepath.Join(dir, "agentos-mcp-git"), filepath.Join(dir, "run-tool.sh")
+	if err := os.WriteFile(server, nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// It writes down what it was given of the limits, and fails, as a launcher that cannot run.
+	if err := os.WriteFile(launcher, []byte("#!/bin/sh\nenv | grep -E '^(AGENTOS_LIMIT|XDG_RUNTIME_DIR=)' | sort >\"$0.env\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gone := func(context.Context, []string, ...string) ([]byte, error) {
+		return []byte("ActiveState=inactive\nResult=success\n"), nil
+	}
+	on := scope.New("/run/user/501", gone).On("tool", scope.Limits{Memory: 64 << 20, Tasks: 32})
+	unit, _ := on.Env(1)
+	for name, k := range map[string]struct {
+		limits *scope.Set
+		want   []string
+	}{
+		"held": {on, []string{"AGENTOS_LIMIT_MEMORY=67108864", "AGENTOS_LIMIT_TASKS=32", "AGENTOS_LIMIT_UNIT=" + unit,
+			"XDG_RUNTIME_DIR=/run/user/501"}},
+		"off":  {scope.Off("tool", scope.Limits{Memory: 64 << 20, Tasks: 32}), []string{"AGENTOS_LIMITS=off"}},
+		"none": {nil, nil},
+	} {
+		cfg := workerConfig()
+		cfg.GitTools = config.GitTools{Server: server, Sandbox: []string{launcher}, Timeout: 10 * time.Second}
+		c, err := gitServer(cfg, false, k.limits, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Call(context.Background(), dir, "resolve_commit", gitmcp.ResolveCommitIn{Commit: "abcdef0"}, &gitmcp.ResolveCommitOut{}); !gitmcp.IsServerFailure(err) {
+			t.Errorf("%s: %v", name, err)
+		}
+		b, err := os.ReadFile(launcher + ".env")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Fields(string(b)); !slices.Equal(got, k.want) {
+			t.Errorf("%s: the launcher got %q, want %q", name, got, k.want)
 		}
 	}
 }
