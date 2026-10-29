@@ -2269,3 +2269,27 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
   跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
 - Linux VM（bwrap，`~/agentos-venv-m5`）：钉住代码的测试和拒绝启动的那组，带 `--verify-after-each`：6 过；6 个栈，1 个 verify 以 0 退出，0 个失败，5 个照设计拒绝启动没验。
+
+### 最后的复审和协调者的运行（e3fce88）
+
+- **两份增量复审**都没有中等及以上的发现。
+  - 安全审查确认两点：这一轮没有放宽 Worker 能读的东西，也没有削弱上一轮的检查；`terminating` 钩子不导出、不在 Options 里，生产代码里一直是 nil。
+  - 对抗性审查确认 R3-1 到 R3-5 都关上了，去掉 flaky 的那个测试仍然是真的测试。它改坏 15 处，抓到 14 处，没抓到的那处是把钩子本身去掉，而钩子只是让测试不再抖。
+- **对抗性审查又找到两条低**，协调者定为不修，记进剩余风险：
+  - R4-1：`.pth` 指向的目录里（code 副本的子目录，或 `python/pinned/N`）有 sitecustomize/usercustomize 时，它照样被拷进副本，每次启动都会被导入。它本身是钉住的（拷了，也算进了根），但和副本里任何一个模块一样，运行时可以自己去碰没钉住的路径。
+  - R4-2：import 根的链接按字面路径判断在不在树里。两跳的链（`python/lib -> sub`，`python/sub -> /outside/lib`）能让副本的 `lib` 指到树外，整个 lib 树就又是活的。要特意摆出这样的布局才会发生。
+  - 不修的理由：
+    - 两条都要特意摆出来的布局，标准的安装工具做不出来；
+    - 读什么仍由沙箱判断，所以都不放宽 Worker 能读的东西，只是代码钉不住；
+    - 它们和“副本里的代码运行时自己伸出去”是同一类剩余风险。
+  - 每一轮复审都还能再找出一两条更偏的低，到这里收住。
+- **协调者在 e3fce88 上的运行**：三种环境各跑一遍所有用 agentd 自己的 Worker 的测试，带 `--verify-after-each`。这些测试是 `test_worker_supervision.py`、T1 的两个文件、T9、`test_agentd_restart.py`、T12、`test_harness.py` 和 `test_sandbox.py`。
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | verify 失败 | 没验（照设计不启动） | 用时 |
+  |---|---|---|---|---|---|---|---|
+  | macOS，不加沙箱 | 61 | 28 | 60 | 53 | 0 | 7 | 14 分 12 秒 |
+  | macOS，srt | 86 | 3 | 67 | 59 | 0 | 8 | 16 分 13 秒 |
+  | Linux VM，bwrap | 74 | 15 | 66 | 58 | 0 | 8 | 12 分 37 秒 |
+
+  - 跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
+  - 完整套件在 a9fb46a 上跑过（见第三轮开头）；e3fce88 之后的完整套件交给 CI。
