@@ -182,6 +182,24 @@ jobs:
           # Fails with "loopback: Failed RTM_NEWADDR" if the profile did not take.
           bwrap --unshare-all --ro-bind / / true
 
+      # On Linux agentd runs each Worker and each git tool call in a systemd user scope, which holds
+      # their memory and task limits (M5 C3a), and refuses to start without the user's systemd
+      # manager. The runner user has one: lingering is on, and user@.service delegates cpu, memory
+      # and pids (trial PR #65). enable-linger changes nothing then, and starts one otherwise. A
+      # job's steps have no login session, so no XDG_RUNTIME_DIR, which agentd and the launchers
+      # find the manager by.
+      - name: A systemd user manager for the resource limits
+        if: env.AGENTOS_SANDBOX == 'bwrap'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          dir=/run/user/$(id -u)
+          for _ in $(seq 100); do [[ -S $dir/systemd/private ]] && break; sleep 0.1; done
+          [[ -S $dir/systemd/private ]] || { echo "::error::no systemd user manager listens at $dir"; exit 1; }
+          echo "XDG_RUNTIME_DIR=$dir" >> "$GITHUB_ENV"
+          # A scope's limits, read back from inside it, as agentd's start check reads them.
+          XDG_RUNTIME_DIR=$dir systemd-run --user --scope --quiet --collect -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=16 \
+            sh -c 'd=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup); test "$(cat "$d/memory.max" "$d/memory.swap.max" "$d/pids.max" | tr "\n" " ")" = "67108864 0 16 "'
+
       - run: make build
       - run: uv sync --locked --group dev
 
