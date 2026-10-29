@@ -145,6 +145,7 @@ type Supervisor struct {
 
 	beforeStart func(n int)           // tests: runs just before generation n's launcher is started
 	startCmd    func(*exec.Cmd) error // starts a launcher: (*exec.Cmd).Start, but in tests
+	terminating func()                // tests: runs as a generation's stop begins
 
 	outMu     sync.Mutex
 	dropped   int         // lines not logged since the last one logged
@@ -549,6 +550,9 @@ func (s *Supervisor) discard(g *generation) {
 func (s *Supervisor) terminate(g *generation) {
 	if closed(g.exited) {
 		return
+	}
+	if s.terminating != nil {
+		s.terminating()
 	}
 	g.closeStopper()
 	if g.exitsWithin(s.t.StopGrace) {

@@ -953,10 +953,19 @@ func TestAStopDuringACheckStartsNothing(t *testing.T) {
 	timing.StopGrace = 300 * time.Millisecond // it does not read its stop channel: SIGTERM after this
 	s, l, r, _ := worker(t, "deaf-stdin", timing)
 	s.o.NewTally = ts.new
+	var once sync.Once
+	s.terminating = func() { // the Stop comes as the check's stop begins, however loaded the machine
+		once.Do(func() {
+			go s.Stop()
+			for !closed(s.stop) {
+				time.Sleep(time.Millisecond)
+			}
+		})
+	}
 	s.Start()
 	readied(t, s)
 	wait(t, "the check", 5*time.Second, func() bool { return len(l.entries("the Worker is not serving")) > 0 })
-	s.Stop()
+	s.Stop() // returns once the supervisor has
 	time.Sleep(100 * time.Millisecond)
 	if n := len(l.entries("worker started")); n != 1 {
 		t.Errorf("%d generations started: %v", n, l.entries(""))
