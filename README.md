@@ -513,7 +513,7 @@ worker:
   code: ../../python                            # its working directory, where it imports from
   workflows: agentos_worker.workflows:WORKFLOWS # the default
   deny_read: []                                 # macOS: more paths its sandbox may not read
-  limits: {memory: 1GiB, tasks: 512}            # Linux: the defaults; macOS refuses any (Resource limits)
+  # limits: {memory: 1GiB, tasks: 512}          # Linux only, these by default; macOS refuses any (Resource limits)
 ```
 
 A sandboxed Worker can read all of its code directory and Python environment: agentd refuses

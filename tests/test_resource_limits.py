@@ -13,6 +13,7 @@ import os
 import random
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 from pathlib import Path
@@ -230,6 +231,40 @@ def test_a_git_tool_call_over_its_memory_limit_is_refused_once(stack: Stack) -> 
            seq=record_seq(stack, run, "1:git.show_diff", 1, "error"), event=end_event(stack, run, "1:git.show_diff"),
            says=("memory limit of 64MiB",))
     assert "within its memory limit of 64MiB" in report_agrees(stack, run, e)
+
+
+# A systemd-run in front of the real one that starts the launcher's scope otherwise than it asked, as a
+# user manager might that does not hold what it is asked, or a launcher run in a scope not its own: the
+# launcher reads its scope back, and refuses to go on (sed's edit of systemd-run's arguments, and why).
+SCOPES_OTHERWISE = {
+    "another unit": ("s/^--unit=\\(.*\\)\\.scope$/--unit=\\1-other.scope/", "not in its scope"),
+    "more memory": ("s/^--property=MemoryMax=.*/--property=MemoryMax=134217728/", "its scope's memory.max is 134217728, not 67108864"),
+    "swap": ("s/^--property=MemorySwapMax=0$/--property=MemorySwapMax=infinity/", "its scope's memory.swap.max is max, not 0"),
+    "more tasks": ("s/^--property=TasksMax=.*/--property=TasksMax=64/", "its scope's pids.max is 64, not 32"),
+    "as asked": ("", ""),
+}
+
+
+@pytest.mark.parametrize("scope", SCOPES_OTHERWISE)
+def test_the_launchers_check_their_scope(tmp_path: Path, scope: str) -> None:
+    """The launcher reads back, in its scope, the scope's cgroup and its memory.max, memory.swap.max and
+    pids.max, and refuses to go on unless they are what it asked; in a scope as asked it goes on."""
+    edit, refusal = SCOPES_OTHERWISE[scope]
+    bin = tmp_path / "bin"
+    bin.mkdir()
+    (bin / "systemd-run").write_text("#!/bin/bash\n"
+                                      f"mapfile -t args < <(printf '%s\\n' \"$@\" | sed -e {shlex.quote(edit)})\n"
+                                      'exec /usr/bin/systemd-run "${args[@]}"\n')
+    (bin / "systemd-run").chmod(0o755)
+    env = {"PATH": f"{bin}:/usr/bin:/bin", "LANG": "C.UTF-8", "AGENTOS_LIMIT_MEMORY": str(64 << 20), "AGENTOS_LIMIT_TASKS": "32",
+           "AGENTOS_LIMIT_UNIT": f"agentos-test-{secrets.token_hex(8)}-tool-1.scope",
+           "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"}
+    r = subprocess.run([str(TOOL_LAUNCHER[SANDBOX]), str(tmp_path), "--", "/bin/sh", "-c", "echo inside"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    if not refusal:
+        assert (r.returncode, r.stdout) == (0, "inside\n"), r.stderr
+    else:
+        assert r.returncode == 1 and "inside" not in r.stdout and refusal in r.stderr, (r.stdout, r.stderr)
 
 
 @pytest.mark.audit_verify(skip="agentd refuses to start by design: there is no user manager")
