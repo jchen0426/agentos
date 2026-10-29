@@ -256,7 +256,7 @@ SRT_ENV = {"SANDBOX_RUNTIME", "GIT_SSH_COMMAND", "GIT_CONFIG_PARAMETERS", "JAVA_
            "DOCKER_HTTPS_PROXY", "DOCKER_HTTP_PROXY", "CLOUDSDK_PROXY_TYPE", "CLOUDSDK_PROXY_ADDRESS",
            "CLOUDSDK_PROXY_PORT", "CLOUDSDK_PROXY_USERNAME", "CLOUDSDK_PROXY_PASSWORD"}
 WORKER_ENV = {
-    "bwrap": {"PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE", "PWD"},
+    "bwrap": {"PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE", "TOKIO_WORKER_THREADS", "PWD"},
     "srt": {"PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE", "TMPDIR", "CLAUDE_CODE_TMPDIR",
             "PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING", *SRT_ENV},
 }
@@ -348,6 +348,8 @@ def test_t9_the_worker_sandbox_reaches_temporal_only_through_agentd(stack: Stack
             assert result.startswith("refused"), (group, key, result)
     if SANDBOX == "bwrap":
         assert report["dev"] == ["full", "null", "random", "shm", "urandom", "zero"], report["dev"]
+        # The SDK core's threads, one for each CPU, under the Worker's task limit (M5 C3a).
+        assert report["env"].get("TOKIO_WORKER_THREADS") == "4", report["env"]
     assert set(report["env"]) <= WORKER_ENV[SANDBOX], sorted(set(report["env"]) - WORKER_ENV[SANDBOX])
 
 
@@ -361,12 +363,15 @@ def test_t9_the_worker_launcher_passes_on_none_of_its_callers_environment(stack:
     launcher = stack.worker_command(None)[:5]  # the launcher and its arguments, up to "--"
     assert launcher[-1] == "--", launcher
     # In a session of its own, as the harness starts Workers: the macOS launcher refuses a controlling terminal.
-    r = subprocess.run([*map(str, launcher), sys.executable, "-c", "import json, os; print(json.dumps(sorted(os.environ)))"],
+    r = subprocess.run([*map(str, launcher), sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
                        capture_output=True, text=True, timeout=120, cwd=REPO, start_new_session=True,
                        env={**stack.sandbox_env(), CANARY_ENV: "a secret the Worker must not see"})
     assert r.returncode == 0, r.stderr
-    env = set(json.loads(r.stdout.strip().splitlines()[-1]))
+    given = json.loads(r.stdout.strip().splitlines()[-1])
+    env = set(given)
     assert CANARY_ENV not in env and env <= WORKER_ENV[SANDBOX], sorted(env - WORKER_ENV[SANDBOX])
+    if SANDBOX == "bwrap":
+        assert given.get("TOKIO_WORKER_THREADS") == "4", given
 
 
 @pytest.mark.skipif(SANDBOX != "srt", reason="the macOS keychain")

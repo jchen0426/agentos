@@ -19,8 +19,10 @@
 #     cgroup that holds all the memory its processes use, the kernel's for them and the private
 #     /tmp among it, with no swap, and its tasks, processes and threads together, as
 #     git_tools.limits says (512 MiB and 128 by default). Past the memory the kernel kills the
-#     call's largest process (git, as a rule) and systemd the rest; agentd refuses the call the
-#     same way every time, as it does one past the CPU time.
+#     call's largest process (git, as a rule) and systemd the rest; agentd runs the call once more,
+#     and refuses it if that is killed too, as it refuses one past the CPU time. The server gets
+#     GOMAXPROCS=4: Go starts a thread for each CPU it may use, and the task limit counts threads (a
+#     show_diff took 9 tasks with 4, 134 with GOMAXPROCS=512, past the 128 it may have).
 #
 # Usage: run-tool.sh <mirror> -- <server> [args...], with the limits in the environment
 # (limits.sh says which), or AGENTOS_LIMITS=off.
@@ -45,6 +47,7 @@ shift
 args=(
   --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8 --setenv AGENTOS_TMPDIR /tmp
+  --setenv GOMAXPROCS 4
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
   --proc /proc --size 67108864 --tmpfs /tmp
   --ro-bind "$(readlink -f "$mirror")" "$mirror"

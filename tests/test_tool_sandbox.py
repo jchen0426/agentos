@@ -79,7 +79,7 @@ print(json.dumps({
     "sockets": {k: connect(u) for k, u in a["sockets"].items()},
     "keychain": {s: keychain(s, a["keychain_file"]) for s in a["keychain"]},
     "dev": sorted(os.listdir("/dev")),
-    "env": sorted(os.environ),
+    "env": dict(os.environ),
 }))
 """
 
@@ -216,6 +216,8 @@ def test_the_git_tool_server_sees_its_mirror_and_nothing_else(outside_stack: Sta
     assert "AGENTOS_TEST_CANARY" not in report["env"] and "AGENTOS_SANDBOX_DENY_READ" not in report["env"], report["env"]
     if SANDBOX == "bwrap":  # no terminal and no pseudo-terminals, whose number the machine's sandboxes share
         assert report["dev"] == ["full", "null", "random", "urandom", "zero"], report["dev"]
+        # Go's threads, one for each CPU it may use, under the call's task limit (M5 C3a).
+        assert report["env"].get("GOMAXPROCS") == "4", report["env"]
 
 
 @pytest.mark.skipif(SANDBOX != "srt", reason="the macOS launcher's deny list")

@@ -30,7 +30,9 @@
 #     process among it (memfd, SysV IPC, pipe and socket buffers, tmpfs: docs/m1-notes.md), with
 #     no swap, and its tasks, processes and threads together, as worker.limits says (1 GiB and
 #     512 by default). Past the memory the kernel kills the Worker; agentd records that, and
-#     starts it again.
+#     starts it again. The Worker gets TOKIO_WORKER_THREADS=4: the Temporal SDK's core starts a
+#     thread for each CPU, and the task limit counts threads (the Worker had at most 23 on 4 CPUs
+#     over the bwrap suite; on some 390 CPUs it would go past 512).
 # Unlike run-tool.sh, no ulimit. -v bounds one process, and the Worker can fork; its address
 # space also grows with the CPU count (glibc gives the SDK's threads malloc arenas): the cgroup
 # bounds what it uses instead. -f would kill the Worker once a log file its output goes to grew
@@ -88,7 +90,7 @@ inner_sock=/run/agentos/$sock_name
 args=(
   --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8
-  --setenv PYTHONDONTWRITEBYTECODE 1
+  --setenv PYTHONDONTWRITEBYTECODE 1 --setenv TOKIO_WORKER_THREADS 4
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
   --proc /proc --dir /tmp --dir /dev/shm
 )
