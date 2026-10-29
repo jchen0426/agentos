@@ -251,6 +251,27 @@ func TestTheWorkerStopsFirst(t *testing.T) {
 	}
 }
 
+// agentd copies the Worker's code with what the Worker must not read, and, sandboxed, what its launcher
+// does not show it.
+func TestSnapOptions(t *testing.T) {
+	cfg := workerConfig()
+	o := snapOptions("darwin", cfg)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(o.Private, workerPrivate(cfg)) || o.Visible == nil || o.Visible(filepath.Join(home, "proj")) || !o.Visible("/usr/lib") {
+		t.Errorf("macOS: %q, shows the home %v", o.Private, o.Visible != nil && o.Visible(filepath.Join(home, "proj")))
+	}
+	if o := snapOptions("linux", cfg); o.Visible == nil || o.Visible("/opt/proj") {
+		t.Error("Linux: shows /opt")
+	}
+	cfg.Worker.Sandbox = nil
+	if o := snapOptions("darwin", cfg); o.Visible != nil || !slices.Equal(o.Private, workerPrivate(cfg)) {
+		t.Errorf("unsandboxed: %+v", o)
+	}
+}
+
 // The copy of the Worker's code takes a directory a .pth names outside its Python environment and its
 // code directory only where the Worker's launcher lets it read it: without one, everywhere; on macOS,
 // outside the homes and the shared temporary directories; on Linux, in /usr.
@@ -335,21 +356,31 @@ func TestHiddenIn(t *testing.T) {
 }
 
 // Linux's sandbox has only /usr of the host's, and its links to it: the copy takes a path whose real
-// path is in /usr only if its first name is one of those, as the sandbox looks it up.
-func TestShownIn(t *testing.T) {
+// path is in /usr only if its first name is one of those, as the sandbox looks it up; /lib64 only
+// where /usr/lib64 is, as the launcher makes it only then.
+func TestBwrapShown(t *testing.T) {
 	dir := t.TempDir()
-	usr := filepath.Join(dir, "usr")
 	for _, d := range []string{"usr/lib/py", "other"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for link, target := range map[string]string{"lib": "usr/lib", "opt": "usr/lib", "etc": "/nowhere", "usr/lib/out": "../../other"} {
+	for link, target := range map[string]string{"lib": "usr/lib", "lib64": "usr/lib", "opt": "usr/lib", "etc": "/nowhere",
+		"usr/lib/out": "../../other"} {
 		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	shown := shownIn(realPath(usr), []string{usr, filepath.Join(dir, "lib")})
+	if bwrapShown(dir)(filepath.Join(dir, "lib64", "py")) {
+		t.Error("lib64/py shown, with no usr/lib64")
+	}
+	if err := os.Mkdir(filepath.Join(dir, "usr", "lib64"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shown := bwrapShown(dir)
+	if !shown(filepath.Join(dir, "lib64", "py")) {
+		t.Error("lib64/py not shown, with usr/lib64")
+	}
 	for path, want := range map[string]bool{
 		"usr/lib/py": true, "lib/py": true, "usr/lib/not-yet": true, "etc": false, "other": false,
 		"opt/py":      false, // in /usr by its real path, but the sandbox has no /opt

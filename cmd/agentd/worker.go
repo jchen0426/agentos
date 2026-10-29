@@ -95,6 +95,12 @@ func workerPrivate(cfg *config.Config) []string {
 	return slices.Concat(toolDenyRead(cfg), cfg.Worker.DenyRead)
 }
 
+// snapOptions are what the copy of the Worker's code on goos may not hold: what the Worker must not read
+// (workerPrivate), and what its launcher does not let it read (workerVisible).
+func snapOptions(goos string, cfg *config.Config) codesnap.Options {
+	return codesnap.Options{Private: workerPrivate(cfg), Visible: workerVisible(goos, len(cfg.Worker.Sandbox) > 0)}
+}
+
 // workerVisible is, for codesnap.Make, whether the Worker's launcher on goos lets it read a path
 // outside its Python environment and its code directory (which every launcher lets it read, wherever
 // they are): a directory a .pth names there goes into the copy of its code only if so. nil without a
@@ -106,8 +112,9 @@ func workerPrivate(cfg *config.Config) []string {
 //     the launcher lists both, whatever the case, as APFS compares names, and by the data volume's
 //     names for them (/System/Volumes/Data/Users/...), as Seatbelt resolves them (darwinHidden).
 //   - sandbox/linux/run-worker.sh (bwrap's --ro-bind /usr /usr, and its links into it: /bin, /sbin,
-//     /lib, /lib64): only what is in /usr, by its real path; and by the path, whose first name the
-//     sandbox looks up in its own root, which holds nothing else of the host's.
+//     /lib, and /lib64 where /usr/lib64 is): only what is in /usr, by its real path; and by the path,
+//     whose first name the sandbox looks up in its own root, which holds nothing else of the host's
+//     (bwrapShown).
 //
 // The deny list both launchers take (AGENTOS_SANDBOX_DENY_READ, workerPrivate) is not in it:
 // codesnap refuses to copy from in or around any of it.
@@ -126,7 +133,7 @@ func workerVisible(goos string, sandboxed bool) func(string) bool {
 		}
 		return hiddenIn(darwinHidden(homes))
 	case "linux":
-		return shownIn("/usr", []string{"/usr", "/bin", "/sbin", "/lib", "/lib64"})
+		return bwrapShown("/")
 	}
 	return func(string) bool { return false } // a launcher agentd does not know: nothing
 }
@@ -167,6 +174,20 @@ func hiddenIn(dirs []string) func(string) bool {
 		}
 		return true
 	}
+}
+
+// bwrapShown is what the Linux launcher's sandbox shows of the host's files under root ("/", but in
+// tests): /usr, and the links to it its root has, /bin, /sbin and /lib, and /lib64 only where
+// /usr/lib64 is ([[ -e /usr/lib64 ]] && --symlink usr/lib64 /lib64).
+func bwrapShown(root string) func(string) bool {
+	names := []string{"usr", "bin", "sbin", "lib"}
+	if _, err := os.Stat(filepath.Join(root, "usr", "lib64")); err == nil {
+		names = append(names, "lib64")
+	}
+	for i, n := range names {
+		names[i] = filepath.Join(root, n)
+	}
+	return shownIn(realPath(filepath.Join(root, "usr")), names)
 }
 
 // shownIn shows a path only if its real path is in root, and its name in one of names: root, and the

@@ -143,8 +143,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	var snap *codesnap.Snapshot
 	if !noWorker {
 		began := time.Now()
-		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, codesnap.Options{Private: workerPrivate(cfg),
-			Visible: workerVisible(runtime.GOOS, len(cfg.Worker.Sandbox) > 0)}); err != nil {
+		if snap, err = codesnap.Make(cfg.Worker.Python, cfg.Worker.Code, snapOptions(runtime.GOOS, cfg)); err != nil {
 			return fmt.Errorf("pin the Worker's code: %w", err)
 		}
 		for _, dir := range snap.LeftOut {
