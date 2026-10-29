@@ -2302,3 +2302,14 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
   - 跑完没有留下 Worker、agentd、`agentos-worker.*` 或 `agentos-code.*`。
   - 完整套件在 a9fb46a 上跑过（见第三轮开头）；e3fce88 之后的完整套件交给 CI。
+
+## C3a：Linux 上 Worker 和工具调用的资源上限（2026-10-29）
+
+用户按推荐批准了设计和设计文档的改动清单（“按推荐批准”）：
+- Linux 上每一代 Worker、每次工具调用各进一个 systemd 用户 scope（cgroup v2）：Worker 1 GiB 内存、512 个任务，工具调用 512 MiB、128 个任务，都不许用交换空间。数值是 10-25 定的。
+- 怎么认出 OOM：给 scope 起名、不加 `--collect`，Worker 或工具服务器非正常退出后，问 systemd 这个 scope 的 `Result`。10-25 的草稿让 agentd 按 cgroup 路径读 `oom_kill`，在 VM 上 5 次 5 次都读不到：OOM 之后 systemd 停掉整个 scope，cgroup 先没了。
+- 工具调用超了内存：按不可重试的拒绝返回，写明是内存上限，和超 CPU 时间一样。
+- `--insecure-dev` 时上限关掉，打警告，记下来；macOS 这次不动。
+- CI：试验 PR #65（已关）显示 GitHub 的 ubuntu-24.04 机器本来就开着 linger，用户管理器在跑，委派了 cpu、memory、pids，只需导出 XDG_RUNTIME_DIR。
+
+设计全文在共享笔记 `m5-c3a-design.md`。设计文档的改动由协调者在合并后改。
