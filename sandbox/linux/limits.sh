@@ -75,7 +75,7 @@ else
     { read -r got <"/sys/fs/cgroup$limits_cgroup/$1"; } 2>/dev/null ||
       limits_fail "its scope has no $1 (is that controller delegated to the user manager?)"
     [[ $got != max || $2 == max ]] ||
-      limits_fail "its scope's $1 is max, not $2: systemd could not set it (journalctl --user says why)"
+      limits_fail "its scope's $1 is max, not $2: the scope was not made as asked, or systemd could not set it (journalctl --user)"
     [[ $got == "$2" ]] || limits_fail "its scope's $1 is $got, not $2"
   }
   limits_check memory.max "$AGENTOS_LIMIT_MEMORY"

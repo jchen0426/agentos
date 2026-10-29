@@ -312,9 +312,9 @@ func (c *Client) call(ctx context.Context, mirror, tool string, args, out any) e
 
 // attempt runs the server once, in a scope of its own if the calls have limits, and calls tool on it.
 // killed says that the kernel's out-of-memory killer killed what ran in the scope, as systemd says once
-// the launcher has exited: asked when the call failed, or when the launcher exited otherwise than as it
-// should after an answer (which stands); asking also clears a failed scope. A launcher that exits as it
-// should costs no systemctl.
+// the launcher has exited. systemd is asked after every call with a scope, however the launcher exited:
+// a server can answer, and exit 0 after a process of its scope was killed, which leaves the scope failed
+// in the user manager, kept there until cleared; asking clears it. An answer, or a refusal, stands.
 func (c *Client) attempt(ctx context.Context, mirror, tool string, args, out any) (killed bool, err error) {
 	callCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -366,10 +366,10 @@ func (c *Client) attempt(ctx context.Context, mirror, tool string, args, out any
 	var failure error
 	var refused *ToolError
 	defer func() {
-		waitErr := cmd.Wait()
+		_ = cmd.Wait()
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // anything of the group still running
 		msg := stderr.String()
-		if unit != "" && (failure != nil || waitErr != nil) {
+		if unit != "" {
 			k, oerr := c.limits.OOMKilled(unit)
 			if oerr != nil {
 				c.warn("could not ask systemd how the git tool call's scope ended", "tool", tool, "scope", unit, "error", oerr)
@@ -398,7 +398,8 @@ func (c *Client) attempt(ctx context.Context, mirror, tool string, args, out any
 	}
 	defer session.Close()
 	// The server answers: its launcher has gone past limits.sh, if it sources it. One that does not runs
-	// the server in no scope and with no limits.
+	// the server in no scope and with no limits. (A wrapper that runs one without exec leaves the process
+	// agentd started outside the scope too, and agentd cannot tell them apart.)
 	if c.limits != nil {
 		if err := c.limits.InScope(cmd.Process.Pid, unit); err != nil {
 			failure = err

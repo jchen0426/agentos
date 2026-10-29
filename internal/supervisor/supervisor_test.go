@@ -1503,16 +1503,28 @@ type limits struct {
 	asked   []string       // the scopes OOMKilled was asked about
 	outside map[int64]bool // the generations whose launcher is not in its scope
 	checked []int          // the pids InScope was asked about
+	// vanishing reads a launcher's cgroup as /proc does once its pid is reaped: it waits for that, a
+	// while, and fails if it came; a launcher that stays is in its scope.
+	vanishing bool
 }
 
 func (l *limits) InScope(pid int, unit string) error {
+	if l.vanishing {
+		for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+				return fmt.Errorf("cannot tell the cgroup of the process agentd started for the worker (pid %d): open /proc/%d/cgroup: %w",
+					pid, pid, os.ErrNotExist)
+			}
+		}
+		return nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.checked = append(l.checked, pid)
 	var n int64
 	fmt.Sscanf(unit, "agentos-test-worker-%d.scope", &n)
 	if l.outside[n] {
-		return fmt.Errorf("the worker's launcher (pid %d) is in the cgroup /elsewhere, not in its scope %s", pid, unit)
+		return fmt.Errorf("the process agentd started for the worker (pid %d) is in the cgroup /elsewhere, not in its scope %s", pid, unit)
 	}
 	return nil
 }
@@ -1619,12 +1631,18 @@ func TestTheFirstWorkerOverItsMemory(t *testing.T) {
 
 // A generation whose launcher, ready, is not in its scope (one that does not source limits.sh) runs with
 // no limits: the supervisor stops it, before its readiness counts, starts no other, and fails, saying
-// why. The first's agentd never gets ready; a later one's stops (agentd's run reads Failed).
+// why. The first's agentd never gets ready; a later one's stops (agentd's run reads Failed). The one
+// outside stays, as a Worker does: one that has exited by the check is its exit (see
+// TestAWorkerThatExitsAsItSaysItIsReady). The one before it is up a while, checked, then exits.
 func TestAWorkerOutsideItsScope(t *testing.T) {
-	for _, outside := range []int64{1, 2} {
+	for _, c := range []struct {
+		outside int64
+		plan    string
+	}{{1, "ready"}, {2, "long,ready"}} {
+		outside := c.outside
 		t.Run(fmt.Sprintf("generation %d", outside), func(t *testing.T) {
 			l := &limits{outside: map[int64]bool{outside: true}}
-			s, logged, _, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond}, "AGENTOS_TEST_PLAN=re,ready,ready")
+			s, logged, _, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond}, "AGENTOS_TEST_PLAN="+c.plan)
 			s.o.Limits = l
 			s.Start()
 			var err error
@@ -1660,5 +1678,33 @@ func TestAWorkerOutsideItsScope(t *testing.T) {
 				t.Errorf("checked %v", l.checked)
 			}
 		})
+	}
+}
+
+// A generation that exits as soon as it says it is ready is reaped before its launcher's cgroup can be
+// read, and /proc no longer has its pid: that is its exit, not a launcher outside its scope. It is
+// started again, as before the scope was checked, and its readiness counts; nothing goes on Failed.
+func TestAWorkerThatExitsAsItSaysItIsReady(t *testing.T) {
+	s, logged, r, _ := worker(t, "planned", Timing{BackoffMin: 20 * time.Millisecond, BackoffMax: 20 * time.Millisecond},
+		"AGENTOS_TEST_PLAN=re,re,ready")
+	s.o.Limits = &limits{vanishing: true}
+	s.Start()
+	readied(t, s)
+	wait(t, "the third generation", 10*time.Second, func() bool { return len(logged.entries("worker ready")) == 3 })
+	select {
+	case err := <-s.Failed():
+		t.Fatalf("failed: %v", err)
+	default:
+	}
+	exits := logged.entries("worker exited")
+	if len(exits) != 2 || exits[0]["ready"] != true || exits[1]["ready"] != true || exits[0]["restart_in"] != "20ms" {
+		t.Errorf("exits %v", exits)
+	}
+	if ev, _ := r.all(); len(ev) != 1 || ev[0].Payload.(map[string]any)["generation"] != 1 {
+		t.Errorf("records %v", ev)
+	}
+	if out := logged.entries("the Worker's launcher did not run it in its systemd user scope, which holds its limits: agentd " +
+		"stopped it, and starts no other"); len(out) != 0 {
+		t.Errorf("logged %v", out)
 	}
 }

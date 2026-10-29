@@ -247,7 +247,7 @@ SCOPES_OTHERWISE = {
     "another unit": ("s/^--unit=\\(.*\\)\\.scope$/--unit=\\1-other.scope/", "not in its scope"),
     "more memory": ("s/^--property=MemoryMax=.*/--property=MemoryMax=134217728/", "its scope's memory.max is 134217728, not 67108864"),
     "swap": ("s/^--property=MemorySwapMax=0$/--property=MemorySwapMax=infinity/",
-             "its scope's memory.swap.max is max, not 0: systemd could not set it"),
+             "its scope's memory.swap.max is max, not 0: the scope was not made as asked, or systemd could not set it"),
     "more tasks": ("s/^--property=TasksMax=.*/--property=TasksMax=64/", "its scope's pids.max is 64, not 32"),
     "as asked": ("", ""),
 }
@@ -302,10 +302,12 @@ def test_a_launcher_that_does_not_source_limits_sh_is_refused(stack: Stack, laun
     log = stack.agentd_log()
     [stopped] = [e for e in log if e.get("msg") == "agentd stopped"]
     assert not any(e.get("msg") == "agentd ready" for e in log), log
-    outside = r"is in the cgroup /\S+, not in its scope agentos-[0-9a-f]{16}-" + launcher + r"-1\.scope: a launcher that does not source sandbox/linux/limits\.sh"
+    outside = (r"the process agentd started for the " + launcher + r" \(pid \d+\) is in the cgroup /\S+, not in its scope agentos-"
+               r"[0-9a-f]{16}-" + launcher + r"-1\.scope: its launcher does not source sandbox/linux/limits\.sh, or a wrapper runs the "
+               r"launcher without exec")
     if launcher == "worker":
         assert re.search("the Worker's launcher did not run it in its systemd user scope, which holds its limits, and agentd stopped it: "
-                         "the worker's launcher \\(pid \\d+\\) " + outside, stopped["error"]), stopped
+                         + outside, stopped["error"]), stopped
     else:  # the self-check's: a call whose server failed, the log says why
         assert stopped["error"].startswith("the git tool server does not work: the git tool server failed on"), stopped
         assert any(e.get("msg") == "the git tool server failed" and re.search(outside, e.get("error", "")) for e in log), log
@@ -330,8 +332,8 @@ def test_a_later_worker_out_of_its_scope_stops_agentd(stack: Stack) -> None:
     assert stack.agentd is not None and stack.agentd.popen.wait(timeout=90) == 1
     log = stack.agentd_log()
     [stopped] = [e for e in log if e.get("msg") == "agentd stopped"]
-    assert re.search(r"agentd stopped it: the worker's launcher \(pid \d+\) is in the cgroup /\S+, not in its scope "
-                     r"agentos-[0-9a-f]{16}-worker-2\.scope", stopped["error"]), stopped
+    assert re.search(r"agentd stopped it: the process agentd started for the worker \(pid \d+\) is in the cgroup /\S+, not in its "
+                     r"scope agentos-[0-9a-f]{16}-worker-2\.scope", stopped["error"]), stopped
     assert len(w.log("worker started")) == 2 and len(w.log("worker ready")) == 1, w.log()
 
 

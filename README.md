@@ -568,17 +568,22 @@ calls keep `run-tool.sh`'s per-process limits too (4 GiB of address space, 30 s 
 The launcher starts the scope itself (`sandbox/linux/limits.sh`), named
 `agentos-<a token of agentd's start>-worker-<generation>.scope` or `-tool-<n>.scope`, and checks that
 its cgroup holds the limits before it starts bwrap; the sandbox sees neither `/sys` nor the user
-manager, so nothing in it can raise them. Each costs about 5 ms. agentd checks too, once a Worker says
-it is ready and once a tool call's server answers, that the launcher is in the run's scope: a launcher
-that does not source `limits.sh` (an older copy, one of your own) is refused. The Worker gets
-`TOKIO_WORKER_THREADS=4` and the git tool server `GOMAXPROCS=4`: both runtimes start a thread for each
-CPU, which the task limit counts.
+manager, so nothing in it can raise them. Each costs about 5 ms, and a git tool call some 3 ms more, as
+agentd asks systemd how its scope ended. agentd checks too, once a Worker says it is ready and once a
+tool call's server answers, that the process it started is in the run's scope, and that the scope holds
+the run's limits: a launcher that does not source `limits.sh` (an older copy, one of your own), or a
+wrapper that runs one without `exec`, is refused. The Worker gets `TOKIO_WORKER_THREADS=4` and the git
+tool server `GOMAXPROCS=4`: both runtimes start a thread for each CPU, which the task limit counts.
 
 As agentd starts, it runs a probe scope of each set of limits and reads them back, and refuses to start
-when they do not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`, else
-`/run/user/<uid>`), or the limits do not take (the controllers are not delegated to it:
-`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/cgroup.controllers` lists those it
-has). Past its memory limit the kernel's out-of-memory killer kills a process of the scope, and systemd
+when they would not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`,
+unless another user owns it, else `/run/user/<uid>`); the limits do not take, as a controller is not
+delegated to the user manager
+(`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/cgroup.controllers` lists those it
+has), or a value reads back otherwise than asked (one systemd did not set); a cgroup v1 hierarchy holds
+the memory or the pids controller, which the limits need on v2; or the kernel's command line has
+`cgroup.memory=nokmem` or `nosocket`, which leave the kernel's memory, or sockets' buffers, out of
+them. Past its memory limit the kernel's out-of-memory killer kills a process of the scope, and systemd
 stops the rest; agentd asks systemd how the scope ended. systemd says only that the killer struck: past
 the scope's own limit as a rule, but memory running out higher up (a slice's limit, the machine's
 memory, systemd-oomd) reads the same. A Worker so killed is logged ("the kernel's out-of-memory killer
@@ -592,8 +597,10 @@ how the scope ended, and for its whole start as it stops; one a killed agentd le
 logind stops your user manager when your last session ends, and with it the Worker and every git tool
 call in their scopes, and the launchers refuse until you log in again: agentd warns at start (`sudo
 loginctl enable-linger <user>` keeps the manager). There is no limit on the Worker's CPU: a subverted
-Worker can keep the CPUs busy, and slow the machine, but not use up its memory or its processes. The
-limits are your user manager's: a process of yours outside the sandbox could change them.
+Worker can keep the CPUs busy, and slow the machine, but not use up its memory or its processes. Nor
+do the scopes hold the kernel's limits per user, which the sandboxes share with agentd and your other
+processes (such as inotify instances and watches, and epoll watches): a subverted sandbox can use them
+up. The limits are your user manager's: a process of yours outside the sandbox could change them.
 
 `--insecure-dev` turns the limits off, and agentd says so at every start: the launchers then get
 `AGENTOS_LIMITS=off`. A Linux launcher run by hand (a Worker of your own, with `--no-worker`) needs

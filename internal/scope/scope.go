@@ -58,29 +58,37 @@ func Exec(ctx context.Context, env []string, argv ...string) ([]byte, error) {
 
 // RuntimeDir is where agentd finds the user manager: its own XDG_RUNTIME_DIR, an absolute path, else
 // /run/user/<uid>, where systemd-logind makes it. An XDG_RUNTIME_DIR another uid owns is not agentd's
-// (su without a login keeps the caller's): it is passed over for /run/user/<uid>.
-func RuntimeDir() string {
+// (su without a login keeps the caller's): it is passed over for /run/user/<uid>, and passedOver says
+// so, for an error that would otherwise name only the directory agentd looked in (Scopes.PassedOver).
+func RuntimeDir() (dir, passedOver string) {
 	d := os.Getenv("XDG_RUNTIME_DIR")
-	if fi, err := os.Stat(d); filepath.IsAbs(d) && (err != nil || ownedByMe(fi)) {
-		return d
+	fi, err := os.Stat(d)
+	if filepath.IsAbs(d) && (err != nil || owner(fi) == os.Getuid()) {
+		return d, ""
 	}
-	return fmt.Sprintf("/run/user/%d", os.Getuid())
+	if filepath.IsAbs(d) {
+		passedOver = fmt.Sprintf("agentd passed over XDG_RUNTIME_DIR=%s, which uid %d owns, not agentd's uid %d", d, owner(fi), os.Getuid())
+	}
+	return fmt.Sprintf("/run/user/%d", os.Getuid()), passedOver
 }
 
-// ownedByMe reports whether this process's uid owns the file.
-func ownedByMe(fi fs.FileInfo) bool {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) == os.Getuid()
+// owner is the uid that owns the file; -1 where the file system does not say.
+func owner(fi fs.FileInfo) int {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid)
+	}
+	return -1
 }
 
 // Scopes are the scopes of one agentd start. Each is named agentos-<token>-<kind>-<n>.scope, with a
 // token of the start's own: no name is one systemd still keeps from another agentd (a failed scope
 // nobody cleared stays until reset-failed, and systemd refuses a second unit of the same name).
 type Scopes struct {
-	dir      string // XDG_RUNTIME_DIR, which systemctl and systemd-run find the user manager by
-	token    string
-	run      Runner
-	readFile func(string) ([]byte, error) // reads /proc's files
+	dir        string // XDG_RUNTIME_DIR, which systemctl and systemd-run find the user manager by
+	passedOver string // an XDG_RUNTIME_DIR agentd did not take, and why (RuntimeDir)
+	token      string
+	run        Runner
+	readFile   func(string) ([]byte, error) // reads /proc's and /sys/fs/cgroup's files
 }
 
 // New makes the scopes of an agentd start, whose user manager listens in dir, asked through run; read
@@ -89,6 +97,13 @@ func New(dir string, run Runner, read func(string) ([]byte, error)) *Scopes {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b) // never fails (crypto/rand)
 	return &Scopes{dir: dir, token: hex.EncodeToString(b), run: run, readFile: read}
+}
+
+// PassedOver records why agentd did not take its own XDG_RUNTIME_DIR (RuntimeDir), for an error that
+// finds no user manager where it looked instead.
+func (s *Scopes) PassedOver(why string) *Scopes {
+	s.passedOver = why
+	return s
 }
 
 // Names is the pattern of the names of the start's scopes, for its log.
@@ -206,26 +221,42 @@ func (t *Set) OOMKilled(unit string) (bool, error) {
 }
 
 // InScope checks that process pid, the launcher of one of the set's runs, is in unit, the run's scope,
-// as limits.sh puts it there. A launcher that does not source limits.sh (an older copy of run-*.sh, one
-// of its own, a wrapper that drops AGENTOS_LIMIT_*) runs its sandbox in no scope and with no limits,
-// while agentd.started says they hold. nil when the limits are off, or the run has no scope.
+// as limits.sh puts it there, and that the scope holds the set's limits. A launcher that does not
+// source limits.sh (an older copy of run-*.sh, one of its own, a wrapper that drops AGENTOS_LIMIT_*)
+// runs its sandbox in no scope and with no limits, while agentd.started says they hold; one that makes
+// a scope of that name with other limits holds those. A scope that has ended holds nothing any more,
+// and is no error: its directory is gone (a cgroup with a live process in it cannot be removed), and
+// a process of it not reaped yet reads "<path> (deleted)". nil when the limits are off, or the run has
+// no scope.
 func (t *Set) InScope(pid int, unit string) error {
 	if t.scopes == nil || unit == "" {
 		return nil
 	}
 	b, err := t.scopes.readFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
-		return fmt.Errorf("cannot tell the cgroup of the %s's launcher (pid %d): %w", t.kind, pid, err)
+		return fmt.Errorf("cannot tell the cgroup of the process agentd started for the %s (pid %d): %w", t.kind, pid, err)
 	}
 	cgroup, err := unified(strings.Split(strings.TrimSpace(string(b)), "\n"))
-	switch {
-	case err != nil:
-		return fmt.Errorf("the %s's launcher (pid %d): %w", t.kind, pid, err)
-	case !strings.HasSuffix(cgroup, "/"+unit):
-		return fmt.Errorf("the %s's launcher (pid %d) is in the cgroup %s, not in its scope %s: a launcher that does not source "+
-			"sandbox/linux/limits.sh runs the sandbox with no limits", t.kind, pid, cgroup, unit)
+	if err != nil {
+		return fmt.Errorf("the process agentd started for the %s (pid %d): %w", t.kind, pid, err)
 	}
-	return nil
+	cgroup = strings.TrimSuffix(cgroup, " (deleted)")
+	if !strings.HasSuffix(cgroup, "/"+unit) {
+		return fmt.Errorf("the process agentd started for the %s (pid %d) is in the cgroup %s, not in its scope %s: its launcher "+
+			"does not source sandbox/linux/limits.sh, or a wrapper runs the launcher without exec", t.kind, pid, cgroup, unit)
+	}
+	dir := "/sys/fs/cgroup" + cgroup
+	got := map[string]string{}
+	for _, f := range limitFiles {
+		if b, err := t.scopes.readFile(dir + "/" + f); err == nil {
+			got[f] = strings.TrimSpace(string(b))
+		}
+	}
+	// After its limits: a directory gone by now has ended, meanwhile perhaps, and lacks no limit.
+	if _, err := t.scopes.readFile(dir + "/cgroup.procs"); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return t.held("the scope "+unit, got)
 }
 
 // unified is a process's cgroup on cgroup v2, from the lines of its /proc/<pid>/cgroup: the path of its
@@ -355,6 +386,9 @@ func (s *Scopes) noManager(why string) error {
 	if u, err := user.Current(); err == nil {
 		name = u.Username
 	}
+	if s.passedOver != "" {
+		why += "; " + s.passedOver
+	}
 	return fmt.Errorf("%w for uid %d at XDG_RUNTIME_DIR %s: %s. agentd runs the Worker and each git tool call in a systemd "+
 		"user scope, which holds their memory and task limits, and the user's manager runs the scopes. A login session "+
 		"starts one; to keep one without a session, enable lingering (sudo loginctl enable-linger %s). Or start agentd "+
@@ -369,7 +403,7 @@ func (t *Set) heldIn(unit string, out []byte) error {
 		k, v, _ := strings.Cut(line, " ")
 		if k == "cgroup" {
 			cgroups = append(cgroups, v)
-		} else {
+		} else if v != "missing" {
 			got[k] = v
 		}
 	}
@@ -380,17 +414,27 @@ func (t *Set) heldIn(unit string, out []byte) error {
 	if !strings.HasSuffix(cgroup, "/"+unit) {
 		return fmt.Errorf("the probe's process is in the cgroup %s, not in its scope's (%s)", cgroup, unit)
 	}
-	for _, f := range []struct{ file, want string }{{"memory.max", strconv.FormatInt(t.limits.Memory, 10)}, {"memory.swap.max", "0"},
-		{"pids.max", strconv.FormatInt(t.limits.Tasks, 10)}} {
-		switch v, ok := got[f.file]; {
-		case !ok || v == "missing":
-			return fmt.Errorf("the probe scope has no %s: is that controller delegated to the user manager? systemd delegates "+
-				"memory and pids to user@<uid>.service by default (Delegate=), and "+
-				"/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers lists those it has", f.file, os.Getuid(), os.Getuid())
+	return t.held("the probe scope", got)
+}
+
+// limitFiles are a scope's files of the limits, under its cgroup's directory.
+var limitFiles = []string{"memory.max", "memory.swap.max", "pids.max"}
+
+// held checks what, a scope, by its limit files as read (got: none for a file not there): each as t asks.
+func (t *Set) held(what string, got map[string]string) error {
+	want := map[string]string{"memory.max": strconv.FormatInt(t.limits.Memory, 10), "memory.swap.max": "0",
+		"pids.max": strconv.FormatInt(t.limits.Tasks, 10)}
+	for _, f := range limitFiles {
+		switch v, ok := got[f]; {
+		case !ok:
+			return fmt.Errorf("%s has no %s: is that controller delegated to the user manager? systemd delegates memory and "+
+				"pids to user@<uid>.service by default (Delegate=), and "+
+				"/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers lists those it has", what, f, os.Getuid(), os.Getuid())
 		case v == "max":
-			return fmt.Errorf("the probe scope's %s is max, not %s: systemd could not set it (journalctl --user says why)", f.file, f.want)
-		case v != f.want:
-			return fmt.Errorf("the probe scope's %s is %s, not %s", f.file, v, f.want)
+			return fmt.Errorf("%s's %s is max, not %s: the scope was not made as asked, or systemd could not set it (journalctl "+
+				"--user)", what, f, want[f])
+		case v != want[f]:
+			return fmt.Errorf("%s's %s is %s, not %s", what, f, v, want[f])
 		}
 	}
 	return nil

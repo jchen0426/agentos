@@ -323,12 +323,45 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			checking()
 		}
 	}
+	// exited handles the generation's exit, without agentd's doing, and reports whether the supervisor stops.
+	exited := func() bool {
+		s.cleanup(g) // its output read to the end: a ready mark in it is seen
+		wasReady := closed(g.ready)
+		if wasReady && ready != nil {
+			sawReady()
+		}
+		ran := g.ended.Sub(g.started)
+		e := exit{generation: g.n, pid: g.pid, ran: ran, ready: wasReady, at: g.ended, oomKill: s.oomKilled(g)}
+		e.code, e.signal = exitStatus(g.cmd.ProcessState)
+		if first && !wasReady {
+			s.logExit(g, e)
+			rec.exit(e)
+			over := ""
+			if e.oomKill {
+				over = "; the kernel's out-of-memory killer killed it, under a memory limit of " + s.o.Limits.Memory()
+			}
+			s.failed <- fmt.Errorf("the Worker exited before it said it was ready (%s%s); its last output:%s", status(g), over, g.tail.text())
+			return true
+		}
+		*backoff = s.next(*backoff, ran)
+		e.restartIn = *backoff
+		s.logExit(g, e)
+		rec.exit(e)
+		return false
+	}
 	for {
 		select {
 		case <-ready:
 			// Before its readiness counts (the first's is agentd's): a launcher that does not source
-			// limits.sh runs the Worker in no scope, with no limits.
+			// limits.sh runs the Worker in no scope, with no limits. (A wrapper that runs one without exec
+			// leaves the process agentd started outside the scope too, and agentd cannot tell them apart.)
 			if err := s.inScope(g); err != nil {
+				if s.reaped(g) {
+					// It exited since it said it was ready, and the pid it had tells nothing any more: this is
+					// its exit, which sees the ready mark that came before it.
+					<-g.exited
+					return exited()
+				}
 				s.terminate(g)
 				s.cleanup(g)
 				s.log.Error("the Worker's launcher did not run it in its systemd user scope, which holds its limits: agentd "+
@@ -367,29 +400,7 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 				s.t.ReadyWithin, g.tail.text())
 			return true
 		case <-g.exited:
-			s.cleanup(g) // its output read to the end: a ready mark in it is seen
-			wasReady := closed(g.ready)
-			if wasReady && ready != nil {
-				sawReady()
-			}
-			ran := g.ended.Sub(g.started)
-			e := exit{generation: g.n, pid: g.pid, ran: ran, ready: wasReady, at: g.ended, oomKill: s.oomKilled(g)}
-			e.code, e.signal = exitStatus(g.cmd.ProcessState)
-			if first && !wasReady {
-				s.logExit(g, e)
-				rec.exit(e)
-				over := ""
-				if e.oomKill {
-					over = "; the kernel's out-of-memory killer killed it, under a memory limit of " + s.o.Limits.Memory()
-				}
-				s.failed <- fmt.Errorf("the Worker exited before it said it was ready (%s%s); its last output:%s", status(g), over, g.tail.text())
-				return true
-			}
-			*backoff = s.next(*backoff, ran)
-			e.restartIn = *backoff
-			s.logExit(g, e)
-			rec.exit(e)
-			return false
+			return exited()
 		case <-s.stop:
 			s.terminate(g)
 			s.cleanup(g)
@@ -400,6 +411,14 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			rec.fire()
 		}
 	}
+}
+
+// reaped reports whether generation g's launcher has exited and been reaped (the reader of its exit
+// reaps it at once): then its pid tells nothing of where it ran. A zombie, not reaped yet, is still
+// there. Once reaped the process answers ErrProcessDone, through its pidfd where Linux has one, and so
+// it does once g.exited is closed.
+func (s *Supervisor) reaped(g *generation) bool {
+	return errors.Is(g.cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone)
 }
 
 // inScope checks that generation g's launcher is in its scope (Options.Limits): nil without limits.

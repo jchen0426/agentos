@@ -159,20 +159,29 @@ func TestRuntimeDir(t *testing.T) {
 	mine := t.TempDir()
 	for _, v := range []string{mine, "/run/user/1234/not-there"} {
 		t.Setenv("XDG_RUNTIME_DIR", v)
-		if d := RuntimeDir(); d != v {
-			t.Errorf("XDG_RUNTIME_DIR=%q: %s", v, d)
+		if d, over := RuntimeDir(); d != v || over != "" {
+			t.Errorf("XDG_RUNTIME_DIR=%q: %s, %q", v, d, over)
 		}
 	}
 	want := fmt.Sprintf("/run/user/%d", os.Getuid())
-	others := []string{"", "run/user/1234"}
-	if os.Getuid() != 0 {
-		others = append(others, "/") // root's
-	}
-	for _, v := range others {
+	for _, v := range []string{"", "run/user/1234"} {
 		t.Setenv("XDG_RUNTIME_DIR", v)
-		if d := RuntimeDir(); d != want {
-			t.Errorf("XDG_RUNTIME_DIR=%q: %s, want %s", v, d, want)
+		if d, over := RuntimeDir(); d != want || over != "" {
+			t.Errorf("XDG_RUNTIME_DIR=%q: %s, %q, want %s", v, d, over, want)
 		}
+	}
+	// Another uid's (root's /, here) is passed over, and the error that finds no user manager says so.
+	if os.Getuid() == 0 {
+		t.Skip("root owns /")
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "/")
+	d, over := RuntimeDir()
+	if d != want || over != fmt.Sprintf("agentd passed over XDG_RUNTIME_DIR=/, which uid 0 owns, not agentd's uid %d", os.Getuid()) {
+		t.Errorf("another uid's: %s, %q", d, over)
+	}
+	err := withProc(New(t.TempDir(), nil, nil).PassedOver(over), nil).Probe(context.Background())
+	if !errors.Is(err, ErrNoManager) || !strings.Contains(err.Error(), over) {
+		t.Errorf("no user manager where it looked instead: %v", err)
 	}
 }
 
@@ -238,10 +247,11 @@ func TestProbe(t *testing.T) {
 		"no swap limit": {dir: dir, probe: report(good, "memory.max 1073741824", "memory.swap.max missing", "pids.max 512"), is: ErrNotHeld,
 			message: []string{"has no memory.swap.max"}},
 		"no memory limit": {dir: dir, probe: report(good, "memory.max max", "memory.swap.max 0", "pids.max 512"), is: ErrNotHeld,
-			message: []string{"memory.max is max, not 1073741824: systemd could not set it", "journalctl --user", "--insecure-dev"},
-			not:     []string{"delegated"}},
+			message: []string{"memory.max is max, not 1073741824: the scope was not made as asked, or systemd could not set it",
+				"journalctl --user", "--insecure-dev"},
+			not: []string{"delegated"}},
 		"swap": {dir: dir, probe: report(good, "memory.max 1073741824", "memory.swap.max max", "pids.max 512"), is: ErrNotHeld,
-			message: []string{"memory.swap.max is max, not 0: systemd could not set it"}},
+			message: []string{"memory.swap.max is max, not 0: the scope was not made as asked, or systemd could not set it"}},
 		"no task limit": {dir: dir, probe: report(good, "memory.max 1073741824", "memory.swap.max 0", "pids.max missing"), is: ErrNotHeld,
 			message: []string{"has no pids.max"}},
 		"another task limit": {dir: dir, probe: report(good, "memory.max 1073741824", "memory.swap.max 0", "pids.max 511"), is: ErrNotHeld,
@@ -300,35 +310,69 @@ func TestProbe(t *testing.T) {
 	}
 }
 
-// After a run's server connected, or its Worker said it is ready, agentd checks that the run's launcher
-// is in the run's scope: one that does not source limits.sh would run the sandbox with no limits. With
-// the limits off, or no scope, there is nothing to check.
+// After a run's server connected, or its Worker said it is ready, agentd checks that the process it
+// started is in the run's scope, and that the scope holds the set's limits: a launcher that does not
+// source limits.sh (or that a wrapper runs without exec) leaves it outside, with no limits; one could
+// also make a scope of that name with other limits. A scope that has ended holds nothing any more: no
+// error. With the limits off, or no scope, there is nothing to check.
 func TestInScope(t *testing.T) {
 	const unit = "agentos-0123456789abcdef-worker-2.scope"
-	app := "0::/user.slice/user-501.slice/user@501.service/app.slice/"
-	for name, c := range map[string]struct {
-		cgroup  string // /proc/42/cgroup; none when ""
-		refusal string // "" for none
-	}{
-		"in its scope":             {app + unit + "\n", ""},
-		"beside a v1 net_cls":      {"9:net_cls:/\n" + app + unit + "\n", ""},
-		"in agentd's session":      {"0::/user.slice/user-501.slice/session-6.scope\n", "is in the cgroup /user.slice/user-501.slice/session-6.scope, not in its scope " + unit},
-		"in another run's scope":   {app + "agentos-0123456789abcdef-worker-1.scope\n", "not in its scope " + unit},
-		"in a scope named like it": {app + "x" + unit + "\n", "not in its scope"},
-		"pids on v1":               {"5:pids:/user.slice\n" + app + unit + "\n", "a cgroup v1 hierarchy holds the pids controller"},
-		"gone":                     {"", "cannot tell the cgroup of the worker's launcher (pid 42)"},
-	} {
-		files := map[string]string{}
-		if c.cgroup != "" {
-			files["/proc/42/cgroup"] = c.cgroup
+	const path = "/user.slice/user-501.slice/user@501.service/app.slice/" + unit
+	dir := "/sys/fs/cgroup" + path
+	held := map[string]string{dir + "/cgroup.procs": "42\n", dir + "/memory.max": "1073741824\n", dir + "/memory.swap.max": "0\n",
+		dir + "/pids.max": "512\n"}
+	with := func(cgroup string, files map[string]string, change ...string) map[string]string {
+		out := map[string]string{"/proc/42/cgroup": cgroup}
+		for k, v := range files {
+			out[k] = v
 		}
-		err := withProc(New("/run/user/501", nil, nil), files).On("worker", workerLimits).InScope(42, unit)
+		for i := 0; i+1 < len(change); i += 2 {
+			if change[i+1] == "" {
+				delete(out, dir+"/"+change[i])
+			} else {
+				out[dir+"/"+change[i]] = change[i+1]
+			}
+		}
+		return out
+	}
+	for name, c := range map[string]struct {
+		files   map[string]string // /proc's and /sys/fs/cgroup's files
+		refusal string            // "" for none
+	}{
+		"in its scope":             {with("0::"+path+"\n", held), ""},
+		"beside a v1 net_cls":      {with("9:net_cls:/\n0::"+path+"\n", held), ""},
+		"in a scope that ended":    {with("0::"+path+" (deleted)\n", nil), ""},
+		"in a scope removed since": {with("0::"+path+"\n", nil), ""},
+		"in agentd's session": {with("0::/user.slice/user-501.slice/session-6.scope\n", held),
+			"the process agentd started for the worker (pid 42) is in the cgroup /user.slice/user-501.slice/session-6.scope, not in its " +
+				"scope " + unit + ": its launcher does not source sandbox/linux/limits.sh, or a wrapper runs the launcher without exec"},
+		"in another run's scope":   {with("0::/user.slice/user-501.slice/user@501.service/app.slice/agentos-0123456789abcdef-worker-1.scope\n", held), "not in its scope " + unit},
+		"in a scope named like it": {with("0::/user.slice/x"+unit+"\n", held), "not in its scope"},
+		"another scope, deleted":   {with("0::/user.slice/user-501.slice/session-6.scope (deleted)\n", nil), "not in its scope " + unit},
+		"pids on v1":               {with("5:pids:/user.slice\n0::"+path+"\n", held), "a cgroup v1 hierarchy holds the pids controller"},
+		"gone":                     {map[string]string{}, "cannot tell the cgroup of the process agentd started for the worker (pid 42)"},
+		"more memory":              {with("0::"+path+"\n", held, "memory.max", "2147483648\n"), "the scope " + unit + "'s memory.max is 2147483648, not 1073741824"},
+		"swap":                     {with("0::"+path+"\n", held, "memory.swap.max", "max\n"), "memory.swap.max is max, not 0: the scope was not made as asked, or systemd could not set it"},
+		"more tasks":               {with("0::"+path+"\n", held, "pids.max", "513\n"), "pids.max is 513, not 512"},
+		"no pids controller":       {with("0::"+path+"\n", held, "pids.max", ""), "the scope " + unit + " has no pids.max: is that controller delegated"},
+	} {
+		err := withProc(New("/run/user/501", nil, nil), c.files).On("worker", workerLimits).InScope(42, unit)
 		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {
 			t.Errorf("%s: %v, want %q", name, err, c.refusal)
 		}
-		if err != nil && c.cgroup != "" && !strings.Contains(err.Error(), "pids") && !strings.Contains(err.Error(), "does not source sandbox/linux/limits.sh") {
-			t.Errorf("%s: %v does not say what a launcher should do", name, err)
+	}
+	// A scope that ends while its limits are read: its directory goes, files and all, after the first.
+	s := withProc(New("/run/user/501", nil, nil), with("0::"+path+"\n", held))
+	read := s.readFile
+	s.readFile = func(path string) ([]byte, error) {
+		b, err := read(path)
+		if path == dir+"/memory.max" {
+			s.readFile = withProc(New("/run/user/501", nil, nil), map[string]string{}).readFile
 		}
+		return b, err
+	}
+	if err := s.On("worker", workerLimits).InScope(42, unit); err != nil {
+		t.Errorf("ended while read: %v", err)
 	}
 	if err := Off("worker", workerLimits).InScope(42, unit); err != nil {
 		t.Errorf("off: %v", err)

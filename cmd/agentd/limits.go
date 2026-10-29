@@ -60,7 +60,8 @@ func resourceLimits(ctx context.Context, goos string, cfg *config.Config, insecu
 			l.tools = scope.Off("tool", tools)
 		}
 	default:
-		l.enforcement, l.scopes = enforcedByScope, scope.New(scope.RuntimeDir(), run, read)
+		dir, passedOver := scope.RuntimeDir()
+		l.enforcement, l.scopes = enforcedByScope, scope.New(dir, run, read).PassedOver(passedOver)
 		var sets []*scope.Set
 		if workerLauncher {
 			l.worker = l.scopes.On("worker", worker)

@@ -1203,7 +1203,7 @@ func (l *limits) InScope(pid int, unit string) error {
 	defer l.mu.Unlock()
 	l.checked = append(l.checked, unit)
 	if l.outside {
-		return fmt.Errorf("the tool's launcher (pid %d) is in the cgroup /elsewhere, not in its scope %s", pid, unit)
+		return fmt.Errorf("the process agentd started for the tool (pid %d) is in the cgroup /elsewhere, not in its scope %s", pid, unit)
 	}
 	return nil
 }
@@ -1251,8 +1251,9 @@ func limitedClient(t *testing.T, answer, first, units string, l *limits, log *lo
 // server failed is asked about once the server has exited: one the kernel's out-of-memory killer killed
 // is run once more, in a new scope, which systemd does not tell from memory running out higher up;
 // killed again, it is refused, the same way every time, saying both; answered, that answer, logged; failed
-// otherwise, that failure. A call whose server answered, or refused, and whose launcher then exited as it
-// should, is not asked about; one whose launcher exited otherwise is, and its answer stands.
+// otherwise, that failure. A call whose server answered, or refused, is asked about too, however its
+// launcher exited (a server can answer, and exit 0 after a process of its scope was killed, which leaves
+// the scope failed): the answer, or the refusal, stands, and a kill after it is logged.
 func TestACallOverItsMemory(t *testing.T) {
 	mirror := t.TempDir()
 	units := filepath.Join(t.TempDir(), "units")
@@ -1277,17 +1278,21 @@ func TestACallOverItsMemory(t *testing.T) {
 				"of 64MiB: the commit is too large to read within it, or the host ran out of memory",
 			log: []string{"the kernel's out-of-memory killer killed the git tool server", "runs once more, in a new scope",
 				"memory_limit=64MiB", "scope=agentos-test-tool-2.scope", "the fake server's own words"}},
-		"killed, then answered": {answer: "answer", first: "failure", killed: map[int64]bool{1: true}, asked: scopes(1), ok: true,
+		"killed, then answered": {answer: "answer", first: "failure", killed: map[int64]bool{1: true}, asked: scopes(1, 2), ok: true,
 			log: []string{"runs once more, in a new scope", "the git tool call's second attempt answered"}},
 		"killed, then failed": {answer: "failure", killed: map[int64]bool{1: true}, asked: scopes(1, 2), failed: true,
 			log: []string{"runs once more, in a new scope", "the git tool server failed"}},
 		"failed": {answer: "failure", asked: scopes(1), failed: true, log: []string{"it broke"}},
 		"systemd cannot tell": {answer: "failure", killed: map[int64]bool{1: true}, err: errors.New("systemctl: exit status 1"),
 			asked: scopes(1), failed: true, log: []string{"could not ask systemd how the git tool call's scope ended", "it broke"}},
-		"answered":                        {answer: "answer", ok: true},
-		"refused":                         {answer: "long refusal", refused: "in <mirror>: xxx"},
+		"answered":                        {answer: "answer", asked: scopes(1), ok: true},
+		"refused":                         {answer: "long refusal", asked: scopes(1), refused: "in <mirror>: xxx"},
 		"answered, then exited otherwise": {answer: "answer, exit 3", asked: scopes(1), ok: true},
 		"answered, then killed": {answer: "answer, exit 3", killed: map[int64]bool{1: true}, asked: scopes(1), ok: true,
+			log: []string{"killed what was left of the git tool call after its server answered: the answer stands"}},
+		"answered, killed, exited 0": {answer: "answer", killed: map[int64]bool{1: true}, asked: scopes(1), ok: true,
+			log: []string{"killed what was left of the git tool call after its server answered: the answer stands", "scope=agentos-test-tool-1.scope"}},
+		"refused, killed, exited 0": {answer: "long refusal", killed: map[int64]bool{1: true}, asked: scopes(1), refused: "in <mirror>: xxx",
 			log: []string{"killed what was left of the git tool call after its server answered: the answer stands"}},
 	} {
 		var log logs
