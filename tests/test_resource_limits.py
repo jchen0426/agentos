@@ -2,7 +2,8 @@
 call in a systemd user scope of its own, a cgroup that holds its memory, with no swap, and its tasks,
 which its launcher starts and checks before it starts bwrap. Past its memory limit the kernel kills
 the Worker, and agentd records that (worker.exited's oom_kill) and starts it again; a git tool call
-past its memory limit is refused, naming the limit, and not tried again. Without a user manager agentd
+past its memory limit is refused, naming the limit, and not tried again. agentd warns as it starts when
+the limits' worst case is over half of the memory, and records it. Without a user manager agentd
 refuses to start, saying so; --insecure-dev turns the limits off, and says so.
 
 Only under bwrap: the macOS sandbox sets no limits (agentd.started says none: test_worker_supervision.py).
@@ -128,6 +129,48 @@ def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> 
     [record] = exit_records(stack)
     assert record["generation"] == 1 and "oom_kill" not in record, record
     assert failed_units(token) == []
+
+
+WORST = "the resource limits' worst case is over half of "
+
+
+def machine_memory() -> int:
+    """The machine's memory, in bytes: /proc/meminfo's MemTotal (in kB)."""
+    [kb] = [line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemTotal:")]
+    return int(kb) << 10
+
+
+def test_a_worst_case_over_half_the_memory_is_warned_of_and_recorded(stack: Stack) -> None:
+    """Each scope holds its own limit, and nothing holds their sum: the Worker's 64GiB and six git tool
+    calls at 512MiB each, far over half of the machine's memory, make agentd warn as it starts, saying
+    what adds up to what, against what, and how to lower it; agentd.started records it."""
+    stack.start_agentd(worker=True, extra=limited(stack, worker={"memory": "64GiB"}))
+    worst = last_start(stack)["limits_worst_case"]
+    made = {k: worst[k] for k in ("memory_bytes", "worker_memory_bytes", "tool_memory_bytes", "tool_calls", "warned")}
+    assert made == {"memory_bytes": (64 << 30) + 6 * (512 << 20), "worker_memory_bytes": 64 << 30, "tool_memory_bytes": 512 << 20,
+                    "tool_calls": 6, "warned": True}, worst
+    # The machine's, or less where a cgroup above the scopes holds less.
+    assert (worst["compared_with"] == "MemTotal" and worst["compared_with_bytes"] == machine_memory() or
+            worst["compared_with"].startswith("/user.slice") and worst["compared_with_bytes"] < machine_memory()), worst
+    [warned] = [e for e in stack.agentd_log() if e.get("msg", "").startswith(WORST)]
+    assert warned["level"] == "WARN", warned
+    assert "the Worker's 64GiB and 6 git tool calls at 512MiB each come to 67GiB, of " in warned["msg"], warned
+    assert ("nothing limits their sum" in warned["msg"] and "the kernel's out-of-memory killer picks its victim from " in warned["msg"]
+            and warned["msg"].endswith("worker.limits.memory and git_tools.limits.memory lower it")), warned
+    assert (warned["worst_case_bytes"], warned["memory_bytes"], warned["memory_from"]) == (
+        worst["memory_bytes"], worst["compared_with_bytes"], worst["compared_with"]), (warned, worst)
+
+
+def test_a_worst_case_under_half_the_memory_is_only_recorded(stack: Stack) -> None:
+    """Small limits, well under half of the machine's memory: agentd warns of nothing, and agentd.started
+    records the worst case, and that it did not warn."""
+    stack.start_agentd(worker=True, extra=limited(stack, worker={"memory": "256MiB"}, tools={"memory": "64MiB"}))
+    worst = last_start(stack)["limits_worst_case"]
+    assert worst == {"memory_bytes": (256 << 20) + 6 * (64 << 20), "worker_memory_bytes": 256 << 20, "tool_memory_bytes": 64 << 20,
+                     "tool_calls": 6, "compared_with": worst["compared_with"], "compared_with_bytes": worst["compared_with_bytes"],
+                     "warned": False}, worst
+    assert worst["compared_with_bytes"] >= 2 * worst["memory_bytes"], worst
+    assert not any(e.get("msg", "").startswith(WORST) for e in stack.agentd_log())
 
 
 def test_a_worker_over_its_memory_limit_is_killed_recorded_and_started_again(stack: Stack) -> None:
@@ -366,6 +409,7 @@ def test_insecure_dev_turns_the_limits_off(stack: Stack, monkeypatch: pytest.Mon
     started = last_start(stack)
     assert started["insecure_dev"] is True, started
     assert started["worker"]["limits"] == {"enforcement": "off"} and started["git_tools_limits"] == {"enforcement": "off"}, started
+    assert "limits_worst_case" not in started, started
     w = stack.worker()
     pid = w.wait_ready(1)
     assert "agentos-" not in cgroup_of(pid), cgroup_of(pid)

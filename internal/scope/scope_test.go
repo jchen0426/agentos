@@ -413,6 +413,47 @@ func TestInScope(t *testing.T) {
 	}
 }
 
+// What the start's scopes can have between them: the machine's memory (MemTotal), or the lowest
+// memory.max above the probe scope, up to the root, where that is less ("max" is no limit, nor is a
+// cgroup without the file). Where /proc/meminfo cannot be read, an error, not a guess. The probe scope
+// is where Probe last found one: the runs' scopes are its siblings.
+func TestRoom(t *testing.T) {
+	const app = "/user.slice/user-501.slice/user@501.service/app.slice"
+	probed := app + "/agentos-0123456789abcdef-probe-tool.scope"
+	meminfo := "MemTotal:       16777216 kB\nMemFree:         1048576 kB\nMemAvailable:    8388608 kB\n"
+	for name, c := range map[string]struct {
+		probed string
+		files  map[string]string
+		room   Room
+		err    string
+	}{
+		"the machine's":      {probed, map[string]string{"/proc/meminfo": meminfo}, Room{16 << 30, "MemTotal"}, ""},
+		"no probe":           {"", map[string]string{"/proc/meminfo": meminfo, "/sys/fs/cgroup" + app + "/memory.max": "1073741824\n"}, Room{16 << 30, "MemTotal"}, ""},
+		"a slice's":          {probed, map[string]string{"/proc/meminfo": meminfo, "/sys/fs/cgroup" + app + "/memory.max": "6442450944\n"}, Room{6 << 30, app}, ""},
+		"max, and none":      {probed, map[string]string{"/proc/meminfo": meminfo, "/sys/fs/cgroup" + app + "/memory.max": "max\n"}, Room{16 << 30, "MemTotal"}, ""},
+		"the lowest":         {probed, map[string]string{"/proc/meminfo": meminfo, "/sys/fs/cgroup" + app + "/memory.max": "8589934592\n", "/sys/fs/cgroup/user.slice/memory.max": "4294967296\n"}, Room{4 << 30, "/user.slice"}, ""},
+		"above the machine":  {probed, map[string]string{"/proc/meminfo": meminfo, "/sys/fs/cgroup/user.slice/memory.max": "34359738368\n"}, Room{16 << 30, "MemTotal"}, ""},
+		"no /proc/meminfo":   {probed, nil, Room{}, "cannot read /proc/meminfo: open /proc/meminfo: file does not exist"},
+		"no MemTotal in it":  {probed, map[string]string{"/proc/meminfo": "MemFree:  1 kB\n"}, Room{}, "/proc/meminfo has no MemTotal agentd can read"},
+		"MemTotal not in kB": {probed, map[string]string{"/proc/meminfo": "MemTotal:       16 GB\n"}, Room{}, "/proc/meminfo has no MemTotal agentd can read"},
+	} {
+		s := withProc(New("/run/user/501", nil, nil), c.files)
+		s.probed = c.probed
+		room, err := s.Room()
+		if room != c.room || (err == nil) != (c.err == "") || err != nil && err.Error() != c.err {
+			t.Errorf("%s: %v, %v; want %v, %q", name, room, err, c.room, c.err)
+		}
+	}
+	// Probe keeps where its probe scope was.
+	s := withProc(New(managed(t), (&systemd{probe: held}).run, nil), map[string]string{"/proc/cmdline": bootLine})
+	if err := s.Probe(context.Background(), s.On("tool", toolLimits)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(s.probed, "/agentos-"+s.token+"-probe-tool.scope") {
+		t.Errorf("probed %q", s.probed)
+	}
+}
+
 // As agentd stops, systemd's failed scopes of its start go, all at once, by the start's pattern.
 func TestResetFailed(t *testing.T) {
 	sd := &systemd{}

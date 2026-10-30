@@ -575,6 +575,17 @@ the run's limits: a launcher that does not source `limits.sh` (an older copy, on
 wrapper that runs one without `exec`, is refused. The Worker gets `TOKIO_WORKER_THREADS=4` and the git
 tool server `GOMAXPROCS=4`: both runtimes start a thread for each CPU, which the task limit counts.
 
+The limits are per scope, and nothing limits their sum: the Worker, and six git tool calls at once (four
+of the runs', two of the run starts'), come at the defaults to 1 GiB + 6 × 512 MiB = 4 GiB at worst.
+Past what the machine has (or a cgroup above the scopes, by its `memory.max`), the kernel's
+out-of-memory killer picks its victim from all of it, not only from the scopes. agentd compares the
+worst case with what the scopes can have between them, the machine's memory (`MemTotal`) or less where
+such a cgroup holds less, and warns at every start when it is over half; `worker.limits.memory` and
+`git_tools.limits.memory` lower it. `agentd.started` records it, as `limits_worst_case`: `memory_bytes`,
+made of `worker_memory_bytes` (0 without a Worker of agentd's own), `tool_memory_bytes` and `tool_calls`
+(0 without `git_tools.sandbox`); `compared_with_bytes` and `compared_with` (`MemTotal`, or the cgroup),
+or `compared_with_error` when agentd cannot read `/proc/meminfo`; and `warned`.
+
 As agentd starts, it runs a probe scope of each set of limits and reads them back, and refuses to start
 when they would not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`,
 unless another user owns it, else `/run/user/<uid>`); the limits do not take, as a controller is not

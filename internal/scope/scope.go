@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -89,10 +90,12 @@ type Scopes struct {
 	token      string
 	run        Runner
 	readFile   func(string) ([]byte, error) // reads /proc's and /sys/fs/cgroup's files
+	probed     string                       // the cgroup of the last probe scope, a sibling of the runs' scopes
 }
 
 // New makes the scopes of an agentd start, whose user manager listens in dir, asked through run; read
-// reads /proc's files (the kernel's command line, a launcher's cgroup): os.ReadFile, but in tests.
+// reads /proc's and /sys/fs/cgroup's files (the kernel's command line, the machine's memory, a
+// launcher's cgroup and its limits): os.ReadFile, but in tests.
 func New(dir string, run Runner, read func(string) ([]byte, error)) *Scopes {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b) // never fails (crypto/rand)
@@ -381,11 +384,54 @@ func (s *Scopes) Probe(ctx context.Context, sets ...*Set) error {
 		case err != nil:
 			return fmt.Errorf("agentd could not start a systemd user scope to check that it holds the %s limits: %w", t.kind, err)
 		}
-		if err := t.heldIn(unit, out); err != nil {
+		cgroup, err := t.heldIn(unit, out)
+		if err != nil {
 			return fmt.Errorf("%w: %w%s", ErrNotHeld, err, orInsecureDev)
 		}
+		s.probed = cgroup
 	}
 	return nil
+}
+
+// Room is the most memory the start's scopes can have between them: the machine's, or less where a
+// cgroup above them holds less.
+type Room struct {
+	Bytes int64
+	// From is where Bytes comes from: "MemTotal" (/proc/meminfo), or the cgroup above the scopes whose
+	// memory.max it is.
+	From string
+}
+
+// Room reads what the start's scopes can have between them: the machine's memory (MemTotal in
+// /proc/meminfo), or the lowest memory.max of the cgroups above the last probe scope, up to the root,
+// where that is less ("max" is no limit, nor is a cgroup without the file). Without a probe, the
+// machine's. Its error says /proc/meminfo could not be read: Room does not guess.
+func (s *Scopes) Room() (Room, error) {
+	b, err := s.readFile("/proc/meminfo")
+	if err != nil {
+		return Room{}, fmt.Errorf("cannot read /proc/meminfo: %w", err)
+	}
+	r := Room{From: "MemTotal"}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "MemTotal:"); ok {
+			if kb, err := strconv.ParseInt(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(v), "kB")), 10, 64); err == nil {
+				r.Bytes = kb << 10
+			}
+		}
+	}
+	if r.Bytes <= 0 {
+		return Room{}, errors.New("/proc/meminfo has no MemTotal agentd can read")
+	}
+	for dir := path.Dir(s.probed); s.probed != "" && dir != "/"; dir = path.Dir(dir) {
+		b, err := s.readFile("/sys/fs/cgroup" + dir + "/memory.max")
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && n < r.Bytes {
+			r = Room{Bytes: n, From: dir}
+		}
+	}
+	return r, nil
 }
 
 // orInsecureDev ends the refusals of limits that do not hold.
@@ -406,8 +452,9 @@ func (s *Scopes) noManager(why string) error {
 		"with --insecure-dev, which turns the limits off (development only)", ErrNoManager, os.Getuid(), s.dir, why, name)
 }
 
-// heldIn checks a probe's report of unit: its cgroup on v2, the unit's, and each limit as t asks.
-func (t *Set) heldIn(unit string, out []byte) error {
+// heldIn checks a probe's report of unit: its cgroup on v2, the unit's, and each limit as t asks. It
+// returns the cgroup.
+func (t *Set) heldIn(unit string, out []byte) (string, error) {
 	var cgroups []string
 	got := map[string]string{}
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
@@ -420,12 +467,12 @@ func (t *Set) heldIn(unit string, out []byte) error {
 	}
 	cgroup, err := unified(cgroups)
 	if err != nil {
-		return fmt.Errorf("the probe scope's process: %w", err)
+		return "", fmt.Errorf("the probe scope's process: %w", err)
 	}
 	if !strings.HasSuffix(cgroup, "/"+unit) {
-		return fmt.Errorf("the probe's process is in the cgroup %s, not in its scope's (%s)", cgroup, unit)
+		return "", fmt.Errorf("the probe's process is in the cgroup %s, not in its scope's (%s)", cgroup, unit)
 	}
-	return t.held("the probe scope", got)
+	return cgroup, t.held("the probe scope", got)
 }
 
 // limitFiles are a scope's files of the limits, under its cgroup's directory.

@@ -252,6 +252,9 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	start := startRecord(configPath, cfg, pol, mods, prices, incarnation, faultScript, testTools, insecureDev, limits.enforcement)
 	start["retention_seconds"] = int64(retention / time.Second)
 	start["no_worker"] = noWorker
+	if r := limits.worstCaseRecord(); r != nil {
+		start["limits_worst_case"] = r
+	}
 	if !noWorker {
 		// The manifest of the copy, in the ledger, at the address agentd.started records as code_sha256.
 		if ref, err := led.PutBlob(ctx, snap.Manifest); err != nil {
@@ -377,7 +380,7 @@ func run(configPath, faultScript string, testTools, insecureDev, noWorker bool, 
 	// A run's commit is resolved through the server too: agentd itself runs no git on a mirror.
 	// Starts take slots of their own, so that slow tool calls of running runs never hold up
 	// another run's start.
-	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors(), git.WithOwnSlots(2))}
+	registry := tasks.Registry{"security-audit": tasks.SecurityAudit(pol, cfg.Mirrors(), git.WithOwnSlots(startCallSlots))}
 	toolset, err := buildTools(cfg, pol, led, tc, git, registry, testTools, log)
 	if err != nil {
 		return err
@@ -774,7 +777,7 @@ func gitServer(cfg *config.Config, insecureDev bool, limits *scope.Set, log *slo
 			"(or start agentd with --insecure-dev, for development only)")
 	}
 	o := gitmcp.Options{Server: g.Server, Sandbox: g.Sandbox, DenyRead: toolDenyRead(cfg), Timeout: g.Timeout,
-		Log: log.With("component", "git-tools")}
+		Parallel: toolCallSlots, Log: log.With("component", "git-tools")}
 	if limits != nil { // a nil *scope.Set in the interface would not be nil
 		o.Limits = limits
 	}

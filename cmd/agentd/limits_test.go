@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -223,6 +224,113 @@ func TestLingering(t *testing.T) {
 		l.clear(slog.New(slog.DiscardHandler))
 		if err != nil || l.noLinger != "" || len(p.systemctl) != 0 {
 			t.Errorf("%s, --insecure-dev %t: %v, %q, %q", c.goos, c.insecureDev, err, l.noLinger, p.systemctl)
+		}
+	}
+}
+
+// procWith reads /proc and /sys/fs/cgroup as proc does, with files besides.
+func procWith(files map[string]string) func(string) ([]byte, error) {
+	return func(path string) ([]byte, error) {
+		if b, ok := files[path]; ok {
+			return []byte(b), nil
+		}
+		return proc(path)
+	}
+}
+
+// The limits' worst case: the Worker's memory limit, and the git tool calls' for each slot (the
+// client's 4 and the run starts' 2), counting only what agentd runs; against the machine's memory, or
+// less where a cgroup above the scopes holds less ("max" is no limit). Over half of it, strictly,
+// agentd warns at every start, saying what adds up to what, against what, and how to lower it; at
+// half or under it says nothing. agentd.started records it either way; where /proc/meminfo cannot be
+// read, agentd says so, and the record says why. Where the limits are off or none, nothing of it.
+func TestTheLimitsWorstCase(t *testing.T) {
+	userManager(t)
+	lingerDir = t.TempDir()
+	t.Cleanup(func() { lingerDir = "/var/lib/systemd/linger" })
+	const vm = 6052052 // kB: the Lima VM's MemTotal, about 5.8GiB
+	meminfo := func(kb int64) string { return fmt.Sprintf("MemTotal:       %d kB\nMemFree:          524288 kB\n", kb) }
+	cgroup := func(dir string) string { return "/sys/fs/cgroup/user.slice" + dir + "/memory.max" }
+	const app, manager, user = "/user-501.slice/user@501.service/app.slice", "/user-501.slice/user@501.service", "/user-501.slice"
+	both := workerConfig()
+	both.GitTools.Sandbox = []string{"/opt/agentos/run-tool.sh"}
+	both.Worker.Limits, both.GitTools.Limits = config.DefaultWorkerLimits, config.DefaultToolLimits
+	worker := workerConfig()
+	worker.Worker.Limits, worker.GitTools.Limits = config.DefaultWorkerLimits, config.DefaultToolLimits
+	big := workerConfig()
+	big.Worker.Limits, big.GitTools.Limits = config.Limits{Memory: 4 << 30, Tasks: 512}, config.DefaultToolLimits
+	record := func(worker, tool, calls int64, with string, withBytes int64, warned bool) map[string]any {
+		return map[string]any{"memory_bytes": worker + tool*calls, "worker_memory_bytes": worker, "tool_memory_bytes": tool,
+			"tool_calls": calls, "compared_with": with, "compared_with_bytes": withBytes, "warned": warned}
+	}
+	for name, c := range map[string]struct {
+		cfg     *config.Config
+		noWork  bool
+		files   map[string]string
+		record  map[string]any
+		warning string // what agentd warns of it; "" for nothing
+	}{
+		"16GiB": {both, false, map[string]string{"/proc/meminfo": meminfo(16 << 20)},
+			record(1<<30, 512<<20, 6, "MemTotal", 16<<30, false), ""},
+		"exactly half": {both, false, map[string]string{"/proc/meminfo": meminfo(8 << 20)},
+			record(1<<30, 512<<20, 6, "MemTotal", 8<<30, false), ""},
+		"a kB over half": {both, false, map[string]string{"/proc/meminfo": meminfo(8<<20 - 1)},
+			record(1<<30, 512<<20, 6, "MemTotal", (8<<20-1)<<10, true), "come to 4GiB"},
+		"the VM's": {both, false, map[string]string{"/proc/meminfo": meminfo(vm)}, record(1<<30, 512<<20, 6, "MemTotal", vm<<10, true),
+			"the resource limits' worst case is over half of the machine's memory: the Worker's 1GiB and 6 git tool calls at " +
+				"512MiB each come to 4GiB, of 5.8GiB (MemTotal in /proc/meminfo). Each scope holds its own limit, and nothing " +
+				"limits their sum: past what the machine has, the kernel's out-of-memory killer picks its victim from the whole " +
+				"machine, not only from the scopes. worker.limits.memory and git_tools.limits.memory lower it"},
+		"--no-worker": {both, true, map[string]string{"/proc/meminfo": meminfo(vm)}, record(0, 512<<20, 6, "MemTotal", vm<<10, true),
+			"over half of the machine's memory: 6 git tool calls at 512MiB each come to 3GiB, of 5.8GiB"},
+		"no git tool launcher": {worker, false, map[string]string{"/proc/meminfo": meminfo(vm)},
+			record(1<<30, 0, 0, "MemTotal", vm<<10, false), ""},
+		"the Worker alone": {big, false, map[string]string{"/proc/meminfo": meminfo(vm)}, record(4<<30, 0, 0, "MemTotal", vm<<10, true),
+			"over half of the machine's memory: the Worker's 4GiB alone, of 5.8GiB"},
+		"a slice that holds less": {both, false, map[string]string{"/proc/meminfo": meminfo(16 << 20), cgroup(app): "6442450944\n"},
+			record(1<<30, 512<<20, 6, "/user.slice"+app, 6<<30, true),
+			"over half of what the cgroup /user.slice" + app + " may use: the Worker's 1GiB and 6 git tool calls at 512MiB each " +
+				"come to 4GiB, of 6GiB (its memory.max). Each scope holds its own limit, and nothing limits their sum: past what " +
+				"that cgroup may use, the kernel's out-of-memory killer picks its victim from all of that cgroup, not only from the scopes"},
+		"max, then less higher up": {both, false, map[string]string{"/proc/meminfo": meminfo(16 << 20), cgroup(app): "max\n",
+			cgroup(manager): "max\n", cgroup(user): "12884901888\n", cgroup(""): "max\n"},
+			record(1<<30, 512<<20, 6, "/user.slice"+user, 12<<30, false), ""},
+		"the lowest of them": {both, false, map[string]string{"/proc/meminfo": meminfo(16 << 20), cgroup(app): "7516192768\n",
+			cgroup(""): "6442450944\n"}, record(1<<30, 512<<20, 6, "/user.slice", 6<<30, true), "of 6GiB (its memory.max)"},
+		"a slice above the machine": {both, false, map[string]string{"/proc/meminfo": meminfo(vm), cgroup(""): "34359738368\n"},
+			record(1<<30, 512<<20, 6, "MemTotal", vm<<10, true), "of 5.8GiB (MemTotal in /proc/meminfo)"},
+		"no /proc/meminfo": {both, false, nil, map[string]any{"memory_bytes": int64(4 << 30), "worker_memory_bytes": int64(1 << 30),
+			"tool_memory_bytes": int64(512 << 20), "tool_calls": int64(6), "warned": false,
+			"compared_with_error": "cannot read /proc/meminfo: open /proc/meminfo: file does not exist"},
+			"agentd cannot tell whether the resource limits' worst case is over half of the memory the scopes can have"},
+	} {
+		var p probes
+		l, err := resourceLimits(context.Background(), "linux", c.cfg, false, c.noWork, p.run, procWith(c.files))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if r := l.worstCaseRecord(); !maps.Equal(r, c.record) {
+			t.Errorf("%s: the record %v, want %v", name, r, c.record)
+		}
+		var log strings.Builder
+		l.say(c.cfg, slog.New(slog.NewTextHandler(&log, nil)))
+		if said := strings.Contains(log.String(), "worst case"); said != (c.warning != "") ||
+			c.warning != "" && !strings.Contains(log.String(), strconv.Quote(c.warning)[1:len(strconv.Quote(c.warning))-1]) {
+			t.Errorf("%s: the log %s, want %q", name, log.String(), c.warning)
+		}
+	}
+	// Off and none: no worst case, said or recorded.
+	for _, c := range []struct {
+		goos        string
+		insecureDev bool
+	}{{"linux", true}, {"darwin", false}} {
+		l, err := resourceLimits(context.Background(), c.goos, both, c.insecureDev, false, (&probes{}).run,
+			procWith(map[string]string{"/proc/meminfo": meminfo(vm)}))
+		var log strings.Builder
+		l.say(both, slog.New(slog.NewTextHandler(&log, nil)))
+		if err != nil || l.worstCaseRecord() != nil || strings.Contains(log.String(), "worst case") {
+			t.Errorf("%s, --insecure-dev %t: %v, %v, %s", c.goos, c.insecureDev, err, l.worstCaseRecord(), log.String())
 		}
 	}
 }
