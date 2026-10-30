@@ -2654,3 +2654,60 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 - 修复轮 2 之后的那些照旧（见那里）：第二次尝试马上就跑；说完就绪、还没核对就退出并被收尸的一代按退出处理；agentd 自己停掉的 Worker 代不问 systemd；停下时 reset-failed 的 defer 没有测试；所有 scope 的总量没有上限（等用户定）；按用户算的内核上限；macOS 没有内存和任务数的上限；Worker 没有 CPU 上限；上限归用户管理器管；要 systemd 253。
 - 这一轮看清的一条（不是这一轮改出来的）：核对只看 agentd 起的那个进程的 cgroup。一个有委派子树的、用户自己写的启动脚本，可以把那个进程留在一个上限对的 cgroup 里，把别的进程挪到上限不对的 cgroup 去；这样的启动脚本是写来绕过核对的，不在它要拦的范围里（它拦的是没有 source limits.sh 的旧副本或自己写的启动脚本，和不用 exec 的包装）。
+
+### 启动时的最坏总内存警告（用户 2026-10-31 定的，8401762 之上）
+
+安全审查第 1 条（所有 scope 加起来的总量没有上限）一直等用户定。用户的原话：“先只警告：启动时，如果 Worker 加上并发工具调用的最坏总内存超过本机内存的一半，就警告，并记进 agentd.started，README 和笔记里写明。”
+
+#### 做了什么
+
+- **最坏情况**：Worker 的内存上限，加上 git 工具调用的上限乘以能同时跑的调用数。现在是 6 个：工具客户端的 4 个 slot（gitServer 原来没设 Options.Parallel，用的是 NewClient 的默认值 4），加上运行启动时 resolve_commit 自己的 2 个（run() 里的 WithOwnSlots(2)）。两个数改成 cmd/agentd 里的常量 `toolCallSlots`、`startCallSlots`，gitServer 的 `Parallel` 和 run() 的 `WithOwnSlots` 用的就是它们，和警告算的是同一处。只算 agentd 真跑的：`--no-worker` 或没有 `worker.sandbox` 时没有 Worker，没有 `git_tools.sandbox` 时没有工具调用（和 resourceLimits 的 workerLauncher、toolLauncher 一样）。第二次尝试在原来那个调用的 slot 里、第一次的 scope 结束以后才跑，不多算。
+- **和什么比**：本机内存（`/proc/meminfo` 的 MemTotal）；探测 scope 以上直到根，哪个 cgroup 的 memory.max 更小，就用那个（`max` 不算上限，没有这个文件的也不算），都经注入的读函数读。scope 包新加 `Scopes.Room()`；Probe 记下探测 scope 的 cgroup（运行用的 scope 和它同在 app.slice 下）。读不了 `/proc/meminfo` 时不猜：日志里一行 Warn 说判断不了，记录里写原因。
+- **超过一半**（严格大于；代码写成“比剩下的多”，免得乘 2 溢出）：每次启动一行 Warn，和 `--insecure-dev` 那行一样。VM 上默认值时的原话："the resource limits' worst case is over half of the machine's memory: the Worker's 1GiB and 6 git tool calls at 512MiB each come to 4GiB, of 5.8GiB (MemTotal in /proc/meminfo). Each scope holds its own limit, and nothing limits their sum: past what the machine has, the kernel's out-of-memory killer picks its victim from the whole machine, not only from the scopes. worker.limits.memory and git_tools.limits.memory lower it"。比的是某个 cgroup 时，说的是 "what the cgroup <路径> may use"、"(its memory.max)"、"all of that cgroup"。结构化的字段：`worst_case_bytes`、`memory_bytes`、`memory_from`。
+- **agentd.started**：上限有效时（`systemd_user_scope`）加 `limits_worst_case`：`memory_bytes`（总和），由 `worker_memory_bytes`（没有 agentd 自己的 Worker 时是 0）、`tool_memory_bytes` 和 `tool_calls`（没有工具的启动脚本时是 0）组成；`compared_with_bytes` 和 `compared_with`（`MemTotal`，或那个 cgroup 的路径），读不了 meminfo 时换成 `compared_with_error`；`warned`。off 和 none 时什么都不加。
+- **README** 的 “Resource limits” 加了一段：上限是每个 scope 各自的，总和没有上限，默认值最坏是 1 GiB + 6 × 512 MiB = 4 GiB；超过本机（或上层 cgroup）能给的以后，OOM 杀手在整台机器（或那个 cgroup）里挑；超过一半时每次启动警告、怎么调低、记录的字段。
+
+#### 我定的几处
+
+- “能给多少”由 scope 包的 `Room` 算：探测 scope 的 cgroup 只有 Probe 知道。最坏情况和措辞在 cmd/agentd：slot 的数在那里。
+- 记录在 run() 里加（和 `retention_seconds`、`no_worker` 一样），不改 startRecord 的参数。
+- `warned` 只说有没有因为超过一半而警告；读不了 meminfo 时是 false，原因在 `compared_with_error`。“判断不了”那行也是 Warn。
+- 没有 Worker 时说 "6 git tool calls at 512MiB each come to 3GiB"；只有 Worker 时说 "the Worker's 4GiB alone"。本机内存不是整 MiB 时写到 GiB 的十分之一（5.8GiB），字段里是字节数。
+
+#### 测试
+
+- **Go**：cmd/agentd 的 `TestTheLimitsWorstCase`：16GiB（不警告）；正好一半（8GiB，不警告）；超过一半 1 kB（警告）；VM 的 MemTotal（警告，整句一字不差）；`--no-worker`（3GiB，警告）；没有工具的启动脚本（只算 Worker，不警告）；只有 Worker、4GiB（"alone"，警告）；app.slice 的 memory.max 更小（警告，说的是那个 cgroup）；跳过 max、更上层的更小；取几个里最小的；上层比本机大（用 MemTotal）；没有 `/proc/meminfo`（说判断不了，记录写原因）；off 和 none 什么都不记、不说。scope 的 `TestRoom`：本机的、没有探测、slice 的、max、取最小、比本机大、读不了、没有 MemTotal、不是 kB；Probe 记下了探测 scope 的 cgroup。
+- **黑盒**（bwrap）：`test_a_worst_case_over_half_the_memory_is_warned_of_and_recorded`（`worker.limits.memory: 64GiB`：Warn 的措辞，结构化的字段和记录一致，比的是 MemTotal 或更小的 cgroup）；`test_a_worst_case_under_half_the_memory_is_only_recorded`（256MiB 和 64MiB：没有这条警告，记录 `warned: false`）；`--insecure-dev` 那个加了一句：没有 `limits_worst_case`。
+- VM 的 MemTotal 是 6052052 kB（约 5.8GiB），默认值 4GiB 超过一半：VM 里每次启动都会警告（app.slice 往上都是 max）。查过黑盒测试，没有哪个假定启动时没有警告：都只按消息挑自己要的那条。CI 的机器（16 GiB）在默认值下不警告。
+
+#### 改坏检查
+
+- **Go 15 处**（12 处，其中 3 处在 cmd/agentd 的测试上也跑了一遍），都抓到：正好一半也警告；不算运行启动的 2 个 slot；`--no-worker` 也算 Worker；没有工具的启动脚本也算调用；不警告；记录总是 `warned: false`；判断不了不说；不读上层 cgroup；取最大的；MemTotal 当成字节；读不了 meminfo 时猜一个；Probe 不记 cgroup。
+- 没抓的一处，等价：gitServer 不设 `Parallel`，gitmcp 的默认值也是 4。常量改了、gitServer 却不跟着的那种漂移，测试看不到，靠的是两处用同一个常量。
+- 黑盒没做改坏版本：两个新测试本身就是这条路径的黑盒检查。
+
+#### 跑过的（58f4f73）
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build-linux` 通过；ruff 对改过的测试文件没意见。改到的包（scope、cmd/agentd）交叉编译成 Linux 的，在 VM 里跑也都过。VM 里先单独跑了两个新测试和 `--insecure-dev` 那个（3 个都过）。
+- 黑盒只跑 VM 的 bwrap（协调者定的）：macOS 上什么上限都没有，那条路由 Go 测试管着，PR 的 CI 会跑 macOS。
+- 新的和受影响的测试（和前几轮同一组文件），`--verify-after-each`，58f4f73：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | Linux VM，bwrap | 114 | 16 | 102 | 73 | 17 | 0 | 12 | 18 分 0 秒 |
+
+  比修复轮 3 多的两个测试、两个栈、两个 verify，就是新加的两个测试。
+- 完整套件，`--verify-after-each`，58f4f73：
+
+  | 环境 | 通过 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|
+  | Linux VM，bwrap | 334 | 18 | 197 | 164 | 19 | 0 | 14 | 33 分 6 秒 |
+
+  也是比修复轮 3 多那两个测试。VM 里每次启动都警告（默认值 4GiB 超过 5.8GiB 的一半），别的测试照样都过。跑完 VM 里没有留下 failed 的 agentos scope、活着的 agentos scope 或状态目录；另一个会话的两个 agentd 没碰。README 里那句“上限有效时才记”是跑完以后加的，只改了文字，和笔记一起提交。
+
+#### 剩余风险
+
+- 只是警告：总和照旧没有上限。机器真的缺内存时，OOM 杀手照样在整台机器里挑（可能是 Temporal、agentd）。给 agentd 的 scope 加一个共同的 slice、设它的 MemoryMax，才是真正的总上限，这一轮没做（用户定的“先只警告”）。
+- 一半是个经验值：MemTotal 不扣别的进程（Temporal、桌面、别的服务）已经用掉的；memory.high 和 systemd-oomd 的压力阈值没有看。
+- 沙箱进程的 oom_score_adj 没有调高（协调者说可能是下一条）。
+- 原来的几条照旧（修复轮 2、3 之后的）。
