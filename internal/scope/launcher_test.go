@@ -1,6 +1,7 @@
 package scope
 
 import (
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -17,7 +18,9 @@ import (
 // cgroup is the scope's, and refuses to go on where it is not (here a systemd-run that only pretends
 // says nothing true). AGENTOS_LIMITS=off it runs without a scope. Anything else it refuses before it
 // starts one: no limits, malformed ones, both, no user manager listening, or a claim to be in the scope
-// already. It fails closed: no launcher runs without its limits by mistake.
+// already. It fails closed: no launcher runs without its limits by mistake. Where a user manager runs
+// (Linux: the VM, CI), the launcher runs in a real scope too: in it, what it starts has the
+// oom_score_adj it gave itself, OOMScoreAdj; off, it leaves its own as it was.
 func TestTheLaunchersTakeWhatEnvGives(t *testing.T) {
 	limitsSh, err := filepath.Abs("../../sandbox/linux/limits.sh")
 	if err != nil {
@@ -123,6 +126,36 @@ func TestTheLaunchersTakeWhatEnvGives(t *testing.T) {
 		stdout, stderr, ok, args := launch(c.env)
 		if ok || strings.Contains(stdout, "the launcher goes on") || args != nil || !strings.Contains(stderr, c.refusal) {
 			t.Errorf("%s: went on %t, %q %q, systemd-run %q; want %q", name, ok, stdout, stderr, args, c.refusal)
+		}
+	}
+
+	if runtime.GOOS != "linux" {
+		return
+	}
+	userManager, _ := RuntimeDir()
+	if fi, err := os.Stat(filepath.Join(userManager, "systemd", "private")); err != nil || fi.Mode().Type() != fs.ModeSocket {
+		t.Logf("no user manager at %s: the launcher did not run in a real scope", userManager)
+		return
+	}
+	scoped := filepath.Join(dir, "run-scoped.sh")
+	if err := os.WriteFile(scoped, []byte("#!/bin/bash\nset -euo pipefail\n. "+strconv.Quote(limitsSh)+
+		"\necho \"the launcher goes on; what it starts is at $(cat /proc/self/oom_score_adj)\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	own, err := os.ReadFile("/proc/self/oom_score_adj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, held := New(userManager, nil, nil).On("tool", Limits{Memory: 64 << 20, Tasks: 32}).Env(1)
+	for name, c := range map[string]struct {
+		env []string
+		adj string
+	}{"in its scope": {held, strconv.Itoa(OOMScoreAdj)}, "off": {off, strings.TrimSpace(string(own))}} {
+		cmd := exec.Command(scoped)
+		cmd.Env = append([]string{"PATH=/usr/bin:/bin"}, c.env...)
+		out, err := cmd.CombinedOutput()
+		if want := "the launcher goes on; what it starts is at " + c.adj + "\n"; err != nil || string(out) != want {
+			t.Errorf("%s: %v, %q; want %q", name, err, out, want)
 		}
 	}
 }

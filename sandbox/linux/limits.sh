@@ -9,6 +9,10 @@
 #   - memory.swap.max 0: none of it goes to swap;
 #   - pids.max: processes and threads together.
 # The sandbox has no /sys and cannot reach the user manager: what runs in it cannot raise them.
+# Then the launcher raises its oom_score_adj to 1000, which every process of the sandbox inherits:
+# when the machine (or a cgroup above the scope) runs out of memory, the kernel's out-of-memory
+# killer picks one of them first, rather than the user's other programs, Temporal or agentd. A
+# process may lower its own again as far as it was (0, as a rule): a subverted sandbox can undo it.
 #
 # agentd gives the launcher, in the environment it makes for it:
 #   AGENTOS_LIMIT_MEMORY  bytes, a whole number of pages (up to 19 digits, as agentd's int64 holds)
@@ -81,4 +85,8 @@ else
   limits_check memory.max "$AGENTOS_LIMIT_MEMORY"
   limits_check memory.swap.max 0
   limits_check pids.max "$AGENTOS_LIMIT_TASKS"
+  # First in line for the out-of-memory killer (agentd records 1000: scope.OOMScoreAdj).
+  { echo 1000 >/proc/self/oom_score_adj; } 2>/dev/null || limits_fail "cannot raise its oom_score_adj to 1000"
+  { read -r limits_oom </proc/self/oom_score_adj; } 2>/dev/null || limits_fail "cannot read its oom_score_adj back"
+  [[ $limits_oom == 1000 ]] || limits_fail "its oom_score_adj is $limits_oom, not 1000"
 fi

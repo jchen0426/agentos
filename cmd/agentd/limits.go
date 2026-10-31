@@ -221,11 +221,12 @@ func (l sandboxLimits) worstCaseRecord() map[string]any {
 }
 
 // limitsRecord is a set of limits in agentd.started: what holds them, a systemd user scope of each run's
-// own (Linux), off (--insecure-dev) or none (macOS); and, where they are held, memory and tasks, and
-// swap, which is always none.
+// own (Linux), off (--insecure-dev) or none (macOS); and, where they are held, memory and tasks, swap,
+// which is always none, and the oom_score_adj the launcher gives the sandbox.
 func limitsRecord(l config.Limits, enforcement string) map[string]any {
 	if enforcement != enforcedByScope {
 		return map[string]any{"enforcement": enforcement}
 	}
-	return map[string]any{"memory_bytes": int64(l.Memory), "tasks": int64(l.Tasks), "swap_bytes": 0, "enforcement": enforcement}
+	return map[string]any{"memory_bytes": int64(l.Memory), "tasks": int64(l.Tasks), "swap_bytes": 0,
+		"oom_score_adj": scope.OOMScoreAdj, "enforcement": enforcement}
 }

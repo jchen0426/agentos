@@ -87,9 +87,10 @@ def test_agentd_starts_its_worker_before_it_says_it_is_ready(stack: Stack) -> No
     assert started["no_worker"] is False, started
     worker = started["worker"]
     # Its limits and what holds them (M5 C3a): under bwrap the defaults, in a scope of each generation's
-    # own; off with --insecure-dev on Linux (none), and none on macOS, without numbers.
-    limits = ({"memory_bytes": 1 << 30, "tasks": 512, "swap_bytes": 0, "enforcement": "systemd_user_scope"} if SANDBOX == "bwrap"
-              else {"enforcement": "off" if is_linux() else "none"})
+    # own, with the sandbox's oom_score_adj; off with --insecure-dev on Linux (none), and none on macOS,
+    # without numbers.
+    limits = ({"memory_bytes": 1 << 30, "tasks": 512, "swap_bytes": 0, "oom_score_adj": 1000, "enforcement": "systemd_user_scope"}
+              if SANDBOX == "bwrap" else {"enforcement": "off" if is_linux() else "none"})
     assert {k: worker.get(k) for k in ("sandbox", "python", "code", "workflows", "limits")} == {
         "sandbox": str(WORKER_LAUNCHER[SANDBOX]) if SANDBOX in WORKER_LAUNCHER else "",
         "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS", "limits": limits}, started

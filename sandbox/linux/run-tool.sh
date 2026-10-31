@@ -20,7 +20,8 @@
 #     /tmp among it, with no swap, and its tasks, processes and threads together, as
 #     git_tools.limits says (512 MiB and 128 by default). Past the memory the kernel kills the
 #     call's largest process (git, as a rule) and systemd the rest; agentd runs the call once more,
-#     and refuses it if that is killed too, as it refuses one past the CPU time. The server gets
+#     and refuses it if that is killed too, as it refuses one past the CPU time. Its oom_score_adj
+#     is 1000: when the machine runs out of memory, the kernel kills it first. The server gets
 #     GOMAXPROCS=4: Go starts a thread for each CPU it may use, and the task limit counts threads (a
 #     show_diff took 9 tasks with 4, 134 with GOMAXPROCS=512, past the 128 it may have).
 #

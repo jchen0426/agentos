@@ -82,9 +82,16 @@ def mcp_servers(agentd: int) -> list[int]:
     return [p for p in descendants(agentd) if Path((command_of(p).split() or [""])[0]).name == "agentos-mcp-git"]
 
 
+def oom_score_adj(pid: int) -> str:
+    """The process's oom_score_adj, as the kernel's out-of-memory killer weighs it (from the host: the
+    same number as the process reads in its sandbox, of /proc/self)."""
+    return Path(f"/proc/{pid}/oom_score_adj").read_text().strip()
+
+
 def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> None:
     """The Worker's generation and a git tool call, each in a scope of its own, named after agentd's
-    start and the run, whose cgroup holds the limits the configuration names, with no swap; agentd.started
+    start and the run, whose cgroup holds the limits the configuration names, with no swap; their
+    sandboxes' processes have an oom_score_adj of 1000, first for the out-of-memory killer; agentd.started
     records them, and what holds them. A scope whose run ended without the kernel killing it is gone."""
     hold = stack.tmp / "hold-in-tool"
     hold.touch()
@@ -92,9 +99,9 @@ def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> 
                                                   tools={"memory": "384MiB", "tasks": 100}),
                        faults=[{"name": "git.show_diff", "attempt": 1, "hold_in_tool_while_exists": str(hold)}])
     started = last_start(stack)
-    assert started["worker"]["limits"] == {"memory_bytes": 768 << 20, "tasks": 300, "swap_bytes": 0,
+    assert started["worker"]["limits"] == {"memory_bytes": 768 << 20, "tasks": 300, "swap_bytes": 0, "oom_score_adj": 1000,
                                            "enforcement": "systemd_user_scope"}, started
-    assert started["git_tools_limits"] == {"memory_bytes": 384 << 20, "tasks": 100, "swap_bytes": 0,
+    assert started["git_tools_limits"] == {"memory_bytes": 384 << 20, "tasks": 100, "swap_bytes": 0, "oom_score_adj": 1000,
                                            "enforcement": "systemd_user_scope"}, started
     [holds] = [e for e in stack.agentd_log() if e.get("msg") == HOLDS]
     assert (holds["worker_memory"], holds["worker_tasks"], holds["tool_memory"], holds["tool_tasks"]) == ("768MiB", 300, "384MiB", 100)
@@ -105,6 +112,7 @@ def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> 
     first = cgroup_of(pid)
     assert SCOPE.fullmatch(first) and SCOPE.fullmatch(first).groups() == (token, "worker", "1"), first
     assert limits_of(first) == {"memory.max": str(768 << 20), "memory.swap.max": "0", "pids.max": "300"}
+    assert oom_score_adj(pid) == "1000" and oom_score_adj(stack.agentd.popen.pid) != "1000", pid
     [launch] = w.log("worker started")
     assert f"AGENTOS_LIMIT_UNIT=agentos-{token}-worker-1.scope" in launch["env"], launch["env"]
 
@@ -115,6 +123,7 @@ def test_each_run_has_a_scope_of_its_own_that_holds_its_limits(stack: Stack) -> 
     m = SCOPE.fullmatch(call)
     assert m and m.groups()[:2] == (token, "tool"), call  # agentd's self-check at start made the first calls
     assert limits_of(call) == {"memory.max": str(384 << 20), "memory.swap.max": "0", "pids.max": "100"}
+    assert oom_score_adj(server) == "1000", server
     hold.unlink()
     assert stack.wait_state(run, TERMINAL, timeout=120)["state"] == "SUCCEEDED"
     assert not Path("/sys/fs/cgroup" + call).exists()
@@ -413,6 +422,7 @@ def test_insecure_dev_turns_the_limits_off(stack: Stack, monkeypatch: pytest.Mon
     w = stack.worker()
     pid = w.wait_ready(1)
     assert "agentos-" not in cgroup_of(pid), cgroup_of(pid)
+    assert oom_score_adj(pid) == oom_score_adj(stack.agentd.popen.pid) != "1000", pid  # agentd's, as it was
     [launch] = w.log("worker started")
     assert "AGENTOS_LIMITS=off" in launch["env"] and not any(v.startswith("AGENTOS_LIMIT_") for v in launch["env"]), launch["env"]
     run = stack.start_run()

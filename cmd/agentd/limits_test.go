@@ -336,14 +336,16 @@ func TestTheLimitsWorstCase(t *testing.T) {
 }
 
 // agentd.started records the limits of the Worker (TestWorkerRecord) and of the git tool calls: where
-// they hold, their memory and tasks, no swap, and what holds them; where they do not, only that.
+// they hold, their memory and tasks, no swap, the sandbox's oom_score_adj, and what holds them; where
+// they do not, only that.
 func TestStartRecordsTheToolLimits(t *testing.T) {
 	cfg := workerConfig()
 	cfg.GitTools.Limits = config.Limits{Memory: 64 << 20, Tasks: 32}
 	for enforcement, want := range map[string]map[string]any{
-		enforcedByScope: {"memory_bytes": int64(64 << 20), "tasks": int64(32), "swap_bytes": 0, "enforcement": enforcedByScope},
-		enforcedOff:     {"enforcement": "off"},
-		enforcedByNone:  {"enforcement": "none"},
+		enforcedByScope: {"memory_bytes": int64(64 << 20), "tasks": int64(32), "swap_bytes": 0, "oom_score_adj": 1000,
+			"enforcement": enforcedByScope},
+		enforcedOff:    {"enforcement": "off"},
+		enforcedByNone: {"enforcement": "none"},
 	} {
 		p := startRecord("agentd.yaml", cfg, &policy.Policy{}, &models.Config{}, &pricing.Table{}, "i", "", false, false, enforcement)
 		if l, ok := p["git_tools_limits"].(map[string]any); !ok || !maps.Equal(l, want) {

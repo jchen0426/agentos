@@ -587,6 +587,15 @@ such a cgroup holds less, and warns at every start when it is over half; `worker
 `compared_with` (`MemTotal`, or the cgroup), or `compared_with_error` when agentd cannot read
 `/proc/meminfo`; and `warned`.
 
+In its scope, the launcher raises its `oom_score_adj` to 1000, which every process of the sandbox
+inherits: when the machine (or a cgroup above the scopes) runs out of memory, the kernel's out-of-memory
+killer picks a process of a sandbox first, rather than your browser, your editor, Temporal or agentd.
+The cost: when something else uses the memory up, the sandboxes go first too, a Worker to be started
+again, a git tool call to be refused once it is killed twice. A process may lower its own again as far
+as it inherited (in the Lima VM, a process in either sandbox lowered its own to 0, agentd's, and no
+lower): a subverted sandbox can undo it, so this holds against an honest overload only. `agentd.started`
+records it with each set's limits.
+
 As agentd starts, it runs a probe scope of each set of limits and reads them back, and refuses to start
 when they would not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`,
 unless another user owns it, else `/run/user/<uid>`); the limits do not take, as a controller is not
@@ -616,12 +625,13 @@ up. The limits are your user manager's: a process of yours outside the sandbox c
 
 `--insecure-dev` turns the limits off, and agentd says so at every start: the launchers then get
 `AGENTOS_LIMITS=off`. A Linux launcher run by hand (a Worker of your own, with `--no-worker`) needs
-either that or the limits, as agentd gives them: `AGENTOS_LIMIT_MEMORY` (bytes),
-`AGENTOS_LIMIT_TASKS`, `AGENTOS_LIMIT_UNIT` (a scope name of your choosing, `agentos-<x>.scope`) and
-`XDG_RUNTIME_DIR`; it refuses to run without them. macOS's sandbox sets none of these limits, and agentd
-refuses a configuration that names any there. `agentd.started` records both sets, as `worker.limits`
-and `git_tools_limits`: where they hold, `memory_bytes`, `tasks`, `swap_bytes` (0) and `enforcement:
-systemd_user_scope`; elsewhere `enforcement` alone, `off` (`--insecure-dev`) or `none` (macOS).
+either that or the limits, as agentd gives them: `AGENTOS_LIMIT_MEMORY` (bytes), `AGENTOS_LIMIT_TASKS`,
+`AGENTOS_LIMIT_UNIT` (a scope name of your choosing, `agentos-<x>.scope`) and `XDG_RUNTIME_DIR`; it
+refuses to run without them. macOS's sandbox sets none of these limits, and agentd refuses a
+configuration that names any there. `agentd.started` records both sets, as `worker.limits` and
+`git_tools_limits`: where they hold, `memory_bytes`, `tasks`, `swap_bytes` (0), `oom_score_adj` (1000)
+and `enforcement: systemd_user_scope`; elsewhere `enforcement` alone, `off` (`--insecure-dev`) or `none`
+(macOS).
 
 ## Tests
 

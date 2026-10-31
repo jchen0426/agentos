@@ -189,9 +189,9 @@ func TestWorkerRecord(t *testing.T) {
 		r["workflows"] != "agentos_worker.workflows:WORKFLOWS" {
 		t.Errorf("%v", r)
 	}
-	// Its limits, with no swap, and what holds them (M5 C3a).
+	// Its limits, with no swap, its sandbox's oom_score_adj, and what holds them (M5 C3a).
 	if l := r["limits"].(map[string]any); !maps.Equal(l, map[string]any{"memory_bytes": int64(768 << 20), "tasks": int64(300),
-		"swap_bytes": 0, "enforcement": "systemd_user_scope"}) {
+		"swap_bytes": 0, "oom_score_adj": 1000, "enforcement": "systemd_user_scope"}) {
 		t.Errorf("limits %v", l)
 	}
 	// The copy it runs, and the thresholds of its liveness.

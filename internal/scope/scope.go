@@ -34,6 +34,13 @@ import (
 // neither it nor the limits refuses to run.
 const OffEnv = "AGENTOS_LIMITS=off"
 
+// OOMScoreAdj is the oom_score_adj a launcher gives its sandbox, in its scope (limits.sh, which writes
+// the same number, and TestTheLaunchersTakeWhatEnvGives holds it to this one): the sandbox's processes
+// are the kernel's out-of-memory killer's first pick when the machine, or a cgroup above the scopes,
+// runs out of memory. A process may lower its own as far as it inherited (0, as a rule), so a subverted
+// sandbox can undo it.
+const OOMScoreAdj = 1000
+
 // Limits are a run's resource limits; its swap is always none.
 type Limits struct {
 	Memory int64 // bytes, a whole number of MiB (so of pages, as the kernel holds memory.max)
