@@ -173,7 +173,7 @@ async def main() -> None:
     report["sockets"] = {k: unix(path) for k, path in extra.get("sockets", {}).items()}
     report["keychain"] = {s: keychain_item(s, extra["keychain_file"]) for s in extra.get("keychain_items", [])}
     report["dev"] = listdir_names("/dev")
-    report["env"] = sorted(os.environ)
+    report["env"] = dict(os.environ)
     print(json.dumps(report))
 
 

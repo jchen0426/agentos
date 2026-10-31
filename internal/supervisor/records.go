@@ -18,6 +18,7 @@ type exit struct {
 	restartIn       time.Duration // the delay before the next generation; 0 for none (agentd stops)
 	unresponsive    string        // the liveness rule it broke, and agentd stopped it for: not_polling, not_answering
 	unresponsiveFor time.Duration // how long it had then
+	oomKill         bool          // the kernel's out-of-memory killer killed it (Options.Limits)
 }
 
 // Event is the audit record of e: a record of agentd's own (no run's), with agentd's own words and
@@ -39,6 +40,9 @@ func (e exit) Event(unrecorded int) audit.Event {
 	}
 	if e.unresponsive != "" {
 		p["unresponsive"], p["unresponsive_ms"] = e.unresponsive, e.unresponsiveFor.Milliseconds()
+	}
+	if e.oomKill {
+		p["oom_kill"] = true
 	}
 	return audit.Event{Type: ExitedType, Actor: audit.Agentd, Payload: p}
 }

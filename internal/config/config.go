@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -98,6 +99,121 @@ type GitTools struct {
 	// ../sandbox/linux/run-tool.sh. Leaving it out needs agentd's --insecure-dev.
 	Sandbox []string      `yaml:"sandbox"`
 	Timeout time.Duration `yaml:"timeout"` // per call; default 60s
+	// Limits are each call's resource limits; DefaultToolLimits where left out.
+	Limits Limits `yaml:"limits"`
+}
+
+// Limits are the resource limits of one sandbox: the Worker's (worker.limits), or each git tool
+// call's (git_tools.limits). On Linux each runs in a systemd user scope of its own, a cgroup that
+// holds them, with no swap (M5 C3a); the macOS sandbox sets none, and Load's caller refuses a
+// configuration that names any there (CheckLimits). A field left out takes its default.
+type Limits struct {
+	// Memory is what all the sandbox's processes may use at once, the kernel's memory for them
+	// among it: page tables, socket and pipe buffers, memfd, tmpfs.
+	Memory Bytes `yaml:"memory"`
+	// Tasks is how many processes and threads, together, the sandbox may have at once.
+	Tasks Count `yaml:"tasks"`
+	// Named says the configuration names either, rather than leaving both to their defaults.
+	Named bool `yaml:"-"`
+}
+
+// The defaults (decided 2026-10-25); and the least a configuration may set, which stops a slip
+// (tasks: 1) as agentd starts rather than at every launch, low enough for the tests' small limits.
+var (
+	DefaultWorkerLimits = Limits{Memory: 1 << 30, Tasks: 512}
+	DefaultToolLimits   = Limits{Memory: 512 << 20, Tasks: 128}
+	leastLimits         = Limits{Memory: 16 << 20, Tasks: 16}
+)
+
+// mostTasks is the kernel's PID_MAX_LIMIT on 64-bit: systemd sets no pids.max above it, and leaves the
+// scope at max.
+const mostTasks = 4 << 20
+
+// Bytes is a size, in bytes; agentd.yaml writes a whole number of MiB or GiB (512MiB, 1GiB), which
+// is a whole number of pages, as the kernel holds memory.max.
+type Bytes int64
+
+var bytesSpec = regexp.MustCompile(`^([1-9][0-9]{0,8})(MiB|GiB)$`)
+
+func (b *Bytes) UnmarshalYAML(n *yaml.Node) error {
+	m := bytesSpec.FindStringSubmatch(n.Value)
+	if n.Kind != yaml.ScalarNode || m == nil {
+		return fmt.Errorf("line %d: %q is not a size: write a whole number of MiB or GiB, as 512MiB or 1GiB", n.Line, n.Value)
+	}
+	v, _ := strconv.ParseInt(m[1], 10, 64) // at most 9 digits: no more than 2^60 bytes either way
+	*b = Bytes(v << map[string]int{"MiB": 20, "GiB": 30}[m[2]])
+	return nil
+}
+
+// String is b as agentd.yaml writes it: in GiB when it is a whole number of them, else in MiB.
+func (b Bytes) String() string {
+	switch {
+	case b > 0 && b%(1<<30) == 0:
+		return fmt.Sprintf("%dGiB", b>>30)
+	case b > 0 && b%(1<<20) == 0:
+		return fmt.Sprintf("%dMiB", b>>20)
+	}
+	return fmt.Sprintf("%d bytes", int64(b))
+}
+
+// Count is a number of things a limit counts: a whole number, at least 1, written in decimal.
+type Count int64
+
+var countSpec = regexp.MustCompile(`^[1-9][0-9]{0,17}$`)
+
+func (c *Count) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.ScalarNode || !countSpec.MatchString(n.Value) {
+		return fmt.Errorf("line %d: %q is not a count: write a whole number, at least 1", n.Line, n.Value)
+	}
+	v, _ := strconv.ParseInt(n.Value, 10, 64) // at most 18 digits
+	*c = Count(v)
+	return nil
+}
+
+// withDefaults is l, each field left out at def's, once it says whether it named any.
+func (l Limits) withDefaults(def Limits) Limits {
+	l.Named = l.Memory != 0 || l.Tasks != 0
+	if l.Memory == 0 {
+		l.Memory = def.Memory
+	}
+	if l.Tasks == 0 {
+		l.Tasks = def.Tasks
+	}
+	return l
+}
+
+// check refuses limits below the least, which no Worker or call would start within, and tasks above
+// the kernel's most.
+func (l Limits) check(key string) error {
+	if l.Memory < leastLimits.Memory {
+		return fmt.Errorf("%s.memory: %s is below the least, %s", key, l.Memory, leastLimits.Memory)
+	}
+	if l.Tasks < leastLimits.Tasks {
+		return fmt.Errorf("%s.tasks: %d is below the least, %d", key, l.Tasks, leastLimits.Tasks)
+	}
+	if l.Tasks > mostTasks {
+		return fmt.Errorf("%s.tasks: %d is above the most, %d (the kernel's PID_MAX_LIMIT)", key, l.Tasks, mostTasks)
+	}
+	return nil
+}
+
+// CheckLimits refuses limits that nothing on goos would hold: agentd sets them on Linux only, in a
+// systemd user scope of each run's own; the macOS sandbox sets none, so a configuration that names
+// any there is refused rather than taken for enforced.
+func (c *Config) CheckLimits(goos string) error {
+	if goos == "linux" {
+		return nil
+	}
+	for _, l := range []struct {
+		key string
+		Limits
+	}{{"worker.limits", c.Worker.Limits}, {"git_tools.limits", c.GitTools.Limits}} {
+		if l.Named {
+			return fmt.Errorf("%s: agentd sets resource limits on Linux only, in systemd user scopes, and %s's sandbox "+
+				"sets none: leave it out", l.key, goos)
+		}
+	}
+	return nil
 }
 
 // DefaultWorkflows is what a Worker serves when the configuration does not say.
@@ -120,9 +236,8 @@ type Worker struct {
 	// DenyRead lists more paths the macOS sandbox keeps from the Worker, on top of the launcher's
 	// own rules and what agentd denies of itself. Linux mounts only what the Worker is given.
 	DenyRead []string `yaml:"deny_read"`
-	// Limits is kept for the Worker's resource limits, which this agentd does not set yet: a
-	// configuration that names any is refused rather than taken for enforced.
-	Limits map[string]any `yaml:"limits"`
+	// Limits are each generation's resource limits; DefaultWorkerLimits where left out.
+	Limits Limits `yaml:"limits"`
 }
 
 type Temporal struct {
@@ -266,8 +381,12 @@ func Load(path string) (*Config, error) {
 	if w.Workflows == "" {
 		w.Workflows = DefaultWorkflows
 	}
-	if len(w.Limits) > 0 {
-		return nil, fmt.Errorf("config %s: worker.limits: this agentd sets no limits on the Worker yet; leave it out", path)
+	w.Limits, c.GitTools.Limits = w.Limits.withDefaults(DefaultWorkerLimits), c.GitTools.Limits.withDefaults(DefaultToolLimits)
+	if err := w.Limits.check("worker.limits"); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
+	if err := c.GitTools.Limits.check("git_tools.limits"); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	if tildeErr != nil {
 		return nil, fmt.Errorf("config %s: %w", path, tildeErr)

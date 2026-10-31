@@ -485,8 +485,8 @@ func TestDesignDocModelsLoad(t *testing.T) {
 }
 
 // The worker section's paths are the config's, like every other: relative to the file, ~/ in the
-// home directory. A Worker serves the product's workflows unless the section says otherwise. Limits
-// are not set yet: a section that names any is refused, not taken for enforced.
+// home directory. A Worker serves the product's workflows unless the section says otherwise, within
+// the default limits unless it names others (TestLimits).
 func TestWorkerSection(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", filepath.Join(dir, "home"))
@@ -505,18 +505,108 @@ func TestWorkerSection(t *testing.T) {
 	w := c.Worker
 	if !slices.Equal(w.Sandbox, []string{filepath.Join(dir, "launch/run-worker.sh"), "--flag"}) || w.Python != filepath.Join(dir, "venv") ||
 		w.Code != filepath.Join(dir, "home/code") || !slices.Equal(w.DenyRead, []string{filepath.Join(dir, "secret"), "/abs/x"}) ||
-		w.Workflows != DefaultWorkflows || len(w.Limits) != 0 {
+		w.Workflows != DefaultWorkflows || w.Limits != DefaultWorkerLimits {
 		t.Errorf("worker %+v", w)
 	}
 	if c, err := load("worker: {workflows: \"tests.rogue_workflows:StepsOutOfLine\", limits: {}}\n"); err != nil ||
-		c.Worker.Workflows != "tests.rogue_workflows:StepsOutOfLine" {
+		c.Worker.Workflows != "tests.rogue_workflows:StepsOutOfLine" || c.Worker.Limits != DefaultWorkerLimits {
 		t.Errorf("workflows: %v, %+v", err, c)
-	}
-	if _, err := load("worker: {limits: {memory: 1GiB}}\n"); err == nil || !strings.Contains(err.Error(), "worker.limits") {
-		t.Errorf("limits: %v", err)
 	}
 	if _, err := load("worker: {pyhton: venv}\n"); err == nil {
 		t.Error("a misspelt field: loaded")
+	}
+}
+
+// Each sandbox's resource limits: the Worker's and each git tool call's, memory in MiB or GiB and
+// tasks, each at its default where left out, and at least the least. Nothing else is taken: no
+// swap, no bare number of bytes, no misspelt key. Only Linux holds them: a configuration that names
+// any is refused on another platform, where nothing would.
+func TestLimits(t *testing.T) {
+	dir := t.TempDir()
+	load := func(body string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(dir, "agentd.yaml")
+		if err := os.WriteFile(path, []byte("policy_file: p\nmodels_file: m\nprices_file: x\n"+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path)
+	}
+	c, err := load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Worker.Limits != (Limits{Memory: 1 << 30, Tasks: 512}) || c.GitTools.Limits != (Limits{Memory: 512 << 20, Tasks: 128}) {
+		t.Errorf("the defaults: %+v, %+v", c.Worker.Limits, c.GitTools.Limits)
+	}
+	for body, want := range map[string][2]Limits{
+		"worker: {limits: {memory: 2GiB, tasks: 1000}}\n":   {{Memory: 2 << 30, Tasks: 1000, Named: true}, DefaultToolLimits},
+		"worker: {limits: {memory: 768MiB}}\n":              {{Memory: 768 << 20, Tasks: 512, Named: true}, DefaultToolLimits},
+		"git_tools: {limits: {tasks: 64}}\n":                {DefaultWorkerLimits, {Memory: 512 << 20, Tasks: 64, Named: true}},
+		"git_tools: {limits: {memory: 16MiB, tasks: 16}}\n": {DefaultWorkerLimits, {Memory: 16 << 20, Tasks: 16, Named: true}},
+		"worker: {limits: {tasks: 4194304}}\n":              {{Memory: 1 << 30, Tasks: 4194304, Named: true}, DefaultToolLimits},
+		"worker: {limits: {memory: 999999999GiB}}\n":        {{Memory: 999999999 << 30, Tasks: 512, Named: true}, DefaultToolLimits},
+		"worker: {limits: {}}\ngit_tools: {limits: {}}\n":   {DefaultWorkerLimits, DefaultToolLimits},
+	} {
+		c, err := load(body)
+		if err != nil || c.Worker.Limits != want[0] || c.GitTools.Limits != want[1] {
+			t.Errorf("%q: %v, %+v, %+v", body, err, c.Worker.Limits, c.GitTools.Limits)
+		}
+	}
+	for body, refusal := range map[string]string{
+		"worker: {limits: {memory: 1073741824}}\n":    "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 536870912}}\n":     "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 1G}}\n":            "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 1.5GiB}}\n":        "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 0MiB}}\n":          "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: -1GiB}}\n":         "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 512KiB}}\n":        "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 1000000000GiB}}\n": "write a whole number of MiB or GiB",
+		"worker: {limits: {memory: 15MiB}}\n":         "worker.limits.memory: 15MiB is below the least, 16MiB",
+		"git_tools: {limits: {memory: 8MiB}}\n":       "git_tools.limits.memory: 8MiB is below the least, 16MiB",
+		"worker: {limits: {tasks: 0}}\n":              "write a whole number, at least 1",
+		"worker: {limits: {tasks: -3}}\n":             "write a whole number, at least 1",
+		"worker: {limits: {tasks: 15}}\n":             "worker.limits.tasks: 15 is below the least, 16",
+		"git_tools: {limits: {tasks: 4194305}}\n":     "git_tools.limits.tasks: 4194305 is above the most, 4194304",
+		"git_tools: {limits: {tasks: 1.5}}\n":         "write a whole number, at least 1",
+		"git_tools: {limits: {tasks: 0x40}}\n":        "write a whole number, at least 1",
+		"git_tools: {limits: {tasks: [64]}}\n":        "write a whole number, at least 1",
+		"worker: {limits: {swap: 0MiB}}\n":            "field swap not found",
+		"git_tools: {limits: {memroy: 1GiB}}\n":       "field memroy not found",
+		"worker: {limits: {named: true}}\n":           "field named not found",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), refusal) {
+			t.Errorf("%q: %v, want %q", body, err, refusal)
+		}
+	}
+	for _, b := range []struct {
+		b    Bytes
+		text string
+	}{{1 << 30, "1GiB"}, {3 << 29, "1536MiB"}, {512 << 20, "512MiB"}, {1<<20 + 1, "1048577 bytes"}, {0, "0 bytes"}} {
+		if b.b.String() != b.text {
+			t.Errorf("%d bytes: %s, want %s", int64(b.b), b.b, b.text)
+		}
+	}
+	// Only Linux holds them.
+	named, err := load("worker: {limits: {tasks: 64}}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, err := load("git_tools: {limits: {memory: 1GiB}}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		cfg     *Config
+		goos    string
+		refusal string
+	}{{named, "linux", ""}, {tools, "linux", ""}, {c, "darwin", ""},
+		{named, "darwin", "worker.limits: agentd sets resource limits on Linux only"},
+		{tools, "darwin", "git_tools.limits: agentd sets resource limits on Linux only"},
+		{tools, "freebsd", "freebsd's sandbox sets none"}} {
+		err := c.cfg.CheckLimits(c.goos)
+		if (c.refusal == "") != (err == nil) || err != nil && !strings.Contains(err.Error(), c.refusal) {
+			t.Errorf("%s, %+v %+v: %v, want %q", c.goos, c.cfg.Worker.Limits, c.cfg.GitTools.Limits, err, c.refusal)
+		}
 	}
 }
 

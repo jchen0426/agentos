@@ -12,9 +12,9 @@
 #   - no file can be created anywhere: the Worker writes none (docs/m1-notes.md). The root, a
 #     tmpfs bwrap makes as large as half the memory, is read-only; /tmp, /run and /dev are only
 #     directories in it. A tmpfs's data, inodes and extended attributes are charged to no
-#     process, so the OOM killer would kill other processes, not a Worker that filled one
-#     (--size bounds the data only). Without a writable /dev/shm, POSIX semaphores and shared
-#     memory (multiprocessing) fail with EROFS;
+#     process (only to the cgroup, below), so the OOM killer would kill other processes, not a
+#     Worker that filled one (--size bounds the data only). Without a writable /dev/shm, POSIX
+#     semaphores and shared memory (multiprocessing) fail with EROFS;
 #   - /dev holds five device nodes, null, zero, full, random and urandom: no terminal and no
 #     pseudo-terminals, whose number this machine's sandboxes share;
 #   - no further user namespaces (--disable-userns): in one, the Worker could mount a tmpfs of
@@ -24,13 +24,21 @@
 #     127.0.0.1:7233 to it, because the Temporal SDK only dials host:port. Its directory is
 #     mounted rather than the socket file: agentd re-creates the socket when it restarts,
 #     and a mounted file would keep pointing at the old one. So that directory must hold
-#     nothing but the socket, also when it is reached through a symlink.
+#     nothing but the socket, also when it is reached through a symlink;
+#   - resource limits (limits.sh, sourced first): each generation runs in a systemd user scope of
+#     its own, a cgroup that holds all the memory its processes use, the memory charged to no
+#     process among it (memfd, SysV IPC, pipe and socket buffers, tmpfs: docs/m1-notes.md), with
+#     no swap, and its tasks, processes and threads together, as worker.limits says (1 GiB and
+#     512 by default). Past the memory the kernel kills the Worker; agentd records that, and
+#     starts it again. Its oom_score_adj is 1000: when the machine runs out of memory, the kernel
+#     kills it before the user's other programs. The Worker gets TOKIO_WORKER_THREADS=4: the
+#     Temporal SDK's core starts a thread for each CPU, and the task limit counts threads (the
+#     Worker had at most 23 on 4 CPUs over the bwrap suite; on some 390 CPUs it would go past 512).
 # Unlike run-tool.sh, no ulimit. -v bounds one process, and the Worker can fork; its address
-# space also grows with the CPU count (glibc gives the SDK's threads malloc arenas). -f would
-# kill the Worker once a log file its output goes to grew past the limit. That output is the
-# one thing it can write without bound: give it a pipe or journald, not a plain file. Memory
-# charged to no process remains (memfd, SysV IPC, pipe and socket buffers); bounding it takes
-# a cgroup (docs/m1-notes.md).
+# space also grows with the CPU count (glibc gives the SDK's threads malloc arenas): the cgroup
+# bounds what it uses instead. -f would kill the Worker once a log file its output goes to grew
+# past the limit. That output is the one thing it can write without bound: give it a pipe or
+# journald, not a plain file.
 #
 # agentd starts this itself (agentd.yaml's worker section), in a session of its own, and starts it
 # again whenever it exits. Its stdin is agentd's stop channel, which bwrap hands the Worker as it is:
@@ -39,15 +47,18 @@
 # off any terminal. AGENTOS_SANDBOX_DENY_READ means nothing here:
 # the sandbox mounts only what it is given.
 #
-# Usage: run-worker.sh <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...]
+# Usage: run-worker.sh <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...], with the
+# limits in the environment (limits.sh says which), or AGENTOS_LIMITS=off.
 # Ubuntu 23.10+ also needs an AppArmor profile that grants bwrap user namespaces
-# (see vm/lima/agentos.yaml).
+# (see vm/lima/agentos.yaml). The limits need a systemd user manager: a login session, or lingering.
 set -euo pipefail
 
 if [[ $# -lt 5 || $4 != "--" ]]; then
   echo "usage: $0 <runtime-socket> <python-env-dir> <code-dir> -- <command> [args...]" >&2
   exit 2
 fi
+# shellcheck source=limits.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/limits.sh" # in its scope from here on
 runtime_sock=$1 pyenv=$2 code=$3
 shift 4
 [[ -S $runtime_sock ]] || { echo "$0: $runtime_sock is not a socket" >&2; exit 1; }
@@ -80,7 +91,7 @@ inner_sock=/run/agentos/$sock_name
 args=(
   --unshare-all --unshare-user --disable-userns --die-with-parent --new-session --clearenv
   --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8
-  --setenv PYTHONDONTWRITEBYTECODE 1
+  --setenv PYTHONDONTWRITEBYTECODE 1 --setenv TOKIO_WORKER_THREADS 4
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib
   --proc /proc --dir /tmp --dir /dev/shm
 )

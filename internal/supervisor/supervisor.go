@@ -114,8 +114,28 @@ type Options struct {
 	// generation's liveness by it (Timing.QuietFor, HoldFor). Unset, nothing is checked.
 	NewTally func() Tally
 	// Code is the root of the code the Worker runs (agentd's snapshot of it), logged with each start.
-	Code   string
+	Code string
+	// Limits, if set, hold each generation to the Worker's resource limits (Linux, M5 C3a): its
+	// launcher gets what Limits.Env gives it, and runs it in a systemd user scope of its own, which the
+	// supervisor checks the launcher is in once the generation says it is ready (a launcher that is not
+	// fails the supervisor: Failed). Once a generation has exited without agentd's doing, the supervisor
+	// asks whether the kernel's out-of-memory killer killed it: its exit's record says so (oom_kill).
+	Limits Limits
 	Timing Timing
+}
+
+// Limits are how a generation's launcher holds it to the Worker's resource limits: a *scope.Set.
+type Limits interface {
+	// Env is what generation n's launcher gets: the name of its scope ("" for none), and the variables
+	// that say what holds it, or that the limits are off.
+	Env(n int64) (unit string, env []string)
+	// InScope checks that the launcher, process pid, is in unit; nil for no scope.
+	InScope(pid int, unit string) error
+	// OOMKilled reports, once what ran in unit has exited, whether the kernel's out-of-memory killer
+	// killed it; its error says it could not be told.
+	OOMKilled(unit string) (bool, error)
+	// Memory is the memory limit, as the log names it.
+	Memory() string
 }
 
 // Tally is what the Runtime proxy saw of one generation's calls: the polls it has open, since when it
@@ -179,7 +199,8 @@ func (s *Supervisor) Start() {
 func (s *Supervisor) Ready() <-chan struct{} { return s.ready }
 
 // Failed has the reason the first generation never got ready, with its last output: it exited
-// first, or did not say it was ready in time and was stopped. No generation follows it.
+// first, or did not say it was ready in time and was stopped; or why a generation's launcher, ready,
+// was not in the generation's scope (Options.Limits), and was stopped. No generation follows either.
 func (s *Supervisor) Failed() <-chan error { return s.failed }
 
 // Current is the last generation started, and its launcher's pid while it runs: 0 for none yet, and
@@ -227,7 +248,8 @@ type generation struct {
 	exited     chan struct{} // closed once Wait has returned: ended is set then
 	ended      time.Time
 	tail       tail
-	tally      Tally // what the Runtime proxy counts of its calls; nil for no checks
+	tally      Tally  // what the Runtime proxy counts of its calls; nil for no checks
+	unit       string // its systemd user scope (Options.Limits); "" for none
 }
 
 func (s *Supervisor) loop() {
@@ -301,9 +323,53 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			checking()
 		}
 	}
+	// exited handles the generation's exit, without agentd's doing, and reports whether the supervisor stops.
+	exited := func() bool {
+		s.cleanup(g) // its output read to the end: a ready mark in it is seen
+		wasReady := closed(g.ready)
+		if wasReady && ready != nil {
+			sawReady()
+		}
+		ran := g.ended.Sub(g.started)
+		e := exit{generation: g.n, pid: g.pid, ran: ran, ready: wasReady, at: g.ended, oomKill: s.oomKilled(g)}
+		e.code, e.signal = exitStatus(g.cmd.ProcessState)
+		if first && !wasReady {
+			s.logExit(g, e)
+			rec.exit(e)
+			over := ""
+			if e.oomKill {
+				over = "; the kernel's out-of-memory killer killed it, under a memory limit of " + s.o.Limits.Memory()
+			}
+			s.failed <- fmt.Errorf("the Worker exited before it said it was ready (%s%s); its last output:%s", status(g), over, g.tail.text())
+			return true
+		}
+		*backoff = s.next(*backoff, ran)
+		e.restartIn = *backoff
+		s.logExit(g, e)
+		rec.exit(e)
+		return false
+	}
 	for {
 		select {
 		case <-ready:
+			// Before its readiness counts (the first's is agentd's): a launcher that does not source
+			// limits.sh runs the Worker in no scope, with no limits. (A wrapper that runs one without exec
+			// leaves the process agentd started outside the scope too, and agentd cannot tell them apart.)
+			if err := s.inScope(g); err != nil {
+				if s.reaped(g) {
+					// It exited since it said it was ready, and the pid it had tells nothing any more: this is
+					// its exit, which sees the ready mark that came before it.
+					<-g.exited
+					return exited()
+				}
+				s.terminate(g)
+				s.cleanup(g)
+				s.log.Error("the Worker's launcher did not run it in a systemd user scope that holds its limits: agentd "+
+					"stopped it, and starts no other", "generation", g.n, "pid", g.pid, "error", err)
+				s.failed <- fmt.Errorf("the Worker's launcher did not run it in a systemd user scope that holds its limits, and "+
+					"agentd stopped it: %w", err)
+				return true
+			}
 			sawReady()
 		case now := <-check:
 			rule, d := s.unresponsive(g, now, quietFrom)
@@ -334,25 +400,7 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 				s.t.ReadyWithin, g.tail.text())
 			return true
 		case <-g.exited:
-			s.cleanup(g) // its output read to the end: a ready mark in it is seen
-			wasReady := closed(g.ready)
-			if wasReady && ready != nil {
-				sawReady()
-			}
-			ran := g.ended.Sub(g.started)
-			e := exit{generation: g.n, pid: g.pid, ran: ran, ready: wasReady, at: g.ended}
-			e.code, e.signal = exitStatus(g.cmd.ProcessState)
-			if first && !wasReady {
-				s.logExit(g, e)
-				rec.exit(e)
-				s.failed <- fmt.Errorf("the Worker exited before it said it was ready (%s); its last output:%s", status(g), g.tail.text())
-				return true
-			}
-			*backoff = s.next(*backoff, ran)
-			e.restartIn = *backoff
-			s.logExit(g, e)
-			rec.exit(e)
-			return false
+			return exited()
 		case <-s.stop:
 			s.terminate(g)
 			s.cleanup(g)
@@ -363,6 +411,44 @@ func (s *Supervisor) watch(g *generation, rec *records, backoff *time.Duration) 
 			rec.fire()
 		}
 	}
+}
+
+// reaped reports whether generation g's launcher has exited and been reaped (the reader of its exit
+// reaps it at once): then its pid tells nothing of where it ran. A zombie, not reaped yet, is still
+// there. Once reaped the process answers ErrProcessDone, through its pidfd where Linux has one, and so
+// it does once g.exited is closed.
+func (s *Supervisor) reaped(g *generation) bool {
+	return errors.Is(g.cmd.Process.Signal(syscall.Signal(0)), os.ErrProcessDone)
+}
+
+// inScope checks that generation g's launcher is in its scope (Options.Limits): nil without limits.
+func (s *Supervisor) inScope(g *generation) error {
+	if s.o.Limits == nil {
+		return nil
+	}
+	return s.o.Limits.InScope(g.pid, g.unit)
+}
+
+// oomKilled reports whether the kernel's out-of-memory killer killed generation g, once g has exited
+// without agentd's doing, and logs it, naming the Worker's memory limit. systemd says it, as the
+// generation's scope ended (Options.Limits), and does not say why the killer struck: past that limit,
+// as a rule, or memory running out higher up (a slice's limit, the host's memory, systemd-oomd). A
+// generation agentd stopped is not asked about.
+func (s *Supervisor) oomKilled(g *generation) bool {
+	if g.unit == "" {
+		return false
+	}
+	killed, err := s.o.Limits.OOMKilled(g.unit)
+	if err != nil {
+		s.log.Warn("could not ask systemd how the Worker's scope ended: its exit's record does not say whether the kernel's "+
+			"out-of-memory killer killed it", "generation", g.n, "pid", g.pid, "scope", g.unit, "error", err)
+		return false
+	}
+	if killed {
+		s.log.Error("the kernel's out-of-memory killer killed the Worker", "generation", g.n, "pid", g.pid,
+			"memory_limit", s.o.Limits.Memory(), "scope", g.unit)
+	}
+	return killed
 }
 
 // unresponsive is the liveness rule the generation breaks at now, if any, and how long it has: a
@@ -447,6 +533,11 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 		return nil, err
 	}
 	g.stopper = stopper
+	if s.o.Limits != nil {
+		var limits []string
+		g.unit, limits = s.o.Limits.Env(int64(n))
+		env = append(env, limits...)
+	}
 	cmd := exec.Command(s.o.Argv[0], s.o.Argv[1:]...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = s.o.Dir, stdin, w, w
 	// A session of its own, and so a process group: the group is killed whole, and the session has
@@ -520,9 +611,9 @@ func (s *Supervisor) launch(n int) (*generation, error) {
 	s.mu.Unlock()
 	// The environment is safe to log, and the log says what the Worker was given: agentd builds it
 	// from scratch (its own PATH and HOME, LANG, and the AGENTOS_SANDBOX_* variables of its own:
-	// cmd/agentd's workerLaunch, whose test pins the keys), inherits nothing else of its own, and never
-	// hands a Worker a secret. A secret here would be one the Worker has, which is the bug to fix, not
-	// the log.
+	// cmd/agentd's workerLaunch, whose test pins the keys; on Linux the limits' AGENTOS_LIMIT* and
+	// XDG_RUNTIME_DIR, internal/scope's), inherits nothing else of its own, and never hands a Worker a
+	// secret. A secret here would be one the Worker has, which is the bug to fix, not the log.
 	attrs := []any{"generation", n, "pid", g.pid, "argv", s.o.Argv, "env", env}
 	if s.o.Code != "" {
 		attrs = append(attrs, "code_sha256", s.o.Code)
@@ -636,6 +727,9 @@ func (s *Supervisor) logExit(g *generation, e exit) {
 	}
 	if e.unresponsive != "" {
 		attrs = append(attrs, "unresponsive", e.unresponsive)
+	}
+	if e.oomKill {
+		attrs = append(attrs, "oom_kill", true)
 	}
 	s.log.Warn("worker exited", append(attrs, "output", g.tail.lines())...)
 }

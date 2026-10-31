@@ -27,7 +27,7 @@ import pytest
 from temporalio.api.enums.v1 import EventType
 
 from tests.harness import (CTTY_EXEC, REPO, SANDBOX, TERMINAL, TEST_MODELS, WORKER_LAUNCHER, Stack, command_of, descendants,
-                           event_types, free_port, started_at, wait_for)
+                           event_types, free_port, is_linux, started_at, wait_for)
 from tests.rogue_workflows import SLOW_HELD, SLOW_HOLDING
 
 NO_TTY = {"??", "?"}  # what ps says of a process with no controlling terminal: macOS, Linux
@@ -86,9 +86,14 @@ def test_agentd_starts_its_worker_before_it_says_it_is_ready(stack: Stack) -> No
     started = last_start(stack)
     assert started["no_worker"] is False, started
     worker = started["worker"]
+    # Its limits and what holds them (M5 C3a): under bwrap the defaults, in a scope of each generation's
+    # own, with the sandbox's oom_score_adj; off with --insecure-dev on Linux (none), and none on macOS,
+    # without numbers.
+    limits = ({"memory_bytes": 1 << 30, "tasks": 512, "swap_bytes": 0, "oom_score_adj": 1000, "enforcement": "systemd_user_scope"}
+              if SANDBOX == "bwrap" else {"enforcement": "off" if is_linux() else "none"})
     assert {k: worker.get(k) for k in ("sandbox", "python", "code", "workflows", "limits")} == {
         "sandbox": str(WORKER_LAUNCHER[SANDBOX]) if SANDBOX in WORKER_LAUNCHER else "",
-        "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS", "limits": {}}, started
+        "python": sys.prefix, "code": str(REPO), "workflows": "agentos_worker.workflows:WORKFLOWS", "limits": limits}, started
     # The copy of the code it runs (M5 C2c), which the start's log names too, and the liveness thresholds.
     assert re.fullmatch(r"[0-9a-f]{64}", worker["code_sha256"]) and launch["code_sha256"] == worker["code_sha256"], (worker, launch)
     assert worker["code_files"] > 1000 and worker["code_bytes"] > 50 << 20, worker

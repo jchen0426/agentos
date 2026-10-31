@@ -57,8 +57,11 @@ Go 1.26, Python 3.12 with [uv](https://docs.astral.sh/uv/), the Temporal CLI
 (`brew install temporal`), git 2.41 or later (the git tool server reads attributes from the
 empty tree, `GIT_ATTR_SOURCE`). For the macOS sandbox: Node 22 (`npm ci` in
 `sandbox/macos`). For the Linux sandbox: bubblewrap 0.8 or later and socat, or the Lima VM
-(`brew install lima`, then `make vm`). Mirrors must belong to the user agentd runs as: git
-runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
+(`brew install lima`, then `make vm`); and for its resource limits a systemd user manager, systemd
+253 or later (Ubuntu 24.04 has 255), on cgroup v2, with the memory and pids controllers delegated to
+it, as systemd does by default (see "Resource limits" below). A login session starts one; to keep
+one without a session, `sudo loginctl enable-linger <user>`. Mirrors must belong to the user agentd
+runs as: git runs without the global configuration, so `safe.directory` does not apply. agentd refuses a
 mirror that holds its data directory, either socket's directory, the Temporal client certificate
 or key, or another repo's mirror: on Linux the git tool server's sandbox mounts all of the call's
 mirror.
@@ -473,7 +476,7 @@ within a minute of the last record is held, and the next record, when the minute
 stops, describes the latest and counts the others (`unrecorded`). A `dropped` in one counts earlier
 `worker.exited` records the audit log lost. `audit verify` and `runs explain` read past these records;
 `agentd.started` names the Worker's launcher, Python environment, code directory, workflows and limits
-(none yet), the copy of its code it runs (below), and the liveness thresholds (`liveness`).
+("Resource limits" below), the copy of its code it runs (below), and the liveness thresholds (`liveness`).
 
 The Worker runs a copy of its code that agentd makes when it starts: the Python environment without
 its bytecode, and the `*.py` and `*.so` files (none whose name begins with a dot) of the code directory
@@ -510,6 +513,7 @@ worker:
   code: ../../python                            # its working directory, where it imports from
   workflows: agentos_worker.workflows:WORKFLOWS # the default
   deny_read: []                                 # macOS: more paths its sandbox may not read
+  # limits: {memory: 1GiB, tasks: 512}          # Linux only, these by default; macOS refuses any (Resource limits)
 ```
 
 A sandboxed Worker can read all of its code directory and Python environment: agentd refuses
@@ -552,6 +556,83 @@ perl -MPOSIX -e '$p = fork // die "fork: $!"; unless ($p) { setsid; exec @ARGV; 
 
 See the headers of `sandbox/macos/run-worker.sh` and `sandbox/linux/run-worker.sh`.
 
+### Resource limits
+
+On Linux, agentd runs each generation of the Worker, and each git tool call, in a systemd user scope of
+its own: a transient unit of your systemd user manager, whose cgroup (v2) holds all the memory its
+processes use, the kernel's for them among it (page tables, socket and pipe buffers, memfd, tmpfs),
+with no swap, and its tasks, processes and threads together. By default the Worker gets 1 GiB and 512
+tasks, each tool call 512 MiB and 128; `worker.limits` and `git_tools.limits` set others, as `memory`
+(a whole number of MiB or GiB: `768MiB`, `2GiB`; at least 16 MiB) and `tasks` (at least 16). The tool
+calls keep `run-tool.sh`'s per-process limits too (4 GiB of address space, 30 s of CPU, 64 MiB a file).
+The launcher starts the scope itself (`sandbox/linux/limits.sh`), named
+`agentos-<a token of agentd's start>-worker-<generation>.scope` or `-tool-<n>.scope`, and checks that
+its cgroup holds the limits before it starts bwrap; the sandbox sees neither `/sys` nor the user
+manager, so nothing in it can raise them. Each costs about 5 ms, and a git tool call some 3 ms more, as
+agentd asks systemd how its scope ended. agentd checks too, once a Worker says it is ready and once a
+tool call's server answers, that the process it started is in the run's scope, and that the scope holds
+the run's limits: a launcher that does not source `limits.sh` (an older copy, one of your own), or a
+wrapper that runs one without `exec`, is refused. The Worker gets `TOKIO_WORKER_THREADS=4` and the git
+tool server `GOMAXPROCS=4`: both runtimes start a thread for each CPU, which the task limit counts.
+
+The limits are per scope, and nothing limits their sum: the Worker, and six git tool calls at once (four
+of the runs', two of the run starts'), come at the defaults to 1 GiB + 6 × 512 MiB = 4 GiB at worst.
+Past what the machine has (or a cgroup above the scopes, by its `memory.max`), the kernel's
+out-of-memory killer picks its victim from all of it, not only from the scopes. agentd compares the
+worst case with what the scopes can have between them, the machine's memory (`MemTotal`) or less where
+such a cgroup holds less, and warns at every start when it is over half; `worker.limits.memory` and
+`git_tools.limits.memory` lower it. Where the limits hold, `agentd.started` records it, as
+`limits_worst_case`: `memory_bytes`, made of `worker_memory_bytes` (0 without a Worker of agentd's own),
+`tool_memory_bytes` and `tool_calls` (0 without `git_tools.sandbox`); `compared_with_bytes` and
+`compared_with` (`MemTotal`, or the cgroup), or `compared_with_error` when agentd cannot read
+`/proc/meminfo`; and `warned`.
+
+In its scope, the launcher raises its `oom_score_adj` to 1000, which every process of the sandbox
+inherits: when the machine (or a cgroup above the scopes) runs out of memory, the kernel's out-of-memory
+killer picks a process of a sandbox first, rather than your browser, your editor, Temporal or agentd.
+The cost: when something else uses the memory up, the sandboxes go first too, a Worker to be started
+again, a git tool call to be refused once it is killed twice. A process may lower its own again as far
+as it inherited (in the Lima VM, a process in either sandbox lowered its own to 0, agentd's, and no
+lower): a subverted sandbox can undo it, so this holds against an honest overload only. `agentd.started`
+records it with each set's limits.
+
+As agentd starts, it runs a probe scope of each set of limits and reads them back, and refuses to start
+when they would not hold, saying which: there is no user manager where it looks (`$XDG_RUNTIME_DIR`,
+unless another user owns it, else `/run/user/<uid>`); the limits do not take, as a controller is not
+delegated to the user manager
+(`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/cgroup.controllers` lists those it
+has), or a value reads back otherwise than asked (one systemd did not set); a cgroup v1 hierarchy holds
+the memory or the pids controller, which the limits need on v2; or the kernel's command line has
+`cgroup.memory=nokmem` or `nosocket`, which leave the kernel's memory, or sockets' buffers, out of
+them. Past its memory limit the kernel's out-of-memory killer kills a process of the scope, and systemd
+stops the rest; agentd asks systemd how the scope ended. systemd says only that the killer struck: past
+the scope's own limit as a rule, but memory running out higher up (a slice's limit, the machine's
+memory, systemd-oomd) reads the same. A Worker so killed is logged ("the kernel's out-of-memory killer
+killed the Worker"), with its limit, and its `worker.exited` has `oom_kill: true`; agentd starts it
+again, as after any exit. A git tool call so killed is run once more, in a new scope; killed again, it
+is refused, and not tried again, saying so and naming the limit: the commit is too large to read within
+it (the same commit goes over it every time, as over the CPU time limit), or the machine ran out of
+memory. A scope the kernel ended stays, failed, until agentd clears it (`reset-failed`), as it learns
+how the scope ended, and for its whole start as it stops; one a killed agentd left shows in `systemctl
+--user --failed`, harmless (`systemctl --user reset-failed 'agentos-*'` clears it). Without lingering,
+logind stops your user manager when your last session ends, and with it the Worker and every git tool
+call in their scopes, and the launchers refuse until you log in again: agentd warns at start (`sudo
+loginctl enable-linger <user>` keeps the manager). There is no limit on the Worker's CPU: a subverted
+Worker can keep the CPUs busy, and slow the machine, but not use up its memory or its processes. Nor
+do the scopes hold the kernel's limits per user, which the sandboxes share with agentd and your other
+processes (such as inotify instances and watches, and epoll watches): a subverted sandbox can use them
+up. The limits are your user manager's: a process of yours outside the sandbox could change them.
+
+`--insecure-dev` turns the limits off, and agentd says so at every start: the launchers then get
+`AGENTOS_LIMITS=off`. A Linux launcher run by hand (a Worker of your own, with `--no-worker`) needs
+either that or the limits, as agentd gives them: `AGENTOS_LIMIT_MEMORY` (bytes), `AGENTOS_LIMIT_TASKS`,
+`AGENTOS_LIMIT_UNIT` (a scope name of your choosing, `agentos-<x>.scope`) and `XDG_RUNTIME_DIR`; it
+refuses to run without them. macOS's sandbox sets none of these limits, and agentd refuses a
+configuration that names any there. `agentd.started` records both sets, as `worker.limits` and
+`git_tools_limits`: where they hold, `memory_bytes`, `tasks`, `swap_bytes` (0), `oom_score_adj` (1000)
+and `enforcement: systemd_user_scope`; elsewhere `enforcement` alone, `off` (`--insecure-dev`) or `none`
+(macOS).
+
 ## Tests
 
 ```bash
@@ -568,8 +649,9 @@ Worker killed or paused, agentd killed), T9's probes of the Worker's sandbox, th
 crash. They kill or pause it through `stack.worker()`, and agentd starts it again; where a test needs
 a while with no Worker running, agentd's fault script holds the next one back
 (`hold_worker_while_exists`). Besides these, only the tests of the supervision itself
-(`tests/test_worker_supervision.py`) and of the harness (`tests/test_harness.py`) run agentd's own
-Worker; the rest run agentd with `--no-worker` and start their own.
+(`tests/test_worker_supervision.py`), of the resource limits (`tests/test_resource_limits.py`, under
+bubblewrap only) and of the harness (`tests/test_harness.py`) run agentd's own Worker; the rest run
+agentd with `--no-worker` and start their own, which on Linux the harness gives agentd's default limits.
 
 `uv run pytest --verify-after-each` also runs `agentctl audit verify` on every agentd a test starts, before it stops: every honest flow must leave an audit log that verifies (exit 0), and a test that tampers on purpose declares the exit and the kinds of mismatch it expects (`@pytest.mark.audit_verify(exit=1, kinds=["anchors_mismatched"])`).
 

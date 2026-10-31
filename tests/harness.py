@@ -127,6 +127,24 @@ TOOL_LAUNCHER = {"srt": REPO / "sandbox/macos/run-tool.sh", "bwrap": REPO / "san
 WORKER_LAUNCHER = {"srt": REPO / "sandbox/macos/run-worker.sh", "bwrap": REPO / "sandbox/linux/run-worker.sh"}
 DEFAULT_QUEUE = "agentos-workflows"  # the Worker's task queue, unless a stack's agentd runs its own
 
+# agentd's default resource limits of its Worker and of each git tool call (M5 C3a), which the Linux
+# launchers hold in a systemd user scope of each run's own: memory in bytes, and tasks.
+LIMITS = {"worker": (1 << 30, 512), "tool": (512 << 20, 128)}
+
+
+def launcher_limits(kind: str = "worker") -> dict[str, str]:
+    """What agentd gives a Linux launcher of its limits (internal/scope), for one run by hand: the
+    defaults of kind's (worker, tool), in a scope of the run's own, which the user manager at this
+    process's XDG_RUNTIME_DIR runs. The launchers refuse to run without them (or AGENTOS_LIMITS=off).
+    Nothing elsewhere: the macOS launchers take none."""
+    if SANDBOX != "bwrap":
+        return {}
+    memory, tasks = LIMITS[kind]
+    return {"AGENTOS_LIMIT_MEMORY": str(memory), "AGENTOS_LIMIT_TASKS": str(tasks),
+            "AGENTOS_LIMIT_UNIT": f"agentos-test-{os.urandom(8).hex()}-{kind}-1.scope",
+            "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"}
+
+
 # Runs its arguments with the terminal on its stdin as its controlling terminal: started in a
 # session of its own, as a shell on a terminal starts a session, then exec'd into the command.
 CTTY_EXEC = "import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])"
@@ -643,7 +661,7 @@ class Stack:
                      test_tools: bool = False, run_id_delay: str | None = None,
                      hold_doorbells: Path | None = None, repos: dict | None = None,
                      worker: bool = False, workflows: str | None = None, terminal: bool = False,
-                     hold_worker: Path | None = None) -> Proc:
+                     hold_worker: Path | None = None, insecure_dev: bool = False) -> Proc:
         """`faults` are fault rules for gateway calls (internal/faults). `run_id_delay` (a Go
         duration) makes StartRun record each run's ID that much later. While `hold_doorbells`
         exists, agentd delivers no doorbell: they wait in its outbox. While `hold_worker` exists,
@@ -654,7 +672,8 @@ class Stack:
         the GitHub tools only dry-run. With `worker`, agentd starts and supervises the Worker
         itself, serving `workflows` (stack.worker()); otherwise it runs with --no-worker, and the
         test starts its own (start_worker). With `terminal`, agentd runs on a pseudo-terminal of its
-        own, its controlling terminal."""
+        own, its controlling terminal. agentd runs with --insecure-dev for AGENTOS_SANDBOX=none, or
+        with `insecure_dev`, whose launchers then run with their resource limits off."""
         if worker and OWN_WORKER_REFUSED:
             import pytest  # only tests get here: the evaluation runs agentd with --no-worker
 
@@ -691,8 +710,8 @@ class Stack:
             self.workflow_queue = config.get("task_queues", {}).get("workflows", DEFAULT_QUEUE)
         (d / "agentd.yaml").write_text(json.dumps(config))
         self._agentd_args = [BIN / "agentd", "--config", d / "agentd.yaml"]
-        if SANDBOX == "none":
-            self._agentd_args.append("--insecure-dev")  # the git tool server runs unsandboxed too
+        if SANDBOX == "none" or insecure_dev:
+            self._agentd_args.append("--insecure-dev")  # with none, the git tool server runs unsandboxed too
         if not worker:
             self._agentd_args.append("--no-worker")  # the test starts its own
         self.supervised, self._agentd_terminal = worker, terminal
@@ -792,9 +811,10 @@ class Stack:
 
     def sandbox_env(self) -> dict[str, str]:
         # In production agentd's data lives under the home directory, which the macOS sandbox
-        # cannot read. Test data lives elsewhere, so keep it out of reach explicitly.
+        # cannot read. Test data lives elsewhere, so keep it out of reach explicitly. On Linux the
+        # launcher holds the Worker to agentd's default limits, as agentd's own launches do.
         denied = [str(p) for p in [self.tmp, *self.deny_read]]
-        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied)}
+        return {**os.environ, "AGENTOS_SANDBOX_DENY_READ": json.dumps(denied), **launcher_limits("worker")}
 
     def start_worker(self, workflows: str | None = None, args: tuple[str, ...] = (), stdin: int | None = None,
                      ready: bool = True) -> Worker:
