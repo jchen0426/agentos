@@ -2601,7 +2601,7 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 #### 剩余风险（修复轮 2 之后）
 
-- 第二次尝试马上就跑（协调者定的，这一轮不修）：机器本身缺内存时（第二次尝试正是为这种情况留的），它可能再触发一次 OOM，而那一次内核在整台机器里挑要杀的进程（可能是 Temporal、agentd）；一直缺内存的机器（systemd-oomd 的压力窗口）最后照样是拒绝，措辞也这么说。第二次尝试之前看一眼机器的内存（MemAvailable、PSI），能把这个口子收窄。
+- 第二次尝试马上就跑（协调者定的，这一轮不修）：机器本身缺内存时（第二次尝试正是为这种情况留的），它可能再触发一次 OOM，而那一次内核在整台机器里挑要杀的进程（可能是 Temporal、agentd）；一直缺内存的机器（systemd-oomd 的压力窗口）最后照样是拒绝，措辞也这么说。第二次尝试之前看一眼机器的内存（MemAvailable、PSI），能把这个口子收窄。更新（2026-10-31，沙箱的 oom_score_adj，见文末）：沙箱的进程 oom_score_adj 是 1000 以后，那一次内核挑中的是某个沙箱的进程，除非被攻破的沙箱把自己的调低了。
 - 说完就绪、还没核对就退出并被收尸的一代，说不清它在不在 scope 里（pid 不再说明什么）：按退出处理、重启，下一代照样核对。所以一个不 source limits.sh、每代说完就绪就退出的启动脚本不会被拒绝，只会按退避一直重启；它在 scope 外也跑不了什么：它一退出，agentd 就杀掉它的整个进程组。
 - agentd 自己停掉的 Worker 代（不在服务、没按时就绪、Stop）照旧不问 systemd：这样一代的 scope 若被 OOM 杀过、留在 failed，要到 agentd 停下时的 reset-failed 才清。之后还会起新一代的只有“不在服务”那一条，个数受退避限制。
 - 停下时 reset-failed 的那个 defer（main.go 的 `run()`）没有测试：修复轮 1 黑盒改坏检查活下来的那处（BBd），照旧。
@@ -2707,7 +2707,63 @@ A 合并成 #45 之后，B 移到 main（f55feec）上，分支 `m5-explain-main
 
 #### 剩余风险
 
-- 只是警告：总和照旧没有上限。机器真的缺内存时，OOM 杀手照样在整台机器里挑（可能是 Temporal、agentd）。给 agentd 的 scope 加一个共同的 slice、设它的 MemoryMax，才是真正的总上限，这一轮没做（用户定的“先只警告”）。
+- 只是警告：总和照旧没有上限。机器真的缺内存时，OOM 杀手照样在整台机器里挑（可能是 Temporal、agentd；沙箱的 oom_score_adj 调到 1000 以后，先挑沙箱的进程，见下一节）。给 agentd 的 scope 加一个共同的 slice、设它的 MemoryMax，才是真正的总上限，这一轮没做（用户定的“先只警告”）。
 - 一半是个经验值：MemTotal 不扣别的进程（Temporal、桌面、别的服务）已经用掉的；memory.high 和 systemd-oomd 的压力阈值没有看。
-- 沙箱进程的 oom_score_adj 没有调高（协调者说可能是下一条）。
+- 沙箱进程的 oom_score_adj 没有调高（协调者说可能是下一条）。后来做了，见下一节。
 - 原来的几条照旧（修复轮 2、3 之后的）。
+
+### 沙箱的 oom_score_adj（用户 2026-10-31 定的，ee9925d 之上）
+
+用户采纳了协调者的提议：启动脚本把沙箱的 oom_score_adj 调到 1000，这样整台机器内存用光时，内核的 OOM 杀手先挑沙箱的进程，而不是用户的浏览器、IDE、Temporal 或 agentd；README 和笔记写明，被攻破的沙箱能把它调回去。
+
+#### 量的（VM，Ubuntu 24.04，内核 6.8，bwrap）
+
+- 协调者在沙箱外量过：没有特权的进程能把自己调到 1000，它的子进程能调回 0，也就是它继承下来的下限。
+- 沙箱里（经 run-tool.sh 和 run-worker.sh 各一次，limits.sh 改过以后，`/bin/sh` 当命令）：读到 1000；CapPrm、CapEff、CapBnd 都是 0；进程能把自己的调回 0；调到 -1 被拒绝（写失败）；它的子进程能再调到 1000、再调回 0，调不到 -1。也就是说，被攻破的沙箱能把自己调回 agentd 那个进程的值（这里是 0），调不到更低。
+- `AGENTOS_LIMITS=off`（`--insecure-dev`）时沙箱里读到 0，和外面一样。
+- 量用的脚本在草稿目录（`oom/measure.sh`），在 VM 的 `/tmp/c3a-oom` 下跑，scope 都是用完即删的，没有留下。
+
+#### 做了什么
+
+- **limits.sh**：在 scope 里、核对完三个上限以后、bwrap 之前，往 `/proc/self/oom_score_adj` 写 1000，再读回来；写不进去、读不回来、读回来不是 1000，都按别的检查的措辞拒绝（"its oom_score_adj is N, not 1000"）。exec 以后的 bwrap 和沙箱里的每个进程都继承它。`AGENTOS_LIMITS=off` 时什么都不做。头部注释写明为什么、被攻破的沙箱能调回去；run-worker.sh、run-tool.sh 的头部各加了一句。
+- **agentd.started**：上限有效时，两组的记录都加 `oom_score_adj: 1000`，来自 Go 的常量 `scope.OOMScoreAdj`。
+- **InScope 不读它**：在那里读 `/proc/<pid>/oom_score_adj` 会把修复轮 2 的竞争带回来（僵尸的启动脚本，或者两次读之间被收尸）。InScope 核对的是启动脚本 source 了 limits.sh，limits.sh 在 bwrap 之前就核对了这个值。
+- **README**：“Resource limits”加了一段：1000、为什么、代价（别的东西用光内存时，先被杀的也是沙箱：Worker 重启，git 工具调用被杀两次就拒绝）、被攻破的沙箱能调回去（量的结果），所以只对老实的过载有用；记录。记录那句加了 `oom_score_adj`。
+
+#### 我定的几处
+
+- 1000 是 limits.sh 里写死的数，不经环境变量传：手动跑启动脚本要给的变量不变（harness、README 都不用改）。Go 的常量 `scope.OOMScoreAdj` 给记录用，`TestTheLaunchersTakeWhatEnvGives` 在有用户管理器的 Linux 上（VM、CI）真起一个 scope 跑启动脚本，要它起的命令读到的正是这个常量，两边就钉在一起了；Go 的记录测试写的是字面的 1000。
+- 黑盒测试从宿主读 `/proc/<pid>/oom_score_adj`（Worker 的进程、工具服务器的进程）：和沙箱里读 `/proc/self` 是同一个数；沙箱里面读的那一遍在上面的量法里。
+
+#### 测试
+
+- **Go**：`TestTheLaunchersTakeWhatEnvGives` 在 Linux、有用户管理器时，用真的 systemd-run 跑一个 source limits.sh 的启动脚本：在 scope 里，它起的 `cat` 读到 `OOMScoreAdj`；off 时读到测试进程自己的值。macOS 和没有用户管理器的地方跳过这一半（记一行日志）。`TestStartRecordsTheToolLimits`、`TestWorkerRecord`：记录有 `oom_score_adj: 1000`。
+- **黑盒**（bwrap）：`test_each_run_has_a_scope_of_its_own_that_holds_its_limits`：Worker 的进程和挂住的 git 工具服务器的进程都是 1000，agentd 自己不是；两组记录都有 `oom_score_adj: 1000`。`test_insecure_dev_turns_the_limits_off`：Worker 的值和 agentd 的一样，不是 1000。`test_worker_supervision.py` 的第一个测试，bwrap 下的记录多了这一项。
+
+#### 改坏检查
+
+- **limits.sh 4 处**，每处跑 VM 里的 Go 启动脚本测试和两个黑盒测试：不写（启动脚本拒绝，两边都抓到）；换成 900（读到 900，两边都抓到）；off 时也写（Go 的 off 那一项抓到，黑盒 `--insecure-dev` 那个也抓到）；不读回来：活下来，等价：内核接受了的写，读回来就是写的那个数，造不出写成功却没生效的机器；留着它，是给那样的机器的，代价是一次 read。
+- **Go 2 处**，都抓到：记录里没有它；常量换成 900（记录测试抓到；VM 里启动脚本测试也会，那里 limits.sh 写的是 1000）。
+
+#### 跑过的（7af7feb）
+
+- `gofmt -l`、`go vet ./...`（macOS 和 GOOS=linux）没输出；`go test ./...` 全过；`make build-linux` 通过；ruff 对改过的测试文件没意见。改到的包（scope、cmd/agentd）交叉编译成 Linux 的，在 VM 里跑也都过，启动脚本测试真起了 scope。VM 里先单独跑了改到的黑盒测试（5 个都过）。
+- 黑盒只跑 VM 的 bwrap（协调者定的）：macOS 上没有上限，PR 的 CI 会跑 macOS。
+- 黑盒，`--verify-after-each`，7af7feb：
+
+  | 环境 | 通过 | 失败 | 跳过 | 起了 agentd 的栈 | verify 以 0 退出 | 照标记 | verify 失败 | 没验 | 用时 |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 目标集，Linux VM，bwrap | 113 | 1 | 16 | 102 | 72 | 17 | 0 | 13 | 17 分 9 秒 |
+  | 完整套件，Linux VM，bwrap | 332 | 2 | 18 | 197 | 162 | 19 | 0 | 16 | 32 分 42 秒 |
+
+  三次失败都和这一条无关，是 VM 的环境：
+  - `test_a_worker_that_exits_is_started_again_with_a_growing_delay`（两次都是它）：测试拿日志的墙上时间比重启的间隔（“worker exited”到下一个“worker started”至少 1 秒、2 秒、4 秒，容差 10 毫秒）。今天 VM 的时钟每 10 秒左右快 100–137 毫秒，lima-guestagent 每 10 秒把它往回拨一次（journal："SyncTime: system time synchronized with host (drift was 133.032875ms)"；目标集那 17 分钟里拨了 108 次，今天从 06 点起几乎一直这样）。拨在那个间隔里，量出来的间隔就短了约 0.1 秒：目标集那次是 1.875 秒对 2 秒，13:37:00 正好拨了一次。单独重跑 7 次，过了 2 次；后 4 次里没过的 3 次逐一对过时间，每个短了的间隔里都有一次 SyncTime。supervisor 的等待用的是单调时钟，实际等够了。
+  - `test_a_git_tool_call_killed_for_memory_twice_is_refused_in_one_attempt`（完整套件那次）：agentd 没起来，配置里 GitHub 的地址是 `http:///`。harness 一见 `githubsim.addr` 存在就读，而 githubsim 用 `os.WriteFile` 写它（先建、再写），读早了就是空的。单独重跑 2 次都过。
+  - 这两处都是测试和 harness 原来就有的问题，这一轮没改（要改的话：前者比较 supervisor 自己记的时间或放宽容差，后者让 githubsim 先写临时文件再改名），留给协调者。
+  跑完 VM 里没有留下 failed 的 agentos scope、活着的 agentos scope 或状态目录；另一个会话的两个 agentd 没碰。
+
+#### 剩余风险
+
+- 被攻破的沙箱能把自己的 oom_score_adj 调回 0（agentd 那个进程的值），这一条只对老实的过载有用。要让它调不回去，得由有 CAP_SYS_RESOURCE 的进程来设（那样下限也跟着设了），比如交给 systemd：scope 的 `OOMScoreAdjust=`。这一轮没做。
+- 代价：别的程序把内存用光时，先被杀的也是沙箱（Worker 被杀、重启；git 工具调用被杀两次就拒绝）。
+- 1000 不保证一定先杀沙箱：内核按 oom_score 挑，别的进程也可能是 1000（比如别的沙箱、浏览器的渲染进程常设 300 或更高）。
